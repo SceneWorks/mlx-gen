@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs on the same ref (the macOS + MLX build is expensive).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: fmt + clippy + test (macOS / Metal GPU)
+    # Apple-Silicon runner: MLX is Apple-Silicon-only and the tests eval on the
+    # Metal GPU (the crate forces RUST_TEST_THREADS=1 via .cargo/config.toml,
+    # since MLX's default Metal device is not thread-safe).
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain versions
+        run: |
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          cmake --version
+
+      - name: Ensure Metal compiler
+        # mlx-sys builds MLX's Metal kernels from source via cmake, which needs the
+        # `metal` compiler. Xcode 16+ ships it as a separately-downloadable component;
+        # Xcode 15 has it built in. Download only if missing so this works on either.
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            echo "metal not found — downloading the Metal Toolchain component"
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          echo "metal: $(xcrun --find metal)"
+          xcrun metal --version || true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + mlx-sys build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test
