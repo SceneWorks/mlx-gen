@@ -38,6 +38,6 @@ for name, (h, w) in CASES.items():
     out[f"{name}.grid_thw"] = mx.array(grid_thw.astype(np.int32))
     print(f"{name}: in=({h},{w}) pixel_values={pixel_values.shape} grid_thw={grid_thw.tolist()}")
 
-path = "/Users/michael/repos/mlx-gen/tests/fixtures/qwen_image_processor.safetensors"
+path = "/Users/michael/repos/mlx-gen/mlx-gen-qwen-image/tests/fixtures/qwen_image_processor.safetensors"
 mx.save_safetensors(path, out)
 print(f"wrote {path} ({len(out)} tensors)")

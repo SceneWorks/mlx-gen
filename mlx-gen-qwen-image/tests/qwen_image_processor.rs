@@ -9,8 +9,8 @@
 //! quantization level, 1/255, after CLIP-normalization) — PIL's fixed-point resampler isn't
 //! bit-reproduced, so that case uses a 1.7e-2 tolerance (just above the measured 1/255).
 
-use mlx_gen::models::qwen::{ImageInput, QwenImageProcessor};
 use mlx_gen::weights::Weights;
+use mlx_gen_qwen_image::{ImageInput, QwenImageProcessor};
 use mlx_rs::ops::{all_close, array_eq};
 use mlx_rs::Array;
 
