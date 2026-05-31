@@ -27,7 +27,7 @@ pub mod vae;
 pub use context_block::ZImageContextBlock;
 pub use final_layer::FinalLayer;
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
-pub use pipeline::{create_noise, decoded_to_image, unpack_latents};
+pub use pipeline::{create_noise, decoded_to_image, denoise, unpack_latents};
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};

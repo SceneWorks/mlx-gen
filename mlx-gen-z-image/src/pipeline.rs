@@ -4,9 +4,11 @@
 //! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`])
 //! lands once `load()` assembles the model from weights (+ the text encoder).
 
-use mlx_gen::{Image, Result};
+use mlx_gen::{FlowMatchEuler, Image, Result};
 use mlx_rs::ops::{add, maximum, minimum, multiply, round};
 use mlx_rs::{random, Array};
+
+use crate::ZImageTransformer;
 
 /// Z-Image latent channel count.
 pub const LATENT_CHANNELS: i32 = 16;
@@ -36,6 +38,27 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 /// axis, drop the singleton temporal axis) before VAE decode.
 pub fn unpack_latents(latents: &Array) -> Result<Array> {
     Ok(latents.expand_dims(0)?.squeeze_axes(&[2])?)
+}
+
+/// Flow-match Euler denoise loop: each step predicts the velocity with the DiT and takes an
+/// Euler step. `latents` is the seeded init (see [`create_noise`]); `cap_feats` is the
+/// text-encoder conditioning. Returns the final latents (pre-VAE).
+///
+/// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
+/// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`. Composes the parity-proven
+/// transformer + scheduler; full-weights numeric parity is the real-hardware E2E (sc-2352).
+pub fn denoise(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    latents: Array,
+    cap_feats: &Array,
+) -> Result<Array> {
+    let mut latents = latents;
+    for t in 0..scheduler.num_steps() {
+        let velocity = transformer.forward(&latents, scheduler.timestep(t), cap_feats)?;
+        latents = scheduler.step(&latents, &velocity, t)?;
+    }
+    Ok(latents)
 }
 
 /// Decoded VAE tensor → RGB8 [`Image`]. Mirrors the fork's `ImageUtil`: denormalize
