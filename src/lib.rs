@@ -13,10 +13,27 @@
 
 pub mod adapters;
 pub mod error;
+pub mod generator;
+pub mod media;
 pub mod models;
 pub mod nn;
 pub mod quant;
+pub mod registry;
+pub mod runtime;
 pub mod tokenizer;
+pub mod transform;
 pub mod weights;
 
 pub use error::{Error, Result};
+pub use generator::{
+    Capabilities, Conditioning, ConditioningKind, ControlKind, GenerationOutput, GenerationRequest,
+    Generator, Modality, ModelDescriptor,
+};
+pub use media::{AudioTrack, Image};
+pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};
+pub use runtime::{
+    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Precision, Progress, Quant, WeightsSource,
+};
+pub use transform::{
+    TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
+};

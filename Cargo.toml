@@ -12,6 +12,8 @@ readme = "README.md"
 [dependencies]
 mlx-rs = "0.25"
 thiserror = "2"
+# Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
+inventory = "0.3"
 # HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
 # onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
