@@ -83,13 +83,6 @@ pub struct QwenImage {
 /// encoder promotes to f32 internally. Q8 quantization and an fp32 override are not yet wired (the
 /// validated path is dense bf16) — both are rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "qwen_image: Q8 quantization is not yet wired in the Rust port; the validated path is \
-             dense bf16 (drop `quantize` to load)"
-                .into(),
-        ));
-    }
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "qwen_image: only dense bf16 is wired in the Rust port (drop the precision override)"
@@ -105,11 +98,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
+    // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load — the
+    // fork's `nn.quantize` predicate matches every Linear, and only the transformer has them
+    // (the text encoder is skip-quantize; the VAE is all conv). Text encoder + VAE stay bf16.
+    let mut transformer = loader::load_transformer(root)?;
+    if let Some(q) = spec.quantize {
+        transformer.quantize(q.bits())?;
+    }
     Ok(Box::new(QwenImage {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
         text_encoder: loader::load_text_encoder(root)?,
-        transformer: loader::load_transformer(root)?,
+        transformer,
         vae: loader::load_vae(root)?,
     }))
 }
@@ -295,14 +295,19 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_single_file_and_quant() {
+    fn load_rejects_single_file() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/q.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
 
+    #[test]
+    fn load_accepts_q8_spec() {
+        // Q8 is wired (transformer-only); a Q8 spec must get past the quant gate and fail later on
+        // the missing snapshot, not on quantization being unsupported.
         let spec =
             LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(mlx_gen::Quant::Q8);
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("quantization"), "got: {err}");
+        assert!(!err.contains("quantization"), "got: {err}");
     }
 }

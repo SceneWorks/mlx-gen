@@ -96,8 +96,17 @@ impl LinearBase {
                 y
             }
             LinearBase::Quantized(q) => {
+                // pmetal-MLX-0.30.6 quirk: `quantized_matmul` with **bf16 activations** + a small
+                // `in_features` (≤128) returns garbage, while f32 activations are correct for every
+                // shape (verified in `mlx-gen-qwen-image/tests/q8_smoke.rs`). Upcast bf16 → f32 so
+                // the quantized path is correct regardless of input dtype (weights stay Q4/Q8).
+                let xf = if x.dtype() == Dtype::Bfloat16 {
+                    x.as_dtype(Dtype::Float32)?
+                } else {
+                    x.clone()
+                };
                 let mut y = quantized_matmul(
-                    x,
+                    &xf,
                     &q.inner.weight.value,
                     &q.scales.value,
                     &q.biases.value,

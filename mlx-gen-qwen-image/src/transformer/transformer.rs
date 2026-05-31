@@ -10,12 +10,12 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::time_text_embed::TimeTextEmbed;
-use super::{AdaLayerNormContinuous, QwenRope3d, QwenTransformerBlock};
+use super::{linear_from, AdaLayerNormContinuous, QwenRope3d, QwenTransformerBlock};
 
 pub struct QwenTransformerConfig {
     pub in_channels: i32,
@@ -48,16 +48,13 @@ impl QwenTransformerConfig {
 }
 
 pub struct QwenTransformer {
-    img_in_w: Array,
-    img_in_b: Array,
+    img_in: AdaptableLinear,
     txt_norm_w: Array,
-    txt_in_w: Array,
-    txt_in_b: Array,
+    txt_in: AdaptableLinear,
     time_text_embed: TimeTextEmbed,
     blocks: Vec<QwenTransformerBlock>,
     norm_out: AdaLayerNormContinuous,
-    proj_out_w: Array,
-    proj_out_b: Array,
+    proj_out: AdaptableLinear,
     rope: QwenRope3d,
     eps: f32,
 }
@@ -81,19 +78,31 @@ impl QwenTransformer {
             )?);
         }
         Ok(Self {
-            img_in_w: w.require(&p("img_in.weight"))?.clone(),
-            img_in_b: w.require(&p("img_in.bias"))?.clone(),
+            img_in: linear_from(w, &p("img_in"), true)?,
             txt_norm_w: w.require(&p("txt_norm.weight"))?.clone(),
-            txt_in_w: w.require(&p("txt_in.weight"))?.clone(),
-            txt_in_b: w.require(&p("txt_in.bias"))?.clone(),
+            txt_in: linear_from(w, &p("txt_in"), true)?,
             time_text_embed: TimeTextEmbed::from_weights(w, &p("time_text_embed"))?,
             blocks,
             norm_out: AdaLayerNormContinuous::from_weights(w, &p("norm_out"))?,
-            proj_out_w: w.require(&p("proj_out.weight"))?.clone(),
-            proj_out_b: w.require(&p("proj_out.bias"))?.clone(),
+            proj_out: linear_from(w, &p("proj_out"), true)?,
             rope: QwenRope3d::qwen_image(),
             eps: cfg.txt_norm_eps,
         })
+    }
+
+    /// Quantize every transformer Linear to Q4/Q8 in place (group_size 64), the mlx-rs equivalent
+    /// of the fork's `nn.quantize(transformer, bits=…)`. The text encoder + VAE stay dense (they
+    /// have no quantizable Linears in the fork's predicate path).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_in.quantize(bits, None)?;
+        self.txt_in.quantize(bits, None)?;
+        self.proj_out.quantize(bits, None)?;
+        self.time_text_embed.quantize(bits)?;
+        for block in &mut self.blocks {
+            block.quantize(bits)?;
+        }
+        self.norm_out.quantize(bits)?;
+        Ok(())
     }
 
     /// `hidden_states`: packed image latents `[B, latent_h·latent_w, in_channels]`.
@@ -113,9 +122,9 @@ impl QwenTransformer {
         let img_seq = hidden_states.shape()[1];
         let txt_seq = encoder_hidden_states.shape()[1];
 
-        let mut hidden = linear(hidden_states, &self.img_in_w, &self.img_in_b)?;
+        let mut hidden = self.img_in.forward(hidden_states)?;
         let encoder = rms_norm(encoder_hidden_states, &self.txt_norm_w, self.eps)?;
-        let mut encoder = linear(&encoder, &self.txt_in_w, &self.txt_in_b)?;
+        let mut encoder = self.txt_in.forward(&encoder)?;
 
         let ts = Array::from_slice(&vec![timestep; b as usize], &[b]);
         let text_emb = self.time_text_embed.forward(&ts)?;
@@ -140,7 +149,7 @@ impl QwenTransformer {
         }
 
         let hidden = self.norm_out.forward(&hidden, &text_emb)?;
-        linear(&hidden, &self.proj_out_w, &self.proj_out_b)
+        self.proj_out.forward(&hidden)
     }
 }
 

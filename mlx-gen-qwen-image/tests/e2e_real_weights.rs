@@ -36,6 +36,10 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_image_golden.safetensors"
 );
+const Q8_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_image_q8_golden.safetensors"
+);
 
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
@@ -142,6 +146,73 @@ fn transformer_pipeline_vae_matches_fork() {
     assert!(
         frac < 0.05,
         "too many divergent pixels: {:.3}%",
+        frac * 100.0
+    );
+}
+
+#[test]
+#[ignore = "needs real Qwen-Image transformer+VAE weights + local Q8 golden"]
+fn transformer_q8_pipeline_matches_fork() {
+    let g = Weights::from_file(Q8_GOLDEN).unwrap();
+    let root = snapshot();
+    // Q8-quantize the transformer (group_size 64) — the same set the fork's `nn.quantize` hits.
+    let mut transformer = loader::load_transformer(&root).unwrap();
+    transformer.quantize(8).unwrap();
+    let vae = loader::load_vae(&root).unwrap();
+
+    let noise = g.require("noise").unwrap().clone();
+    let pos = g.require("prompt_embeds").unwrap();
+    let neg = g.require("negative_prompt_embeds").unwrap();
+    let scheduler = qwen_scheduler(STEPS, WIDTH, HEIGHT);
+    let latents = denoise_with_progress(
+        &transformer,
+        &scheduler,
+        noise,
+        pos,
+        neg,
+        GUIDANCE,
+        WIDTH,
+        HEIGHT,
+        &CancelFlag::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let want_latents = g.require("final_latents").unwrap();
+    assert_eq!(latents.shape(), want_latents.shape(), "final_latents shape");
+    let (peak, mean) = rel_errors(&latents, want_latents);
+    println!("Q8 final_latents: peak-rel = {peak:.3e}, mean-rel = {mean:.3e}");
+    // Q8 vs fork-Q8: packing is byte-identical (sc-2342) so this stays near the qmm-parity floor,
+    // a touch looser than the bf16 path to absorb quantized-matmul accumulation over the loop.
+    assert!(
+        mean < 3e-2,
+        "Q8 final_latents mean-rel regressed: {mean:.3e}"
+    );
+    assert!(
+        peak < 1.5e-1,
+        "Q8 final_latents peak-rel regressed: {peak:.3e}"
+    );
+
+    let unpacked = unpack_latents(&latents, WIDTH, HEIGHT).unwrap();
+    let decoded = vae.decode(&unpacked).unwrap();
+    let want_decoded = g.require("decoded").unwrap();
+    let (_dpeak, dmean) = rel_errors(&decoded, want_decoded);
+    println!("Q8 decoded: mean-rel = {dmean:.3e}");
+    assert!(dmean < 6e-2, "Q8 decoded mean-rel regressed: {dmean:.3e}");
+
+    let got_img = decoded_to_image(&decoded).unwrap();
+    let want_img = decoded_to_image(want_decoded).unwrap();
+    let differ = got_img
+        .pixels
+        .iter()
+        .zip(&want_img.pixels)
+        .filter(|(a, b)| (**a as i16 - **b as i16).abs() > 8)
+        .count();
+    let frac = differ as f32 / got_img.pixels.len() as f32;
+    println!("Q8 pixels >8 apart: {:.3}%", frac * 100.0);
+    assert!(
+        frac < 0.02,
+        "Q8: too many divergent pixels: {:.3}%",
         frac * 100.0
     );
 }

@@ -1,41 +1,34 @@
 //! Joint (dual-stream) attention. Port of the fork's `QwenAttention`: separate q/k/v projections
 //! for the image (`to_*`) and text (`add_*_proj`) streams, per-head q/k RMSNorm, **interleaved**
 //! complex RoPE, then attention over the concatenated `[txt, img]` sequence, split back into the
-//! two streams and projected (`attn_to_out.0` / `to_add_out`).
+//! two streams and projected (`attn_to_out.0` / `to_add_out`). All eight projections are
+//! [`AdaptableLinear`] (Q8-quantizable); the q/k RMSNorm weights stay dense.
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::join;
+use super::{join, linear_from};
 
 const RMS_EPS: f32 = 1e-6;
 
 pub struct QwenJointAttention {
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    add_q_w: Array,
-    add_q_b: Array,
-    add_k_w: Array,
-    add_k_b: Array,
-    add_v_w: Array,
-    add_v_b: Array,
+    to_q: AdaptableLinear,
+    to_k: AdaptableLinear,
+    to_v: AdaptableLinear,
+    add_q: AdaptableLinear,
+    add_k: AdaptableLinear,
+    add_v: AdaptableLinear,
+    to_out: AdaptableLinear,
+    to_add_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
     norm_added_q: Array,
     norm_added_k: Array,
-    out_w: Array,
-    out_b: Array,
-    add_out_w: Array,
-    add_out_b: Array,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -45,30 +38,34 @@ impl QwenJointAttention {
     pub fn from_weights(w: &Weights, prefix: &str, num_heads: i32, head_dim: i32) -> Result<Self> {
         let g = |s: &str| w.require(&join(prefix, s)).cloned();
         Ok(Self {
-            q_w: g("to_q.weight")?,
-            q_b: g("to_q.bias")?,
-            k_w: g("to_k.weight")?,
-            k_b: g("to_k.bias")?,
-            v_w: g("to_v.weight")?,
-            v_b: g("to_v.bias")?,
-            add_q_w: g("add_q_proj.weight")?,
-            add_q_b: g("add_q_proj.bias")?,
-            add_k_w: g("add_k_proj.weight")?,
-            add_k_b: g("add_k_proj.bias")?,
-            add_v_w: g("add_v_proj.weight")?,
-            add_v_b: g("add_v_proj.bias")?,
+            to_q: linear_from(w, &join(prefix, "to_q"), true)?,
+            to_k: linear_from(w, &join(prefix, "to_k"), true)?,
+            to_v: linear_from(w, &join(prefix, "to_v"), true)?,
+            add_q: linear_from(w, &join(prefix, "add_q_proj"), true)?,
+            add_k: linear_from(w, &join(prefix, "add_k_proj"), true)?,
+            add_v: linear_from(w, &join(prefix, "add_v_proj"), true)?,
+            to_out: linear_from(w, &join(prefix, "attn_to_out.0"), true)?,
+            to_add_out: linear_from(w, &join(prefix, "to_add_out"), true)?,
             norm_q: g("norm_q.weight")?,
             norm_k: g("norm_k.weight")?,
             norm_added_q: g("norm_added_q.weight")?,
             norm_added_k: g("norm_added_k.weight")?,
-            out_w: g("attn_to_out.0.weight")?,
-            out_b: g("attn_to_out.0.bias")?,
-            add_out_w: g("to_add_out.weight")?,
-            add_out_b: g("to_add_out.bias")?,
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
         })
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.to_q.quantize(bits, None)?;
+        self.to_k.quantize(bits, None)?;
+        self.to_v.quantize(bits, None)?;
+        self.add_q.quantize(bits, None)?;
+        self.add_k.quantize(bits, None)?;
+        self.add_v.quantize(bits, None)?;
+        self.to_out.quantize(bits, None)?;
+        self.to_add_out.quantize(bits, None)?;
+        Ok(())
     }
 
     /// `img`/`txt`: `[B, seq, dim]`; rope tables `[seq, head_dim/2]`; `mask`: optional additive
@@ -87,32 +84,24 @@ impl QwenJointAttention {
         let (b, img_seq) = (img.shape()[0], img.shape()[1]);
         let txt_seq = txt.shape()[1];
         let (h, hd) = (self.num_heads, self.head_dim);
-        let to_heads = |x: &Array, w: &Array, bias: &Array, seq: i32| -> Result<Array> {
-            Ok(linear(x, w, bias)?.reshape(&[b, seq, h, hd])?)
+        let to_heads = |lin: &AdaptableLinear, x: &Array, seq: i32| -> Result<Array> {
+            Ok(lin.forward(x)?.reshape(&[b, seq, h, hd])?)
         };
 
-        let img_q = rms_norm(
-            &to_heads(img, &self.q_w, &self.q_b, img_seq)?,
-            &self.norm_q,
-            RMS_EPS,
-        )?;
-        let img_k = rms_norm(
-            &to_heads(img, &self.k_w, &self.k_b, img_seq)?,
-            &self.norm_k,
-            RMS_EPS,
-        )?;
-        let img_v = to_heads(img, &self.v_w, &self.v_b, img_seq)?;
+        let img_q = rms_norm(&to_heads(&self.to_q, img, img_seq)?, &self.norm_q, RMS_EPS)?;
+        let img_k = rms_norm(&to_heads(&self.to_k, img, img_seq)?, &self.norm_k, RMS_EPS)?;
+        let img_v = to_heads(&self.to_v, img, img_seq)?;
         let txt_q = rms_norm(
-            &to_heads(txt, &self.add_q_w, &self.add_q_b, txt_seq)?,
+            &to_heads(&self.add_q, txt, txt_seq)?,
             &self.norm_added_q,
             RMS_EPS,
         )?;
         let txt_k = rms_norm(
-            &to_heads(txt, &self.add_k_w, &self.add_k_b, txt_seq)?,
+            &to_heads(&self.add_k, txt, txt_seq)?,
             &self.norm_added_k,
             RMS_EPS,
         )?;
-        let txt_v = to_heads(txt, &self.add_v_w, &self.add_v_b, txt_seq)?;
+        let txt_v = to_heads(&self.add_v, txt, txt_seq)?;
 
         let img_q = apply_rope_qwen(&img_q, img_cos, img_sin)?;
         let img_k = apply_rope_qwen(&img_k, img_cos, img_sin)?;
@@ -136,8 +125,8 @@ impl QwenJointAttention {
         // split back along the sequence axis: text first, then image.
         let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
         let img_idx = Array::from_slice(&(txt_seq..joint).collect::<Vec<i32>>(), &[img_seq]);
-        let txt_attn = linear(&o.take_axis(&txt_idx, 1)?, &self.add_out_w, &self.add_out_b)?;
-        let img_attn = linear(&o.take_axis(&img_idx, 1)?, &self.out_w, &self.out_b)?;
+        let txt_attn = self.to_add_out.forward(&o.take_axis(&txt_idx, 1)?)?;
+        let img_attn = self.to_out.forward(&o.take_axis(&img_idx, 1)?)?;
         Ok((img_attn, txt_attn))
     }
 }

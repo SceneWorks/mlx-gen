@@ -22,14 +22,21 @@ pub use norm_out::AdaLayerNormContinuous;
 pub use rope::QwenRope3d;
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 
-use mlx_rs::ops::matmul;
-use mlx_rs::Array;
-
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// `y = x · Wᵀ` for a stored `[out, in]` weight (bias-less Linear).
-pub(crate) fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
-    Ok(matmul(x, w.t())?)
+/// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
+/// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole
+/// model can be Q8-quantized in place without touching the forward.
+pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
+    let weight = w.require(&format!("{prefix}.weight"))?.clone();
+    let bias = if has_bias {
+        Some(w.require(&format!("{prefix}.bias"))?.clone())
+    } else {
+        None
+    };
+    Ok(AdaptableLinear::dense(weight, bias))
 }
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix.

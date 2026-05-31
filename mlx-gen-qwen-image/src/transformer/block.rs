@@ -6,19 +6,18 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, multiply, split};
 use mlx_rs::Array;
 
-use mlx_gen::nn::{linear, silu};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, FeedForward, QwenJointAttention};
+use super::{join, linear_from, FeedForward, QwenJointAttention};
 
 const LN_EPS: f32 = 1e-6;
 
 pub struct QwenTransformerBlock {
-    img_mod_w: Array,
-    img_mod_b: Array,
-    txt_mod_w: Array,
-    txt_mod_b: Array,
+    img_mod: AdaptableLinear,
+    txt_mod: AdaptableLinear,
     attn: QwenJointAttention,
     img_ff: FeedForward,
     txt_ff: FeedForward,
@@ -27,14 +26,21 @@ pub struct QwenTransformerBlock {
 impl QwenTransformerBlock {
     pub fn from_weights(w: &Weights, prefix: &str, num_heads: i32, head_dim: i32) -> Result<Self> {
         Ok(Self {
-            img_mod_w: w.require(&join(prefix, "img_mod_linear.weight"))?.clone(),
-            img_mod_b: w.require(&join(prefix, "img_mod_linear.bias"))?.clone(),
-            txt_mod_w: w.require(&join(prefix, "txt_mod_linear.weight"))?.clone(),
-            txt_mod_b: w.require(&join(prefix, "txt_mod_linear.bias"))?.clone(),
+            img_mod: linear_from(w, &join(prefix, "img_mod_linear"), true)?,
+            txt_mod: linear_from(w, &join(prefix, "txt_mod_linear"), true)?,
             attn: QwenJointAttention::from_weights(w, &join(prefix, "attn"), num_heads, head_dim)?,
             img_ff: FeedForward::from_weights(w, &join(prefix, "img_ff"))?,
             txt_ff: FeedForward::from_weights(w, &join(prefix, "txt_ff"))?,
         })
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.img_mod.quantize(bits, None)?;
+        self.txt_mod.quantize(bits, None)?;
+        self.attn.quantize(bits)?;
+        self.img_ff.quantize(bits)?;
+        self.txt_ff.quantize(bits)?;
+        Ok(())
     }
 
     /// Returns `(encoder_hidden_states, hidden_states)` (text, image) — matching the fork's order.
@@ -50,8 +56,8 @@ impl QwenTransformerBlock {
         txt_sin: &Array,
         mask: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        let img_mod = linear(&silu(text_embeddings)?, &self.img_mod_w, &self.img_mod_b)?;
-        let txt_mod = linear(&silu(text_embeddings)?, &self.txt_mod_w, &self.txt_mod_b)?;
+        let img_mod = self.img_mod.forward(&silu(text_embeddings)?)?;
+        let txt_mod = self.txt_mod.forward(&silu(text_embeddings)?)?;
         let img_mod = split(&img_mod, 2, 1)?; // [mod1, mod2], each [B, 3*dim]
         let txt_mod = split(&txt_mod, 2, 1)?;
 

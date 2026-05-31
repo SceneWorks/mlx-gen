@@ -1,34 +1,37 @@
 //! Per-stream feed-forward: `mlp_out(gelu_approx(mlp_in(x)))` (both biased, 4× expansion).
-//! Port of the fork's `QwenFeedForward`.
+//! Port of the fork's `QwenFeedForward`. Both Linears are [`AdaptableLinear`] so the transformer
+//! can be quantized (Q8) without changing the forward.
 
 use mlx_rs::nn::gelu_approximate;
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::join;
+use super::{join, linear_from};
 
 pub struct FeedForward {
-    in_w: Array,
-    in_b: Array,
-    out_w: Array,
-    out_b: Array,
+    mlp_in: AdaptableLinear,
+    mlp_out: AdaptableLinear,
 }
 
 impl FeedForward {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            in_w: w.require(&join(prefix, "mlp_in.weight"))?.clone(),
-            in_b: w.require(&join(prefix, "mlp_in.bias"))?.clone(),
-            out_w: w.require(&join(prefix, "mlp_out.weight"))?.clone(),
-            out_b: w.require(&join(prefix, "mlp_out.bias"))?.clone(),
+            mlp_in: linear_from(w, &join(prefix, "mlp_in"), true)?,
+            mlp_out: linear_from(w, &join(prefix, "mlp_out"), true)?,
         })
     }
 
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        let h = gelu_approximate(linear(x, &self.in_w, &self.in_b)?)?;
-        linear(&h, &self.out_w, &self.out_b)
+        let h = gelu_approximate(self.mlp_in.forward(x)?)?;
+        self.mlp_out.forward(&h)
+    }
+
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.mlp_in.quantize(bits, None)?;
+        self.mlp_out.quantize(bits, None)?;
+        Ok(())
     }
 }

@@ -10,7 +10,9 @@ remove cross-impl RNG / text-encoder precision from the comparison).
 
 Run from the mflux fork venv (loads the full ~54 GB model — needs the RAM the fork already uses):
     cd ~/repos/mflux && uv run python ~/repos/mlx-gen/tools/dump_qwen_image_golden.py
-Output (gitignored): tools/golden/qwen_image_golden.safetensors
+Set `QUANTIZE=8` to dump the Q8 transformer golden instead (sc-2348 slice 5):
+    cd ~/repos/mflux && QUANTIZE=8 uv run python ~/repos/mlx-gen/tools/dump_qwen_image_golden.py
+Output (gitignored): tools/golden/qwen_image_golden.safetensors (or `…_q8_golden…` when quantized).
 """
 
 import os
@@ -30,8 +32,9 @@ STEPS = 4
 HEIGHT = 512
 WIDTH = 512
 GUIDANCE = 4.0
+QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
 
-model = QwenImage(quantize=None)
+model = QwenImage(quantize=QUANTIZE)
 config = Config(
     model_config=model.model_config,
     num_inference_steps=STEPS,
@@ -86,7 +89,8 @@ out = {
 }
 golden_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(golden_dir, exist_ok=True)
-path_out = os.path.join(golden_dir, "qwen_image_golden.safetensors")
+suffix = f"_q{QUANTIZE}" if QUANTIZE else ""
+path_out = os.path.join(golden_dir, f"qwen_image{suffix}_golden.safetensors")
 mx.save_safetensors(
     path_out,
     out,
@@ -97,6 +101,7 @@ mx.save_safetensors(
         "width": str(WIDTH),
         "guidance": str(GUIDANCE),
         "prompt": PROMPT,
+        "quantize": str(QUANTIZE),
     },
 )
 print(f"prompt_embeds={prompt_embeds.shape} neg={neg_embeds.shape} noise={noise.shape}")
