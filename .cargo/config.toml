@@ -5,3 +5,14 @@
 # (and CI) just work. Individual ops are still fast; tests run sequentially.
 [env]
 RUST_TEST_THREADS = "1"
+
+# Build MLX at the macOS 26 / Metal 400 deployment target so the Apple matrix-unit
+# ("NAX") Metal kernels compile in. mlx-sys's build.rs floors the target at macOS 14
+# (Metal 310), which trips MLX's kernel gate and defines -DMLX_METAL_NO_NAX, omitting
+# the fast steel_gemm_*_nax / steel_attention_nax kernels -> ~2.5x slower DiT per step.
+# resolve_deployment_target() in the fork honors a higher value, so no fork edit is needed.
+# force=true so a stray lower MACOSX_DEPLOYMENT_TARGET (e.g. a Tauri 10.13 default) can't
+# silently revert us to the slow Metal-310 path. NB: build.rs has no rerun-if-env-changed,
+# so a clean rebuild of pmetal-mlx-sys is required for a change here to take effect.
+# Requires macOS 26 at runtime (same floor Apple's mlx wheel already imposes). See sc-2352.
+MACOSX_DEPLOYMENT_TARGET = { value = "26.0", force = true }
