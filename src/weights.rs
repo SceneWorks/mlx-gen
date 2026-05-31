@@ -60,6 +60,20 @@ impl Weights {
         self.metadata.get(key).map(String::as_str)
     }
 
+    /// Insert (or overwrite) a tensor under `key`. Used by checkpoint remapping (diffusers →
+    /// internal names + conv-weight transposes) when loading real weights.
+    pub fn insert(&mut self, key: impl Into<String>, tensor: Array) {
+        self.tensors.insert(key.into(), tensor);
+    }
+
+    /// Copy the tensor at `from` to the new key `to` (no-op if `from` is absent). A convenience
+    /// for the identity-but-renamed entries in a checkpoint→internal mapping.
+    pub fn alias(&mut self, from: &str, to: &str) {
+        if let Some(t) = self.tensors.get(from).cloned() {
+            self.tensors.insert(to.to_string(), t);
+        }
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

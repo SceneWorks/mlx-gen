@@ -3,13 +3,15 @@
 //! unify → main transformer stack → final layer → unpatchify, returning the negated velocity.
 //!
 //! Attention is full-valid everywhere (the fork builds all-ones masks), so the blocks run
-//! `mask=None`. Padded tokens are zero embeddings (the fork's `where(pad, 0, ·)`), which we
-//! apply as a multiplicative keep-mask after embedding; their pre-embed values are irrelevant,
-//! so patchify pads with zeros instead of repeat-last. Position ids / coord grids are computed
-//! in plain Rust and asserted exact in the parity test.
+//! `mask=None`. Padded token positions are set to the **learned** `x_pad_token` / `cap_pad_token`
+//! embeddings (the fork's `where(pad_mask, pad_token, ·)`) — NOT zero. With no attention mask the
+//! padded tokens mix into the real tokens, so their value matters; a fresh model zero-inits the
+//! pad tokens (which is why a tiny random fixture can't tell zeroing from pad-token), but the
+//! trained checkpoint's pad tokens are non-zero. Position ids / coord grids are computed in plain
+//! Rust and asserted exact in the parity test.
 
 use mlx_rs::fast::rms_norm;
-use mlx_rs::ops::{concatenate_axis, multiply};
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
 use super::context_block::ZImageContextBlock;
@@ -86,11 +88,27 @@ pub struct ZImageTransformer {
     layers: Vec<ZImageTransformerBlock>,
     rope: RopeEmbedder,
     final_layer: FinalLayer,
+    x_pad_token: Array,
+    cap_pad_token: Array,
+}
+
+/// `where(keep == 1, emb, pad)` for `emb` `[N, dim]`, `keep` `[N, 1]` (1 = real, 0 = padded),
+/// `pad` `[1, dim]` — set padded token positions to the learned pad-token embedding.
+fn apply_pad(emb: &Array, keep: &Array, pad: &Array) -> Result<Array> {
+    let inv = subtract(Array::from_slice(&[1.0f32], &[1]), keep)?; // 1 - keep
+    Ok(add(&multiply(emb, keep)?, &multiply(pad, &inv)?)?)
 }
 
 impl ZImageTransformer {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: ZImageTransformerConfig) -> Result<Self> {
-        let p = |s: &str| format!("{prefix}.{s}");
+        // Tolerate an empty prefix (real checkpoints are un-prefixed) without a leading dot.
+        let p = |s: &str| {
+            if prefix.is_empty() {
+                s.to_string()
+            } else {
+                format!("{prefix}.{s}")
+            }
+        };
         let key = cfg.embed_key();
         let bcfg = cfg.block_cfg();
 
@@ -133,6 +151,8 @@ impl ZImageTransformer {
             layers: block_vec("layers", cfg.n_layers)?,
             rope: RopeEmbedder::new(cfg.rope_theta, &cfg.axes_dims, &cfg.axes_lens),
             final_layer: FinalLayer::from_weights(w, &p(&format!("all_final_layer.{key}")))?,
+            x_pad_token: w.require(&p("x_pad_token"))?.reshape(&[1, cfg.dim])?,
+            cap_pad_token: w.require(&p("cap_pad_token"))?.reshape(&[1, cfg.dim])?,
             cfg,
         })
     }
@@ -145,19 +165,19 @@ impl ZImageTransformer {
 
         let patched = self.patchify(x, cap_feats);
 
-        // Image stream: embed -> zero padded positions -> noise refiner.
+        // Image stream: embed -> set padded positions to x_pad_token -> noise refiner.
         let mut x_emb = linear(&patched.x_tokens, &self.x_embedder_w, &self.x_embedder_b)?;
-        x_emb = multiply(&x_emb, &patched.x_keep)?;
+        x_emb = apply_pad(&x_emb, &patched.x_keep, &self.x_pad_token)?;
         let x_freqs = self.rope.forward(&patched.x_pos_ids)?;
         let mut x_emb = x_emb.expand_dims(0)?;
         for layer in &self.noise_refiner {
             x_emb = layer.forward(&x_emb, &x_freqs, &t_emb)?;
         }
 
-        // Caption stream: RMSNorm -> linear -> zero padded -> context refiner.
+        // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
         let cap_normed = rms_norm(&patched.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
         let mut cap_emb = linear(&cap_normed, &self.cap_linear_w, &self.cap_linear_b)?;
-        cap_emb = multiply(&cap_emb, &patched.cap_keep)?;
+        cap_emb = apply_pad(&cap_emb, &patched.cap_keep, &self.cap_pad_token)?;
         let cap_freqs = self.rope.forward(&patched.cap_pos_ids)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.context_refiner {

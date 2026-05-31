@@ -13,3 +13,7 @@ mlx-gen = { path = ".." }
 mlx-rs = "0.25"
 # Link-time self-registration into mlx-gen's model registry.
 inventory = "0.3"
+
+[dev-dependencies]
+# Save the end-to-end E2E render as a PNG for visual inspection (ignored real-weights test only).
+image = { version = "0.25", default-features = false, features = ["png"] }
