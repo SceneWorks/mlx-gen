@@ -2,7 +2,7 @@
 
 use mlx_rs::Array;
 
-use super::{conv2d, upsample_nearest};
+use crate::nn::{conv2d, upsample_nearest};
 use crate::weights::Weights;
 use crate::Result;
 

@@ -14,6 +14,7 @@
 pub mod adapters;
 pub mod error;
 pub mod models;
+pub mod nn;
 pub mod quant;
 pub mod tokenizer;
 pub mod weights;

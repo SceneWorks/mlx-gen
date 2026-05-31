@@ -15,8 +15,9 @@ use mlx_rs::Array;
 use super::context_block::ZImageContextBlock;
 use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
-use super::timestep_embedder::{linear, TimestepEmbedder};
+use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
+use crate::nn::linear;
 use crate::weights::Weights;
 use crate::Result;
 

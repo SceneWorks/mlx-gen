@@ -4,8 +4,7 @@
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use super::{conv2d, group_norm};
-use crate::models::z_image::timestep_embedder::silu;
+use crate::nn::{conv2d, group_norm, silu};
 use crate::weights::Weights;
 use crate::Result;
 

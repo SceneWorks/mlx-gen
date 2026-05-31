@@ -5,7 +5,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
-use super::timestep_embedder::{linear, silu};
+use crate::nn::{linear, silu};
 use crate::weights::Weights;
 use crate::Result;
 

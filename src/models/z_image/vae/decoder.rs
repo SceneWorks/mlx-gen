@@ -8,7 +8,7 @@ use mlx_rs::Array;
 use super::conv_layers::{ConvLayer, ConvNormOut};
 use super::mid_block::UNetMidBlock;
 use super::up_decoder_block::UpDecoderBlock;
-use crate::models::z_image::timestep_embedder::silu;
+use crate::nn::silu;
 use crate::weights::Weights;
 use crate::Result;
 

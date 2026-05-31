@@ -3,7 +3,7 @@
 
 use mlx_rs::Array;
 
-use super::{conv2d, group_norm};
+use crate::nn::{conv2d, group_norm};
 use crate::weights::Weights;
 use crate::Result;
 

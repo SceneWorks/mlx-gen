@@ -1,20 +1,12 @@
 //! Z-Image timestep embedding. Port of `TimestepEmbedder`: sinusoidal frequency embedding
 //! (`frequency_embedding_size=256`) → Linear → SiLU → Linear, producing `min(dim, 256)` dims.
 
-use mlx_rs::ops::{add, matmul, multiply, sigmoid};
+use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
+use crate::nn::{linear, silu};
 use crate::weights::Weights;
 use crate::Result;
-
-/// `y = x · Wᵀ + b` for a stored `[out, in]` weight + bias.
-pub(crate) fn linear(x: &Array, w: &Array, b: &Array) -> Result<Array> {
-    Ok(add(&matmul(x, w.t())?, b)?)
-}
-
-pub(crate) fn silu(x: &Array) -> Result<Array> {
-    Ok(multiply(x, &sigmoid(x)?)?)
-}
 
 pub struct TimestepEmbedder {
     l1_w: Array,

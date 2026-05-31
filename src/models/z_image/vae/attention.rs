@@ -5,8 +5,7 @@ use mlx_rs::fast::scaled_dot_product_attention;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use super::group_norm;
-use crate::models::z_image::timestep_embedder::linear;
+use crate::nn::{group_norm, linear};
 use crate::weights::Weights;
 use crate::Result;
 
