@@ -32,6 +32,15 @@ impl FeedForward {
         let h3 = self.w3.forward(x)?;
         self.w2.forward(&multiply(&silu, &h3)?)
     }
+
+    /// Quantize the three projections to Q4/Q8 (group_size 64) — the fork's `nn.quantize` hits
+    /// every Linear in the SwiGLU FFN.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [&mut self.w1, &mut self.w2, &mut self.w3] {
+            lin.quantize(bits, None)?;
+        }
+        Ok(())
+    }
 }
 
 impl AdaptableHost for FeedForward {

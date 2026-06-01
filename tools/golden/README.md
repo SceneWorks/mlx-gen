@@ -45,6 +45,8 @@ Prerequisites: macOS + Metal; the frozen `mflux` fork at `~/repos/mflux`; the mo
 | golden | dump script | consumed by | notes |
 |---|---|---|---|
 | `z_image_golden.safetensors` (+ `.png`) | `dump_z_image_golden.py` | `tests/e2e_real_weights.rs` | txt2img stage + full pipeline. Env: `ZIMAGE_PROMPT/SEED/STEPS/W/H` (use `W=H=1024` for the e2e size; default 256²). Emits the **static shift=3.0** schedule (sc-2536). |
+| `z_image_q8_golden.safetensors`, `z_image_q4_golden.safetensors` (+ `.png`) | `dump_z_image_golden.py` with `QUANTIZE=8` / `QUANTIZE=4` | `tests/e2e_real_weights.rs` (`transformer_q8/q4_pipeline_matches_fork`) | sc-2532 Q4/Q8 transformer parity. Same env as above; `ZImage(quantize=N)` runs the fork's real quantized path and the dumped `cap_feats` is the fork's quantized-text-encoder output (so the gate isolates the transformer + VAE-decode). |
+| `zq8_pack_probe.safetensors` | `dump_z_image_q8_pack_probe.py` | `tests/e2e_real_weights.rs` (`q8_packing_byte_identical_to_fork`) | sc-2532 byte-level Q8 packing proof on a **real bf16 model weight** (`layers.0.attention.to_q`) — confirms mlx-rs `mx.quantize`/`quantized_matmul` reproduce the fork's exactly. |
 | `z_image_img2img_golden.safetensors` (+ `*_init.png`, `*_out.png`) | `dump_z_image_img2img_golden.py` | `tests/img2img_real_weights.rs` | img2img (`Conditioning::Reference`). Env: `ZIMAGE_PROMPT/SEED/STEPS/W/H/STRENGTH/IW/IH`. Dumps `init_image_u8` so Rust uses byte-identical pixels. |
 
 ### Qwen-Image / Qwen-Image-Edit (`mlx-gen-qwen-image`)

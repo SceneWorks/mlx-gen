@@ -24,6 +24,14 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/z_image_golden.safetensors"
 );
+const Q8_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/z_image_q8_golden.safetensors"
+);
+const Q4_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/z_image_q4_golden.safetensors"
+);
 
 /// Locate the Z-Image-Turbo snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
@@ -304,4 +312,172 @@ fn e2e_full_pipeline_generates_fox() {
         differ < img.pixels.len() / 20,
         "full-pipeline image diverges: {differ} pixels"
     );
+}
+
+/// sc-2532: the Q4/Q8 transformer parity gate. Quantize the Rust transformer (group_size 64 — the
+/// fork's `nn.quantize` set, all 276 transformer Linears), feed the fork's seeded init noise +
+/// quantized-text-encoder `cap_feats`, run the denoise loop on the fork's exact sigmas, and confirm
+/// the latents + decoded image match the fork's quantized golden. Mirrors qwen's
+/// `transformer_q8_pipeline_matches_fork`.
+///
+/// **Why the px threshold is looser than the bf16 e2e (which is sub-1%).** The quantization itself
+/// is byte-identical to the fork (`q8_packing_byte_identical_to_fork`: same wq/scales/biases/qmm on
+/// a real bf16 weight), and the quantized-Linear *set* matches the fork exactly. The residual
+/// divergence is the Q8/Q4 mode's own perturbation sensitivity: the fork's *own* dense→Q8 output
+/// already moves ~9% of pixels >8 (Q8 is a lossy mode), and it is sensitive to tiny activation
+/// dtype / op-ordering differences (the fork's own bf16-vs-f32-activation Q8 run differs by ~1.7%
+/// px). The Rust DiT runs f32 activations (its `apply_pad` / f32 `t_emb` promote the stream, exactly
+/// as the fork's stream promotes after block 0) vs the fork's bf16 production path, and that ~1e-2
+/// per-step difference compounds over the 4 iterative steps. The result tracks the fork's Q8 more
+/// closely (~5%) than the fork's *dense* output does (~9%), which is the meaningful bar for a faithful
+/// Q-mode. The latent mean-rel gate (~the Q8 noise floor, like qwen's) is the tighter check.
+fn q_pipeline_matches_fork(
+    golden_path: &str,
+    bits: i32,
+    max_latent_mean_rel: f32,
+    max_px_frac: f32,
+) {
+    let g = Weights::from_file(golden_path).unwrap();
+    let stored: i32 = g.metadata("quantize").unwrap().parse().unwrap();
+    assert_eq!(stored, bits, "golden was dumped at a different bit-width");
+    let snap = snapshot();
+
+    let mut transformer = load_transformer(&snap).unwrap();
+    transformer.quantize(bits).unwrap();
+    let vae = load_vae(&snap).unwrap();
+
+    // Fork's exact sigmas (isolate the loop from any schedule recompute) + its bf16 init/cap.
+    let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
+    let scheduler = FlowMatchEuler { sigmas };
+    let init = bf16(g.require("init").unwrap());
+    let cap = bf16(g.require("cap_feats").unwrap());
+    let latents = denoise(&transformer, &scheduler, init, &cap)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+
+    let golden = g.require("final_latents").unwrap();
+    assert_eq!(latents.shape(), golden.shape(), "final latents shape");
+    // mean-rel is the stable metric (peak_rel is a single high-dynamic-range outlier); print both.
+    let a = latents.reshape(&[-1]).unwrap();
+    let b = golden.reshape(&[-1]).unwrap();
+    let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
+    let mabs: f32 = ys.iter().map(|y| y.abs()).sum::<f32>() / ys.len() as f32;
+    let mean_rel: f32 =
+        xs.iter().zip(ys).map(|(x, y)| (x - y).abs()).sum::<f32>() / xs.len() as f32 / mabs;
+    println!(
+        "Q{bits} final_latents: mean_rel={mean_rel:.3e} peak_rel={:.3e} shape={:?}",
+        peak_rel(&latents, golden),
+        latents.shape()
+    );
+    assert!(
+        mean_rel < max_latent_mean_rel,
+        "Q{bits} final latents diverged from fork-Q{bits}: mean_rel {mean_rel:.3e} >= {max_latent_mean_rel:.3e}"
+    );
+
+    // Dense-VAE decode of the Rust Q-latents vs the fork's quantized decode, compared as RGB8. (The
+    // VAE mid-block-attention Linears the fork also quantizes are pixel-irrelevant here: decoding
+    // the fork's *exact* Q8 latents through the dense Rust VAE reproduces the fork's quantized-VAE
+    // decode to 0 px>8 — measured during the sc-2532 investigation.)
+    let unpacked = unpack_latents(&latents).unwrap();
+    let sh = unpacked.shape();
+    let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+    let decoded = vae
+        .decode(&latent5)
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+    let golden_dec = g.require("decoded").unwrap();
+
+    let img = decoded_to_image(&decoded).unwrap();
+    let gimg = decoded_to_image(golden_dec).unwrap();
+    let differ = img
+        .pixels
+        .iter()
+        .zip(&gimg.pixels)
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+        .count();
+    let frac = differ as f32 / img.pixels.len() as f32;
+    println!(
+        "Q{bits} pixels >8 apart: {:.3}% ({} / {})",
+        frac * 100.0,
+        differ,
+        img.pixels.len()
+    );
+    assert!(
+        frac < max_px_frac,
+        "Q{bits}: too many divergent pixels: {:.3}% >= {:.3}%",
+        frac * 100.0,
+        max_px_frac * 100.0
+    );
+    println!("✓ Q{bits} pipeline matches fork-Q{bits}");
+}
+
+/// sc-2532: prove the Q8 quantization is byte-identical to the fork on a **real bf16 model weight**
+/// (the existing `quant_parity.rs` covers an f32 weight; the model quantizes bf16). Quantizing the
+/// same `layers.0.attention.to_q` weight with mlx-rs reproduces the fork's `mx.quantize` wq/scales/
+/// biases exactly and `quantized_matmul` to 0 — so the Q8 e2e residual is the Q8 mode's sensitivity,
+/// not a packing/qmm difference. Golden from `tools/dump_z_image_q8_pack_probe.py`.
+#[test]
+#[ignore = "needs the zq8_pack_probe golden (tools/dump_z_image_q8_pack_probe.py)"]
+fn q8_packing_byte_identical_to_fork() {
+    use mlx_rs::ops::{quantize, quantized_matmul};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tools/golden/zq8_pack_probe.safetensors"
+    );
+    let g = Weights::from_file(path).unwrap();
+    // f32→bf16 of an already-bf16 value is exact, so this is the fork's exact quantized weight.
+    let w = bf16(g.require("w").unwrap());
+    let x = bf16(g.require("x").unwrap());
+
+    let (wq, scales, biases) = quantize(&w, 64, 8).unwrap();
+    let wq_match = mlx_rs::ops::eq(&wq, g.require("wq").unwrap())
+        .unwrap()
+        .all(None)
+        .unwrap()
+        .item::<bool>();
+    let sc_pr = peak_rel(
+        &scales.as_dtype(Dtype::Float32).unwrap(),
+        g.require("scales").unwrap(),
+    );
+    let bi_pr = peak_rel(
+        &biases.as_dtype(Dtype::Float32).unwrap(),
+        g.require("biases").unwrap(),
+    );
+    let qmm = quantized_matmul(&x, &wq, &scales, &biases, true, 64, 8).unwrap();
+    let qmm_pr = peak_rel(
+        &qmm.as_dtype(Dtype::Float32).unwrap(),
+        g.require("qmm").unwrap(),
+    );
+    println!(
+        "Q8 packing vs fork: wq_exact={wq_match} scales_pr={sc_pr:.2e} biases_pr={bi_pr:.2e} qmm_pr={qmm_pr:.2e}"
+    );
+    assert!(
+        wq_match,
+        "Q8 packed weight is not byte-identical to the fork"
+    );
+    assert!(
+        sc_pr == 0.0 && bi_pr == 0.0,
+        "Q8 scales/biases differ from the fork"
+    );
+    assert!(
+        qmm_pr < 1e-6,
+        "Q8 quantized_matmul differs from the fork: {qmm_pr:.2e}"
+    );
+}
+
+#[test]
+#[ignore = "needs real Z-Image weights + local Q8 golden (QUANTIZE=8 dump_z_image_golden.py)"]
+fn transformer_q8_pipeline_matches_fork() {
+    // Measured (256², fox, seed 42): latent mean_rel 3.9e-2, px>8 5.16%. Thresholds leave headroom
+    // for machine/run variance while staying well inside the fork's own dense→Q8 envelope (~9% px).
+    q_pipeline_matches_fork(Q8_GOLDEN, 8, 5e-2, 0.07);
+}
+
+#[test]
+#[ignore = "needs real Z-Image weights + local Q4 golden (QUANTIZE=4 dump_z_image_golden.py)"]
+fn transformer_q4_pipeline_matches_fork() {
+    // Measured (256², fox, seed 42): latent mean_rel ~3e-2, px>8 3.88%.
+    q_pipeline_matches_fork(Q4_GOLDEN, 4, 5e-2, 0.07);
 }

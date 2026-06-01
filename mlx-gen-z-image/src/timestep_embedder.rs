@@ -4,34 +4,45 @@
 use mlx_rs::ops::multiply;
 use mlx_rs::Array;
 
-use mlx_gen::nn::{linear, silu};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 pub struct TimestepEmbedder {
-    l1_w: Array,
-    l1_b: Array,
-    l2_w: Array,
-    l2_b: Array,
+    linear1: AdaptableLinear,
+    linear2: AdaptableLinear,
     frequency_embedding_size: i32,
 }
 
 impl TimestepEmbedder {
     pub fn from_weights(w: &Weights, prefix: &str, frequency_embedding_size: i32) -> Result<Self> {
+        let dense = |name: &str| -> Result<AdaptableLinear> {
+            Ok(AdaptableLinear::dense(
+                w.require(&format!("{prefix}.{name}.weight"))?.clone(),
+                Some(w.require(&format!("{prefix}.{name}.bias"))?.clone()),
+            ))
+        };
         Ok(Self {
-            l1_w: w.require(&format!("{prefix}.linear1.weight"))?.clone(),
-            l1_b: w.require(&format!("{prefix}.linear1.bias"))?.clone(),
-            l2_w: w.require(&format!("{prefix}.linear2.weight"))?.clone(),
-            l2_b: w.require(&format!("{prefix}.linear2.bias"))?.clone(),
+            linear1: dense("linear1")?,
+            linear2: dense("linear2")?,
             frequency_embedding_size,
         })
+    }
+
+    /// Quantize both projections to Q4/Q8 (group_size 64) — both are `nn.Linear` in the fork.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [&mut self.linear1, &mut self.linear2] {
+            lin.quantize(bits, None)?;
+        }
+        Ok(())
     }
 
     /// `t`: `(B,)` → `(B, out)`.
     pub fn forward(&self, t: &Array) -> Result<Array> {
         let t_freq = self.timestep_embedding(t)?;
-        let h = silu(&linear(&t_freq, &self.l1_w, &self.l1_b)?)?;
-        linear(&h, &self.l2_w, &self.l2_b)
+        let h = silu(&self.linear1.forward(&t_freq)?)?;
+        self.linear2.forward(&h)
     }
 
     /// Sinusoidal embedding: `concat(cos(t·freqs), sin(t·freqs))`, `freqs[i]=10000^(-i/half)`.

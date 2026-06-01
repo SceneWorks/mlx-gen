@@ -105,6 +105,20 @@ impl ZImageAttention {
         self.to_out.forward(&o)
     }
 
+    /// Quantize the QKV + output projections to Q4/Q8 (group_size 64). QK-norm weights are
+    /// RMSNorm scales (not Linears), so they stay dense — matching the fork's `nn.quantize`.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+        ] {
+            lin.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+
     /// Port of `ZImageAttention._apply_rotary_emb`. `x`:(b,s,h,hd), `fc`:(s,hd/2,2).
     fn apply_rope(&self, x: &Array, fc: &Array) -> Result<Array> {
         let sh = x.shape();

@@ -67,6 +67,15 @@ impl ZImageTransformerBlock {
         })
     }
 
+    /// Quantize every Linear in the block to Q4/Q8 (group_size 64): attention QKV/out, the
+    /// SwiGLU FFN, and the adaLN modulation projection — the fork's `nn.quantize` set.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attention.quantize(bits)?;
+        self.feed_forward.quantize(bits)?;
+        self.ada_ln.quantize(bits, None)?;
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array, freqs_cis: &Array, t_emb: &Array) -> Result<Array> {
         // adaLN modulation: (1, 4*dim) -> (1, 1, 4*dim) -> 4 × (1, 1, dim)
         let modulation = self.ada_ln.forward(t_emb)?.expand_dims(1)?;

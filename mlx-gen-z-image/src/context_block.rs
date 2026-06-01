@@ -50,6 +50,14 @@ impl ZImageContextBlock {
         })
     }
 
+    /// Quantize the block's Linears to Q4/Q8 (group_size 64). The context block has no adaLN
+    /// modulation (it carries no timestep), so only attention + FFN have Linears.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attention.quantize(bits)?;
+        self.feed_forward.quantize(bits)?;
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array, freqs_cis: &Array) -> Result<Array> {
         let attn_out = self
             .attention

@@ -6,6 +6,12 @@ Loads the real Tongyi-MAI/Z-Image-Turbo models and runs a fixed (prompt, seed, s
 generation by hand (mirroring z_image.py), dumping EVERY intermediate so the Rust port can be
 validated stage-by-stage: the chat-template string, input_ids/attention_mask, cap_feats, the
 seeded init noise, the final latents, and the decoded image. Real bf16 path (matches production).
+
+Set `QUANTIZE=8` (or `4`) to dump the Q8/Q4 golden instead (sc-2532) — `ZImage(quantize=N)` runs
+the fork's real quantized path (`nn.quantize` over transformer + text encoder + VAE). The dumped
+`cap_feats` is then the fork's quantized-text-encoder output; the Rust Q8/Q4 parity test feeds it
+in, so the gate isolates the transformer's (and VAE-decode's) quantization parity — the same
+methodology as `dump_qwen_image_golden.py`. Output suffix: `_q8` / `_q4`.
 """
 
 import mlx.core as mx
@@ -25,8 +31,6 @@ import os
 # `CARGO_MANIFEST_DIR/../tools/golden` resolves when run from this checkout/worktree.
 _GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(_GOLDEN_DIR, exist_ok=True)
-OUT = os.path.join(_GOLDEN_DIR, "z_image_golden.safetensors")
-PNG = os.path.join(_GOLDEN_DIR, "z_image_golden.png")
 # Env-overridable so the same golden can be regenerated at any size/prompt for parity checks.
 # Defaults match the fast 256^2 stage-test baseline; set ZIMAGE_* to render at, e.g., 1024^2.
 PROMPT = os.environ.get("ZIMAGE_PROMPT", "a fox")
@@ -34,6 +38,11 @@ SEED = int(os.environ.get("ZIMAGE_SEED", "42"))
 STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
 W = int(os.environ.get("ZIMAGE_W", "256"))
 H = int(os.environ.get("ZIMAGE_H", "256"))
+QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+
+_SUFFIX = f"_q{QUANTIZE}" if QUANTIZE else ""
+OUT = os.path.join(_GOLDEN_DIR, f"z_image{_SUFFIX}_golden.safetensors")
+PNG = os.path.join(_GOLDEN_DIR, f"z_image{_SUFFIX}_golden.png")
 
 
 class Holder:
@@ -41,7 +50,7 @@ class Holder:
 
 
 model = Holder()
-ZImageInitializer.init(model, model_config=ModelConfig.z_image_turbo(), quantize=None)
+ZImageInitializer.init(model, model_config=ModelConfig.z_image_turbo(), quantize=QUANTIZE)
 
 tok = model.tokenizers["z_image"]
 chat = tok.tokenizer.apply_chat_template(
@@ -101,6 +110,6 @@ tensors = {
     "sigmas": sigmas.astype(mx.float32),
 }
 meta = {"prompt": PROMPT, "seed": str(SEED), "steps": str(STEPS), "w": str(W), "h": str(H),
-        "num_valid": str(num_valid), "chat": chat}
+        "num_valid": str(num_valid), "chat": chat, "quantize": str(QUANTIZE)}
 mx.save_safetensors(OUT, tensors, meta)
 print(f"\nwrote {OUT} + {PNG}; final_latents {tuple(latents.shape)}, decoded {tuple(decoded.shape)}")

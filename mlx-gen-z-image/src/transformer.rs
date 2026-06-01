@@ -19,7 +19,7 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -77,11 +77,9 @@ impl ZImageTransformerConfig {
 
 pub struct ZImageTransformer {
     cfg: ZImageTransformerConfig,
-    x_embedder_w: Array,
-    x_embedder_b: Array,
+    x_embedder: AdaptableLinear,
     cap_norm_w: Array,
-    cap_linear_w: Array,
-    cap_linear_b: Array,
+    cap_linear: AdaptableLinear,
     t_embedder: TimestepEmbedder,
     noise_refiner: Vec<ZImageTransformerBlock>,
     context_refiner: Vec<ZImageContextBlock>,
@@ -132,15 +130,19 @@ impl ZImageTransformer {
         };
 
         Ok(Self {
-            x_embedder_w: w
-                .require(&p(&format!("all_x_embedder.{key}.weight")))?
-                .clone(),
-            x_embedder_b: w
-                .require(&p(&format!("all_x_embedder.{key}.bias")))?
-                .clone(),
+            x_embedder: AdaptableLinear::dense(
+                w.require(&p(&format!("all_x_embedder.{key}.weight")))?
+                    .clone(),
+                Some(
+                    w.require(&p(&format!("all_x_embedder.{key}.bias")))?
+                        .clone(),
+                ),
+            ),
             cap_norm_w: w.require(&p("cap_embedder.0.weight"))?.clone(),
-            cap_linear_w: w.require(&p("cap_embedder.1.weight"))?.clone(),
-            cap_linear_b: w.require(&p("cap_embedder.1.bias"))?.clone(),
+            cap_linear: AdaptableLinear::dense(
+                w.require(&p("cap_embedder.1.weight"))?.clone(),
+                Some(w.require(&p("cap_embedder.1.bias"))?.clone()),
+            ),
             t_embedder: TimestepEmbedder::from_weights(
                 w,
                 &p("t_embedder"),
@@ -157,6 +159,37 @@ impl ZImageTransformer {
         })
     }
 
+    /// Quantize every Linear in the DiT to Q4/Q8 (group_size 64), the mlx-rs equivalent of the
+    /// fork's `nn.quantize(transformer, bits=…)`. That predicate (`hasattr(module,"to_quantized")`)
+    /// matches *every* `nn.Linear` — here the image/caption embedders, the timestep + final
+    /// layers, and every block/context-block attention, FFN, and adaLN projection. RMSNorm /
+    /// LayerNorm scales and the learned pad tokens are not Linears, so they stay dense.
+    ///
+    /// The fork's `nn.quantize` also quantizes the text encoder + VAE components; the Rust generate
+    /// path runs those dense (the transformer is ~all of the weight, so memory parity is met, and
+    /// the parity gate feeds the fork's quantized `cap_feats` to isolate the transformer). The
+    /// quantization is byte-identical to the fork's per `mx.quantize` (sc-2342, re-confirmed on a
+    /// real bf16 weight under MLX 0.31.1); the residual e2e divergence from the fork's Q8 is the
+    /// Q8 mode's own sensitivity (the fork's dense→Q8 output already moves ~9% of pixels), not a
+    /// packing difference — see `tests/e2e_real_weights.rs`.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for lin in [&mut self.x_embedder, &mut self.cap_linear] {
+            lin.quantize(bits, None)?;
+        }
+        self.t_embedder.quantize(bits)?;
+        self.final_layer.quantize(bits)?;
+        for block in &mut self.noise_refiner {
+            block.quantize(bits)?;
+        }
+        for block in &mut self.context_refiner {
+            block.quantize(bits)?;
+        }
+        for block in &mut self.layers {
+            block.quantize(bits)?;
+        }
+        Ok(())
+    }
+
     /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].
     /// Returns the latent-shaped velocity `(C, F, H, W)`.
     pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
@@ -166,7 +199,7 @@ impl ZImageTransformer {
         let patched = self.patchify(x, cap_feats);
 
         // Image stream: embed -> set padded positions to x_pad_token -> noise refiner.
-        let mut x_emb = linear(&patched.x_tokens, &self.x_embedder_w, &self.x_embedder_b)?;
+        let mut x_emb = self.x_embedder.forward(&patched.x_tokens)?;
         x_emb = apply_pad(&x_emb, &patched.x_keep, &self.x_pad_token)?;
         let x_freqs = self.rope.forward(&patched.x_pos_ids)?;
         let mut x_emb = x_emb.expand_dims(0)?;
@@ -176,7 +209,7 @@ impl ZImageTransformer {
 
         // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
         let cap_normed = rms_norm(&patched.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
-        let mut cap_emb = linear(&cap_normed, &self.cap_linear_w, &self.cap_linear_b)?;
+        let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
         cap_emb = apply_pad(&cap_emb, &patched.cap_keep, &self.cap_pad_token)?;
         let cap_freqs = self.rope.forward(&patched.cap_pos_ids)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
