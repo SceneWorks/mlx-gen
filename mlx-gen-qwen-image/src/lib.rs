@@ -22,7 +22,9 @@ pub mod transformer;
 pub mod vae;
 
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
-pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
+pub use loader::{
+    load_text_encoder, load_tokenizer, load_transformer, load_vae, load_vision_encoder,
+};
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
 pub use pipeline::{
     compute_guided_noise, create_noise, decoded_to_image, denoise_with_progress, qwen_scheduler,

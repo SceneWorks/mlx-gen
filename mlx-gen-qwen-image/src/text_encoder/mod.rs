@@ -13,6 +13,7 @@ pub mod encoder;
 pub mod layer;
 pub mod mlp;
 pub mod rope;
+pub mod vision;
 
 pub use attention::QwenTextAttention;
 pub use encoder::{QwenTextEncoder, QwenTextEncoderConfig};

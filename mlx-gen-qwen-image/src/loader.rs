@@ -21,6 +21,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::Array;
 
+use crate::text_encoder::vision::{VisionConfig, VisionTransformer};
 use crate::text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 use crate::transformer::{QwenTransformer, QwenTransformerConfig};
 use crate::vae::QwenVae;
@@ -60,6 +61,37 @@ pub fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
 pub fn load_text_encoder(root: &Path) -> Result<QwenTextEncoder> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
     QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())
+}
+
+/// Load the Qwen2.5-VL **vision transformer** (Qwen-Image-Edit) from a snapshot's `text_encoder/`
+/// shards. The vision weights live under `visual.*` alongside the LM; we apply the fork's vision
+/// rules ([`remap_vision_keys`]) then read under the `"visual"` prefix. Edit-only — the T2I snapshot
+/// has no `visual.*` weights.
+pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
+    let mut w = Weights::from_dir(root.join("text_encoder"))?;
+    remap_vision_keys(&mut w)?;
+    VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())
+}
+
+/// The fork's vision weight transforms (`qwen_weight_mapping.py`), applied in place: transpose the
+/// patch-embed conv (PyTorch `[O,I,kD,kH,kW]` → MLX `[O,kD,kH,kW,I]`) and rename the merger
+/// `Sequential` `mlp.{0,2}` → `mlp_{0,1}`. Everything else under `visual.*` matches 1:1.
+pub fn remap_vision_keys(w: &mut Weights) -> Result<()> {
+    const PATCH_EMBED: &str = "visual.patch_embed.proj.weight";
+    if let Some(t) = w.get(PATCH_EMBED).cloned() {
+        if t.shape().len() == 5 {
+            w.insert(PATCH_EMBED, t.transpose_axes(&[0, 2, 3, 4, 1])?);
+        }
+    }
+    for (from, to) in [
+        ("visual.merger.mlp.0.weight", "visual.merger.mlp_0.weight"),
+        ("visual.merger.mlp.0.bias", "visual.merger.mlp_0.bias"),
+        ("visual.merger.mlp.2.weight", "visual.merger.mlp_1.weight"),
+        ("visual.merger.mlp.2.bias", "visual.merger.mlp_1.bias"),
+    ] {
+        w.alias(from, to);
+    }
+    Ok(())
 }
 
 /// Load the 60-layer MMDiT transformer, applying the diffusers→internal key renames.
