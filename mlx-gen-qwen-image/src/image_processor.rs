@@ -170,7 +170,13 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> 
 /// Two-pass (horizontal then vertical) bicubic resize of a uint8 HWC image, with clip8
 /// rounding between/after passes — the structure of PIL's `ImagingResample`. Returns f32
 /// HWC with integer-valued samples in `[0, 255]` (i.e. `np.array(img.resize(...))` as float).
-fn resize_bicubic_u8(src: &[u8], in_h: usize, in_w: usize, out_h: usize, out_w: usize) -> Vec<f32> {
+pub(crate) fn resize_bicubic_u8(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    out_h: usize,
+    out_w: usize,
+) -> Vec<f32> {
     let c = 3usize;
     let clip8 = |v: f64| (v.round().clamp(0.0, 255.0)) as f32;
 

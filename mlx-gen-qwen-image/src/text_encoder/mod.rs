@@ -14,12 +14,14 @@ pub mod layer;
 pub mod mlp;
 pub mod rope;
 pub mod vision;
+pub mod vision_language;
 
 pub use attention::QwenTextAttention;
 pub use encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use layer::QwenEncoderLayer;
 pub use mlp::QwenMlp;
 pub use rope::TextRope;
+pub use vision_language::QwenVisionLanguageEncoder;
 
 use mlx_rs::ops::matmul;
 use mlx_rs::Array;

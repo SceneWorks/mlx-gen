@@ -20,10 +20,12 @@ pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vl_tokenizer;
 
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_vae, load_vision_encoder,
+    load_vision_language_encoder,
 };
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
 pub use pipeline::{
@@ -33,3 +35,4 @@ pub use pipeline::{
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;
+pub use vl_tokenizer::{tokenize_edit, EditInputs};

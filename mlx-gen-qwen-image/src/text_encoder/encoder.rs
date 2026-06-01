@@ -75,23 +75,34 @@ impl QwenTextEncoder {
         })
     }
 
-    /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns the final-normed hidden states
-    /// `[b, s, hidden]` (f32).
-    pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
-        let sh = input_ids.shape();
-        let (b, s) = (sh[0], sh[1]);
-
-        let mut hidden = self
+    /// Token embedding (f32): `input_ids` `[b, s]` int32 → `[b, s, hidden]`. Exposed so the VL
+    /// encoder can splice vision embeds into the stream before running the layers.
+    pub fn embed(&self, input_ids: &Array) -> Result<Array> {
+        Ok(self
             .embed_tokens
             .take_axis(input_ids, 0)?
-            .as_dtype(Dtype::Float32)?; // [b, s, hidden]
+            .as_dtype(Dtype::Float32)?)
+    }
+
+    /// Run the decoder stack (RoPE + 28 layers + final RMSNorm) over pre-embedded `[b, s, hidden]`
+    /// hidden states. Shared by [`forward`](Self::forward) and the VL encoder's spliced path.
+    pub fn forward_from_embeds(&self, embeds: &Array, attention_mask: &Array) -> Result<Array> {
+        let sh = embeds.shape();
+        let (b, s) = (sh[0], sh[1]);
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
+        let mut hidden = embeds.clone();
         for layer in &self.layers {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
         }
         Ok(rms_norm(&hidden, &self.norm, self.eps)?)
+    }
+
+    /// `input_ids` / `attention_mask`: `[b, s]` int32. Returns the final-normed hidden states
+    /// `[b, s, hidden]` (f32).
+    pub fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
+        self.forward_from_embeds(&self.embed(input_ids)?, attention_mask)
     }
 
     /// Prompt conditioning: final-normed hidden states with the leading `drop_idx` system-prompt
