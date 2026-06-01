@@ -22,7 +22,7 @@ use mlx_gen::{Error, Result};
 use mlx_rs::Array;
 
 use crate::text_encoder::vision::{VisionConfig, VisionTransformer};
-use crate::text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
+use crate::text_encoder::{QwenTextEncoder, QwenTextEncoderConfig, QwenVisionLanguageEncoder};
 use crate::transformer::{QwenTransformer, QwenTransformerConfig};
 use crate::vae::QwenVae;
 
@@ -71,6 +71,15 @@ pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
     let mut w = Weights::from_dir(root.join("text_encoder"))?;
     remap_vision_keys(&mut w)?;
     VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())
+}
+
+/// Load the Qwen-Image-**Edit** vision-language conditioning encoder: the Qwen2.5-VL LM (`model.*`,
+/// same layout as T2I) + the vision transformer (`visual.*`), composed into a
+/// [`QwenVisionLanguageEncoder`]. Edit-only.
+pub fn load_vision_language_encoder(root: &Path) -> Result<QwenVisionLanguageEncoder> {
+    let lm = load_text_encoder(root)?;
+    let visual = load_vision_encoder(root)?;
+    Ok(QwenVisionLanguageEncoder::new(lm, visual))
 }
 
 /// The fork's vision weight transforms (`qwen_weight_mapping.py`), applied in place: transpose the

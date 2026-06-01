@@ -24,6 +24,7 @@ pub mod vae;
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_vae, load_vision_encoder,
+    load_vision_language_encoder,
 };
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
 pub use pipeline::{

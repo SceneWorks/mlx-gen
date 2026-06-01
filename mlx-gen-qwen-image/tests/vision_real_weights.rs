@@ -13,16 +13,20 @@
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_qwen_image::load_vision_encoder;
 use mlx_gen_qwen_image::text_encoder::vision::grid::{
     cu_seqlens, rot_pos_emb, window_index, Grid, VisionGridConfig,
 };
 use mlx_gen_qwen_image::text_encoder::vision::{VisionConfig, VisionTransformer};
+use mlx_gen_qwen_image::{load_vision_encoder, load_vision_language_encoder};
 use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_vision_golden.safetensors"
+);
+const VL_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_vl_encoder_golden.safetensors"
 );
 
 const GRIDS: [&str; 3] = ["g0", "g1", "g2"];
@@ -178,4 +182,35 @@ fn vision_transformer_real_weights_matches_fork() {
     );
     assert!(mean < 2e-3, "real vt mean-rel {mean:.3e}");
     assert!(peak < 1e-2, "real vt peak-rel {peak:.3e}");
+}
+
+/// Gate C (slice 6b-3): the full **VL conditioning encoder** — vision embeds spliced into the text
+/// stream, 28 LM layers, drop-64 — loaded from the Edit-2509 snapshot, vs the fork's f32
+/// `prompt_embeds`. Validates `load_vision_language_encoder` + the splice + drop end-to-end.
+#[test]
+#[ignore = "needs real Qwen-Image-Edit-2509 weights + local VL golden"]
+fn vl_encoder_real_weights_matches_fork() {
+    let g = Weights::from_file(VL_GOLDEN).unwrap();
+    let enc = load_vision_language_encoder(&edit_snapshot()).unwrap();
+    let grids = grids_of(&g, "vl");
+    let got = enc
+        .encode(
+            g.require("input_ids").unwrap(),
+            g.require("attention_mask").unwrap(),
+            g.require("pixel_values").unwrap(),
+            &grids,
+        )
+        .unwrap();
+    let want = g.require("prompt_embeds").unwrap();
+    assert_eq!(got.shape(), want.shape(), "prompt_embeds shape");
+    let (peak, mean) = rel_errors(&got, want);
+    println!(
+        "VL encoder {:?}: peak-rel {peak:.3e}  mean-rel {mean:.3e}",
+        got.shape()
+    );
+    // Looser than the single-component gates: this stacks bf16 weight rounding through the vision
+    // tower AND the 28 LM layers (vs f32 fork weights). The observed ~2.4e-3 is uniform *relative*
+    // error (peak ≈ mean) — the bf16 mantissa signature, not a logic error.
+    assert!(mean < 5e-3, "VL encoder mean-rel {mean:.3e}");
+    assert!(peak < 1e-2, "VL encoder peak-rel {peak:.3e}");
 }
