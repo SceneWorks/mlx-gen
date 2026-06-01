@@ -96,8 +96,21 @@ impl TextTokenizer {
             });
         }
 
-        let rendered = self.config.chat_template.render(prompt);
-        let encoding = self.inner.encode(rendered, true).map_err(tok_err)?;
+        self.tokenize_preformatted(&self.config.chat_template.render(prompt))
+    }
+
+    /// Tokenize an **already-formatted** string (no chat-template wrapping) → `(1, L)` ids + mask,
+    /// with the same truncation/padding policy as [`tokenize`](Self::tokenize). For callers that
+    /// build the full templated text themselves — e.g. the Qwen-Image-Edit VL path, which
+    /// interleaves an expanded run of `<|image_pad|>` tokens that depends on the image grid.
+    pub fn tokenize_preformatted(&self, text: &str) -> Result<TokenizerOutput> {
+        if text.is_empty() {
+            return Ok(TokenizerOutput {
+                input_ids: empty_row(),
+                attention_mask: empty_row(),
+            });
+        }
+        let encoding = self.inner.encode(text, true).map_err(tok_err)?;
 
         let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
         let max = self.config.max_length;

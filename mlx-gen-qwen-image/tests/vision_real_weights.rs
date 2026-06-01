@@ -17,7 +17,8 @@ use mlx_gen_qwen_image::text_encoder::vision::grid::{
     cu_seqlens, rot_pos_emb, window_index, Grid, VisionGridConfig,
 };
 use mlx_gen_qwen_image::text_encoder::vision::{VisionConfig, VisionTransformer};
-use mlx_gen_qwen_image::{load_vision_encoder, load_vision_language_encoder};
+use mlx_gen_qwen_image::vl_tokenizer::build_edit_text;
+use mlx_gen_qwen_image::{load_tokenizer, load_vision_encoder, load_vision_language_encoder};
 use mlx_rs::Array;
 
 const GOLDEN: &str = concat!(
@@ -27,6 +28,10 @@ const GOLDEN: &str = concat!(
 const VL_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_vl_encoder_golden.safetensors"
+);
+const VL_TOKENIZE_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_vl_tokenize_golden.safetensors"
 );
 
 const GRIDS: [&str; 3] = ["g0", "g1", "g2"];
@@ -213,4 +218,25 @@ fn vl_encoder_real_weights_matches_fork() {
     // error (peak ≈ mean) — the bf16 mantissa signature, not a logic error.
     assert!(mean < 5e-3, "VL encoder mean-rel {mean:.3e}");
     assert!(peak < 1e-2, "VL encoder peak-rel {peak:.3e}");
+}
+
+/// Slice 6b-2: the edit chat template + `<|image_pad|>` expansion + special-token tokenization,
+/// byte-exact vs the fork. Image/weight-free — `build_edit_text` is reconstructed for the same fixed
+/// (prompt, n_image_tokens) the golden was dumped with, then tokenized via the materialized
+/// `tokenizer.json`. Must match `tools/dump_qwen_vl_tokenize_golden.py`.
+#[test]
+#[ignore = "needs the Edit tokenizer.json + local VL-tokenize golden"]
+fn vl_tokenize_matches_fork() {
+    let g = Weights::from_file(VL_TOKENIZE_GOLDEN).unwrap();
+    let tok = load_tokenizer(&edit_snapshot()).unwrap();
+    let text = build_edit_text("make the sky purple at sunset", 36);
+    let out = tok.tokenize_preformatted(&text).unwrap();
+    let want = g.require("input_ids").unwrap();
+    assert_eq!(out.input_ids.shape(), want.shape(), "input_ids shape");
+    assert_eq!(
+        out.input_ids.as_slice::<i32>(),
+        want.as_slice::<i32>(),
+        "input_ids must be byte-exact vs the fork"
+    );
+    println!("VL tokenize: input_ids {:?} byte-exact OK", want.shape());
 }
