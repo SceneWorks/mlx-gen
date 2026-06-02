@@ -94,10 +94,11 @@ pub struct ZImageTurbo {
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Tongyi-MAI/Z-Image-Turbo`
 /// snapshot (the diffusers multi-component tree — `tokenizer/`, `text_encoder/`, `transformer/`,
 /// `vae/`). Weights load dense at their on-disk dtype (bf16); the text encoder promotes to f32
-/// internally. `spec.quantize` (Q4/Q8) quantizes the **transformer only** (group_size 64) after
-/// the dense load — the mflux fork's `nn.quantize` predicate matches every Linear in the
-/// transformer. An fp32 precision override is not wired (the validated dense path is bf16) and is
-/// rejected rather than silently ignored.
+/// internally. `spec.quantize` (Q4/Q8) quantizes the **whole model** — transformer, text encoder,
+/// and VAE (group_size 64) — after the dense load, matching the mflux fork's `nn.quantize` over
+/// every quantizable Linear (plus the text encoder's token Embedding) so a Q4/Q8 consumer gets the
+/// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
+/// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -403,8 +404,9 @@ mod tests {
 
     #[test]
     fn load_accepts_quantization_spec() {
-        // Q4/Q8 is wired (transformer-only); a quant spec must get past the load entry point and
-        // fail later on the missing snapshot, not on quantization being unsupported.
+        // Q4/Q8 is wired (whole model: transformer + text encoder + VAE); a quant spec must get
+        // past the load entry point and fail later on the missing snapshot, not on quantization
+        // being unsupported.
         for q in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
             let err = load(&spec).err().expect("expected an error").to_string();

@@ -3,8 +3,10 @@
 //! dimension-parametric. `to_q/to_k/to_v/to_out` are adapter hosts (LoRA/LoKr targets).
 //!
 //! Numeric parity proven stage-by-stage in the sc-2338 spike (tolerance 1e-2 — MLX runs
-//! fp32 matmul in reduced precision on Metal). Attention mask is not yet wired (the
-//! turbo T2I path runs full-valid, SDPA `mask=None`); it lands with the full model.
+//! fp32 matmul in reduced precision on Metal). The DiT is **intentionally maskless** (SDPA
+//! `mask=None`, final by design): the fork builds all-ones masks, and padded positions are
+//! handled by the learned pad-token embeddings rather than attention masking — so there is no
+//! mask to wire (see `transformer.rs`).
 
 use mlx_rs::{
     fast::{rms_norm, scaled_dot_product_attention},

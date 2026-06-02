@@ -5,8 +5,8 @@
 //! Latents are scaled by per-channel `mean`/`std` (fork `QwenVAE.LATENTS_{MEAN,STD}`). Weight keys
 //! mirror the fork's *internal* module tree (`decoder.conv_in.conv3d.weight`,
 //! `encoder.down_blocks.0.resnets.0.…`, etc.), so a `Weights` dumped from a loaded fork VAE drops
-//! straight in. The on-disk-snapshot key remapping (diffusers → this tree) lands with the full
-//! model assembly (e2e slice).
+//! straight in. The on-disk-snapshot key remapping (diffusers → this tree) is applied by the loader
+//! (`remap_vae_keys`).
 
 pub mod blocks;
 

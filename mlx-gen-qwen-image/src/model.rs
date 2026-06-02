@@ -37,8 +37,9 @@ const NEGATIVE_FALLBACK: &str = " ";
 pub const MODEL_ID: &str = "qwen_image";
 
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
-/// introspection). T2I only for now (Edit reference conditioning is sc-2465); LoRA wiring is a
-/// later slice, so it is advertised off rather than silently ignored.
+/// introspection). This is the **T2I** variant (`qwen_image`); Qwen-Image-Edit ships as a separate
+/// `qwen_image_edit` model (sc-2465). LoRA/LoKr is not yet wired (sc-2528), so it is advertised off
+/// rather than silently ignored.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -80,8 +81,10 @@ pub struct QwenImage {
 ///
 /// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `Qwen/Qwen-Image` snapshot (the
 /// diffusers multi-component tree). Weights load dense at their on-disk dtype (bf16); the text
-/// encoder promotes to f32 internally. Q8 quantization and an fp32 override are not yet wired (the
-/// validated path is dense bf16) — both are rejected rather than silently ignored.
+/// encoder promotes to f32 internally. `spec.quantize` (Q4/Q8) quantizes the transformer only
+/// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note below). An
+/// fp32 precision override is not wired (the validated dense path is bf16) and is rejected rather
+/// than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(

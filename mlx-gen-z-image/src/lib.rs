@@ -9,8 +9,10 @@
 //! fp32 matmul in reduced precision) and validated end-to-end on real bf16 weights (sc-2352):
 //! the Qwen text encoder (prompt → `cap_feats`), the flow-match Euler scheduler, the DiT
 //! transformer (block, context block, timestep / RoPE embedders, final layer, full forward),
-//! and the VAE decoder. [`load`](model::load) assembles the model from a snapshot directory and
-//! [`ZImageTurbo::generate`](model::ZImageTurbo) runs the full prompt→image pipeline.
+//! and the VAE encoder + decoder. [`load`](model::load) assembles the model from a snapshot
+//! directory and [`ZImageTurbo::generate`](model::ZImageTurbo) runs the full prompt→image
+//! pipeline, including img2img (VAE-encode an init image + noise blend, sc-2533) and whole-model
+//! Q4/Q8 quantization (sc-2532).
 
 pub mod attention;
 pub mod context_block;

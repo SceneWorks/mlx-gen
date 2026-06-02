@@ -39,7 +39,7 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 pub const MODEL_ID: &str = "qwen_image_edit";
 
 /// Qwen-Image-Edit's identity + capabilities. Accepts a single `Reference` conditioning image (the
-/// fork's `use_picture_prefix=False` edit path); multi-reference is a follow-on.
+/// fork's `use_picture_prefix=False` edit path); multi-reference is a tracked follow-on (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,

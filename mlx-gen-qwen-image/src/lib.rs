@@ -5,13 +5,13 @@
 //! registry) and — once the model lands — self-registers via `inventory` so that
 //! `mlx_gen::load("qwen_image", …)` resolves. See `docs/MODEL_ARCHITECTURE.md`.
 //!
-//! Ported from the frozen Python mflux fork (`~/repos/mflux/src/mflux/models/qwen/`). The
-//! Qwen-Image port lands slice-by-slice (sc-2348): the causal-Conv3d VAE, the Qwen2.5-VL text
-//! encoder, the 60-layer dual-stream MMDiT, then the T2I pipeline; Qwen-Image-Edit (vision
-//! transformer + reference conditioning) follows in sc-2465.
-//!
-//! Currently shipped: the **Qwen2-VL image processor** (sc-2341), relocated here from core as the
-//! first slice of the port — Qwen-Image-Edit's reference-image preprocessing.
+//! Ported from the frozen Python mflux fork (`~/repos/mflux/src/mflux/models/qwen/`) and
+//! parity-proven against it on real bf16 weights. Shipped: **Qwen-Image T2I** (`qwen_image`,
+//! sc-2348) and **Qwen-Image-Edit** (`qwen_image_edit`, sc-2465) — the causal-Conv3d VAE, the
+//! Qwen2.5-VL text encoder, the 60-layer dual-stream MMDiT, the Qwen2-VL image processor +
+//! Qwen2.5-VL vision transformer + reference-latent conditioning (Edit), and transformer-only
+//! Q4/Q8 quantization (sc-2565; the fork keeps the text encoder + VAE dense). LoRA/LoKr and
+//! multi-image Edit are not yet wired (sc-2528 / sc-2529).
 
 pub mod image_processor;
 pub mod loader;

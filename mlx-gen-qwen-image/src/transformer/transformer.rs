@@ -3,8 +3,8 @@
 //! 60 dual-stream blocks, then `AdaLayerNormContinuous` + `proj_out` back to patch space.
 //!
 //! Weight keys follow the fork's *internal* module tree (e.g. `transformer_blocks.{i}.img_mod_linear`,
-//! `…attn.attn_to_out.0`, `…img_ff.mlp_in`); the on-disk diffusers→internal remapping lands with
-//! the full-model assembly (e2e slice). Per-block weights are exercised by the synthetic-weight
+//! `…attn.attn_to_out.0`, `…img_ff.mlp_in`); the on-disk diffusers→internal remapping is applied by
+//! the loader (`remap_transformer_keys`). Per-block weights are exercised by the synthetic-weight
 //! block parity test; the full 60-layer forward is validated end-to-end against the image golden.
 
 use mlx_rs::fast::rms_norm;
