@@ -43,8 +43,11 @@ STEPS = int(os.environ.get("FLUX_STEPS", "4" if VARIANT == "schnell" else "20"))
 GUIDANCE = float(os.environ.get("FLUX_GUIDANCE", "0.0" if VARIANT == "schnell" else "3.5"))
 
 _PREC_SUFFIX = "_f32" if os.environ.get("FLUX_PRECISION", "").lower() in ("f32", "float32", "fp32") else ""
-OUT = os.path.join(_GOLDEN_DIR, f"flux1_{VARIANT}{_PREC_SUFFIX}_golden.safetensors")
-PNG = os.path.join(_GOLDEN_DIR, f"flux1_{VARIANT}{_PREC_SUFFIX}_golden.png")
+# QUANTIZE=8/4 dumps the fork's Q8/Q4 golden (FluxInitializer quantize=N), like dump_z_image_golden.py.
+QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
+_Q_SUFFIX = f"_q{QUANTIZE}" if QUANTIZE else ""
+OUT = os.path.join(_GOLDEN_DIR, f"flux1_{VARIANT}{_Q_SUFFIX}{_PREC_SUFFIX}_golden.safetensors")
+PNG = os.path.join(_GOLDEN_DIR, f"flux1_{VARIANT}{_Q_SUFFIX}{_PREC_SUFFIX}_golden.png")
 
 model_config = ModelConfig.schnell() if VARIANT == "schnell" else ModelConfig.dev()
 
@@ -54,7 +57,7 @@ class Holder:
 
 
 model = Holder()
-FluxInitializer.init(model, model_config=model_config, quantize=None)
+FluxInitializer.init(model, model_config=model_config, quantize=QUANTIZE)
 
 config = Config(
     model_config=model_config,
@@ -184,6 +187,7 @@ meta = {
     "w": str(W),
     "h": str(H),
     "guidance": str(GUIDANCE),
+    "quantize": str(QUANTIZE),
 }
 mx.save_safetensors(OUT, tensors, meta)
 print(f"\nwrote {OUT} + {PNG}")

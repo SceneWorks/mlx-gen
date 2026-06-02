@@ -13,11 +13,130 @@ use std::path::PathBuf;
 
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
+use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, Quant, WeightsSource};
 use mlx_gen_flux::{
     load_clip_encoder, load_t5_encoder, load_transformer, load_vae, unpack_latents, FluxVariant,
 };
+use mlx_rs::ops::{add, multiply};
 use mlx_rs::{Array, Dtype};
+
+const GOLDEN_Q8: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/flux1_schnell_q8_golden.safetensors"
+);
+const GOLDEN_Q4: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/flux1_schnell_q4_golden.safetensors"
+);
+
+/// Q8/Q4 verification. TWO checks:
+/// (a) build-independent quant gate — feed the fork-Q golden's OWN embeds+init into the Rust
+///     transformer.quantize(bits), run the denoise on the fork's sigmas, decode, and compare to the
+///     fork-Q golden (isolates the quantized transformer from the NAX-build text-encoder divergence);
+/// (b) full public `load(spec.with_quant(Q)).generate()` render, saved for visual inspection.
+/// `quantized_matmul` is fp32-accumulated (correct on the NAX build), so this should land at the
+/// dense f32 transformer floor, not blow up.
+fn verify_quant(golden_path: &str, quant: Quant, bits: i32) {
+    let g = Weights::from_file(golden_path).unwrap();
+    let stored: i32 = g.metadata("quantize").unwrap().parse().unwrap();
+    assert_eq!(stored, bits, "golden dumped at a different bit-width");
+    let w: u32 = g.metadata("w").unwrap().parse().unwrap();
+    let h: u32 = g.metadata("h").unwrap().parse().unwrap();
+    let snap = snapshot();
+
+    // (a) quant-transformer gate
+    let mut t = load_transformer(&snap, FluxVariant::Schnell).unwrap();
+    t.quantize(bits).unwrap();
+    let vae = load_vae(&snap).unwrap();
+    let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
+    let steps = sigmas.len() - 1;
+    let mut latents = f32a(g.require("init").unwrap());
+    let pe = f32a(g.require("prompt_embeds").unwrap());
+    let pooled = f32a(g.require("pooled_prompt_embeds").unwrap());
+    for i in 0..steps {
+        let v = t
+            .forward(&latents, &pe, &pooled, sigmas[i], 0.0, w, h)
+            .unwrap();
+        let dt = sigmas[i + 1] - sigmas[i];
+        latents = add(
+            &latents,
+            &multiply(&v, Array::from_slice(&[dt], &[1])).unwrap(),
+        )
+        .unwrap();
+    }
+    let golden_lat = g.require("final_latents").unwrap();
+    let lat_mr = mean_abs_rel(&f32a(&latents), golden_lat);
+    let unpacked = unpack_latents(&latents, w, h).unwrap();
+    let decoded = f32a(&vae.decode(&unpacked).unwrap());
+    let img = decoded_to_image(&decoded).unwrap();
+    let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
+    let differ = img
+        .pixels
+        .iter()
+        .zip(&gimg.pixels)
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+        .count();
+    let frac = differ as f32 / img.pixels.len() as f32;
+    println!(
+        "Q{bits} transformer gate (fork-Q embeds+init): latents mean_rel={lat_mr:.3e}  decoded px>8={:.2}% vs fork-Q{bits}",
+        frac * 100.0
+    );
+    // Same envelope as the dense f32 floor; quantized_matmul must not add gross divergence.
+    assert!(
+        lat_mr < 1.5e-1,
+        "Q{bits} quant transformer diverged: latents mean_rel {lat_mr:.3e}"
+    );
+
+    // (b) full public quantized generate — coherence + save PNG
+    let spec = LoadSpec::new(WeightsSource::Dir(snap)).with_quant(quant);
+    let gen = mlx_gen::load("flux1_schnell", &spec).unwrap();
+    let req = GenerationRequest {
+        prompt: g.metadata("prompt").unwrap().to_string(),
+        width: w,
+        height: h,
+        seed: Some(g.metadata("seed").unwrap().parse().unwrap()),
+        steps: Some(steps as u32),
+        ..Default::default()
+    };
+    let out = gen.generate(&req, &mut |_| {}).unwrap();
+    let img = match out {
+        GenerationOutput::Images(mut v) => v.pop().unwrap(),
+        other => panic!("expected Images, got {other:?}"),
+    };
+    let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../tools/golden/rust_flux_q{bits}.png"));
+    image::save_buffer(
+        &out_path,
+        &img.pixels,
+        img.width,
+        img.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+    let differ = img
+        .pixels
+        .iter()
+        .zip(&gimg.pixels)
+        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+        .count();
+    println!(
+        "Q{bits} full generate: {:.2}% px>8 vs fork-Q{bits} (incl. NAX build delta); saved {}",
+        100.0 * differ as f32 / img.pixels.len() as f32,
+        out_path.display()
+    );
+}
+
+#[test]
+#[ignore = "needs real FLUX.1-schnell weights + Q8 golden (QUANTIZE=8 dump_flux_golden.py)"]
+fn e2e_q8_matches_fork() {
+    verify_quant(GOLDEN_Q8, Quant::Q8, 8);
+}
+
+#[test]
+#[ignore = "needs real FLUX.1-schnell weights + Q4 golden (QUANTIZE=4 dump_flux_golden.py)"]
+fn e2e_q4_matches_fork() {
+    verify_quant(GOLDEN_Q4, Quant::Q4, 4);
+}
 
 const GOLDEN_BF16: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -252,7 +371,6 @@ fn e2e_init_noise_matches_golden() {
 #[test]
 #[ignore = "needs real FLUX.1-schnell weights + local golden"]
 fn e2e_denoise_loop_matches_golden() {
-    use mlx_rs::ops::{add, multiply};
     let g = golden();
     let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
     let steps = sigmas.len() - 1;
