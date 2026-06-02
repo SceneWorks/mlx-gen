@@ -169,13 +169,14 @@ impl ZImageTransformer {
     /// layers, and every block/context-block attention, FFN, and adaLN projection. RMSNorm /
     /// LayerNorm scales and the learned pad tokens are not Linears, so they stay dense.
     ///
-    /// The fork's `nn.quantize` also quantizes the text encoder + VAE components; the Rust generate
-    /// path runs those dense (the transformer is ~all of the weight, so memory parity is met, and
-    /// the parity gate feeds the fork's quantized `cap_feats` to isolate the transformer). The
-    /// quantization is byte-identical to the fork's per `mx.quantize` (sc-2342, re-confirmed on a
-    /// real bf16 weight under MLX 0.31.1); the residual e2e divergence from the fork's Q8 is the
-    /// Q8 mode's own sensitivity (the fork's dense→Q8 output already moves ~9% of pixels), not a
-    /// packing difference — see `tests/e2e_real_weights.rs`.
+    /// The fork's full `nn.quantize` also covers the text encoder + VAE; the whole-model quant is
+    /// wired in `model.rs::load` (sc-2532). The quantization is byte-identical to the fork's
+    /// `mx.quantize` **because `AdaptableLinear::quantize` casts the weight to bf16 first** (the
+    /// fork's compute dtype). Z-Image-Turbo ships an f32 transformer checkpoint; quantizing it
+    /// as-loaded (f32) yields group scales ~0.13% off the fork's bf16 scales and a ~0.78% px>8
+    /// base-Q8 residual (sc-2604, once misread as "source-MLX-vs-wheel toolchain"). With the bf16
+    /// cast the Q8/Q4 e2e collapses to the dense floor (~0.03% px>8 @1024²) — see
+    /// `tests/e2e_real_weights.rs` and `tests/q8_xemb_diag.rs`.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         for lin in [&mut self.x_embedder, &mut self.cap_linear] {
             lin.quantize(bits, None)?;
@@ -192,6 +193,12 @@ impl ZImageTransformer {
             block.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Diagnostic accessor (sc-2604 Q8 root-cause): the image patch embedder, so a test can
+    /// byte-compare its loaded quantization and run its forward in isolation against the fork.
+    pub fn x_embedder(&self) -> &AdaptableLinear {
+        &self.x_embedder
     }
 
     /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].

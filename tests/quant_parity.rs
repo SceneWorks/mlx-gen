@@ -9,7 +9,7 @@
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_rs::ops::{all_close, array_eq, dequantize, quantize, quantized_matmul};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -65,6 +65,12 @@ fn quantize_packs_identically_to_mflux() {
 
 #[test]
 fn adaptable_linear_quantize_matches_reference() {
+    // sc-2604: `AdaptableLinear::quantize` mirrors mflux — it quantizes the **bf16-cast** weight
+    // (the fork's compute dtype), NOT the as-loaded f32 weight. Quantizing an f32 checkpoint as f32
+    // yields group `scales` ~0.13% off the fork's bf16 scales (`wq`/`biases` survive), which
+    // compounds into the base-model Q8/Q4 e2e residual. So the wrapper's forward must match a
+    // **bf16** quantize, not the fixture's f32 reference (`q{bits}.qmm`, covered by
+    // `quantize_packs_identically_to_mflux` as the free-op version-drift gate).
     let w = Weights::from_file(FIXTURE).unwrap();
     let weight = w.require("w").unwrap().clone();
     let x = w.require("x").unwrap();
@@ -74,17 +80,15 @@ fn adaptable_linear_quantize_matches_reference() {
         assert!(!lin.is_quantized());
         lin.quantize(bits, None).unwrap();
         assert!(lin.is_quantized());
-
-        // Quantized AdaptableLinear.forward equals the fork's quantized_matmul reference.
         let out = lin.forward(x).unwrap();
+
+        // Fork-faithful reference: quantize the bf16-cast weight, run the same `quantized_matmul`.
+        let wbf = weight.as_dtype(Dtype::Bfloat16).unwrap();
+        let (wq, scales, biases) = quantize(&wbf, GROUP_SIZE, bits).unwrap();
+        let reference = quantized_matmul(x, &wq, &scales, &biases, true, GROUP_SIZE, bits).unwrap();
         assert!(
-            close(
-                &out,
-                w.require(&format!("q{bits}.qmm")).unwrap(),
-                1e-2,
-                1e-2
-            ),
-            "q{bits}: AdaptableLinear quantized forward diverged from reference"
+            close(&out, &reference, 1e-3, 1e-4),
+            "q{bits}: AdaptableLinear quantized forward diverged from the bf16 (fork-faithful) reference"
         );
     }
 }

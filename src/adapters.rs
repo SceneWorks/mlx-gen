@@ -50,6 +50,8 @@ pub fn reconstruct_lokr_delta(
         _ => return Err("LoKr: w2 missing (need full w2 or w2_a@w2_b)".into()),
     };
     let delta = multiply(&kron(&factor1, &factor2)?, scalar(alpha / rank))?;
+    // PARITY-BF16 (sc-2609): the fork reconstructs the LoKr delta at bf16; f32 would be more precise.
+    // (`residual` already reconciles this delta to the activation dtype, so flipping to f32 is local.)
     Ok(delta.reshape(base_shape)?.as_dtype(Dtype::Bfloat16)?)
 }
 
@@ -171,6 +173,34 @@ impl AdaptableLinear {
         matches!(self.base, LinearBase::Quantized(_))
     }
 
+    /// Diagnostic accessor: the quantized base's `(packed_weight, scales, biases, bias, group_size,
+    /// bits)`, or `None` if the base is still dense. Used by the sc-2604 Q8 root-cause diagnostic to
+    /// byte-compare the *loaded* model's quantization against the fork's `mx.quantize` (the
+    /// `qmm_smallk` probe only exercised the free `quantize` op, not `try_from_linear`).
+    /// Diagnostic accessor: the dense base's `(weight, bias)`, or `None` if already quantized.
+    /// Used by the sc-2604 diagnostic to inspect the loaded weight dtype before quantization.
+    pub fn dense_weight(&self) -> Option<(&Array, Option<&Array>)> {
+        match &self.base {
+            LinearBase::Dense(l) => Some((&l.weight.value, l.bias.value.as_ref())),
+            LinearBase::Quantized(_) => None,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn quantized_params(&self) -> Option<(&Array, &Array, &Array, Option<&Array>, i32, i32)> {
+        match &self.base {
+            LinearBase::Quantized(q) => Some((
+                &q.inner.weight.value,
+                &q.scales.value,
+                &q.biases.value,
+                q.inner.bias.value.as_ref(),
+                q.group_size,
+                q.bits,
+            )),
+            LinearBase::Dense(_) => None,
+        }
+    }
+
     /// The base weight's logical `[out, in]` shape — what a LoKr delta must reshape to.
     /// For a quantized base the packed weight is opaque, so recover it from the scales grid
     /// (`[out, in/group_size]`) times the group size.
@@ -190,8 +220,31 @@ impl AdaptableLinear {
     /// why the base is never fused: fusing would force re-quantization on every adapter swap.
     pub fn quantize(&mut self, bits: i32, group_size: Option<i32>) -> Result<()> {
         if let LinearBase::Dense(l) = &self.base {
+            // PARITY-BF16 (sc-2609): downcast for fork parity. f32 quantization (f32 group scales)
+            // is *more* accurate; we cast to bf16 only to byte-match the fork's golden. Flip to f32
+            // for quality once parity is no longer the goal — f32 is safe (the qmm path never hits
+            // the bf16-GEMM bug). Rationale below.
+            //
+            // The fork (mflux) loads every weight at bf16 — its compute dtype — and quantizes THAT.
+            // Some checkpoints (e.g. Z-Image-Turbo's transformer) ship f32 on disk; quantizing the
+            // as-loaded f32 weight yields group `scales` that differ from the fork's bf16 scales by
+            // ~0.13% (the integer `wq` codes and `biases` survive the perturbation, the scales do
+            // not), which compounds into the base-model Q8/Q4 e2e residual (sc-2604). Cast weight +
+            // bias to bf16 first so the packing is byte-identical to the fork. No-op when already
+            // bf16 (e.g. Qwen, whose checkpoint is bf16-native — which is why its Q8 already matched).
+            let weight = l.weight.value.as_dtype(Dtype::Bfloat16)?;
+            let bias = l
+                .bias
+                .value
+                .as_ref()
+                .map(|b| b.as_dtype(Dtype::Bfloat16))
+                .transpose()?;
+            let linear = Linear {
+                weight: Param::new(weight),
+                bias: Param::new(bias),
+            };
             let q = QuantizedLinear::try_from_linear(
-                l.clone(),
+                linear,
                 group_size.unwrap_or(crate::quant::DEFAULT_GROUP_SIZE),
                 bits,
             )?;

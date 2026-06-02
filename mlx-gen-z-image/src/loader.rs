@@ -49,6 +49,13 @@ pub fn load_text_encoder(root: &Path) -> Result<TextEncoder> {
 }
 
 /// Load the DiT transformer, applying the timestep-embedder + final-layer key remaps.
+///
+/// KEEP-F32 (sc-2609): Z-Image-Turbo ships f32 weights on disk and we deliberately keep them f32
+/// (the fork downcasts to bf16). The dense render is then *sharper / more contrast* than the fork's
+/// bf16 — Michael's preferred output — and it costs nothing today (activations already run f32, so
+/// the matmul is f32 either way). Do NOT downcast these to bf16 for parity. The only place we cast
+/// to bf16 is the quantize path (`AdaptableLinear::quantize`, tagged PARITY-BF16) to byte-match the
+/// fork's Q8/Q4 golden; that too is a flip-to-f32 candidate once parity stops being the goal.
 pub fn load_transformer(root: &Path) -> Result<ZImageTransformer> {
     let mut w = Weights::from_dir(root.join("transformer"))?;
     remap_transformer_keys(&mut w);

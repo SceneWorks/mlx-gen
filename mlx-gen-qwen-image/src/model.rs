@@ -131,6 +131,8 @@ impl QwenImage {
             return Err(Error::Msg("qwen_image: empty prompt".into()));
         }
         let embeds = self.text_encoder.encode(&t.input_ids, &t.attention_mask)?;
+        // PARITY-BF16 (sc-2609): round embeds to bf16 to match the fork (Qwen is bf16-native on disk,
+        // so this is near-lossless here — unlike Z-Image's f32 checkpoint; flip to f32 with the rest).
         Ok(embeds.as_dtype(Dtype::Bfloat16)?)
     }
 }
