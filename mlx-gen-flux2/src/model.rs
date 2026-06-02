@@ -1,18 +1,32 @@
-//! FLUX.2-klein provider registration.
+//! FLUX.2-klein provider registration + the txt2img generation path.
 //!
-//! S0 registers the two variant ids (`flux2_klein_9b`, `flux2_klein_9b_edit`) so the registry
-//! resolves them and consumers can introspect their descriptors **without loading weights**.
-//! Actual loading + generation is **guarded**: the Qwen3 text encoder (S1), the 32-ch VAE (S2),
-//! and the MMDiT transformer (S3) don't exist yet, so `load()` returns a clear,
-//! slice-referencing error. `validate()` is real (and tested) — it gates request shape/size now
-//! and will gate the wired model later.
+//! `load()` assembles the tokenizer, Qwen3 text encoder, MMDiT transformer, and 32-ch VAE from a
+//! snapshot directory. `generate()` runs the flow-match denoise loop (CFG dual-forward when
+//! `guidance > 1`; distilled klein defaults to 1.0 = single forward), then BN-denormalizes +
+//! 2×2-unpatchifies + VAE-decodes. Edit (`flux2_klein_9b_edit`) generation lands in S5.
+//!
+//! Activations run f32 (matmul(f32, bf16)→f32): dodges the dense 16-bit Metal GEMM bug and is the
+//! quality target. Pixel-parity with the fork's bf16 render is therefore not the gate (see the
+//! e2e test) — component f32 parity + visual correctness is.
 
+use mlx_gen::array::scalar;
+use mlx_gen::image::decoded_to_image;
+use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    ModelRegistration, Progress, Result,
+    default_seed, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Result, WeightsSource,
 };
+use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::Array;
 
-use crate::config::Flux2Variant;
+use crate::config::{Flux2Variant, DEFAULT_GUIDANCE};
+use crate::pipeline::{
+    create_noise, prepare_grid_ids, prepare_text_ids, schedule, timesteps_x1000,
+};
+use crate::text_encoder::Qwen3TextEncoder;
+use crate::transformer::Flux2Transformer;
+use crate::vae::Flux2Vae;
+use crate::{loader, Flux2Config};
 
 pub fn descriptor_klein_9b() -> ModelDescriptor {
     Flux2Variant::Klein9b.descriptor()
@@ -30,22 +44,56 @@ pub fn load_klein_9b_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Klein9bEdit, spec)
 }
 
-fn load_variant(variant: Flux2Variant, _spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // S0 guard: the model modules (Qwen3 TE / FLUX.2 VAE / MMDiT) are not ported yet.
-    Err(Error::Msg(format!(
-        "{}: model loading lands across S1 (Qwen3 text encoder), S2 (FLUX.2 VAE), and S3 \
-         (MMDiT transformer); S0 ships the scaffold, config, flow-match schedule, 2×2 \
-         pack/unpack, the 4-axis RoPE table, and the latent/text id builders only",
-        variant.id()
-    )))
+fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only dense bf16 is wired (Q4/Q8 = sc-2643)",
+            variant.id()
+        )));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p,
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(format!(
+                "{} expects a FLUX.2-klein snapshot directory (tokenizer/ text_encoder/ \
+                 transformer/ vae/), not a single .safetensors file",
+                variant.id()
+            )))
+        }
+    };
+    if !spec.adapters.is_empty() {
+        return Err(Error::Msg(format!(
+            "{}: LoRA/LoKr adapters are sc-2646",
+            variant.id()
+        )));
+    }
+    if spec.quantize.is_some() {
+        return Err(Error::Msg(format!(
+            "{}: Q4/Q8 quantization is sc-2643",
+            variant.id()
+        )));
+    }
+
+    Ok(Box::new(Flux2 {
+        descriptor: variant.descriptor(),
+        variant,
+        config: variant.config(),
+        tokenizer: Some(loader::load_tokenizer(root)?),
+        text_encoder: Some(loader::load_text_encoder(root)?),
+        transformer: Some(loader::load_transformer(root)?),
+        vae: Some(loader::load_vae(root)?),
+    }))
 }
 
-/// The FLUX.2-klein generator. S0 is a registration/validation shell — the model fields land in
-/// S1–S3 and `generate()` is wired in S4 (txt2img) / S5 (edit).
+/// The FLUX.2-klein generator.
 pub struct Flux2 {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)]
     variant: Flux2Variant,
+    config: Flux2Config,
+    tokenizer: Option<TextTokenizer>,
+    text_encoder: Option<Qwen3TextEncoder>,
+    transformer: Option<Flux2Transformer>,
+    vae: Option<Flux2Vae>,
 }
 
 impl Flux2 {
@@ -54,7 +102,46 @@ impl Flux2 {
         Self {
             descriptor: variant.descriptor(),
             variant,
+            config: variant.config(),
+            tokenizer: None,
+            text_encoder: None,
+            transformer: None,
+            vae: None,
         }
+    }
+
+    fn parts(
+        &self,
+    ) -> Result<(
+        &TextTokenizer,
+        &Qwen3TextEncoder,
+        &Flux2Transformer,
+        &Flux2Vae,
+    )> {
+        let err = |what: &str| Error::Msg(format!("{}: {what} is not loaded", self.descriptor.id));
+        Ok((
+            self.tokenizer.as_ref().ok_or_else(|| err("tokenizer"))?,
+            self.text_encoder
+                .as_ref()
+                .ok_or_else(|| err("text encoder"))?,
+            self.transformer
+                .as_ref()
+                .ok_or_else(|| err("transformer"))?,
+            self.vae.as_ref().ok_or_else(|| err("VAE"))?,
+        ))
+    }
+
+    /// Encode a prompt → `(prompt_embeds [1,512,joint], text_ids [1,512,4])`.
+    fn encode(
+        &self,
+        tokenizer: &TextTokenizer,
+        te: &Qwen3TextEncoder,
+        prompt: &str,
+    ) -> Result<(Array, Array)> {
+        let tok = tokenizer.tokenize(prompt)?;
+        let embeds = te.prompt_embeds(&tok.input_ids, &tok.attention_mask)?;
+        let ids = prepare_text_ids(embeds.shape()[1] as usize);
+        Ok((embeds, ids))
     }
 }
 
@@ -69,13 +156,68 @@ impl Generator for Flux2 {
 
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        Err(Error::Msg(format!(
-            "{}: generation is wired in S4 (txt2img) / S5 (edit); S0 is scaffold only",
-            self.descriptor.id
-        )))
+        self.validate(req)?;
+        if self.variant.is_edit() {
+            return Err(Error::Msg(format!(
+                "{}: image-conditioned edit generation is S5",
+                self.descriptor.id
+            )));
+        }
+        let (tokenizer, te, transformer, vae) = self.parts()?;
+        let base_seed = req.seed.unwrap_or_else(default_seed);
+        let steps = req.steps.unwrap_or(crate::config::DEFAULT_STEPS) as usize;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+
+        let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &req.prompt)?;
+        // klein is distilled (guidance 1.0); CFG dual-forward only kicks in for base variants.
+        let negative = if guidance > 1.0 {
+            Some(self.encode(tokenizer, te, " ")?)
+        } else {
+            None
+        };
+
+        let sched = schedule(steps, req.width, req.height);
+        let timesteps = timesteps_x1000(&sched);
+        let lat_h = (req.height / 16) as usize;
+        let lat_w = (req.width / 16) as usize;
+        let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
+        let in_channels = self.config.in_channels as i32;
+
+        let mut images = Vec::with_capacity(req.count as usize);
+        for i in 0..req.count {
+            let seed = base_seed.wrapping_add(i as u64);
+            let mut latents = create_noise(seed, req.width, req.height, self.config.in_channels)?;
+            for (t, &ts) in timesteps.iter().enumerate() {
+                if req.cancel.is_cancelled() {
+                    return Err(Error::Msg("generation cancelled".into()));
+                }
+                let v =
+                    transformer.forward(&latents, &prompt_embeds, &latent_ids, &text_ids, ts)?;
+                let v = match &negative {
+                    Some((neg_embeds, neg_ids)) => {
+                        let vn =
+                            transformer.forward(&latents, neg_embeds, &latent_ids, neg_ids, ts)?;
+                        // noise = neg + guidance·(pos − neg)
+                        add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?
+                    }
+                    None => v,
+                };
+                latents = sched.step(&latents, &v, t)?;
+                on_progress(Progress::Step {
+                    current: t as u32 + 1,
+                    total: steps as u32,
+                });
+            }
+            on_progress(Progress::Decoding);
+            let packed = latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
+            let decoded = vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
+            let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
+            images.push(decoded_to_image(&nchw)?);
+        }
+        Ok(GenerationOutput::Images(images))
     }
 }
 
@@ -218,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_is_guarded_in_s0() {
+    fn generate_without_weights_errors_not_loaded() {
         let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
         let req = GenerationRequest {
             prompt: "x".into(),
@@ -226,7 +368,7 @@ mod tests {
         };
         let mut progress = |_p: Progress| {};
         let err = model.generate(&req, &mut progress).unwrap_err().to_string();
-        assert!(err.contains("S4"));
+        assert!(err.contains("not loaded"));
     }
 
     #[test]

@@ -36,17 +36,28 @@ fn edit_advertises_single_reference_txt2img_does_not() {
 }
 
 #[test]
-fn loading_is_guarded_until_modules_land() {
+fn load_resolves_then_fails_on_missing_snapshot() {
     for id in ["flux2_klein_9b", "flux2_klein_9b_edit"] {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let err = mlx_gen::load(id, &spec)
             .err()
-            .expect("S0 load is guarded")
+            .expect("a missing snapshot dir must error")
             .to_string();
-        // The guard names the slices, not a generic "no generator registered" miss.
+        // The id resolves through the registry and reaches the loader (which then fails to read the
+        // snapshot) — i.e. NOT a "no generator registered" miss.
         assert!(
-            err.contains("S1") && err.contains("S3"),
-            "expected the S0 load guard, got: {err}"
+            !err.contains("no generator registered"),
+            "id should resolve through the registry, got: {err}"
         );
     }
+}
+
+#[test]
+fn single_file_spec_is_rejected() {
+    let spec = LoadSpec::new(WeightsSource::File("/unused.safetensors".into()));
+    let err = mlx_gen::load("flux2_klein_9b", &spec)
+        .err()
+        .expect("a single-file spec is rejected")
+        .to_string();
+    assert!(err.contains("snapshot directory"), "got: {err}");
 }

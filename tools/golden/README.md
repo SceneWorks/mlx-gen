@@ -69,6 +69,7 @@ See each script's module docstring for its exact env vars / arguments.
 |---|---|---|---|
 | `flux2_te_real.safetensors`, `flux2_te_real_f32.safetensors` | `dump_flux2_te_real_golden.py` (`FLUX2_TE_F32=1` for the f32 ref) | `tests/te_real_weights.rs` | sc-2346 S1 Qwen3 text encoder + tokenizer. The f32 golden is the **correctness** ref (Rust runs f32 activations → peak_rel ~1e-5); the bf16 golden is the fork's production precision (the residual there is bf16-vs-f32 over 36 layers). The committed `tests/fixtures/te_golden.safetensors` (tiny synthetic) proves the encoder math on CI without weights. |
 | `flux2_vae.safetensors` | `dump_flux2_vae_golden.py` | `tests/vae_real_weights.rs` | sc-2346 S2 VAE: `decode_packed_latents` (BN-denorm + 2×2 unpatchify + decode) and `encode`. f32 golden (Rust VAE runs f32) → mean_rel ~2e-3. Tensors are NCHW; the test transposes to the Rust VAE's NHWC. |
+| `flux2_e2e.safetensors` | `dump_flux2_e2e_golden.py` | `tests/e2e_real_weights.rs` | sc-2346 S4 txt2img e2e (256², 4 steps, guidance 1.0), f32. Gates: seeded noise byte-match, step-0 velocity (real-weights transformer, chaos-free) mean_rel ~4e-4, full `generate()` render ~0.9% px>8 vs the fork's f32 image (the residual is the NAX-vs-wheel build delta over the sampler). |
 
 ### Weight-independent
 
