@@ -321,12 +321,12 @@ fn e2e_full_pipeline_generates_fox() {
 /// product path — quantizing the text encoder + VAE too — is gated by `q{8,4}_full_generate_renders`;
 /// feeding `cap_feats` here isolates the transformer from the text encoder.)
 ///
-/// The quantization is byte-identical to the fork (`q8_packing_byte_identical_to_fork`: same
-/// wq/scales/biases/qmm on a real bf16 weight) and the quantized-Linear set matches exactly, so the
-/// only residual is the Q-mode's sensitivity to the binding-level kernel rounding (our source-built
-/// MLX vs the fork's prebuilt wheel — see the bf16-version analysis in sc-2532). At **1024²**
-/// (production) that is sub-1% px>8; at 256² the same arithmetic shows ~5% purely because the
-/// per-pixel metric is coarser there. Golden is regenerated at 1024² (see the `#[ignore]` message).
+/// The quantization is byte-identical to the fork *once the weight is quantized at bf16* — the fork's
+/// compute dtype. Z-Image-Turbo ships an **f32** transformer checkpoint; quantizing it as-loaded
+/// (f32) yields group `scales` ~0.13% off the fork's bf16 scales, which compounded into a ~0.78%
+/// px>8 base-Q8 residual (sc-2604, previously misattributed to "source-MLX-vs-wheel toolchain").
+/// `AdaptableLinear::quantize` now casts to bf16 first, so the residual collapses to the dense floor
+/// (~0.03% px>8 @1024²). Golden is regenerated at 1024² (see the `#[ignore]` message).
 fn q_pipeline_matches_fork(
     golden_path: &str,
     bits: i32,
@@ -481,16 +481,18 @@ fn q8_packing_byte_identical_to_fork() {
 #[test]
 #[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q8_pipeline_matches_fork() {
-    // Measured (1024², fox, seed 42): latent mean_rel 2.0e-2, px>8 0.78%. Thresholds leave headroom
-    // for machine/run variance.
-    q_pipeline_matches_fork(Q8_GOLDEN, 8, 3e-2, 0.02);
+    // Measured (1024², fox, seed 42) AFTER sc-2604: latent mean_rel 3.6e-3, px>8 0.028% (was
+    // 2.0e-2 / 0.78% when the f32 checkpoint was quantized as f32 — see `quantize` in adapters.rs).
+    // Now at the dense-path floor; thresholds catch a regression to the old f32-quantize residual.
+    q_pipeline_matches_fork(Q8_GOLDEN, 8, 1e-2, 0.005);
 }
 
 #[test]
 #[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024 dump_z_image_golden.py)"]
 fn transformer_q4_pipeline_matches_fork() {
-    // Measured (1024², fox, seed 42): latent mean_rel 1.6e-2, px>8 0.64%.
-    q_pipeline_matches_fork(Q4_GOLDEN, 4, 3e-2, 0.02);
+    // Measured (1024², fox, seed 42) AFTER sc-2604: latent mean_rel 4.5e-3, px>8 0.137% (was
+    // 1.6e-2 / 0.64% with the f32-quantize bug). Now at the dense-path floor.
+    q_pipeline_matches_fork(Q4_GOLDEN, 4, 1e-2, 0.005);
 }
 
 /// sc-2532: the **full public product path** — `load("z_image_turbo", spec.with_quant(Q)).generate()`
@@ -558,13 +560,15 @@ fn q_full_generate_renders(golden_path: &str, quant: mlx_gen::Quant, bits: i32, 
 #[test]
 #[ignore = "needs real Z-Image weights + Q8 golden @1024² (QUANTIZE=8 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
 fn q8_full_generate_renders() {
-    // Measured (1024²): 0.81% px>8 vs fork-Q8 (whole-model quant: transformer + text encoder + VAE).
-    q_full_generate_renders(Q8_GOLDEN, mlx_gen::Quant::Q8, 8, 0.02);
+    // Measured (1024²) AFTER sc-2604: 0.024% px>8 vs fork-Q8 (whole-model quant: transformer + text
+    // encoder + VAE — all f32 on disk, all fixed by the bf16-cast-before-quantize). Was 0.81%.
+    q_full_generate_renders(Q8_GOLDEN, mlx_gen::Quant::Q8, 8, 0.005);
 }
 
 #[test]
 #[ignore = "needs real Z-Image weights + Q4 golden @1024² (QUANTIZE=4 ZIMAGE_W=1024 ZIMAGE_H=1024)"]
 fn q4_full_generate_renders() {
-    // Measured (1024²): 0.73% px>8 vs fork-Q4 (whole-model quant). Transformer-only was ~18%.
-    q_full_generate_renders(Q4_GOLDEN, mlx_gen::Quant::Q4, 4, 0.02);
+    // Measured (1024²) AFTER sc-2604: 0.088% px>8 vs fork-Q4 (whole-model quant). Was 0.73%
+    // (transformer-only-dense-TE was ~18%, fixed in sc-2532; the f32-quantize residual in sc-2604).
+    q_full_generate_renders(Q4_GOLDEN, mlx_gen::Quant::Q4, 4, 0.005);
 }

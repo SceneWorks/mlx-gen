@@ -243,20 +243,21 @@ fn control_denoise_loop_matches_golden() {
 }
 
 /// Q8 control gate (sc-2257 Q8 control branch): proves the control port adds **zero** error to the
-/// base Q8 path, so the Rust-vs-fork Q8 render gap (~8% px>8 over the 8-step loop) is entirely the
-/// base z_image Q8 residual (sc-2532), inherited — NOT a control-branch defect.
+/// base Q8 path, so the Rust-vs-fork Q8 render gap was entirely the base z_image Q8 residual,
+/// inherited — NOT a control-branch defect.
 ///
-/// Root-caused by stage bisection (`control_q8_bisect` + `tools/probe_z_control_q8_bisect.py`):
-///   - Every control-specific stage (control embedder, refiner/main hints, threaded state) matches
-///     the fork to <0.6% mean-rel. The divergence appears only in the **base** 30-layer main loop.
-///   - The control model's base path (control inert, scale=0) is **byte-identical** to a freshly
-///     loaded standalone base Q8 forward (asserted below, mean-rel 0) — the control adds nothing.
-///   - The base Q8 single forward itself diverges ~1.26% mean-rel from the fork (vs ~0.15% dense);
-///     that ~8× quantized-kernel residual is a base-model property (sc-2532), accumulated here over
-///     8 steps + the deeper control stack. (NOT the activation dtype: the fork's own Q8 bf16-vs-f32
-///     is only 0.24% — see `probe_z_control_q8_dtype.py`.)
+/// Root cause of that base residual (sc-2604): Z-Image-Turbo ships an **f32** transformer checkpoint;
+/// the loader kept it f32 and quantized f32, yielding group `scales` ~0.13% off the fork's **bf16**
+/// scales (the integer `wq` codes + `biases` survive, the scales don't) → ~1.26% mean-rel per
+/// forward → ~8% px>8 over the 8-step loop. `AdaptableLinear::quantize` now casts to bf16 (the fork's
+/// compute dtype) first, so the loaded scales are byte-identical and the residual collapses to the
+/// dense floor (**0.184% px>8 transformer-isolated, 0.123% full-generate**, measured below/sibling).
 ///
-/// The dense control path is pixel-faithful (`control_full_pipeline_matches_fork`, 0.166%).
+/// The earlier "source-MLX-vs-wheel toolchain" / "Q8-mode kernel sensitivity" reading was wrong —
+/// the stage bisection had correctly localized it to the base loop, but the mechanism was the f32
+/// quantize, proven by `tests/q8_xemb_diag.rs` (loaded scales byte-compare). The composition proofs
+/// still hold (control base path byte-identical to standalone base Q8). The dense control path is
+/// pixel-faithful (`control_full_pipeline_matches_fork`, 0.166%).
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local Q8 control golden \
             (QUANTIZE=8 dump_z_image_control_golden.py)"]
@@ -360,6 +361,12 @@ fn control_q8_transformer_matches_golden() {
         "control Q8 transformer-isolated decode: {:.3}% px>8 ({differ}/{})",
         frac * 100.0,
         img.pixels.len()
+    );
+    // sc-2604: was 8.41% (f32-quantize); now 0.184% at the dense floor. 1% catches a regression.
+    assert!(
+        frac < 0.01,
+        "control Q8 transformer-isolated render diverged: {:.3}% px>8 (sc-2604 f32-quantize regression?)",
+        frac * 100.0
     );
 }
 
@@ -691,17 +698,16 @@ fn control_full_pipeline_matches_fork() {
 /// sc-2257 Q8 control branch: the **full public Q8 path** (`with_quant(Q8)`) vs the fork's Q8
 /// control golden. Base + control quantized together; the control patch embedder stays dense.
 ///
-/// Measured ~8% px>8 — the **inherited base z_image Q8 residual** (sc-2532) accumulated over the
-/// control's 8-step loop + deeper stack, NOT a control-branch defect. Proven by
-/// `control_q8_transformer_matches_golden`: the control's base path is byte-identical to a
-/// standalone base Q8 forward (composition adds zero error) and every control-specific stage matches
-/// the fork to <0.6%. The base Q8 per-forward residual (~1.26% mean-rel, vs ~0.15% dense) is a
-/// quantized-kernel property of the base model — see [[zimage-q4q8-sc2532]] / the base Q8 gates. The
-/// dense control path is the pixel-faithful parity gate (`control_full_pipeline_matches_fork`,
-/// 0.166%). The bound (12%) accommodates the inherited residual with run-variance headroom.
+/// Measured **0.123% px>8 AFTER sc-2604** (was ~8%). The old ~8% was NOT a control-branch defect and
+/// NOT a "kernel/toolchain" property — it was the **inherited base z_image f32-quantize bug**:
+/// Z-Image-Turbo ships an f32 checkpoint, and quantizing it as f32 (instead of bf16, the fork's
+/// compute dtype) gave group scales ~0.13% off → ~1.26% mean-rel per forward → ~8% over the 8-step
+/// loop. `AdaptableLinear::quantize` now casts to bf16, collapsing it to the dense floor. The
+/// composition proof still holds (`control_q8_transformer_matches_golden`: the control base path is
+/// byte-identical to a standalone base Q8). Bound tightened to 1% (catches a regression to ~8%).
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local Q8 control golden \
             (QUANTIZE=8 dump_z_image_control_golden.py)"]
 fn control_q8_full_pipeline_matches_fork() {
-    full_pipeline(Q8_GOLDEN, Some(Quant::Q8), "_q8", 0.12);
+    full_pipeline(Q8_GOLDEN, Some(Quant::Q8), "_q8", 0.01);
 }

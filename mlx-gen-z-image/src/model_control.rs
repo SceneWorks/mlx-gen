@@ -252,6 +252,8 @@ impl Generator for ZImageTurboControl {
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
             // bf16-round to match the fork's seeded sample exactly, then promote to f32 for the loop.
+            // PARITY-BF16 (sc-2609): bf16 matches the fork's seed→image mapping; f32 is a different
+            // (higher-precision) realization, not just sharper. Revisit with the other f32 flips.
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
             let latents = if is_img2img {
                 let (image, _) = reference.expect("is_img2img implies a reference");

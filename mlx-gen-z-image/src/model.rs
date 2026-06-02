@@ -222,6 +222,8 @@ impl Generator for ZImageTurbo {
         let cap = if is_img2img {
             cap
         } else {
+            // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's golden;
+            // f32 is more accurate (sharper). Flip to f32 for quality once parity is not the goal.
             cap.as_dtype(Dtype::Bfloat16)?
         };
 
@@ -234,6 +236,9 @@ impl Generator for ZImageTurbo {
             // Distinct seed per image in a batch (the fork's `seed + i` convention).
             let seed = base_seed.wrapping_add(i as u64);
             // Seeded noise as bf16 (the fork's `create_noise` casts to model precision).
+            // PARITY-BF16 (sc-2609): bf16 to match the fork's seed→image mapping; flipping to f32 is
+            // a *different* (higher-precision) noise realization, not just sharper — so it changes the
+            // output, not only its crispness. Revisit alongside the other f32 flips.
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
             let latents = if is_img2img {
                 // VAE-encode the init image to clean latents (f32), then blend with the noise at
