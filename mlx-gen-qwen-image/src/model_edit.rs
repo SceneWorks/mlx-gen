@@ -76,8 +76,11 @@ pub struct QwenImageEdit {
 
 /// Construct a [`QwenImageEdit`] from a [`LoadSpec`] (a `Qwen/Qwen-Image-Edit-2509` snapshot dir).
 /// `spec.quantize` (Q4/Q8) quantizes the **transformer only** (group_size 64) after the dense bf16
-/// load — same as T2I ([`crate::model::load`]); the VL encoder (LM + vision) and VAE stay bf16, which
-/// matches the fork (`nn.quantize` only hits the transformer's Linears).
+/// load — same as T2I ([`crate::model::load`]). This is the fork's full `quantize=N` scope, not a
+/// descope: the Edit variant uses the same `QwenWeightDefinition`, whose `text_encoder` component
+/// (the VL model — **LM + vision tower**, all under `text_encoder/`) is `skip_quantization=True`,
+/// and whose VAE is all-conv (no `to_quantized` leaves). So the VL encoder and VAE stay bf16,
+/// matching the fork (sc-2565).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(

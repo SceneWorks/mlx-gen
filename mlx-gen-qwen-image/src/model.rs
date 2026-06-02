@@ -98,9 +98,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load — the
-    // fork's `nn.quantize` predicate matches every Linear, and only the transformer has them
-    // (the text encoder is skip-quantize; the VAE is all conv). Text encoder + VAE stay bf16.
+    // Q4/Q8 quantizes the **transformer only** (group_size 64) after the dense bf16 load. This is
+    // the fork's full `quantize=N` scope, not a descope (sc-2565): `QwenWeightDefinition` marks the
+    // `text_encoder` component `skip_quantization=True` ("Quantization causes significant semantic
+    // degradation"), so its Linears/Embedding are never quantized; and the VAE is all-conv
+    // (`nn.Conv2d`/`Conv3d` lack `to_quantized`), so the fork's `nn.quantize(vae)` is a no-op. The
+    // transformer is the only component with quantizable leaves. (Z-Image differs — its fork *does*
+    // quantize the TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
