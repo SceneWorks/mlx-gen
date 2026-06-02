@@ -44,6 +44,9 @@ GUIDANCE = float(os.environ.get("FLUX_GUIDANCE", "0.0" if VARIANT == "schnell" e
 
 _PREC_SUFFIX = "_f32" if os.environ.get("FLUX_PRECISION", "").lower() in ("f32", "float32", "fp32") else ""
 # QUANTIZE=8/4 dumps the fork's Q8/Q4 golden (FluxInitializer quantize=N), like dump_z_image_golden.py.
+# For the e2e quant parity gate, ALSO set FLUX_PRECISION=f32: the Rust transformer runs f32 activations,
+# so the reference must be quantized AND f32-compute (a bf16-precision Q golden conflates quant with the
+# fork's bf16 modulation precision — large for FLUX.1-dev's guidance term). Filename gets _q{N}_f32.
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
 _Q_SUFFIX = f"_q{QUANTIZE}" if QUANTIZE else ""
 OUT = os.path.join(_GOLDEN_DIR, f"flux1_{VARIANT}{_Q_SUFFIX}{_PREC_SUFFIX}_golden.safetensors")
