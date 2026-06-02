@@ -8,7 +8,7 @@ use mlx_rs::nn::gelu;
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::group_norm;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -63,6 +63,14 @@ impl AttentionMHA {
     /// `x`: `[B, L, D]` (queries); `context`: `[B, S, Dctx]` (keys/values; == `x` for self-attn).
     /// Fused `scaled_dot_product_attention` (mathematically the reference's `nn.MultiHeadAttention`;
     /// an explicit softmax matmul was tried and gave no measurable parity gain at large e2e cost).
+    /// The four LoRA-targetable attention projections, by diffusers leaf name (the `.to_out.0`
+    /// dot is the GEGLU-style indexed leaf the kohya flattener turns into `to_out_0`).
+    fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+            out.push(format!("{prefix}.{leaf}"));
+        }
+    }
+
     fn forward(&self, x: &Array, context: &Array) -> Result<Array> {
         let (b, l) = (x.shape()[0], x.shape()[1]);
         let s = context.shape()[1];
@@ -244,5 +252,58 @@ impl Transformer2D {
         }
         let y = self.proj_out.forward(&y)?.reshape(&[b, h, w_, c])?;
         Ok(add(&y, x)?)
+    }
+
+    /// LoRA-targetable Linears under this `attentions.{i}` module, by diffusers path: `proj_in`,
+    /// `proj_out`, and each transformer block's attention projections. The GEGLU FF (`linear1/2/3`)
+    /// is intentionally excluded — the vendored `lora.py` can't reach it (mlx-examples renames it),
+    /// so faithfully porting that path omits it too (sc-2671 adds it).
+    pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        out.push(format!("{prefix}.proj_in"));
+        out.push(format!("{prefix}.proj_out"));
+        for (k, b) in self.blocks.iter().enumerate() {
+            b.attn1
+                .lora_target_paths(&format!("{prefix}.transformer_blocks.{k}.attn1"), out);
+            b.attn2
+                .lora_target_paths(&format!("{prefix}.transformer_blocks.{k}.attn2"), out);
+        }
+    }
+}
+
+// LoRA key→module routing (sc-2639). Diffusers leaf naming; the GEGLU FF and (for the U-Net)
+// mid_block are intentionally unreachable here to mirror the vendored `lora.py` surface.
+impl AdaptableHost for AttentionMHA {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.q),
+            ["to_k"] => Some(&mut self.k),
+            ["to_v"] => Some(&mut self.v),
+            ["to_out", "0"] => Some(&mut self.out),
+            _ => None,
+        }
+    }
+}
+
+impl AdaptableHost for TransformerBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
+            ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+}
+
+impl AdaptableHost for Transformer2D {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["proj_in"] => Some(&mut self.proj_in),
+            ["proj_out"] => Some(&mut self.proj_out),
+            ["transformer_blocks", k, rest @ ..] => self
+                .blocks
+                .get_mut(k.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
     }
 }

@@ -7,6 +7,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -131,5 +132,35 @@ impl UNetBlock2D {
             output_states.push(x.clone());
         }
         Ok((x, output_states))
+    }
+
+    /// Emit the diffusers paths of this block's LoRA-targetable Linears (resnet `time_emb_proj`s +
+    /// each `attentions.{j}` transformer's projections), prefixed by `prefix` (e.g. `down_blocks.1`).
+    pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        for (j, r) in self.resnets.iter().enumerate() {
+            r.lora_target_paths(&format!("{prefix}.resnets.{j}"), out);
+        }
+        if let Some(attns) = &self.attentions {
+            for (j, a) in attns.iter().enumerate() {
+                a.lora_target_paths(&format!("{prefix}.attentions.{j}"), out);
+            }
+        }
+    }
+}
+
+impl AdaptableHost for UNetBlock2D {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["resnets", j, rest @ ..] => self
+                .resnets
+                .get_mut(j.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["attentions", j, rest @ ..] => self
+                .attentions
+                .as_mut()?
+                .get_mut(j.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
     }
 }

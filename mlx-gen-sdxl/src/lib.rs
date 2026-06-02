@@ -17,6 +17,7 @@
 //! Parity target = the vendored fp16 reference (`StableDiffusionXL.generate_latents`), validated
 //! stage-by-stage against goldens (see `tools/dump_sdxl_golden.py`).
 
+pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod model;
@@ -27,6 +28,7 @@ pub mod tokenizer;
 pub mod unet;
 pub mod vae;
 
+pub use adapters::{apply_sdxl_adapters, SdxlLoraReport};
 pub use config::{
     BetaSchedule, ClipActivation, ClipTextConfig, DiffusionConfig, UNetConfig, VaeConfig,
 };

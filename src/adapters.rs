@@ -180,6 +180,28 @@ impl AdaptableLinear {
         &self.adapters
     }
 
+    /// Merge a precomputed `[out, in]` delta into the dense base weight (`W += δ`) — the in-place
+    /// LoRA/LoKr *merge*, distinct from the forward-time [`Adapter::residual`] stack. The merge
+    /// reproduces a reference's merged-weight forward (`(W+δ)·x`) bit-for-bit, where a residual
+    /// (`W·x + δ·x`) differs by ~1 ULP; on a chaos-sensitive sampler (SDXL's ancestral) that 1-ULP
+    /// cascades to a visible whole-image divergence, so the SDXL provider merges (matching the
+    /// vendored `lora.py` `module.weight += delta`) rather than stacking residuals. `delta` is cast
+    /// to the base weight's dtype before the add. Errors on a quantized base — a LoRA must be merged
+    /// into the dense (e.g. f32) weight BEFORE quantization (the fork merges pre-quantize too).
+    pub fn merge_dense_delta(&mut self, delta: &Array) -> Result<()> {
+        match &mut self.base {
+            LinearBase::Dense(l) => {
+                let merged = add(&l.weight.value, &delta.as_dtype(l.weight.value.dtype())?)?;
+                l.weight = Param::new(merged);
+                Ok(())
+            }
+            LinearBase::Quantized(_) => Err(
+                "merge_dense_delta: base is quantized; a LoRA must be merged before quantization"
+                    .into(),
+            ),
+        }
+    }
+
     /// `true` once the base has been quantized (Q4/Q8).
     pub fn is_quantized(&self) -> bool {
         matches!(self.base, LinearBase::Quantized(_))
@@ -377,6 +399,45 @@ mod tests {
                 .item::<bool>(),
             "bf16 residual diverged from the f32 reference (bf16 GEMM bug?)"
         );
+    }
+
+    #[test]
+    fn merge_dense_delta_adds_to_weight_and_zero_is_noop() {
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let x = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
+
+        // A zero delta is a bit-exact no-op (`W + 0 == W`) — the scale-0 LoRA invariant.
+        let mut lin = AdaptableLinear::dense(w.clone(), None);
+        let base = lin.forward(&x).unwrap();
+        lin.merge_dense_delta(&Array::from_slice(&[0.0f32; 4], &[2, 2]))
+            .unwrap();
+        assert!(array_eq(lin.forward(&x).unwrap(), &base, false)
+            .unwrap()
+            .item::<bool>());
+
+        // A nonzero delta is exactly `(W + δ)·x`.
+        let delta = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let mut lin2 = AdaptableLinear::dense(w.clone(), None);
+        lin2.merge_dense_delta(&delta).unwrap();
+        let want = AdaptableLinear::dense(add(&w, &delta).unwrap(), None)
+            .forward(&x)
+            .unwrap();
+        assert!(array_eq(lin2.forward(&x).unwrap(), &want, false)
+            .unwrap()
+            .item::<bool>());
+
+        // Merging into a quantized base is rejected (must merge before quantization).
+        let mut lin3 = AdaptableLinear::dense(
+            Array::from_slice(
+                &(0..4096).map(|i| i as f32 * 1e-3).collect::<Vec<_>>(),
+                &[64, 64],
+            ),
+            None,
+        );
+        lin3.quantize(8, None).unwrap();
+        assert!(lin3
+            .merge_dense_delta(&Array::from_slice(&[0.0f32; 4096], &[64, 64]))
+            .is_err());
     }
 
     #[test]
