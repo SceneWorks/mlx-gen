@@ -45,15 +45,21 @@ DIM = 3072  # all attention projections are [3072, 3072]
 
 
 def build_lora(path):
+    # peft `lora_A/B` under the `diffusion_model.` prefix, but a BARE `alpha` (the fork's Qwen
+    # mapping has bare-only alpha patterns). alpha = 2*RANK so alpha/rank = 2 has a visible,
+    # non-trivial effect — this exercises the loader's bare-alpha-under-a-prefix fold (sc-2528
+    # adversarial review); the fork applies the same scaling via its bare alpha pattern.
     rng = np.random.default_rng(20260602)
     t = {}
     for b in BLOCKS:
         for proj in PROJS:
             base = f"diffusion_model.transformer_blocks.{b}.attn.{proj}"
+            bare = f"transformer_blocks.{b}.attn.{proj}"
             a = rng.normal(0.0, LORA_STD, size=(RANK, DIM)).astype(np.float32)
             bb = rng.normal(0.0, LORA_STD, size=(DIM, RANK)).astype(np.float32)
             t[f"{base}.lora_A.weight"] = mx.array(a)
             t[f"{base}.lora_B.weight"] = mx.array(bb)
+            t[f"{bare}.alpha"] = mx.array(np.array([float(2 * RANK)], dtype=np.float32))
     mx.save_safetensors(path, t)
     return path
 

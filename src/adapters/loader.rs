@@ -116,17 +116,42 @@ pub fn apply_lora_peft(
     let prefix = strip_prefix.unwrap_or("");
     let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
     for key in w.keys().map(str::to_string).collect::<Vec<_>>() {
-        let rest = match key.strip_prefix(prefix) {
-            Some(r) => r,
-            None => continue,
-        };
-        if let Some(path) = rest.strip_suffix(".lora_A.weight") {
-            groups.entry(path.to_string()).or_default().a = Some(w.require(&key)?.clone());
-        } else if let Some(path) = rest.strip_suffix(".lora_B.weight") {
-            groups.entry(path.to_string()).or_default().b = Some(w.require(&key)?.clone());
-        } else if let Some(path) = rest.strip_suffix(".alpha") {
-            groups.entry(path.to_string()).or_default().alpha =
-                w.require(&key)?.as_slice::<f32>().first().copied();
+        // `lora_A/B` always carry the file's namespace prefix.
+        if let Some(rest) = key.strip_prefix(prefix) {
+            if let Some(path) = rest.strip_suffix(".lora_A.weight") {
+                groups.entry(path.to_string()).or_default().a = Some(w.require(&key)?.clone());
+                continue;
+            }
+            if let Some(path) = rest.strip_suffix(".lora_B.weight") {
+                groups.entry(path.to_string()).or_default().b = Some(w.require(&key)?.clone());
+                continue;
+            }
+        }
+        // `alpha` may be prefixed (`<prefix><path>.alpha`) OR bare (`<path>.alpha`): some trainers
+        // pair prefixed `lora_A/B` with a bare `alpha` — notably the fork's `QwenLoRAMapping`, whose
+        // alpha patterns are bare-only. Resolve to the same `<path>` either way (rather than
+        // stripping the A/B prefix off the alpha key and dropping a bare one) so the `alpha/rank`
+        // fold is kept; a prefixed and a bare alpha that *disagree* for one path is a hard error (no
+        // silent pick). Without this, a prefixed-A/B + bare-alpha file applied at the wrong
+        // (unscaled) strength while reporting success (sc-2528 adversarial review).
+        if let Some(path) = key
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(".alpha"))
+            .or_else(|| key.strip_suffix(".alpha"))
+        {
+            if let Some(new) = w.require(&key)?.as_slice::<f32>().first().copied() {
+                let slot = &mut groups.entry(path.to_string()).or_default().alpha;
+                match *slot {
+                    Some(existing) if existing != new => {
+                        return Err(format!(
+                            "LoRA alpha conflict for `{path}`: {existing} vs {new} \
+                             (prefixed and bare alpha keys disagree)"
+                        )
+                        .into());
+                    }
+                    _ => *slot = Some(new),
+                }
+            }
         }
     }
 
@@ -345,6 +370,90 @@ mod tests {
         assert!(all_close(&got, &want, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    #[test]
+    fn lora_peft_folds_bare_alpha_under_a_prefix() {
+        // Prefixed `lora_A/B` (`transformer.lin.lora_{A,B}.weight`) + a BARE `lin.alpha` — the
+        // fork's Qwen convention (bare-only alpha patterns). The bare alpha must NOT be dropped:
+        // the residual folds alpha/rank into B exactly as the all-bare case does. (sc-2528 review.)
+        let weight = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        let a_raw = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]); // [r=2, in=3]
+        let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        let alpha = Array::from_slice(&[4.0f32], &[1]); // rank=2 -> factor 2
+
+        let path = tmp("lora_prefixed_bare_alpha.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.lin.lora_A.weight", &a_raw),
+                ("transformer.lin.lora_B.weight", &b_raw),
+                ("lin.alpha", &alpha), // BARE — no `transformer.` prefix
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_lora_peft(&mut host, &w, 0.5, Some("transformer.")).unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.unmatched_paths.is_empty());
+
+        // Reference: B scaled by alpha/rank = 2 (the bare alpha was honored).
+        let mut expected = AdaptableLinear::dense(weight, None);
+        let b_scaled = b_raw
+            .t()
+            .multiply(Array::from_slice(&[2.0f32], &[1]))
+            .unwrap();
+        expected.push(Adapter::Lora {
+            a: a_raw.t(),
+            b: b_scaled,
+            scale: 0.5,
+        });
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let got = host.lin.forward(&x).unwrap();
+        let want = expected.forward(&x).unwrap();
+        assert!(
+            all_close(&got, &want, 1e-5, 1e-5, false)
+                .unwrap()
+                .item::<bool>(),
+            "bare alpha under a prefix was dropped or mis-folded"
+        );
+    }
+
+    #[test]
+    fn lora_peft_conflicting_alpha_errors() {
+        // A prefixed alpha and a bare alpha that disagree for the same path -> hard error, no
+        // silent pick.
+        let weight = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        let a_raw = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, -0.3], &[2, 3]);
+        let b_raw = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75, 0.1, 0.2, -0.3, 0.4], &[4, 2]);
+        let path = tmp("lora_conflicting_alpha.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer.lin.lora_A.weight", &a_raw),
+                ("transformer.lin.lora_B.weight", &b_raw),
+                ("transformer.lin.alpha", &Array::from_slice(&[4.0f32], &[1])),
+                ("lin.alpha", &Array::from_slice(&[8.0f32], &[1])), // disagrees
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight, None),
+        };
+        assert!(apply_lora_peft(&mut host, &w, 1.0, Some("transformer.")).is_err());
     }
 
     #[test]
