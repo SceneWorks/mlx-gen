@@ -120,6 +120,11 @@ impl QwenTextEncoder {
 
 /// Additive attention mask `[b, 1, s, s]`: `0` where a query may attend (key is causal **and**
 /// not padding), `-inf` otherwise.
+///
+/// Built host-side (a one-time `O(b·s²)` fill per prompt encode, **not** per denoise step).
+/// Deliberately kept on the host rather than constructed with on-device broadcast ops: at realistic
+/// prompt lengths this is negligible against the denoise loop, and a plain fill is the simplest way
+/// to stay bit-exact with the fork (sc-2583). Revisit only if profiling ever flags it.
 fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
     let am = host_i32(attention_mask)?;
     let (b, s) = (b as usize, s as usize);
