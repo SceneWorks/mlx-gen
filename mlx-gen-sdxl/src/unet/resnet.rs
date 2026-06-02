@@ -7,7 +7,7 @@
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -96,5 +96,23 @@ impl ResnetBlock2D {
             None => x.clone(),
         };
         Ok(add(&residual, &y)?)
+    }
+
+    /// The one LoRA-targetable Linear on a U-Net resnet — `time_emb_proj`. `conv_shortcut` is a
+    /// 1×1 conv in the fork (4-D conv LoRAs target it, which the vendored Linear-only merge skips),
+    /// so it is intentionally not a target.
+    pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        if self.time_emb_proj.is_some() {
+            out.push(format!("{prefix}.time_emb_proj"));
+        }
+    }
+}
+
+impl AdaptableHost for ResnetBlock2D {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["time_emb_proj"] => self.time_emb_proj.as_mut(),
+            _ => None,
+        }
     }
 }

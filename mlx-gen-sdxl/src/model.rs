@@ -57,9 +57,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // img2img Reference (sc-2638). LoRA/LoKr land in sc-2639/sc-2640 (advertised once wired).
+            // img2img Reference (sc-2638). LoRA (kohya `lora_unet_` + PEFT) is wired (sc-2639);
+            // LoKr lands in sc-2640 (advertised once wired).
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
+            supports_lora: true,
             supports_lokr: false,
             // Only the wired + parity-proven sampler is advertised. The fork's SDXL path uses the
             // ancestral Euler step exclusively (there is no plain-`euler` SDXL golden), so a request
@@ -116,13 +117,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    if !spec.adapters.is_empty() {
-        // LoRA/LoKr land in sc-2639/sc-2640 (the SDXL key→module map). Surface rather than
-        // silently ignore a requested adapter.
-        return Err(Error::Msg(
-            "sdxl: LoRA/LoKr adapters are not yet wired (sc-2639/sc-2640)".into(),
-        ));
-    }
     if spec.quantize.is_some() {
         // Q4/Q8 parity for SDXL is validated + scoped in sc-2641 (the sc-1975 base-1.0 Q8 caveat
         // needs a dedicated check); don't ship an unvalidated quantized path.
@@ -131,12 +125,21 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         ));
     }
 
+    let mut unet = loader::load_unet(root)?;
+    if !spec.adapters.is_empty() {
+        // Merge LoRA (kohya `lora_unet_` / PEFT) into the dense f32 U-Net weights at load — the
+        // vendored `lora.py` merges pre-quantization, and merging (not a forward-time residual)
+        // keeps the chaos-sensitive ancestral sampler bit-exact (sc-2639). LoKr is rejected here
+        // (sc-2640). Out-of-surface keys (mid_block/ff/conv) are surfaced in the report, not dropped.
+        crate::adapters::apply_sdxl_adapters(&mut unet, &spec.adapters)?;
+    }
+
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
         te1: loader::load_text_encoder_1(root)?,
         te2: loader::load_text_encoder_2(root)?,
-        unet: loader::load_unet(root)?,
+        unet,
         vae: loader::load_vae(root)?,
         sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true),
     }))

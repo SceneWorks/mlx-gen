@@ -11,6 +11,7 @@ mod transformer;
 use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -208,5 +209,40 @@ impl UNet2DConditionModel {
         )?;
         let x = silu(&x)?;
         conv2d(&x, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+    }
+
+    /// Every LoRA-targetable Linear's diffusers dotted path, matching the vendored `lora.py`
+    /// reachable surface (sc-2639): down/up attention (`to_q/k/v`, `to_out.0`), the `proj_in`/`proj_out`
+    /// projections, and each resnet's `time_emb_proj`. **`mid_block` is intentionally omitted** — the
+    /// vendored mlx-examples UNet names it `mid_blocks.1.…`, so community/diffusers LoRA keys
+    /// (`mid_block.attentions.0.…`) never match and the vendored path silently drops them; this port
+    /// reproduces that exactly. The correct/complete mid_block + ff coverage (strictly more than the
+    /// vendored path) is sc-2671. This list also builds the kohya `flattened→dotted` lookup table.
+    pub fn lora_target_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.down_blocks.iter().enumerate() {
+            b.lora_target_paths(&format!("down_blocks.{i}"), &mut out);
+        }
+        for (k, b) in self.up_blocks.iter().enumerate() {
+            b.lora_target_paths(&format!("up_blocks.{k}"), &mut out);
+        }
+        out
+    }
+}
+
+impl AdaptableHost for UNet2DConditionModel {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["down_blocks", i, rest @ ..] => self
+                .down_blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["up_blocks", k, rest @ ..] => self
+                .up_blocks
+                .get_mut(k.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // mid_block intentionally not routed — faithful to the vendored 515-module surface (sc-2671).
+            _ => None,
+        }
     }
 }
