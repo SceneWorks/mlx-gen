@@ -573,6 +573,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-sdxl"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "inventory",
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "regex",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-z-image"
 version = "0.0.0"
 dependencies = [

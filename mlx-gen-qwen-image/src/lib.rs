@@ -33,8 +33,9 @@ pub use loader::{
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
 pub use model_edit::QwenImageEdit;
 pub use pipeline::{
-    compute_guided_noise, create_noise, decoded_to_image, denoise_edit_with_progress,
-    denoise_with_progress, pack_latents, qwen_scheduler, unpack_latents,
+    add_noise_by_interpolation, compute_guided_noise, create_noise, decoded_to_image,
+    denoise_edit_with_progress, denoise_with_progress, encode_init_latents, init_time_step,
+    pack_latents, preprocess_init_image, qwen_scheduler, unpack_latents,
 };
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};

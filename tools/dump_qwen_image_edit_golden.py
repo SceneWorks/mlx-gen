@@ -29,12 +29,23 @@ PROMPT = "make it autumn"
 STEPS = 2
 GUIDANCE = 4.0
 
-# Fixed synthetic reference image (deterministic gradient) → a temp PNG the fork loads by path.
+# Fixed synthetic reference images (deterministic gradients) → temp PNGs the fork loads by path.
+# Two distinct patterns (same 512² size) so the multi-image golden exercises a genuine second
+# reference. The Rust gates reproduce these exact patterns (`tests/edit_real_weights.rs`).
 W0, H0 = 512, 512
-base = np.add.outer(np.arange(H0), np.arange(W0)).astype(np.int64) % 256
-rgb = np.stack([base, (base * 2) % 256, (base * 3) % 256], axis=-1).astype(np.uint8)
+base1 = np.add.outer(np.arange(H0), np.arange(W0)).astype(np.int64) % 256
+rgb1 = np.stack([base1, (base1 * 2) % 256, (base1 * 3) % 256], axis=-1).astype(np.uint8)
 ref_path = "/tmp/qwen_edit_ref.png"
-Image.fromarray(rgb).save(ref_path)
+Image.fromarray(rgb1).save(ref_path)
+
+base2 = (2 * np.arange(H0)[:, None] + np.arange(W0)[None, :]).astype(np.int64) % 256
+rgb2 = np.stack([(base2 * 3) % 256, base2, (base2 * 2) % 256], axis=-1).astype(np.uint8)
+ref_path2 = "/tmp/qwen_edit_ref2.png"
+Image.fromarray(rgb2).save(ref_path2)
+
+# MULTI → condition on [ref1, ref2] (dual-latent multi-reference, sc-2529); else single ref.
+MULTI = bool(os.environ.get("MULTI"))
+image_paths = [ref_path, ref_path2] if MULTI else [ref_path]
 
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
 model = QwenImageEdit(quantize=QUANTIZE)  # defaults → Qwen-Image-Edit-2509; Q8 quantizes transformer
@@ -45,7 +56,7 @@ config, vl_w, vl_h, vae_w, vae_h = model._compute_dimensions(
     guidance=GUIDANCE,
     scheduler="linear",
     image_path=None,
-    image_paths=[ref_path],
+    image_paths=image_paths,
     num_inference_steps=STEPS,
 )
 
@@ -55,7 +66,7 @@ noise0 = latents
 pos_emb, pos_mask, neg_emb, neg_mask = model._encode_prompts_with_images(
     prompt=PROMPT,
     negative_prompt=None,
-    image_paths=[ref_path],
+    image_paths=image_paths,
     config=config,
     vl_width=vl_w,
     vl_height=vl_h,
@@ -67,11 +78,15 @@ static, qwen_image_ids, cond_h, cond_w, num_images = QwenEditUtil.create_image_c
     height=vae_h,
     vl_width=vl_w,
     vl_height=vl_h,
-    image_paths=[ref_path],
+    image_paths=image_paths,
     tiling_config=model.tiling_config,
 )
 
-cond_image_grid = (1, cond_h, cond_w)
+# Match QwenImageEdit.generate_image: a list of per-image grids for multi-image, else a single tuple.
+if num_images > 1:
+    cond_image_grid = [(1, cond_h, cond_w) for _ in range(num_images)]
+else:
+    cond_image_grid = (1, cond_h, cond_w)
 for t in range(len(config.scheduler.timesteps)):
     hidden = mx.concatenate([latents, static], axis=1)
     n_pos = model.transformer(
@@ -98,17 +113,19 @@ out = {
     "neg_embeds": neg_emb.astype(mx.float32),
     "static_image_latents": static.astype(mx.float32),
     "cond_grid": mx.array([cond_h, cond_w], dtype=mx.int32),
+    "num_images": mx.array([num_images], dtype=mx.int32),
     "out_dims": mx.array([config.width, config.height], dtype=mx.int32),
     "final_latents": final.astype(mx.float32),
     "decoded": decoded.astype(mx.float32),
 }
 golden_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")
 os.makedirs(golden_dir, exist_ok=True)
-suffix = f"_q{QUANTIZE}" if QUANTIZE else ""
+suffix = ("_multi" if MULTI else "") + (f"_q{QUANTIZE}" if QUANTIZE else "")
 path_out = os.path.join(golden_dir, f"qwen_image_edit{suffix}_golden.safetensors")
 mx.save_safetensors(path_out, out)
 print(
-    f"out={config.width}x{config.height} vl={vl_w}x{vl_h} cond=({cond_h},{cond_w}) "
-    f"noise={noise0.shape} static={static.shape} final={final.shape} decoded={decoded.shape}"
+    f"num_images={num_images} out={config.width}x{config.height} vl={vl_w}x{vl_h} "
+    f"cond=({cond_h},{cond_w}) noise={noise0.shape} static={static.shape} "
+    f"final={final.shape} decoded={decoded.shape}"
 )
 print(f"wrote {path_out}")

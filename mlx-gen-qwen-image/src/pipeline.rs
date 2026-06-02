@@ -11,9 +11,11 @@ use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract, sum_axes};
 use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
-use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Progress, Result};
+use mlx_gen::image::resize_lanczos_u8;
+use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Image, Progress, Result};
 
 use crate::transformer::QwenTransformer;
+use crate::vae::QwenVae;
 
 /// VAE latent channel count.
 pub const LATENT_CHANNELS: i32 = 16;
@@ -65,6 +67,68 @@ pub fn pack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
     let x = latents.reshape(&[1, c, lh, p, lw, p])?;
     let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?;
     Ok(x.reshape(&[1, lh * lw, c * p * p])?)
+}
+
+/// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
+/// `strength` in `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img).
+/// Higher strength → later start → fewer denoise steps → output stays closer to the init image
+/// (the fork's convention). Shared shape with the Z-Image port (sc-2533).
+pub fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// Scale an RGB8 init image to `target` dims with PIL LANCZOS (the fork's `scale_to_dimensions`,
+/// a no-op when already sized), normalize `[0,255] → [-1,1]`, and lay out as NCHW `[1, 3, H, W]`
+/// f32 — the input the VAE encoder expects. Port of `ImageUtil.to_array(scale_to_dimensions(...))`.
+pub fn preprocess_init_image(
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (target_width as usize, target_height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "init image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    // PIL LANCZOS on the uint8 image (no-op when already at target size), matching the fork.
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    // /255 then [-1,1], as NHWC, then transpose to NCHW (the fork's `to_array` convention).
+    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    let nhwc = Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]);
+    Ok(nhwc.transpose_axes(&[0, 3, 1, 2])?)
+}
+
+/// img2img init image → packed clean latents `[1, (h/16)·(w/16), 64]` (f32). Port of the fork's
+/// `LatentCreator.encode_image` ∘ `QwenLatentCreator.pack_latents`: PIL-LANCZOS scale to the target
+/// dims, normalize `[0,255] → [-1,1]` NCHW, VAE-encode (causal-Conv3d → scaled 16-ch latent), drop
+/// the temporal axis, and pack. Mirrors the Edit `encode_reference_latents` encode, minus the
+/// dual-latent `cond_grid` (T2I img2img blends into the noise rather than concatenating).
+pub fn encode_init_latents(vae: &QwenVae, image: &Image, width: u32, height: u32) -> Result<Array> {
+    let image_nchw = preprocess_init_image(image, width, height)?; // [1, 3, H, W]
+    let latent = vae.encode(&image_nchw)?.squeeze_axes(&[2])?; // [1, 16, 1, H/8, W/8] → [1, 16, H/8, W/8]
+    pack_latents(&latent, width, height) // [1, (h/16)·(w/16), 64]
+}
+
+/// Port of `LatentCreator.add_noise_by_interpolation`: `(1 - sigma) * clean + sigma * noise`. The
+/// img2img blend that seeds the denoise loop at `sigma = sigmas[init_time_step]`.
+pub fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> Result<Array> {
+    let one_minus = Array::from_slice(&[1.0 - sigma], &[1]);
+    let s = Array::from_slice(&[sigma], &[1]);
+    Ok(add(&multiply(clean, one_minus)?, &multiply(noise, s)?)?)
 }
 
 /// Qwen-Image's flow-match sigma schedule: `linspace(1, 1/n, n)` run through the exponential
@@ -135,6 +199,10 @@ fn l2_over_channels(x: &Array) -> Result<Array> {
 /// cancellation. Each step runs the transformer twice (positive + negative conditioning),
 /// combines via [`compute_guided_noise`], and takes an Euler step. The fork passes the **raw
 /// sigma** (`scheduler.sigmas[t]`) as the transformer timestep. Returns the final packed latents.
+///
+/// `start_step` is the fork's `Config.init_time_step`: `0` for txt2img (loop over every step), or
+/// [`init_time_step`] for img2img (loop `range(init_time_step, steps)` so the blended init latents
+/// are denoised from the matching sigma). Progress reports `steps - start_step` total steps.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &QwenTransformer,
@@ -145,13 +213,14 @@ pub fn denoise_with_progress(
     guidance: f32,
     width: u32,
     height: u32,
+    start_step: usize,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = scheduler.num_steps() as u32;
-    for t in 0..scheduler.num_steps() {
+    let total = (scheduler.num_steps() - start_step) as u32;
+    for t in start_step..scheduler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
@@ -163,7 +232,7 @@ pub fn denoise_with_progress(
         let guided = compute_guided_noise(&pos, &neg, guidance)?;
         latents = scheduler.step(&latents, &guided, t)?;
         on_progress(Progress::Step {
-            current: t as u32 + 1,
+            current: (t - start_step) as u32 + 1,
             total,
         });
     }
@@ -263,6 +332,46 @@ mod tests {
         assert!((s[3] - 0.02).abs() < 1e-4, "got {}", s[3]);
         // first sigma stays at 1.0 (linspace start, shift fixes 1.0 -> 1.0).
         assert!((s[0] - 1.0).abs() < 1e-4, "got {}", s[0]);
+    }
+
+    #[test]
+    fn init_time_step_matches_fork() {
+        // txt2img: no/zero strength → 0.
+        assert_eq!(init_time_step(4, None), 0);
+        assert_eq!(init_time_step(4, Some(0.0)), 0);
+        // floor(steps·strength), clamped to >= 1.
+        assert_eq!(init_time_step(4, Some(0.6)), 2); // floor(2.4)
+        assert_eq!(init_time_step(8, Some(0.5)), 4);
+        assert_eq!(init_time_step(4, Some(0.1)), 1); // floor(0.4)=0 → max(1)
+        assert_eq!(init_time_step(4, Some(1.0)), 4);
+        assert_eq!(init_time_step(4, Some(2.0)), 4); // strength clamps to 1.0
+    }
+
+    #[test]
+    fn blend_endpoints() {
+        let clean = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let noise = Array::from_slice(&[10.0f32, 20.0, 30.0, 40.0], &[1, 2, 2]);
+        // sigma=0 → all clean; sigma=1 → all noise.
+        let c = add_noise_by_interpolation(&clean, &noise, 0.0).unwrap();
+        let n = add_noise_by_interpolation(&clean, &noise, 1.0).unwrap();
+        assert_eq!(c.as_slice::<f32>(), clean.as_slice::<f32>());
+        assert_eq!(n.as_slice::<f32>(), noise.as_slice::<f32>());
+    }
+
+    #[test]
+    fn preprocess_init_image_shape_and_range() {
+        // 2×2 RGB, no resize (target == source): pixels map [0,255] → [-1,1] NCHW.
+        let img = Image {
+            width: 2,
+            height: 2,
+            pixels: vec![0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255],
+        };
+        let pre = preprocess_init_image(&img, 2, 2).unwrap();
+        assert_eq!(pre.shape(), &[1, 3, 2, 2]);
+        let v = pre.as_slice::<f32>();
+        assert!(v.iter().all(|&x| (-1.0..=1.0).contains(&x)));
+        // first pixel (0,0,0) → -1 across channels; channel-planar NCHW so index 0,4,8 are R,G,B@(0,0).
+        assert!((v[0] + 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
     Precision, Progress, Result, WeightsSource,
 };
+use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 use crate::image_processor::{ImageInput, QwenImageProcessor};
@@ -41,8 +42,9 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 /// Registry id for Qwen-Image-Edit.
 pub const MODEL_ID: &str = "qwen_image_edit";
 
-/// Qwen-Image-Edit's identity + capabilities. Accepts a single `Reference` conditioning image (the
-/// fork's `use_picture_prefix=False` edit path); multi-reference is a tracked follow-on (sc-2529).
+/// Qwen-Image-Edit's identity + capabilities. Accepts one `Reference` or N `MultiReference`
+/// conditioning images — the fork's `use_picture_prefix=False` edit path, where every reference is
+/// VAE-encoded and folded into the transformer's dual-latent sequence (sc-2529).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -52,7 +54,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            conditioning: vec![ConditioningKind::Reference],
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+            ],
             // LoRA/LoKr wired (sc-2528): shared `QwenTransformer` host; stacked + mixed.
             supports_lora: true,
             supports_lokr: true,
@@ -141,9 +146,9 @@ impl Generator for QwenImageEdit {
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
         validate_request(&self.descriptor.capabilities, req)?;
-        if reference_image(req).is_none() {
+        if reference_images(req).is_empty() {
             return Err(Error::Msg(
-                "qwen_image_edit requires a Reference conditioning image".into(),
+                "qwen_image_edit requires a Reference or MultiReference conditioning image".into(),
             ));
         }
         Ok(())
@@ -155,26 +160,28 @@ impl Generator for QwenImageEdit {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        let reference = reference_image(req).expect("validated present");
-        let img = || ImageInput {
-            data: &reference.pixels,
-            height: reference.height as usize,
-            width: reference.width as usize,
-        };
+        let references = reference_images(req);
+        let first = references[0];
+        let last = *references.last().expect("validated non-empty");
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let (out_w, out_h) = (req.width, req.height);
 
-        // VL condition / dual-latent reference resolution (~384² area, /32), from the ref aspect.
-        let (vl_w, vl_h) =
-            condition_resize_dims(reference.width as usize, reference.height as usize);
+        // VL condition / dual-latent reference resolution (~384² area, /32). The fork's
+        // `_compute_dimensions` derives all dims from `image_paths[-1]`, so the dual-latent
+        // resolution comes from the **last** reference's aspect (identical to the first when the
+        // references share an aspect ratio, the common case).
+        let (vl_w, vl_h) = condition_resize_dims(last.width as usize, last.height as usize);
 
-        // Preprocess the reference once (condition-resize + patchify) and run the 32-block vision
-        // tower once — both depend only on the image, so the positive + negative encodes reuse the
-        // vision embeds rather than re-running the tower per prompt (F-004).
-        let pre = preprocess_edit_image(&self.processor, img())?;
+        // Text/VL conditioning: the fork's `use_picture_prefix=False` edit template carries a
+        // single `<|image_pad|>`, so only the **first** reference enters the prompt embeds (verified:
+        // multi-image `input_ids` is byte-identical to single-image, and the vision splice consumes
+        // only image-0's rows). Run the existing single-image text path on `references[0]` — its
+        // block-diagonal vision output is identical whether computed alone or alongside the others.
+        // The tower runs once (image-only), so the positive + negative encodes reuse it (F-004).
+        let pre = preprocess_edit_image(&self.processor, image_input(first))?;
         let grids: Vec<Grid> = host_i32(&pre.grid_thw)?
             .chunks(3)
             .map(|c| [c[0], c[1], c[2]])
@@ -189,10 +196,23 @@ impl Generator for QwenImageEdit {
             &vision,
         )?;
 
-        // Dual-latent reference (static across steps + samples): VAE-encode → pack, + its cond grid.
-        let (static_latents, cond_grid) =
-            encode_reference_latents(&self.vae, img(), vl_w as u32, vl_h as u32)?;
-        let cond_grids = [cond_grid];
+        // Dual-latent references (static across steps + samples): VAE-encode **each** reference at
+        // the VL resolution, pack, and concatenate over the sequence axis — one `cond_grid` per
+        // reference so the MMDiT RoPE spans `[noise] + references` (fork
+        // `QwenEditUtil.create_image_conditioning_latents` + `forward_multi`).
+        let mut packed = Vec::with_capacity(references.len());
+        let mut cond_grids = Vec::with_capacity(references.len());
+        for im in &references {
+            let (latents, grid) =
+                encode_reference_latents(&self.vae, image_input(im), vl_w as u32, vl_h as u32)?;
+            packed.push(latents);
+            cond_grids.push(grid);
+        }
+        let static_latents = if packed.len() == 1 {
+            packed.pop().expect("len checked")
+        } else {
+            concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
+        };
 
         let scheduler = qwen_scheduler(steps, out_w, out_h);
         let mut images = Vec::with_capacity(req.count as usize);
@@ -223,12 +243,28 @@ impl Generator for QwenImageEdit {
     }
 }
 
-/// The first `Reference` conditioning image, if any.
-fn reference_image(req: &GenerationRequest) -> Option<&Image> {
-    req.conditioning.iter().find_map(|c| match c {
-        Conditioning::Reference { image, .. } => Some(image),
-        _ => None,
-    })
+/// Borrow an [`Image`] as an [`ImageInput`] (RGB uint8 HWC) for the preprocess/VAE-encode paths.
+fn image_input(im: &Image) -> ImageInput<'_> {
+    ImageInput {
+        data: &im.pixels,
+        height: im.height as usize,
+        width: im.width as usize,
+    }
+}
+
+/// The conditioning reference images, in order — a single `Reference` or every `MultiReference`
+/// image. The first drives the text/VL prompt embeds (fork `use_picture_prefix=False`); all of them
+/// are VAE-encoded into the dual-latent sequence.
+fn reference_images(req: &GenerationRequest) -> Vec<&Image> {
+    let mut out = Vec::new();
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, .. } => out.push(image),
+            Conditioning::MultiReference { images } => out.extend(images.iter()),
+            _ => {}
+        }
+    }
+    out
 }
 
 inventory::submit! {
@@ -245,6 +281,7 @@ mod tests {
         assert_eq!(d.id, "qwen_image_edit");
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(!d.capabilities.accepts(ConditioningKind::Depth));
     }
 
@@ -268,6 +305,36 @@ mod tests {
         };
         // validate_request (size/conditioning) passes, but the edit generator needs a reference.
         assert!(validate_request(&caps, &req).is_ok());
-        assert!(reference_image(&req).is_none());
+        assert!(reference_images(&req).is_empty());
+    }
+
+    #[test]
+    fn reference_images_collects_single_and_multi() {
+        use mlx_gen::Conditioning;
+        let img = |w| Image {
+            width: w,
+            height: 8,
+            pixels: vec![0u8; (w * 8 * 3) as usize],
+        };
+        // A single `Reference` yields one image.
+        let single = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(8),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(reference_images(&single).len(), 1);
+        // `MultiReference` yields every image, in order (first drives the text path, last the dims).
+        let multi = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![img(8), img(16), img(24)],
+            }],
+            ..Default::default()
+        };
+        let got = reference_images(&multi);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].width, 8);
+        assert_eq!(got.last().unwrap().width, 24);
     }
 }

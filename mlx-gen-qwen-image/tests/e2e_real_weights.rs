@@ -113,6 +113,7 @@ fn transformer_pipeline_vae_matches_fork() {
         GUIDANCE,
         WIDTH,
         HEIGHT,
+        0, // txt2img: denoise every step
         &CancelFlag::default(),
         &mut |_| {},
     )
@@ -189,6 +190,7 @@ fn q_pipeline_matches_fork(golden_path: &str, bits: i32, max_latent_mean: f32, m
         GUIDANCE,
         WIDTH,
         HEIGHT,
+        0, // txt2img: denoise every step
         &CancelFlag::default(),
         &mut |_| {},
     )

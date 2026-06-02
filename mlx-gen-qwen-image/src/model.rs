@@ -13,14 +13,15 @@
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
     Precision, Progress, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
 use crate::loader;
 use crate::pipeline::{
-    create_noise, decoded_to_image, denoise_with_progress, qwen_scheduler, unpack_latents,
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
+    encode_init_latents, init_time_step, qwen_scheduler, unpack_latents,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -37,9 +38,9 @@ const NEGATIVE_FALLBACK: &str = " ";
 pub const MODEL_ID: &str = "qwen_image";
 
 /// Qwen-Image's identity + capabilities — constructible without loading weights (registry
-/// introspection). This is the **T2I** variant (`qwen_image`); Qwen-Image-Edit ships as a separate
-/// `qwen_image_edit` model (sc-2465). LoRA/LoKr is not yet wired (sc-2528), so it is advertised off
-/// rather than silently ignored.
+/// introspection). This is the **T2I** variant (`qwen_image`), which also accepts a single init
+/// `Reference` image for **img2img** (sc-2530); Qwen-Image-Edit ships as a separate `qwen_image_edit`
+/// model (sc-2465). LoRA/LoKr is wired (sc-2528).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -50,8 +51,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Edit (reference conditioning) is a separate variant (sc-2465).
-            conditioning: Vec::new(),
+            // img2img: a single init `Reference` image (+ `image_strength`) seeds the latents via
+            // the noise blend (sc-2530, the fork's `Img2Img` path). Reference *conditioning* for
+            // editing is the separate `qwen_image_edit` variant (sc-2465).
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr wired (sc-2528): the fork's `QwenLoRAMapping` targets routed onto the
             // transformer's `AdaptableHost`; stacked + mixed via the core seam.
             supports_lora: true,
@@ -142,6 +145,30 @@ impl QwenImage {
         // so this is near-lossless here — unlike Z-Image's f32 checkpoint; flip to f32 with the rest).
         Ok(embeds.as_dtype(Dtype::Bfloat16)?)
     }
+
+    /// Extract the single img2img init image + its strength from the request's conditioning. The
+    /// per-reference strength wins over `req.strength`. Qwen-Image T2I img2img conditions on exactly
+    /// one init image, so more than one `Reference` is an error (the multi-image edit path is
+    /// `qwen_image_edit` + `MultiReference`, sc-2529). Returns `None` for pure txt2img.
+    fn resolve_reference<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Option<(&'a Image, Option<f32>)>> {
+        let mut reference = None;
+        for c in &req.conditioning {
+            if let Conditioning::Reference { image, strength } = c {
+                if reference.is_some() {
+                    return Err(Error::Msg(
+                        "qwen_image: multiple reference images are not supported (single img2img \
+                         init only)"
+                            .into(),
+                    ));
+                }
+                reference = Some((image, strength.or(req.strength)));
+            }
+        }
+        Ok(reference)
+    }
 }
 
 impl Generator for QwenImage {
@@ -164,6 +191,15 @@ impl Generator for QwenImage {
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
+        // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
+        // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
+        let reference = self.resolve_reference(req)?;
+        let start_step = match reference {
+            Some((_, strength)) => init_time_step(steps, strength),
+            None => 0,
+        };
+        let is_img2img = start_step > 0;
+
         // Positive + negative conditioning (bf16). Empty negative → a single space (fork fallback).
         let pos = self.encode_prompt(&req.prompt)?;
         let neg_prompt = match req.negative_prompt.as_deref() {
@@ -172,24 +208,36 @@ impl Generator for QwenImage {
         };
         let neg = self.encode_prompt(neg_prompt)?;
 
-        // The schedule is resolution-dependent but seed-independent — build it once.
+        // The schedule is resolution-dependent but seed-independent — build it once. img2img indexes
+        // `sigmas[start_step]` for the blend, so this must match the fork's `config.scheduler.sigmas`.
         let scheduler = qwen_scheduler(steps, req.width, req.height);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
-            // Latents stay f32 through the loop: the fork keeps txt2img noise f32, and MLX
+            // Latents stay f32 through the loop: the fork keeps txt2img/img2img noise f32, and MLX
             // promotes the bf16 transformer weights to f32 per-op (only `prompt_embeds` is bf16).
             let noise = create_noise(seed, req.width, req.height)?;
+            let latents = if is_img2img {
+                // VAE-encode the init image to packed clean latents (f32), then blend with the noise
+                // at `sigma = sigmas[init_time_step]` (the fork's `create_for_txt2img_or_img2img`).
+                let (image, _) = reference.expect("is_img2img implies a reference");
+                let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                let sigma = scheduler.sigmas[start_step];
+                add_noise_by_interpolation(&clean, &noise, sigma)?
+            } else {
+                noise
+            };
             let latents = denoise_with_progress(
                 &self.transformer,
                 &scheduler,
-                noise,
+                latents,
                 &pos,
                 &neg,
                 guidance,
                 req.width,
                 req.height,
+                start_step,
                 &req.cancel,
                 on_progress,
             )?;

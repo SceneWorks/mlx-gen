@@ -31,6 +31,14 @@ const EDIT_Q8_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_image_edit_q8_golden.safetensors"
 );
+const EDIT_MULTI_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_image_edit_multi_golden.safetensors"
+);
+const EDIT_MULTI_Q8_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tools/golden/qwen_image_edit_multi_q8_golden.safetensors"
+);
 const TOKENIZE_DEBUG_GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../tools/golden/qwen_edit_tokenize_debug.safetensors"
@@ -170,6 +178,27 @@ fn synthetic_reference() -> Image {
             pixels.push(base as u8);
             pixels.push(((base * 2) % 256) as u8);
             pixels.push(((base * 3) % 256) as u8);
+        }
+    }
+    Image {
+        width: w,
+        height: h,
+        pixels,
+    }
+}
+
+/// A second deterministic synthetic reference (distinct pattern, same 512² size) for the
+/// multi-image gates. Matches the `rgb2` gradient in `tools/dump_qwen_image_edit_golden.py`
+/// (`base = (2y + x) % 256`, channels `[3·base, base, 2·base]`).
+fn synthetic_reference2() -> Image {
+    let (w, h) = (512u32, 512u32);
+    let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+    for y in 0..h {
+        for x in 0..w {
+            let base = (2 * y + x) % 256;
+            pixels.push(((base * 3) % 256) as u8);
+            pixels.push(base as u8);
+            pixels.push(((base * 2) % 256) as u8);
         }
     }
     Image {
@@ -518,6 +547,116 @@ fn edit_generate_q8_matches_fork() {
     assert!(
         frac < 0.02,
         "Q8 edit generate diverges from fork-Q8: {:.3}% px>8",
+        frac * 100.0
+    );
+}
+
+/// sc-2529 (multi-image e2e): the whole `qwen_image_edit` Generator with a **`MultiReference`** of
+/// two distinct references — load → text path on `references[0]` → dual-latent encode/concat of
+/// **both** refs → multi-grid edit denoise → decode → RGB8 — vs the fork's decoded multi-image edit
+/// (`image_paths=[ref1, ref2]`, `cond_image_grid=[(1,h,w),(1,h,w)]`). Confirms the second reference
+/// is wired through the dual-latent sequence (the text/VL embeds match the single-image path).
+#[test]
+#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local multi edit golden"]
+fn edit_generate_multi_matches_fork() {
+    let g = Weights::from_file(EDIT_MULTI_GOLDEN).unwrap();
+    assert_eq!(
+        g.require("num_images").unwrap().as_slice::<i32>(),
+        &[2],
+        "golden must be the 2-image dump (MULTI=1)"
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot()));
+    let generator = model_edit::load(&spec).unwrap();
+
+    let req = GenerationRequest {
+        prompt: "make it autumn".into(),
+        width: 1024,
+        height: 1024,
+        count: 1,
+        seed: Some(42),
+        steps: Some(STEPS as u32),
+        guidance: Some(GUIDANCE),
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![synthetic_reference(), synthetic_reference2()],
+        }],
+        ..Default::default()
+    };
+    let out = generator.generate(&req, &mut |_| {}).unwrap();
+    let got = match out {
+        GenerationOutput::Images(mut v) => v.swap_remove(0),
+        _ => panic!("expected images"),
+    };
+
+    let want = decoded_to_image(g.require("decoded").unwrap()).unwrap();
+    assert_eq!(got.pixels.len(), want.pixels.len(), "pixel count");
+    let differ = got
+        .pixels
+        .iter()
+        .zip(&want.pixels)
+        .filter(|(a, b)| (**a as i16 - **b as i16).abs() > 8)
+        .count();
+    let frac = differ as f32 / got.pixels.len() as f32;
+    println!("multi edit generate pixels >8 apart: {:.3}%", frac * 100.0);
+    // PIXEL-PARITY with the fork, like single-image edit: both references are VAE-encoded with the
+    // PIL-exact resampler and folded into the dual-latent sequence; the f32-activation 60-layer net
+    // stays within bf16-rounding (< 8/255).
+    assert!(
+        frac < 0.001,
+        "multi edit generate diverges from the fork: {:.3}% px>8",
+        frac * 100.0
+    );
+}
+
+/// sc-2529 (multi-image e2e, Q8): the multi-reference Generator with a **Q8** `LoadSpec` vs the
+/// fork-Q8 multi-image edit golden. Exercises the dual-latent multi-ref concat through the Q8
+/// transformer end-to-end.
+#[test]
+#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local multi Q8 edit golden"]
+fn edit_generate_multi_q8_matches_fork() {
+    let g = Weights::from_file(EDIT_MULTI_Q8_GOLDEN).unwrap();
+    assert_eq!(
+        g.require("num_images").unwrap().as_slice::<i32>(),
+        &[2],
+        "golden must be the 2-image Q8 dump (MULTI=1 QUANTIZE=8)"
+    );
+    let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot())).with_quant(mlx_gen::Quant::Q8);
+    let generator = model_edit::load(&spec).unwrap();
+
+    let req = GenerationRequest {
+        prompt: "make it autumn".into(),
+        width: 1024,
+        height: 1024,
+        count: 1,
+        seed: Some(42),
+        steps: Some(STEPS as u32),
+        guidance: Some(GUIDANCE),
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![synthetic_reference(), synthetic_reference2()],
+        }],
+        ..Default::default()
+    };
+    let out = generator.generate(&req, &mut |_| {}).unwrap();
+    let got = match out {
+        GenerationOutput::Images(mut v) => v.swap_remove(0),
+        _ => panic!("expected images"),
+    };
+
+    let want = decoded_to_image(g.require("decoded").unwrap()).unwrap();
+    assert_eq!(got.pixels.len(), want.pixels.len(), "pixel count");
+    let differ = got
+        .pixels
+        .iter()
+        .zip(&want.pixels)
+        .filter(|(a, b)| (**a as i16 - **b as i16).abs() > 8)
+        .count();
+    let frac = differ as f32 / got.pixels.len() as f32;
+    println!(
+        "multi Q8 edit generate pixels >8 apart: {:.3}%",
+        frac * 100.0
+    );
+    assert!(
+        frac < 0.02,
+        "multi Q8 edit generate diverges from fork-Q8: {:.3}% px>8",
         frac * 100.0
     );
 }
