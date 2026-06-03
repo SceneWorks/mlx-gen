@@ -22,7 +22,9 @@ pub mod model;
 pub mod positions;
 pub mod rope;
 pub mod schedule;
+pub mod text_encoder;
 
 pub use config::{LtxConfig, RopeType};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
+pub use text_encoder::LtxTextEncoder;

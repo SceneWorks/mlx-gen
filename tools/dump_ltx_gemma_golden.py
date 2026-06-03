@@ -52,7 +52,8 @@ def gemma_path() -> str:
     return snaps[-1]
 
 
-MAX_LEN = 64
+# Multiple of the connector's 128 learnable registers (the connector tiles registers over seq_len).
+MAX_LEN = 128
 PROMPT = "A cat playing a grand piano on a city rooftop at sunset."
 
 gp = gemma_path()

@@ -133,6 +133,10 @@ pub fn precompute_split_freqs_cis(
 /// `out = [a·cos − b·sin, b·cos + a·sin]` — the GPT-NeoX "rotate-halves" form, matching
 /// `rope.py::apply_split_rotary_emb`.
 pub fn apply_split_rotary_emb(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    // Compute in f32 for precision, then cast back to the input dtype — matching the reference's
+    // `_apply_split_rope` (`...astype(input_dtype)`). This keeps a bf16 caller (the connector /
+    // bf16 DiT) bf16 while an f32 caller stays f32.
+    let in_dtype = x.dtype();
     let x = x.as_dtype(mlx_rs::Dtype::Float32)?;
     let cos = cos.as_dtype(mlx_rs::Dtype::Float32)?;
     let sin = sin.as_dtype(mlx_rs::Dtype::Float32)?;
@@ -142,7 +146,7 @@ pub fn apply_split_rotary_emb(x: &Array, cos: &Array, sin: &Array) -> Result<Arr
     let second = &halves[1];
     let out_first = subtract(&multiply(first, &cos)?, &multiply(second, &sin)?)?;
     let out_second = add(&multiply(second, &cos)?, &multiply(first, &sin)?)?;
-    Ok(concatenate_axis(&[&out_first, &out_second], axis)?)
+    Ok(concatenate_axis(&[&out_first, &out_second], axis)?.as_dtype(in_dtype)?)
 }
 
 #[cfg(test)]

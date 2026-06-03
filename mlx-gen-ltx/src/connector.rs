@@ -7,8 +7,11 @@
 //! connector-specific **1-D SPLIT RoPE** (positions `arange(seq)/4096`, double-precision).
 //!
 //! Two connectors exist in the checkpoint (`video_embeddings_connector.*`,
-//! `audio_embeddings_connector.*`); this core uses the video one. Activations run **f32**
-//! (quality target + dodges the pmetal bf16 GEMM bug); weights are up-cast to f32 at load.
+//! `audio_embeddings_connector.*`); this core uses the video one. Compute dtype is a parameter:
+//! **bf16** to match the reference pipeline end-to-end, **f32** for the isolated bit-exact gate.
+//! The fused SDPA is always run in **f32** regardless — the pmetal bf16 maskless-SDPA kernel
+//! returns garbage at this shape (see `tests/bf16_sdpa_bug.rs`); the reference's wheel MLX has a
+//! correct bf16 SDPA, so f32 matches it to bf16 rounding.
 
 use std::f64::consts::PI;
 
@@ -54,19 +57,21 @@ pub struct Connector {
     head_dim: i32,
     theta: f64,
     max_pos: i32,
-    ones: Array, // unit RMSNorm weight (dim,)
+    ones: Array,  // unit RMSNorm weight (dim,)
+    dtype: Dtype, // compute dtype: bf16 to match the reference pipeline; f32 for the isolated gate
 }
 
 impl Connector {
     /// Build the connector from a `Weights` map (e.g. `connector.safetensors`) under `prefix`
-    /// (`"video_embeddings_connector."`). Weights are up-cast to f32.
-    pub fn from_weights(w: &Weights, prefix: &str, cfg: &LtxConfig) -> Result<Self> {
+    /// (`"video_embeddings_connector."`). Weights are cast to `dtype` (bf16 to match the reference
+    /// pipeline end-to-end; f32 for the isolated bit-exact gate).
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: &LtxConfig, dtype: Dtype) -> Result<Self> {
         let n = cfg.connector_num_layers as usize;
         let dim = cfg.connector_num_attention_heads * cfg.connector_attention_head_dim;
         let f32w = |key: &str| -> Result<Array> {
             w.get(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?
-                .as_dtype(Dtype::Float32)
+                .as_dtype(dtype)
                 .map_err(Error::from)
         };
         let mut blocks = Vec::with_capacity(n);
@@ -99,7 +104,8 @@ impl Connector {
             head_dim: cfg.connector_attention_head_dim,
             theta: cfg.positional_embedding_theta,
             max_pos: cfg.connector_positional_embedding_max_pos,
-            ones: Array::ones::<f32>(&[dim])?,
+            ones: Array::ones::<f32>(&[dim])?.as_dtype(dtype)?,
+            dtype,
         })
     }
 
@@ -183,7 +189,20 @@ impl Connector {
         let q = apply_split_rotary_emb(&q, cos, sin)?;
         let k = apply_split_rotary_emb(&k, cos, sin)?;
         let scale = 1.0 / (d as f32).sqrt();
-        let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?; // (b,h,s,d)
+        // SDPA in f32: the pmetal bf16 fused-SDPA kernel returns garbage at this shape (mask=None,
+        // 32 heads, head_dim 128) — a sibling of the bf16-GEMM bug, NOT fixed by sc-2714 (which
+        // patched matmul.cpp only). The reference's wheel MLX has a correct bf16 SDPA, so an f32
+        // SDPA matches it to bf16 rounding. (No-op when the connector already runs f32.) See
+        // tests/op_bf16_probe.rs.
+        let out = scaled_dot_product_attention(
+            &q.as_dtype(Dtype::Float32)?,
+            &k.as_dtype(Dtype::Float32)?,
+            &v.as_dtype(Dtype::Float32)?,
+            scale,
+            None,
+            None,
+        )?
+        .as_dtype(self.dtype)?; // (b,h,s,d)
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, -1])?;
         // Gated: out_head *= sigmoid(to_gate_logits(x)).
         let gates = sigmoid(&linear(x, &blk.gate_w, &blk.gate_b)?)?.reshape(&[b, s, h, 1])?;
@@ -206,7 +225,7 @@ impl Connector {
     /// Run the connector. `x` = `(1, seq, dim)` feature-extractor output (f32); `mask01` = `(1, seq)`
     /// 1/0 attention mask (1 = valid; left-padded). Returns video embeddings `(1, seq, dim)`.
     pub fn forward(&self, x: &Array, mask01: &Array) -> Result<Array> {
-        let mut h = self.replace_with_registers(&x.as_dtype(Dtype::Float32)?, mask01)?;
+        let mut h = self.replace_with_registers(&x.as_dtype(self.dtype)?, mask01)?;
         let (cos, sin) = self.rope(h.shape()[1] as usize)?;
         for blk in &self.blocks {
             h = self.block(blk, &h, &cos, &sin)?;

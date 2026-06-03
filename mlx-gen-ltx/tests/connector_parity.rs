@@ -40,7 +40,13 @@ fn connector_matches_reference() {
     let dir = eros_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
     let w = Weights::from_file(dir.join("connector.safetensors")).expect("connector.safetensors");
-    let conn = Connector::from_weights(&w, "video_embeddings_connector.", &cfg).expect("build");
+    let conn = Connector::from_weights(
+        &w,
+        "video_embeddings_connector.",
+        &cfg,
+        mlx_rs::Dtype::Float32,
+    )
+    .expect("build");
 
     let g = Weights::from_file(GOLDEN).expect("golden");
     let features = g.require("features").unwrap();
