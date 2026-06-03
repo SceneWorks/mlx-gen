@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod connector;
+pub mod gemma;
 pub mod model;
 pub mod positions;
 pub mod rope;
