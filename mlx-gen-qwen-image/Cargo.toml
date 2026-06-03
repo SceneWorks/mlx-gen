@@ -11,6 +11,6 @@ categories = ["science"]
 [dependencies]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "1f293623fa74e0ce6502300bb8312f325e50f756" }
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
 # Link-time self-registration into mlx-gen's model registry (wired when the Generator lands).
 inventory = "0.3"

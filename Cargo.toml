@@ -19,15 +19,16 @@ readme = "README.md"
 # core v0.31.1 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
 # The mlx-c C layer is a submodule of ml-explore/mlx-c (Apple) at v0.6.0; pmetal's delta is
 # additive Rust bindings only. Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
-# SHA 1f293623 = ecda3f46 (0.31.1 bump, sc-2517) + the metallib-search-path patch ONLY. The earlier
-# sc-2714 (dense GEMM) and sc-2770 (fast SDPA) NAX-dispatch gate patches were REMOVED in sc-2772: their
-# root cause was the metal-kernel deployment target, not the dispatch. The NAX matrix-unit kernels
-# (mpp::tensor_ops::matmul2d) are only valid for macOS >= 26.2; compiling them at 26.0 (the old target)
-# miscompiled them to garbage for 16-bit, which the gates worked around. mlx-gen now builds the kernels
-# at 26.2 (.cargo/config.toml) so the NAX 16-bit GEMM + SDPA are correct (and 16-bit uses the faster NAX
-# matrix unit). Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
-# 0.31.1 is numerically identical to the Python fork's MLX 0.31.0 (exact parity). See sc-2352 / sc-2517 / sc-2714 / sc-2770 / sc-2772.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "1f293623fa74e0ce6502300bb8312f325e50f756" }
+# SHA e59ffd88 = 1f293623 + the sc-2781 MLX 0.31.1->0.31.2 bump (+ a TEMPORARY mlx-c fft FFTNorm patch
+# so mlx-c 0.6.0 compiles against 0.31.2's new fft signature; the submodule stays pristine at Apple
+# upstream v0.6.0, drop the patch once Apple tags a 0.31.2-compatible mlx-c). 1f293623 = ecda3f46
+# (0.31.x bump, sc-2517) + metallib-search-path patch ONLY; the sc-2714/sc-2770 NAX dispatch-gate
+# patches were REMOVED in sc-2772 — their root cause was the metal-kernel deployment target (the NAX
+# matrix-unit `mpp::tensor_ops::matmul2d` is valid only for macOS >= 26.2; compiling at 26.0 miscompiled
+# it to garbage for 16-bit). mlx-gen builds the kernels at 26.2 (.cargo/config.toml) so NAX 16-bit is
+# correct + uses the faster matrix unit. Guarded by mlx-gen-qwen-image/tests/{bf16_matmul_sweep,sdpa_nax_repro}.
+# MLX 0.31.2 matches the SceneWorks production/golden environments (byte-parity target). See sc-2352 / sc-2517 / sc-2714 / sc-2770 / sc-2772 / sc-2781.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"
