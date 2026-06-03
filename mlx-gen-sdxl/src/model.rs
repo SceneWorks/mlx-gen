@@ -117,14 +117,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    if spec.quantize.is_some() {
-        // Q4/Q8 parity for SDXL is validated + scoped in sc-2641 (the sc-1975 base-1.0 Q8 caveat
-        // needs a dedicated check); don't ship an unvalidated quantized path.
-        return Err(Error::Msg(
-            "sdxl: Q4/Q8 quantization is not yet validated (sc-2641)".into(),
-        ));
-    }
-
     let mut unet = loader::load_unet(root)?;
     if !spec.adapters.is_empty() {
         // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense f32
@@ -133,14 +125,33 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         // keys (mid_block/ff/conv) are surfaced in the report, not dropped.
         crate::adapters::apply_sdxl_adapters(&mut unet, &spec.adapters)?;
     }
+    let mut te1 = loader::load_text_encoder_1(root)?;
+    let mut te2 = loader::load_text_encoder_2(root)?;
+    let vae = loader::load_vae(root)?;
+
+    if let Some(q) = spec.quantize {
+        // Q4/Q8 (group_size 64) over every quantizable Linear of the U-Net + both CLIP encoders —
+        // applied AFTER the adapter merge (the merge needs the dense weight; `merge_dense_delta`
+        // errors on a quantized base, matching the fork's "LoRA merged pre-quantization"). The core
+        // `AdaptableLinear::quantize` casts each weight to bf16 before packing (sc-2604): SDXL ships
+        // fp16/fp32 on disk, and quantizing the as-loaded dtype would give drifted group scales — the
+        // sc-1975 "Q8 broken on base-1.0". Convs / norms / token & position embeddings stay dense
+        // (gather lookups, not matmuls). The **VAE stays f32** — its only Linears are the tiny
+        // quant/post-quant projections (negligible memory), and a dense decode preserves output
+        // quality. Scope verified empirically by the full `load(Q).generate()` gate (sc-2641).
+        let bits = q.bits();
+        unet.quantize(bits)?;
+        te1.quantize(bits)?;
+        te2.quantize(bits)?;
+    }
 
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
-        te1: loader::load_text_encoder_1(root)?,
-        te2: loader::load_text_encoder_2(root)?,
+        te1,
+        te2,
         unet,
-        vae: loader::load_vae(root)?,
+        vae,
         sampler: EulerSampler::new(&DiffusionConfig::sdxl_base(), true),
     }))
 }

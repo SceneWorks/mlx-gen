@@ -1,5 +1,5 @@
 [workspace]
-members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-ltx"]
+members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx"]
 resolver = "2"
 
 [package]
@@ -19,9 +19,11 @@ readme = "README.md"
 # core v0.31.1 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
 # The mlx-c C layer is a submodule of ml-explore/mlx-c (Apple) at v0.6.0; pmetal's delta is
 # additive Rust bindings only. Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
-# SHA ecda3f46 = 4b43ffff (0.25.8) + the MLX 0.30.6→0.31.1 / mlx-c 0.5.0→0.6.0 bump (sc-2517);
-# 0.31.1 is numerically identical to the Python fork's MLX 0.31.0 (exact parity). See sc-2352 / sc-2517.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "ecda3f4661ad7f7510b5568f1799d6092a424952" }
+# SHA 18c17b88 = ecda3f46 (0.31.1 bump, sc-2517) + the sc-2714 NAX 16-bit dense GEMM fix: a vendored
+# matmul.cpp patch gating the broken NAX GEMM dispatch to f32/TF32 so bf16/f16 use the correct non-NAX
+# kernel (temporary until upstream MLX fixes it; verified by mlx-gen-qwen-image/tests/bf16_matmul_sweep).
+# 0.31.1 is numerically identical to the Python fork's MLX 0.31.0 (exact parity). See sc-2352 / sc-2517 / sc-2714.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "18c17b88292bd37bbe5cfbbb1e08dbfea6a49926" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"

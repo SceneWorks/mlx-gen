@@ -553,6 +553,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-flux"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-z-image",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
+name = "mlx-gen-flux2"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "inventory",
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
@@ -596,7 +617,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=ecda3f4661ad7f7510b5568f1799d6092a424952#ecda3f4661ad7f7510b5568f1799d6092a424952"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=18c17b88292bd37bbe5cfbbb1e08dbfea6a49926#18c17b88292bd37bbe5cfbbb1e08dbfea6a49926"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -608,7 +629,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=ecda3f4661ad7f7510b5568f1799d6092a424952#ecda3f4661ad7f7510b5568f1799d6092a424952"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=18c17b88292bd37bbe5cfbbb1e08dbfea6a49926#18c17b88292bd37bbe5cfbbb1e08dbfea6a49926"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -764,7 +785,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=ecda3f4661ad7f7510b5568f1799d6092a424952#ecda3f4661ad7f7510b5568f1799d6092a424952"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=18c17b88292bd37bbe5cfbbb1e08dbfea6a49926#18c17b88292bd37bbe5cfbbb1e08dbfea6a49926"
 dependencies = [
  "dyn-clone",
  "half",
@@ -787,7 +808,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=ecda3f4661ad7f7510b5568f1799d6092a424952#ecda3f4661ad7f7510b5568f1799d6092a424952"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=18c17b88292bd37bbe5cfbbb1e08dbfea6a49926#18c17b88292bd37bbe5cfbbb1e08dbfea6a49926"
 dependencies = [
  "bindgen",
  "cc",
