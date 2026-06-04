@@ -70,7 +70,12 @@ fn render(adapter: Option<(PathBuf, AdapterKind, f32)>) -> Vec<u8> {
 
     let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     if let Some((path, kind, scale)) = adapter {
-        spec = spec.with_adapters(vec![AdapterSpec { path, scale, kind }]);
+        spec = spec.with_adapters(vec![AdapterSpec {
+            path,
+            scale,
+            kind,
+            pass_scales: None,
+        }]);
     }
     let generator = mlx_gen::load("flux1_dev", &spec).unwrap();
     let req = GenerationRequest {
@@ -178,6 +183,7 @@ fn real_zhibi_resolves_full_surface_no_unmatched() {
             path: lora_file(),
             scale: 1.0,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }],
     )
     .unwrap();

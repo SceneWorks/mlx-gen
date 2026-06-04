@@ -34,6 +34,11 @@ use crate::upsampler::{upsample_latents, LatentUpsampler};
 use crate::vae::LtxVideoVae;
 use crate::vocoder::LtxVocoder;
 
+/// Number of distilled denoise passes (stage-1 + stage-2). Drives the per-pass LoRA strength
+/// schedule (sc-2687): `pass_scales` on an [`AdapterSpec`](mlx_gen::AdapterSpec) carries one entry
+/// per pass, and [`generate_t2v_latents`] selects the active pass on the DiT before each stage.
+pub const NUM_DENOISE_PASSES: usize = 2;
+
 /// Distilled stage-1 sigmas (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps).
 pub const STAGE1_SIGMAS: [f32; 9] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
@@ -208,6 +213,8 @@ pub fn generate_t2v_latents(
     latent_std: &Array,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
+    // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
+    dit.set_lora_pass(0);
     let lat = denoise(
         dit,
         stage1_noise,
@@ -219,6 +226,7 @@ pub fn generate_t2v_latents(
     )?;
     let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
     let lat = renoise(&lat, stage2_noise, STAGE2_SIGMAS[0])?;
+    dit.set_lora_pass(1);
     denoise(
         dit,
         &lat,
@@ -438,6 +446,8 @@ pub fn generate_av_latents(
         }
         None => (video_s1_noise.clone(), None),
     };
+    // Select the per-pass LoRA strength for stage 1 (a no-op without adapters; sc-2687).
+    dit.set_lora_pass(0);
     let (v, a) = denoise_av(
         dit,
         &vlat1,
@@ -462,6 +472,7 @@ pub fn generate_av_latents(
         None => (renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?, None),
     };
     let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
+    dit.set_lora_pass(1);
     denoise_av(
         dit,
         &vlat2,

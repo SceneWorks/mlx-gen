@@ -7,7 +7,8 @@
 //! **Scope:** the full **AudioVideo** path (`generate_av.py`, sc-2684) — synchronized audio+video;
 //! `generate()` runs the joint dual-modality denoise and returns video frames + an audio track. Built
 //! on the sc-2679 video core + **single-image I2V** (sc-2685) + checkpoint-driven **Q4/Q8** quant
-//! (sc-2686). LoRA and LoKr are sibling stories.
+//! (sc-2686) + **LoRA in generate** (sc-2687 — forward-time residuals + per-pass strength over the
+//! full video+audio+cross-modal surface; see [`adapters`]). LoKr (sc-2393) is a sibling story.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
@@ -27,8 +28,10 @@
 //! (the reference's native bf16 activations — the production-speed path). The quant geometry (**Q4**/Q8)
 //! rides on the checkpoint's `split_model.json` (sc-2686). **I2V** single-image conditioning (sc-2685)
 //! is wired into the same 2-stage path ([`conditioning`] + [`pipeline::generate_i2v_latents`], gated
-//! bit-exact by `tests/i2v_parity.rs`). LoRA, LoKr, and audio are siblings.
+//! bit-exact by `tests/i2v_parity.rs`). **LoRA in generate** (sc-2687) is wired (forward-time residuals
+//! + per-pass strength; see [`adapters`]). LoKr (sc-2393) is a sibling.
 
+pub mod adapters;
 pub mod audio_vae;
 pub mod conditioning;
 pub mod config;
@@ -46,6 +49,7 @@ pub mod upsampler;
 pub mod vae;
 pub mod vocoder;
 
+pub use adapters::{apply_ltx_adapters, LtxLoraReport};
 pub use audio_vae::AudioDecoder;
 pub use conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
 pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};

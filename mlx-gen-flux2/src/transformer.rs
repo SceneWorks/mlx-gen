@@ -1264,6 +1264,7 @@ mod tests {
                 path,
                 scale: 1.0,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1385,6 +1386,7 @@ mod tests {
                 path: bpath,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1434,6 +1436,7 @@ mod tests {
                 path: ppath,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1500,6 +1503,7 @@ mod tests {
                 path,
                 scale: 1.0,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();

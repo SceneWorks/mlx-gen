@@ -97,12 +97,14 @@ pub fn descriptor() -> ModelDescriptor {
         capabilities: Capabilities {
             // Distilled 2-stage path: CFG is forced to 1.0, so no guidance / negative prompt.
             // I2V single-image conditioning (sc-2685) is wired via `Reference`; audio is always
-            // produced (sc-2684). LoRA, LoKr, and Q4/Q8-of-everything are sibling slices.
+            // produced (sc-2684). Q4/Q8-of-everything is a sibling slice.
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            supports_lora: false,
+            // LoRA in generate (sc-2687): forward-time residuals + per-pass strength over the full
+            // video+audio+cross-modal surface. LoKr = sc-2393.
+            supports_lora: true,
             supports_lokr: false,
             samplers: Vec::new(),
             schedulers: Vec::new(),
@@ -246,12 +248,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             Dtype::Float32,
         ),
     };
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "ltx_2_3: LoRA/LoKr adapters are sibling slices (sc-2687 / sc-2393), not yet wired"
-                .into(),
-        ));
-    }
 
     let config = LtxConfig::from_model_dir(root)?;
     let vae_config = LtxVaeConfig::from_model_dir(root)?;
@@ -286,7 +282,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &config,
         Dtype::Bfloat16,
     )?;
-    let transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
+    let mut transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
+    // LoRA in generate (sc-2687): forward-time residuals over the (quantized/dense) base, applied on
+    // the still-mutable transformer — the load-time seam. Routes the full video+audio+cross-modal
+    // surface. `pass_scales` (per-adapter) carries one strength per distilled denoise pass; the
+    // pipeline selects the active pass per stage. No-op when `spec.adapters` is empty; LoKr rejected
+    // (sc-2393).
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_ltx_adapters(
+            &mut transformer,
+            &spec.adapters,
+            crate::pipeline::NUM_DENOISE_PASSES,
+        )?;
+    }
+
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
     // The VAE carries its encoder (Some) so the model can serve I2V conditioning.
     let vae = LtxVideoVae::from_weights(&vae_w, Some(&vae_enc_w), &vae_config)?;

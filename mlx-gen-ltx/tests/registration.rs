@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::{registry, AdapterKind, AdapterSpec, LoadSpec, Modality, Quant, WeightsSource};
+use mlx_gen::{registry, LoadSpec, Modality, Quant, WeightsSource};
 
 use mlx_gen_ltx::MODEL_ID;
 
@@ -65,9 +65,11 @@ fn ltx_is_registered() {
     assert_eq!(d.id, "ltx_2_3");
     assert_eq!(d.family, "ltx");
     assert_eq!(d.modality, Modality::Video);
-    // Distilled core: no guidance / negative prompt; siblings (LoRA/LoKr) off.
+    // Distilled core: no guidance / negative prompt. LoRA in generate is wired (sc-2687); LoKr is the
+    // sibling sc-2393, still off.
     assert!(!d.capabilities.supports_guidance);
-    assert!(!d.capabilities.supports_lora);
+    assert!(d.capabilities.supports_lora);
+    assert!(!d.capabilities.supports_lokr);
     assert!(!d.capabilities.requires_sigma_shift);
 }
 
@@ -94,23 +96,15 @@ fn load_rejects_unwired_features() {
         &LoadSpec::new(WeightsSource::File(dir.join("embedded_config.json")))
     )
     .is_err());
-    // Quantization (sibling slice).
+    // Quantization (sibling slice — the transformer ships Q8 already).
     assert!(registry::load(
         MODEL_ID,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
     )
     .is_err());
-    // Adapters (sibling slice).
-    let adapters = vec![AdapterSpec {
-        path: dir.join("x.safetensors"),
-        scale: 1.0,
-        kind: AdapterKind::Lora,
-    }];
-    assert!(registry::load(
-        MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
-    )
-    .is_err());
+    // (LoRA adapters are NO LONGER rejected — sc-2687 wires them; a LoKr file is rejected at apply
+    // time, after the transformer loads, so it can't be exercised weight-free here. The full adapter
+    // surface — routing, parity, per-pass, LoKr rejection — is gated by `lora_real_weights`.)
 
     std::fs::remove_dir_all(&dir).ok();
 }

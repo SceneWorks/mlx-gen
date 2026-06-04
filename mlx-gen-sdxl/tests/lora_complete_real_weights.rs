@@ -74,6 +74,7 @@ fn lora_spec(scale: f32) -> AdapterSpec {
         path: lora_path(),
         scale,
         kind: AdapterKind::Lora,
+        pass_scales: None,
     }
 }
 

@@ -944,11 +944,13 @@ mod tests {
                 path: lora_path.clone(),
                 scale: 0.5,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             },
             AdapterSpec {
                 path: lokr_path.clone(),
                 scale: 1.0,
                 kind: AdapterKind::Lokr,
+                pass_scales: None,
             },
         ];
 
@@ -1029,6 +1031,7 @@ mod tests {
             path,
             scale: 1.0,
             kind: AdapterKind::Lokr,
+            pass_scales: None,
         }];
         let mut host = OneLinear {
             lin: AdaptableLinear::dense(Array::from_slice(&[1.0f32], &[1, 1]), None),
@@ -1051,6 +1054,7 @@ mod tests {
             path,
             scale: 1.0,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }];
         let mut host = OneLinear {
             lin: AdaptableLinear::dense(Array::from_slice(&[1.0f32], &[1, 1]), None),
@@ -1108,6 +1112,7 @@ mod tests {
             path,
             scale: 1.0,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }];
         let report = apply_adapter_specs_autoprefix(&mut host, &specs).unwrap();
         assert_eq!(
@@ -1134,6 +1139,7 @@ mod tests {
             path: miss,
             scale: 1.0,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }];
         assert!(apply_adapters_strict(&mut host2, &specs2, "test").is_err());
     }
@@ -1209,6 +1215,7 @@ mod tests {
                 path: kohya_path,
                 scale: 0.75,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
             "test",
         )
@@ -1222,6 +1229,7 @@ mod tests {
                 path: peft_path,
                 scale: 0.75,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
             "test",
         )
@@ -1319,6 +1327,7 @@ mod tests {
                 path,
                 scale: 1.0,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
             "test",
         )

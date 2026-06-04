@@ -100,6 +100,32 @@ pub struct AdapterSpec {
     pub path: PathBuf,
     pub scale: f32,
     pub kind: AdapterKind,
+    /// Per-denoise-pass strength override (LTX-2.3 only). When `Some`, the slice gives this
+    /// adapter's strength for each distilled stage (LTX runs a 2-stage denoise, so a length-2
+    /// `[stage1, stage2]`); when `None`, [`scale`](Self::scale) is applied uniformly to every pass.
+    /// This is the LTX "per-pass strength" feature (sc-2687) — the reference has no per-stage
+    /// schedule, so it is net-new. Like [`LoadSpec::control`], it is a model-specific knob on the
+    /// shared spec: **only LTX reads it**; every other model ignores it (its denoise is single-pass).
+    pub pass_scales: Option<Vec<f32>>,
+}
+
+impl AdapterSpec {
+    /// A uniform-strength adapter (the common case): [`scale`](Self::scale) on every denoise pass,
+    /// no per-pass override. Equivalent to a literal with `pass_scales: None`.
+    pub fn new(path: PathBuf, scale: f32, kind: AdapterKind) -> Self {
+        Self {
+            path,
+            scale,
+            kind,
+            pass_scales: None,
+        }
+    }
+
+    /// Builder-style per-pass strength override (LTX only — see [`pass_scales`](Self::pass_scales)).
+    pub fn with_pass_scales(mut self, pass_scales: Vec<f32>) -> Self {
+        self.pass_scales = Some(pass_scales);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

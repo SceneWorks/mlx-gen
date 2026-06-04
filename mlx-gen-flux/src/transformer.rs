@@ -1541,6 +1541,7 @@ mod tests {
                 path: bfl_path,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1554,6 +1555,7 @@ mod tests {
                 path: peft_path,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1649,6 +1651,7 @@ mod tests {
                 path: bfl_path,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1662,6 +1665,7 @@ mod tests {
                 path: peft_path,
                 scale: 0.8,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .unwrap();
@@ -1756,11 +1760,13 @@ mod tests {
                     path: lora_path,
                     scale: 1.0,
                     kind: AdapterKind::Lora,
+                    pass_scales: None,
                 },
                 AdapterSpec {
                     path: lokr_path,
                     scale: 1.0,
                     kind: AdapterKind::Lokr,
+                    pass_scales: None,
                 },
             ],
         )
@@ -1792,6 +1798,7 @@ mod tests {
                 path: miss,
                 scale: 1.0,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .is_err());

@@ -54,6 +54,7 @@ fn lora_spec(g: &Weights, scale: f32) -> AdapterSpec {
         path: PathBuf::from(g.metadata("lora_path").expect("golden lora_path")),
         scale,
         kind: AdapterKind::Lora,
+        pass_scales: None,
     }
 }
 
@@ -219,6 +220,7 @@ fn peft_format_merges_end_to_end() {
             path,
             scale: 1.0,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }],
     )
     .unwrap();

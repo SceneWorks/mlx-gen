@@ -44,6 +44,7 @@ fn spec(g: &Weights, key: &str, scale: f32, kind: AdapterKind) -> AdapterSpec {
         path: PathBuf::from(g.metadata(key).unwrap_or_else(|| panic!("golden {key}"))),
         scale,
         kind,
+        pass_scales: None,
     }
 }
 

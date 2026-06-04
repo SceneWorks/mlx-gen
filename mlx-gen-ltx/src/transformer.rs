@@ -24,9 +24,12 @@
 //! mirrors the reference's own bf16 compute (the production-speed path). [`Precision::dense_f32`]
 //! additionally dequantizes the weights to dense f32 — the S3a block-math gate.
 
+use std::cell::Cell;
+
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
-    add, concatenate_axis, dequantize, divide, multiply, quantized_matmul, sigmoid, subtract,
+    add, concatenate_axis, dequantize, divide, matmul, multiply, quantized_matmul, sigmoid,
+    subtract,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -124,8 +127,8 @@ fn modulate(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
     )?)
 }
 
-/// A Linear — dense or Q8-quantized, selected by [`Precision`] at load.
-enum Linear {
+/// A Linear's base weight — dense or Q8-quantized, selected by [`Precision`] at load.
+enum LinearKind {
     Dense {
         w: Array, // [out, in]
         b: Array, // [out]
@@ -140,50 +143,11 @@ enum Linear {
     },
 }
 
-impl Linear {
-    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
-        let dt = prec.dtype();
-        let b = to_dtype(w.require(&format!("{prefix}.bias"))?, dt)?;
-        match w.get(&format!("{prefix}.scales")) {
-            Some(scales) => {
-                let q = w.require(&format!("{prefix}.weight"))?;
-                let biases = w.require(&format!("{prefix}.biases"))?;
-                if prec.keep_quant() {
-                    // Keep the weights packed; `quantized_matmul` dequantizes on the fly with fp32
-                    // accumulation and is correct for f32 *or* bf16 activations (the Z-Image/Qwen Q8
-                    // path) at either bit-width. Scales / biases are cast to the compute dtype so the
-                    // on-the-fly dequant matches the reference's (f32 for the quant_f32 path — a
-                    // lossless upcast of the bf16 file scales). bits/group come from the checkpoint's
-                    // split_model.json via `prec`, so Q4 and Q8 both load unchanged.
-                    Ok(Linear::Quant {
-                        q: q.clone(),
-                        scales: to_dtype(scales, dt)?,
-                        biases: to_dtype(biases, dt)?,
-                        b,
-                        group: prec.group,
-                        bits: prec.bits,
-                    })
-                } else {
-                    // Dequantize to dense f32 (bit-identical to the reference's mx.dequantize).
-                    let dense =
-                        dequantize(q, scales, Some(biases), Some(prec.group), Some(prec.bits))?;
-                    Ok(Linear::Dense {
-                        w: to_dtype(&dense, Dtype::Float32)?,
-                        b,
-                    })
-                }
-            }
-            None => Ok(Linear::Dense {
-                w: to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?,
-                b,
-            }),
-        }
-    }
-
+impl LinearKind {
     fn forward(&self, x: &Array) -> Result<Array> {
         match self {
-            Linear::Dense { w, b } => linear(x, w, b),
-            Linear::Quant {
+            LinearKind::Dense { w, b } => linear(x, w, b),
+            LinearKind::Quant {
                 q,
                 scales,
                 biases,
@@ -195,6 +159,144 @@ impl Linear {
                 b,
             )?),
         }
+    }
+}
+
+/// One LoRA adapter as a forward-time residual — the reference `lora/apply.py::LoRALinear`
+/// (`out + scale·strength·(x·Aᵀ·Bᵀ)`), NOT a merged weight. Residual (vs the reference's
+/// alternative `apply_loras_to_model` merge→bf16) keeps the shipped Q8 base intact — a full
+/// attn+ff LoRA over this 22B Q8 transformer would dequantize ~15 GB to bf16 if merged, and
+/// per-pass strength would double it — and leaves the bit-exact base forward (sc-2842) untouched.
+/// The factors keep their loaded (bf16) dtype so a bf16 `x` (Bf16Q8) runs bf16 and an f32 `x`
+/// (F32Q8) promotes to f32, exactly as the reference does (the sc-2772 toolchain fix means the
+/// low-rank bf16 GEMM is correct, so no f32 forcing is needed — that note is stale).
+struct LtxLora {
+    a: Array, // Aᵀ : [in, rank] (residual form; `lora_A` transposed)
+    b: Array, // Bᵀ : [rank, out] (`lora_B` transposed)
+    /// Effective scale per denoise pass = `(alpha/rank)·strength[pass]`. A length-1 vec is the
+    /// uniform case (same strength every pass); a per-pass override (sc-2687) carries one entry
+    /// per distilled stage. `Linear::forward` clamps the active pass index into this.
+    pass_scale: Vec<f32>,
+}
+
+/// The adapter overlay on a [`Linear`]: the stacked residuals plus the active denoise-pass index,
+/// set by [`LtxDiT::set_lora_pass`] before each stage. The pass lives in a `Cell` so a shared
+/// `&self` forward reads it and the pipeline switches passes without `&mut` (the crate runs
+/// single-device, one job per thread — see the runtime docs; `Cell<usize>` is `Send`).
+struct LoraStack {
+    adapters: Vec<LtxLora>,
+    pass: Cell<usize>,
+}
+
+/// A Linear: a base weight ([`LinearKind`]) plus an optional forward-time LoRA overlay. With no
+/// adapters the forward is byte-identical to the pre-sc-2687 path (the Q8/dense base only).
+pub struct Linear {
+    kind: LinearKind,
+    lora: Option<LoraStack>,
+}
+
+impl Linear {
+    fn load(w: &Weights, prefix: &str, prec: Precision) -> Result<Self> {
+        let dt = prec.dtype();
+        let b = to_dtype(w.require(&format!("{prefix}.bias"))?, dt)?;
+        let kind = match w.get(&format!("{prefix}.scales")) {
+            Some(scales) => {
+                let q = w.require(&format!("{prefix}.weight"))?;
+                let biases = w.require(&format!("{prefix}.biases"))?;
+                if prec.keep_quant() {
+                    // Keep the weights packed; `quantized_matmul` dequantizes on the fly with fp32
+                    // accumulation and is correct for f32 *or* bf16 activations at either bit-width
+                    // (the Z-Image/Qwen Q8 path). Scales / biases are cast to the compute dtype so the
+                    // on-the-fly dequant matches the reference's (f32 for quant_f32 — a lossless upcast
+                    // of the bf16 file scales). bits/group come from the checkpoint's split_model.json
+                    // via `prec` (sc-2686), so Q4 and Q8 both load unchanged.
+                    LinearKind::Quant {
+                        q: q.clone(),
+                        scales: to_dtype(scales, dt)?,
+                        biases: to_dtype(biases, dt)?,
+                        b,
+                        group: prec.group,
+                        bits: prec.bits,
+                    }
+                } else {
+                    // Dequantize to dense f32 (bit-identical to the reference's mx.dequantize).
+                    let dense =
+                        dequantize(q, scales, Some(biases), Some(prec.group), Some(prec.bits))?;
+                    LinearKind::Dense {
+                        w: to_dtype(&dense, Dtype::Float32)?,
+                        b,
+                    }
+                }
+            }
+            None => LinearKind::Dense {
+                w: to_dtype(w.require(&format!("{prefix}.weight"))?, dt)?,
+                b,
+            },
+        };
+        Ok(Linear { kind, lora: None })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let mut out = self.kind.forward(x)?;
+        if let Some(stack) = &self.lora {
+            let pass = stack.pass.get();
+            for ad in &stack.adapters {
+                // residual = (x·Aᵀ)·Bᵀ · scale[pass], factors at loaded dtype (MLX promotes a bf16
+                // factor against an f32 activation), the scale through a dtype-matched scalar so the
+                // multiply preserves the residual dtype (the reference's weak Python-float `scale·…`).
+                let r = matmul(&matmul(x, &ad.a)?, &ad.b)?;
+                let s = ad.pass_scale[pass.min(ad.pass_scale.len() - 1)];
+                out = add(&out, &multiply(&r, &scalar(s).as_dtype(r.dtype())?)?)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Stack a LoRA residual (the loader installs one per resolved target). `a`/`b` are the raw
+    /// `lora_A [rank,in]` / `lora_B [out,rank]` transposed to residual form by the caller.
+    pub(crate) fn push_lora(&mut self, a: Array, b: Array, pass_scale: Vec<f32>) {
+        let stack = self.lora.get_or_insert_with(|| LoraStack {
+            adapters: Vec::new(),
+            pass: Cell::new(0),
+        });
+        stack.adapters.push(LtxLora { a, b, pass_scale });
+    }
+
+    /// Select the active denoise pass for this linear's LoRA residuals (no-op without adapters).
+    fn set_lora_pass(&self, pass: usize) {
+        if let Some(stack) = &self.lora {
+            stack.pass.set(pass);
+        }
+    }
+}
+
+/// A model tree that routes a LoRA target's dotted path (post LTX key normalization) to its
+/// [`Linear`] and selects the active denoise pass for all installed residuals. Implemented by the
+/// video-only [`LtxDiT`] building block and the production dual-modality [`AvDiT`], so the adapter
+/// loader ([`crate::adapters::apply_ltx_adapters`]) is generic over both (sc-2687).
+pub trait LtxAdaptable {
+    /// Resolve a target path to its [`Linear`], or `None` if it names no adaptable module (reported
+    /// skipped by the loader, never silently dropped).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear>;
+    /// Select the active distilled denoise pass for every installed residual (no-op without adapters).
+    fn set_lora_pass(&self, pass: usize);
+}
+
+impl LtxAdaptable for LtxDiT {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        LtxDiT::adaptable_mut(self, path)
+    }
+    fn set_lora_pass(&self, pass: usize) {
+        LtxDiT::set_lora_pass(self, pass)
+    }
+}
+
+impl LtxAdaptable for AvDiT {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        AvDiT::adaptable_mut(self, path)
+    }
+    fn set_lora_pass(&self, pass: usize) {
+        AvDiT::set_lora_pass(self, pass)
     }
 }
 
@@ -306,6 +408,29 @@ impl Attention {
         }
         self.to_out.forward(&out)
     }
+
+    /// LoRA key→module map (diffusers/peft naming, post LTX normalization). `to_out.0`→`to_out`
+    /// is done by the loader; `to_gate_logits` resolves only when the gated branch is present.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out"] => Some(&mut self.to_out),
+            ["to_gate_logits"] => self.gate.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn set_lora_pass(&self, pass: usize) {
+        self.to_q.set_lora_pass(pass);
+        self.to_k.set_lora_pass(pass);
+        self.to_v.set_lora_pass(pass);
+        self.to_out.set_lora_pass(pass);
+        if let Some(g) = &self.gate {
+            g.set_lora_pass(pass);
+        }
+    }
 }
 
 /// `proj_in → gelu(tanh) → proj_out`.
@@ -325,6 +450,20 @@ impl FeedForward {
     fn forward(&self, x: &Array) -> Result<Array> {
         self.proj_out
             .forward(&gelu_tanh(&self.proj_in.forward(x)?)?)
+    }
+
+    /// LoRA targets: `ff.net.0.proj`→`ff.proj_in`, `ff.net.2`→`ff.proj_out` (renamed by the loader).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["proj_in"] => Some(&mut self.proj_in),
+            ["proj_out"] => Some(&mut self.proj_out),
+            _ => None,
+        }
+    }
+
+    fn set_lora_pass(&self, pass: usize) {
+        self.proj_in.set_lora_pass(pass);
+        self.proj_out.set_lora_pass(pass);
     }
 }
 
@@ -439,6 +578,21 @@ impl VideoBlock {
 
         Ok(x)
     }
+
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
+            ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn set_lora_pass(&self, pass: usize) {
+        self.attn1.set_lora_pass(pass);
+        self.attn2.set_lora_pass(pass);
+        self.ff.set_lora_pass(pass);
+    }
 }
 
 /// PixArt sinusoidal timestep embedding (`flip_sin_to_cos`, `downscale_freq_shift = 0`, max_period
@@ -490,6 +644,25 @@ impl AdaLayerNormSingle {
         let scale_shift = self.linear.forward(&mlx_gen::nn::silu(&embedded)?)?;
         Ok((scale_shift, embedded))
     }
+
+    /// LoRA targets in diffusers naming: `emb.timestep_embedder.linear1/linear2` and `linear`. (A
+    /// trained file spelling the embedder `linear_1`/`linear_2` — the PixArt convention — does NOT
+    /// resolve here and is reported skipped, matching the reference `_normalize_ltx_lora_key`, which
+    /// has no such rename; the base checkpoint names them `linear1`/`linear2`.)
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["emb", "timestep_embedder", "linear1"] => Some(&mut self.ts_lin1),
+            ["emb", "timestep_embedder", "linear2"] => Some(&mut self.ts_lin2),
+            ["linear"] => Some(&mut self.linear),
+            _ => None,
+        }
+    }
+
+    fn set_lora_pass(&self, pass: usize) {
+        self.ts_lin1.set_lora_pass(pass);
+        self.ts_lin2.set_lora_pass(pass);
+        self.linear.set_lora_pass(pass);
+    }
 }
 
 /// The LTX-2.3 video DiT: preprocessor + 48 blocks + output projection. Predicts velocity.
@@ -523,6 +696,39 @@ impl LtxDiT {
             cfg: cfg.clone(),
             prec,
         })
+    }
+
+    /// Resolve a LoRA target (diffusers/peft dotted path, post LTX key normalization) to its
+    /// [`Linear`], so the loader ([`crate::adapters`]) can install a residual onto it. The video-only
+    /// surface: the 48 blocks' `attn{1,2}` + `ff` leaves, the two adaLN-single modules, and the
+    /// global `patchify_proj`/`proj_out`. Audio / `av_ca` / `a2v` targets and the PixArt-spelled adaLN
+    /// embedder (`linear_1/2`) resolve to `None` here → reported skipped, never silently dropped.
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["patchify_proj"] => Some(&mut self.patchify_proj),
+            ["proj_out"] => Some(&mut self.proj_out),
+            ["adaln_single", rest @ ..] => self.adaln.adaptable_mut(rest),
+            ["prompt_adaln_single", rest @ ..] => self.prompt_adaln.as_mut()?.adaptable_mut(rest),
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Select the active distilled denoise pass for every installed LoRA residual (sc-2687 per-pass
+    /// strength). The pipeline calls this before each stage; a no-adapter model is unaffected.
+    pub fn set_lora_pass(&self, pass: usize) {
+        self.patchify_proj.set_lora_pass(pass);
+        self.proj_out.set_lora_pass(pass);
+        self.adaln.set_lora_pass(pass);
+        if let Some(p) = &self.prompt_adaln {
+            p.set_lora_pass(pass);
+        }
+        for b in &self.blocks {
+            b.set_lora_pass(pass);
+        }
     }
 
     /// The preprocessor (mirrors the reference `TransformerArgsPreprocessor.prepare`): patchify_proj →
@@ -858,6 +1064,18 @@ impl Stream {
         let normed = layer_norm(h, None, None, self.eps)?;
         self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
     }
+
+    /// Select the active denoise pass for this stream's LoRA-targetable Linears (the patchify/out
+    /// projections + the four adaLN-single modules). The `scale_shift_table`/gate params carry no
+    /// Linear, so they are unaffected.
+    fn set_lora_pass(&self, pass: usize) {
+        self.patchify.set_lora_pass(pass);
+        self.proj_out.set_lora_pass(pass);
+        self.adaln.set_lora_pass(pass);
+        self.prompt_adaln.set_lora_pass(pass);
+        self.cross_ss_adaln.set_lora_pass(pass);
+        self.cross_gate_adaln.set_lora_pass(pass);
+    }
 }
 
 /// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables. Returns
@@ -1057,6 +1275,38 @@ impl AvBlock {
         ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
         Ok((vx, ax))
     }
+
+    /// LoRA key→module map for one AV block: the video self/text attns + ff, the audio analogues, and
+    /// the two cross-modal attns (`audio_to_video_attn`/`video_to_audio_attn`). `audio_ff.net.*` →
+    /// `audio_ff.proj_*` is renamed by the loader before reaching here.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["attn1", rest @ ..] => self.attn1.adaptable_mut(rest),
+            ["attn2", rest @ ..] => self.attn2.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["audio_attn1", rest @ ..] => self.a_attn1.adaptable_mut(rest),
+            ["audio_attn2", rest @ ..] => self.a_attn2.adaptable_mut(rest),
+            ["audio_ff", rest @ ..] => self.a_ff.adaptable_mut(rest),
+            ["audio_to_video_attn", rest @ ..] => self.a2v.adaptable_mut(rest),
+            ["video_to_audio_attn", rest @ ..] => self.v2a.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn set_lora_pass(&self, pass: usize) {
+        for attn in [
+            &self.attn1,
+            &self.attn2,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a2v,
+            &self.v2a,
+        ] {
+            attn.set_lora_pass(pass);
+        }
+        self.ff.set_lora_pass(pass);
+        self.a_ff.set_lora_pass(pass);
+    }
 }
 
 /// The LTX-2.3 **AudioVideo** DiT (`LTXModel` with both stacks). Predicts `(video_velocity,
@@ -1125,6 +1375,56 @@ impl AvDiT {
             audio,
             blocks,
         })
+    }
+
+    /// Resolve a LoRA target (diffusers/peft dotted path, post LTX key normalization) to its
+    /// [`Linear`] across the **full** AudioVideo surface (sc-2687): the per-block video/audio self +
+    /// text attns, the two cross-modal attns, both stacks' feed-forwards, and every stream-global
+    /// projection / adaLN-single (video + audio + the four `av_ca_*` cross modules). The module name
+    /// itself selects the stream (`audio_*` / `av_ca_audio_*` / `av_ca_v2a_*` → audio). A target that
+    /// names no module (e.g. the PixArt-spelled adaLN embedder `linear_1/2`, or an out-of-range block)
+    /// resolves to `None` → reported skipped, never silently dropped.
+    pub(crate) fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut Linear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            // Video-stream globals.
+            ["patchify_proj"] => Some(&mut self.video.patchify),
+            ["proj_out"] => Some(&mut self.video.proj_out),
+            ["adaln_single", rest @ ..] => self.video.adaln.adaptable_mut(rest),
+            ["prompt_adaln_single", rest @ ..] => self.video.prompt_adaln.adaptable_mut(rest),
+            ["av_ca_video_scale_shift_adaln_single", rest @ ..] => {
+                self.video.cross_ss_adaln.adaptable_mut(rest)
+            }
+            ["av_ca_a2v_gate_adaln_single", rest @ ..] => {
+                self.video.cross_gate_adaln.adaptable_mut(rest)
+            }
+            // Audio-stream globals.
+            ["audio_patchify_proj"] => Some(&mut self.audio.patchify),
+            ["audio_proj_out"] => Some(&mut self.audio.proj_out),
+            ["audio_adaln_single", rest @ ..] => self.audio.adaln.adaptable_mut(rest),
+            ["audio_prompt_adaln_single", rest @ ..] => self.audio.prompt_adaln.adaptable_mut(rest),
+            ["av_ca_audio_scale_shift_adaln_single", rest @ ..] => {
+                self.audio.cross_ss_adaln.adaptable_mut(rest)
+            }
+            ["av_ca_v2a_gate_adaln_single", rest @ ..] => {
+                self.audio.cross_gate_adaln.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Select the active distilled denoise pass for every installed LoRA residual (sc-2687 per-pass
+    /// strength) across both streams and all blocks. The pipeline calls this before each stage; a
+    /// no-adapter model is unaffected.
+    pub fn set_lora_pass(&self, pass: usize) {
+        self.video.set_lora_pass(pass);
+        self.audio.set_lora_pass(pass);
+        for b in &self.blocks {
+            b.set_lora_pass(pass);
+        }
     }
 
     /// Joint velocity forward.
@@ -1201,5 +1501,92 @@ mod tests {
         let s = row0.as_slice::<f32>();
         assert!((s[0] - 1.0).abs() < 1e-6); // cos(0)
         assert!(s[128].abs() < 1e-6); // sin(0)
+    }
+
+    use mlx_rs::ops::{all_close, array_eq};
+
+    /// A bare dense Linear (no bias contribution) for the residual-math gates.
+    fn dense(w: Array) -> Linear {
+        let out = w.shape()[0];
+        Linear {
+            kind: LinearKind::Dense {
+                w,
+                b: Array::zeros::<f32>(&[out]).unwrap(),
+            },
+            lora: None,
+        }
+    }
+
+    #[test]
+    fn lora_scale_zero_is_bit_exact_noop_and_nonzero_has_effect() {
+        // base [out=2, in=3]; LoRA a=[in=3, rank=2], b=[rank=2, out=2] (residual form, alpha/rank
+        // already folded into the per-pass scale by the loader — here it's the raw scale).
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        // scale 0 → bit-exact no-op (`out + 0·residual`).
+        let mut lin0 = dense(w.clone());
+        lin0.push_lora(a.clone(), b.clone(), vec![0.0]);
+        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
+            .unwrap()
+            .item::<bool>());
+
+        // scale 0.5 → differs from base and equals `base + 0.5·(x·a)·b` exactly.
+        let mut lin1 = dense(w);
+        lin1.push_lora(a.clone(), b.clone(), vec![0.5]);
+        let got = lin1.forward(&x).unwrap();
+        assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
+        let resid = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
+        let want = add(&base, &resid).unwrap();
+        assert!(all_close(&got, &want, 1e-6, 1e-6, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn lora_per_pass_selects_strength() {
+        // pass_scale [0.0, 1.0]: pass 0 is a no-op, pass 1 applies the full residual (sc-2687).
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        let mut lin = dense(w);
+        lin.push_lora(a, b, vec![0.0, 1.0]);
+        lin.set_lora_pass(0);
+        assert!(
+            array_eq(lin.forward(&x).unwrap(), &base, false)
+                .unwrap()
+                .item::<bool>(),
+            "pass 0 (strength 0) must be a no-op"
+        );
+        lin.set_lora_pass(1);
+        assert!(
+            !array_eq(lin.forward(&x).unwrap(), &base, false)
+                .unwrap()
+                .item::<bool>(),
+            "pass 1 (strength 1) must change the output"
+        );
+    }
+
+    #[test]
+    fn lora_pass_index_clamps_into_uniform_scale() {
+        // A uniform (length-1) pass_scale is used regardless of the selected pass — the clamp keeps a
+        // uniform adapter working even when the pipeline advances to pass 1.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let mut lin = dense(w);
+        lin.push_lora(a, b, vec![0.5]);
+        lin.set_lora_pass(0);
+        let p0 = lin.forward(&x).unwrap();
+        lin.set_lora_pass(1);
+        let p1 = lin.forward(&x).unwrap();
+        assert!(array_eq(&p0, &p1, false).unwrap().item::<bool>());
     }
 }

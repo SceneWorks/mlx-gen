@@ -99,6 +99,7 @@ fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u
             path: golden_dir().join(file),
             scale,
             kind,
+            pass_scales: None,
         }]);
     }
     let generator = mlx_gen::load("qwen_image", &spec).unwrap();
@@ -321,6 +322,7 @@ fn kohya_matches_peft_on_real_tree() {
             path: kpath,
             scale: 0.8,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }],
     )
     .unwrap();
@@ -338,6 +340,7 @@ fn kohya_matches_peft_on_real_tree() {
             path: ppath,
             scale: 0.8,
             kind: AdapterKind::Lora,
+            pass_scales: None,
         }],
     )
     .unwrap();
@@ -391,6 +394,7 @@ fn kohya_matches_peft_on_real_tree() {
                 path: opath,
                 scale: 1.0,
                 kind: AdapterKind::Lora,
+                pass_scales: None,
             }],
         )
         .is_err(),
