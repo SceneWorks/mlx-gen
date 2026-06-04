@@ -22,11 +22,13 @@
 //!
 //! **Format.** PEFT `lora_A`/`lora_B` and kohya `lora_down`/`lora_up`, optional per-module `.alpha`
 //! (default = rank), `diffusion_model.`-prefixed (the real SceneWorks Wan2.2 MoE LoRAs ship PEFT,
-//! bf16, rank 64, no alpha). `scale = alpha/rank` (the reference `LoRAWeights.scale`). LoKr is
-//! rejected loudly (sc-2393). The kohya `lora_unet_`-**flattened** external form is not part of the
-//! reference Wan surface (its `_normalize_wan_lora_key` only strips prefixes + renames dotted paths);
-//! such keys resolve to no module and are surfaced (never silently dropped) — adding it would be
-//! net-new beyond the fork.
+//! bf16, rank 64, no alpha). `scale = alpha/rank` (the reference `LoRAWeights.scale`). **LoKr**
+//! (sc-2393 — net-new; the reference Wan path is LoRA-only) is parsed by the core `parse_lokr`, its
+//! per-module `[out,in]` delta reconstructed via `reconstruct_lokr_delta` (`alpha/rank` folded in),
+//! and folded into the weight through the **same in-place merge** as LoRA (`merge_one_lokr`). The
+//! kohya `lora_unet_`-**flattened** external form is not part of the reference Wan surface (its
+//! `_normalize_wan_lora_key` only strips prefixes + renames dotted paths); such keys resolve to no
+//! module and are surfaced (never silently dropped) — adding it would be net-new beyond the fork.
 //!
 //! **Skips, never errors-on-skip.** Mirrors the reference (`apply_loras_to_weights` counts skipped
 //! modules, never raises): a LoRA target absent from this checkpoint is reported, not fatal. The
@@ -38,11 +40,11 @@ use std::collections::BTreeMap;
 use mlx_rs::ops::{add, matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::loader::is_lokr;
+use mlx_gen::adapters::loader::{is_lokr, parse_lokr};
 use mlx_gen::array::scalar;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::Result;
 
 /// LoRA key namespace prefixes stripped (longest-first), matching the reference
 /// `_normalize_wan_lora_key`. SceneWorks' trained Wan LoRAs use `diffusion_model.`.
@@ -165,11 +167,9 @@ pub(crate) fn normalize_wan_key(key: &str) -> String {
 fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut WanLoraReport) -> Result<()> {
     let lw = Weights::from_file(&spec.path)?;
     if spec.kind == AdapterKind::Lokr || is_lokr(&lw) {
-        return Err(Error::Msg(format!(
-            "wan2_2 adapter {}: LoKr is not yet supported (sc-2393); the reference Wan lora/ path is \
-             LoRA-only (merge)",
-            spec.path.display()
-        )));
+        // LoKr (sc-2393 — net-new; the reference Wan path is LoRA-only) merges through the same
+        // in-place weight fold, with the delta reconstructed from Kronecker factors instead of B·A.
+        return merge_one_lokr(w, &lw, spec.scale, report);
     }
 
     // Group factors by normalized module path.
@@ -215,12 +215,43 @@ fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut WanLoraReport) ->
     Ok(())
 }
 
-/// Merge every LoRA in `specs` that targets `expert` into the expert weight map `w` (sc-2683). Shared
+/// Merge one LoKr file's deltas into the weight map `w` at `scale` (sc-2393 — net-new; the reference
+/// Wan path is LoRA-only). Each module's `[out,in]` delta is reconstructed (f32, `alpha/rank` folded
+/// in) from its Kronecker factors via the core `reconstruct_lokr_delta`, scaled by the user strength,
+/// and folded into the weight (cast to its dtype) — the same in-place merge as the LoRA path, so the
+/// no-adapter forward stays byte-identical and adapters accumulate by reading the merged weight back.
+/// A target absent from this checkpoint is surfaced (skipped), never fatal.
+fn merge_one_lokr(
+    w: &mut Weights,
+    lw: &Weights,
+    scale: f32,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let file = parse_lokr(lw)?;
+    for (raw_path, factors) in &file.groups {
+        let path = normalize_wan_key(raw_path);
+        let wkey = format!("{path}.weight");
+        let Some(base) = w.get(&wkey).cloned() else {
+            report.skipped.push(path);
+            continue;
+        };
+        // Reconstruct f32 (the SDXL merge precedent, sc-2640) — the merge casts to the weight dtype.
+        let delta = file.delta(factors, base.shape(), Dtype::Float32)?;
+        let delta = multiply(&delta, &scalar(scale).as_dtype(delta.dtype())?)?;
+        let merged = add(&base, &delta.as_dtype(base.dtype())?)?;
+        w.insert(wkey, merged);
+        report.applied += 1;
+    }
+    Ok(())
+}
+
+/// Merge every adapter in `specs` that targets `expert` into the expert weight map `w` (sc-2683 LoRA /
+/// sc-2393 LoKr). Shared
 /// specs (`moe_expert == None`) are applied first, then this expert's specific ones (`Some(expert)`),
 /// mirroring the reference `(loras)+(loras_high/low)` order so a module hit by both accumulates in
-/// the same order. LoKr is rejected (sc-2393); per-key skips are reported, not fatal (the reference
-/// warns on skip). Returns the merge report; the caller enforces the "matched nothing across both
-/// experts" error.
+/// the same order. LoRA and LoKr are dispatched per file by metadata / the spec kind; per-key skips
+/// are reported, not fatal (the reference warns on skip). Returns the merge report; the caller
+/// enforces the "matched nothing across both experts" error.
 pub fn merge_wan_adapters(
     w: &mut Weights,
     specs: &[AdapterSpec],
@@ -544,14 +575,98 @@ mod tests {
     }
 
     #[test]
-    fn lokr_is_rejected() {
-        // A spec declared LoKr is rejected loudly (sc-2393) before any merge.
-        let lora = write_lora("lk.safetensors", &[("blocks.0.self_attn.q", 16, 8)], 4, 0.2);
-        let lokr_spec = AdapterSpec {
-            kind: AdapterKind::Lokr,
-            ..spec(lora, 1.0, None)
-        };
+    fn lokr_merge_matches_reconstruct_and_scale_zero_is_noop() {
+        // sc-2393: LoKr merges through the same in-place fold. `blocks.0.self_attn.q` is [16,8] =
+        // kron(w1[4,2], w2[4,4]); the merged weight must equal W + (reconstruct·scale).astype(W.dtype),
+        // and scale 0 must be a bit-exact no-op.
+        use mlx_gen::adapters::reconstruct_lokr_delta;
+        use std::collections::HashMap;
+
+        let w1 = Array::from_slice(
+            &(0..8)
+                .map(|i| (i as f32 * 0.03).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 2],
+        );
+        let w2 = Array::from_slice(
+            &(0..16)
+                .map(|i| (i as f32 * 0.05).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 4],
+        );
+        let (alpha, rank) = (4.0f32, 4.0f32); // alpha/rank = 1.0
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), alpha.to_string());
+        meta.insert("rank".to_string(), rank.to_string());
+        let lokr_path = tmp("lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.self_attn.q.lokr_w1", &w1),
+                ("blocks.0.self_attn.q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &lokr_path,
+        )
+        .unwrap();
+
+        let scale = 0.5f32;
         let mut w = synthetic_weights();
-        assert!(merge_wan_adapters(&mut w, &[lokr_spec], MoeExpert::High).is_err());
+        let report = merge_wan_adapters(
+            &mut w,
+            &[AdapterSpec {
+                kind: AdapterKind::Lokr,
+                ..spec(lokr_path, scale, None)
+            }],
+            MoeExpert::High,
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.skipped.is_empty());
+
+        let base = synthetic_weights();
+        let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
+        let delta = reconstruct_lokr_delta(
+            alpha,
+            rank,
+            q_base.shape(),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap();
+        let delta = multiply(&delta, scalar(scale).as_dtype(delta.dtype()).unwrap()).unwrap();
+        let want = add(q_base, delta.as_dtype(q_base.dtype()).unwrap()).unwrap();
+        let got = w.require("blocks.0.self_attn.q.weight").unwrap();
+        assert!(
+            array_eq(got, &want, false).unwrap().item::<bool>(),
+            "merged LoKr weight must be bit-exact to W + (reconstruct·scale).astype(W.dtype)"
+        );
+
+        // scale 0 → the merged weight is bit-identical to the base.
+        let mut w0 = synthetic_weights();
+        merge_wan_adapters(
+            &mut w0,
+            &[AdapterSpec {
+                kind: AdapterKind::Lokr,
+                ..spec(tmp("lokr.safetensors"), 0.0, None)
+            }],
+            MoeExpert::High,
+        )
+        .unwrap();
+        assert!(
+            array_eq(
+                w0.require("blocks.0.self_attn.q.weight").unwrap(),
+                q_base,
+                false
+            )
+            .unwrap()
+            .item::<bool>(),
+            "scale-0 LoKr merge must be a bit-exact no-op"
+        );
     }
 }

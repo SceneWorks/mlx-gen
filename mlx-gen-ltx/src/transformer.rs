@@ -160,23 +160,64 @@ impl LinearKind {
             )?),
         }
     }
+
+    /// The base weight's logical `[out, in]` — what a LoKr delta reshapes to. The quantized packed
+    /// weight is opaque, so recover `in` from the scales grid (`[out, in/group]`) × the group size
+    /// (mirrors the core `AdaptableLinear::base_shape`).
+    fn base_shape(&self) -> Vec<i32> {
+        match self {
+            LinearKind::Dense { w, .. } => w.shape().to_vec(),
+            LinearKind::Quant { scales, group, .. } => {
+                let s = scales.shape();
+                vec![s[0], s[1] * group]
+            }
+        }
+    }
 }
 
-/// One LoRA adapter as a forward-time residual — the reference `lora/apply.py::LoRALinear`
+/// One adapter as a forward-time residual — the reference `lora/apply.py::LoRALinear`
 /// (`out + scale·strength·(x·Aᵀ·Bᵀ)`), NOT a merged weight. Residual (vs the reference's
 /// alternative `apply_loras_to_model` merge→bf16) keeps the shipped Q8 base intact — a full
-/// attn+ff LoRA over this 22B Q8 transformer would dequantize ~15 GB to bf16 if merged, and
+/// attn+ff adapter over this 22B Q8 transformer would dequantize ~15 GB to bf16 if merged, and
 /// per-pass strength would double it — and leaves the bit-exact base forward (sc-2842) untouched.
-/// The factors keep their loaded (bf16) dtype so a bf16 `x` (Bf16Q8) runs bf16 and an f32 `x`
-/// (F32Q8) promotes to f32, exactly as the reference does (the sc-2772 toolchain fix means the
-/// low-rank bf16 GEMM is correct, so no f32 forcing is needed — that note is stale).
-struct LtxLora {
-    a: Array, // Aᵀ : [in, rank] (residual form; `lora_A` transposed)
-    b: Array, // Bᵀ : [rank, out] (`lora_B` transposed)
-    /// Effective scale per denoise pass = `(alpha/rank)·strength[pass]`. A length-1 vec is the
-    /// uniform case (same strength every pass); a per-pass override (sc-2687) carries one entry
-    /// per distilled stage. `Linear::forward` clamps the active pass index into this.
-    pass_scale: Vec<f32>,
+///
+/// **LoRA** keeps its factors at their loaded (bf16) dtype so a bf16 `x` (Bf16Q8) runs bf16 and an
+/// f32 `x` (F32Q8) promotes to f32, exactly as the reference does (the sc-2772 toolchain fix means
+/// the low-rank bf16 GEMM is correct, so no f32 forcing is needed). **LoKr** (sc-2393 — net-new, the
+/// reference `lora/` has no LoKr) carries a precomputed `[out,in]` delta (`alpha/rank` already folded
+/// in by `reconstruct_lokr_delta`); the residual is `x·ΔWᵀ` with `ΔW` cast to the activation dtype,
+/// mirroring the fork's `LoKrLinear` / the core `Adapter::Lokr`. Both variants apply a per-pass scale.
+enum LtxAdapter {
+    /// `residual = pass_scale[pass] · (x·Aᵀ)·Bᵀ`. `pass_scale` already folds `(alpha/rank)·strength`.
+    Lora {
+        a: Array, // Aᵀ : [in, rank] (residual form; `lora_A` transposed)
+        b: Array, // Bᵀ : [rank, out] (`lora_B` transposed)
+        pass_scale: Vec<f32>,
+    },
+    /// `residual = pass_scale[pass] · x·ΔWᵀ`. `ΔW` ([out,in], bf16) has `alpha/rank` baked in, so
+    /// `pass_scale` is the user `strength[pass]` alone (no further alpha/rank fold).
+    Lokr {
+        delta: Array, // ΔW : [out, in] (bf16; cast to the activation dtype at forward)
+        pass_scale: Vec<f32>,
+    },
+}
+
+impl LtxAdapter {
+    /// Per-pass effective strengths (one entry per distilled stage, or a length-1 uniform vec).
+    /// `Linear::forward` clamps the active pass index into this.
+    fn pass_scale(&self) -> &[f32] {
+        match self {
+            LtxAdapter::Lora { pass_scale, .. } | LtxAdapter::Lokr { pass_scale, .. } => pass_scale,
+        }
+    }
+
+    /// The unscaled residual `x·Aᵀ·Bᵀ` (LoRA) or `x·ΔWᵀ` (LoKr), before the per-pass scale.
+    fn residual(&self, x: &Array) -> Result<Array> {
+        Ok(match self {
+            LtxAdapter::Lora { a, b, .. } => matmul(&matmul(x, a)?, b)?,
+            LtxAdapter::Lokr { delta, .. } => matmul(x, delta.as_dtype(x.dtype())?.t())?,
+        })
+    }
 }
 
 /// The adapter overlay on a [`Linear`]: the stacked residuals plus the active denoise-pass index,
@@ -184,7 +225,7 @@ struct LtxLora {
 /// `&self` forward reads it and the pipeline switches passes without `&mut` (the crate runs
 /// single-device, one job per thread — see the runtime docs; `Cell<usize>` is `Send`).
 struct LoraStack {
-    adapters: Vec<LtxLora>,
+    adapters: Vec<LtxAdapter>,
     pass: Cell<usize>,
 }
 
@@ -241,11 +282,13 @@ impl Linear {
         if let Some(stack) = &self.lora {
             let pass = stack.pass.get();
             for ad in &stack.adapters {
-                // residual = (x·Aᵀ)·Bᵀ · scale[pass], factors at loaded dtype (MLX promotes a bf16
-                // factor against an f32 activation), the scale through a dtype-matched scalar so the
-                // multiply preserves the residual dtype (the reference's weak Python-float `scale·…`).
-                let r = matmul(&matmul(x, &ad.a)?, &ad.b)?;
-                let s = ad.pass_scale[pass.min(ad.pass_scale.len() - 1)];
+                // residual = (LoRA: (x·Aᵀ)·Bᵀ | LoKr: x·ΔWᵀ) · scale[pass], factors/delta at the
+                // activation dtype (MLX promotes a bf16 factor against an f32 activation), the scale
+                // through a dtype-matched scalar so the multiply preserves the residual dtype (the
+                // reference's weak Python-float `scale·…`).
+                let r = ad.residual(x)?;
+                let ps = ad.pass_scale();
+                let s = ps[pass.min(ps.len() - 1)];
                 out = add(&out, &multiply(&r, &scalar(s).as_dtype(r.dtype())?)?)?;
             }
         }
@@ -255,11 +298,26 @@ impl Linear {
     /// Stack a LoRA residual (the loader installs one per resolved target). `a`/`b` are the raw
     /// `lora_A [rank,in]` / `lora_B [out,rank]` transposed to residual form by the caller.
     pub(crate) fn push_lora(&mut self, a: Array, b: Array, pass_scale: Vec<f32>) {
-        let stack = self.lora.get_or_insert_with(|| LoraStack {
+        self.lora_stack()
+            .adapters
+            .push(LtxAdapter::Lora { a, b, pass_scale });
+    }
+
+    /// Stack a LoKr residual (sc-2393). `delta` is the precomputed `[out,in]` bf16 weight delta
+    /// (`alpha/rank` already folded in by `reconstruct_lokr_delta`); `pass_scale` is the per-pass
+    /// user strength alone. Net-new — the reference `lora/` is LoRA-only.
+    pub(crate) fn push_lokr(&mut self, delta: Array, pass_scale: Vec<f32>) {
+        self.lora_stack()
+            .adapters
+            .push(LtxAdapter::Lokr { delta, pass_scale });
+    }
+
+    /// The adapter stack, created empty (pass 0) on first install.
+    fn lora_stack(&mut self) -> &mut LoraStack {
+        self.lora.get_or_insert_with(|| LoraStack {
             adapters: Vec::new(),
             pass: Cell::new(0),
-        });
-        stack.adapters.push(LtxLora { a, b, pass_scale });
+        })
     }
 
     /// Select the active denoise pass for this linear's LoRA residuals (no-op without adapters).
@@ -267,6 +325,11 @@ impl Linear {
         if let Some(stack) = &self.lora {
             stack.pass.set(pass);
         }
+    }
+
+    /// The base weight's logical `[out, in]` — the shape a LoKr delta reshapes to (sc-2393).
+    pub(crate) fn base_shape(&self) -> Vec<i32> {
+        self.kind.base_shape()
     }
 }
 
@@ -1588,5 +1651,69 @@ mod tests {
         lin.set_lora_pass(1);
         let p1 = lin.forward(&x).unwrap();
         assert!(array_eq(&p0, &p1, false).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn lokr_scale_zero_is_noop_nonzero_matches_delta_and_per_pass() {
+        // sc-2393: a LoKr residual carries a precomputed `[out,in]` delta (alpha/rank baked in). The
+        // forward is `out + pass_scale · x·ΔWᵀ` — scale 0 a bit-exact no-op, scale s = `base + s·x·ΔWᵀ`,
+        // and the per-pass strength selects exactly like LoRA. `base [out=2,in=3]`, `ΔW [2,3]`.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let delta = Array::from_slice(&[0.05f32, -0.1, 0.2, 0.15, -0.25, 0.3], &[2, 3]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        // scale 0 → bit-exact no-op.
+        let mut lin0 = dense(w.clone());
+        lin0.push_lokr(delta.clone(), vec![0.0]);
+        assert!(array_eq(lin0.forward(&x).unwrap(), &base, false)
+            .unwrap()
+            .item::<bool>());
+
+        // scale 0.5 → `base + 0.5·x·ΔWᵀ` exactly, and differs from base.
+        let mut lin = dense(w.clone());
+        lin.push_lokr(delta.clone(), vec![0.5]);
+        let got = lin.forward(&x).unwrap();
+        assert!(!array_eq(&got, &base, false).unwrap().item::<bool>());
+        let resid = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.5)).unwrap();
+        let want = add(&base, &resid).unwrap();
+        assert!(all_close(&got, &want, 1e-6, 1e-6, false)
+            .unwrap()
+            .item::<bool>());
+
+        // Per-pass [0.0, 1.0]: pass 0 no-op, pass 1 applies.
+        let mut linp = dense(w);
+        linp.push_lokr(delta, vec![0.0, 1.0]);
+        linp.set_lora_pass(0);
+        assert!(array_eq(linp.forward(&x).unwrap(), &base, false)
+            .unwrap()
+            .item::<bool>());
+        linp.set_lora_pass(1);
+        assert!(!array_eq(linp.forward(&x).unwrap(), &base, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn lora_and_lokr_stack_on_one_linear() {
+        // Both adapter kinds sum onto a single base: `out + lora_resid + lokr_resid`.
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let delta = Array::from_slice(&[0.05f32, -0.1, 0.2, 0.15, -0.25, 0.3], &[2, 3]);
+        let base = dense(w.clone()).forward(&x).unwrap();
+
+        let mut lin = dense(w);
+        lin.push_lora(a.clone(), b.clone(), vec![0.5]);
+        lin.push_lokr(delta.clone(), vec![0.25]);
+        let got = lin.forward(&x).unwrap();
+
+        let lora_r = multiply(matmul(matmul(&x, &a).unwrap(), &b).unwrap(), scalar(0.5)).unwrap();
+        let lokr_r = multiply(matmul(&x, delta.t()).unwrap(), scalar(0.25)).unwrap();
+        let want = add(add(&base, &lora_r).unwrap(), &lokr_r).unwrap();
+        assert!(all_close(&got, &want, 1e-6, 1e-6, false)
+            .unwrap()
+            .item::<bool>());
     }
 }

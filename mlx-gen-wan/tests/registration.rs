@@ -201,9 +201,9 @@ fn wan_t2v_14b_is_registered() {
     assert!(d.capabilities.supports_negative_prompt);
     assert!(d.capabilities.supports_kv_cache);
     assert!(d.capabilities.conditioning.is_empty());
-    // LoRA-in-generate is wired (sc-2683, per-expert merge); LoKr is the sibling sc-2393.
+    // LoRA (sc-2683) + LoKr (sc-2393) in generate, per-expert merge.
     assert!(d.capabilities.supports_lora);
-    assert!(!d.capabilities.supports_lokr);
+    assert!(d.capabilities.supports_lokr);
     assert!(d.capabilities.samplers.contains(&"unipc"));
     // H/W align to patch×vae_stride = 16 for the z16 VAE (vs 32 for the 5B's z48).
     assert_eq!(d.capabilities.min_size, 16);
@@ -281,7 +281,7 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
     assert!(registry::load(MODEL_ID_T2V_14B, &spec).is_err());
-    // LoKr is the sibling sc-2393 → rejected at load.
+    // LoKr (sc-2393) is now ACCEPTED at load — merged per expert at generate (the file is read then).
     let lokr = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
         scale: 1.0,
@@ -293,7 +293,7 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
         MODEL_ID_T2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
     )
-    .is_err());
+    .is_ok());
     // A LoRA adapter (incl. an MoE-expert-tagged one) is ACCEPTED at load (sc-2683); the per-expert
     // merge is deferred to generate (which needs the real expert weights), so load itself succeeds.
     let lora = vec![AdapterSpec {
@@ -330,9 +330,9 @@ fn wan_i2v_14b_is_registered() {
         vec![mlx_gen::ConditioningKind::Reference]
     );
     assert_eq!(d.capabilities.max_count, 1);
-    // LoRA-in-generate is wired (sc-2683, per-expert merge); LoKr is the sibling sc-2393.
+    // LoRA (sc-2683) + LoKr (sc-2393) in generate, per-expert merge.
     assert!(d.capabilities.supports_lora);
-    assert!(!d.capabilities.supports_lokr);
+    assert!(d.capabilities.supports_lokr);
     assert_eq!(d.capabilities.min_size, 16);
 }
 
@@ -430,7 +430,7 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
     assert!(registry::load(MODEL_ID_I2V_14B, &spec).is_err());
-    // LoKr is the sibling sc-2393 → rejected at load.
+    // LoKr (sc-2393) is now ACCEPTED at load — merged per expert at generate (the file is read then).
     let lokr = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
         scale: 1.0,
@@ -442,7 +442,7 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         MODEL_ID_I2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
     )
-    .is_err());
+    .is_ok());
     // A LoRA adapter is ACCEPTED at load (sc-2683); the per-expert merge is deferred to generate.
     let lora = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
