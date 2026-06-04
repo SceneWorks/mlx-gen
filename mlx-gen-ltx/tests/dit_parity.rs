@@ -19,7 +19,7 @@ use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::transformer::{LtxDiT, Precision};
 
 const GOLDEN: &str = concat!(
@@ -27,7 +27,7 @@ const GOLDEN: &str = concat!(
     "/tests/fixtures/ltx_dit_golden.safetensors"
 );
 /// The reference's **native bf16+Q8** velocity golden (`LTX_BF16=1 dump_ltx_dit_golden.py`) — the
-/// production-precision target for [`Precision::Bf16Q8`].
+/// production-precision target for [`Precision::quant_bf16`].
 const GOLDEN_BF16: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/ltx_dit_golden_bf16.safetensors"
@@ -60,9 +60,17 @@ fn mean_rel(got: &Array, want: &Array) -> f32 {
     num.item::<f32>() / den.item::<f32>().max(1e-12)
 }
 
-fn build_prec(prec: Precision, golden: &str) -> (LtxDiT, Weights) {
+/// Build the DiT at the checkpoint's quant geometry (`split_model.json` — base_q8 ⇒ Q8). `bf16`
+/// selects the activation dtype: the f32 quality path (`false`) or the native bf16 path (`true`).
+fn build_prec(bf16: bool, golden: &str) -> (LtxDiT, Weights) {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
+    let prec = if bf16 {
+        Precision::quant_bf16(split.bits, split.group)
+    } else {
+        Precision::quant_f32(split.bits, split.group)
+    };
     let w =
         Weights::from_file(dir.join("transformer.safetensors")).expect("transformer.safetensors");
     let dit = LtxDiT::from_weights(&w, &cfg, prec).expect("build LtxDiT");
@@ -71,7 +79,7 @@ fn build_prec(prec: Precision, golden: &str) -> (LtxDiT, Weights) {
 }
 
 fn build() -> (LtxDiT, Weights) {
-    build_prec(Precision::F32Q8, GOLDEN)
+    build_prec(false, GOLDEN)
 }
 
 #[test]
@@ -103,7 +111,7 @@ fn dit_velocity_matches_reference() {
     );
 }
 
-/// The reference's **native bf16+Q8** per-forward — the production-speed path ([`Precision::Bf16Q8`]).
+/// The reference's **native bf16+Q8** per-forward — the production-speed path ([`Precision::quant_bf16`]).
 /// Bit-exact at matched mlx 0.31.2 (the distilled stage-1 sampler is chaos-sensitive, so the bf16
 /// per-forward must be as tight as the f32 one). The same sc-2842 timestep-table fix applies, plus
 /// the `timestep × 1000` scaling must run in the **input (bf16) dtype** — `denoise_av` feeds a bf16
@@ -111,7 +119,7 @@ fn dit_velocity_matches_reference() {
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
 fn dit_velocity_matches_reference_bf16() {
-    let (dit, g) = build_prec(Precision::Bf16Q8, GOLDEN_BF16);
+    let (dit, g) = build_prec(true, GOLDEN_BF16);
     let got = dit
         .forward(
             g.require("latent").unwrap(),

@@ -8,7 +8,7 @@
 //! latents, and the decoded uint8 frames.
 //!
 //! **The golden MUST be mlx 0.31.2** (the Rust build): `quantized_matmul` changed 0.31.0→0.31.2.
-//! Run in the **f32** regime (`Precision::F32Q8`, f32 latents) — gates the pipeline *math* (legacy
+//! Run in the **f32** regime (`Precision::quant_f32`, f32 latents) — gates the pipeline *math* (legacy
 //! Euler, re-noise, 2-stage orchestration, uint8 conversion) isolated from bf16 rounding, mirroring
 //! the S3b DiT gate. The bf16-production px>8 verdict is S6. Honors "divergence is not rounding":
 //! stage-1 + final latents + frames are gated separately to localize any gap.
@@ -19,7 +19,7 @@ use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig};
+use mlx_gen_ltx::config::{LtxConfig, LtxVaeConfig, SplitModel};
 use mlx_gen_ltx::pipeline::{
     decode_to_frames, denoise, generate_t2v_latents, renoise, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
@@ -76,8 +76,10 @@ fn px_gt8(got: &Array, want: &Array) -> f32 {
 fn pipeline_matches_reference() {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
     let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
-    let dit = LtxDiT::from_weights(&tw, &cfg, Precision::F32Q8).expect("build LtxDiT");
+    let dit = LtxDiT::from_weights(&tw, &cfg, Precision::quant_f32(split.bits, split.group))
+        .expect("build LtxDiT");
 
     let uw = Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler");
     let up = LatentUpsampler::from_weights(&uw).expect("build LatentUpsampler");
@@ -98,6 +100,7 @@ fn pipeline_matches_reference() {
         g.require("context").unwrap(),
         g.require("stage1_positions").unwrap(),
         &STAGE1_SIGMAS,
+        None,
         &mut |_| {},
     )
     .expect("stage1 denoise");

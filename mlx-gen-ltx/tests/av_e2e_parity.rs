@@ -14,7 +14,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::audio_vae::AudioDecoder;
-use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, VocoderConfig};
+use mlx_gen_ltx::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use mlx_gen_ltx::pipeline::{decode_audio_track, decode_to_frames, generate_av_latents};
 use mlx_gen_ltx::positions::{create_audio_position_grid, create_position_grid};
 use mlx_gen_ltx::transformer::{AvDiT, Precision};
@@ -68,8 +68,10 @@ fn px_gt8(got: &Array, want: &Array) -> f32 {
 fn av_e2e_matches_reference() {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("config");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
     let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
-    let dit = AvDiT::from_weights(&tw, &cfg, Precision::F32Q8).expect("dit");
+    let dit =
+        AvDiT::from_weights(&tw, &cfg, Precision::quant_f32(split.bits, split.group)).expect("dit");
     let upsampler = LatentUpsampler::from_weights(
         &Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler"),
     )
@@ -112,6 +114,7 @@ fn av_e2e_matches_reference() {
         g.require("audio_ctx").unwrap(),
         mean,
         std,
+        None, // T2V+A (no I2V conditioning in this gate)
         &mut |_| steps += 1,
     )
     .expect("generate_av_latents");

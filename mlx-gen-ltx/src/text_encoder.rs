@@ -23,7 +23,7 @@ use mlx_gen::{Error, Result};
 
 use crate::config::LtxConfig;
 use crate::connector::Connector;
-use crate::gemma::{GemmaConfig, GemmaModel};
+use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
 const RMS_EPS: f32 = 1e-6;
 
@@ -61,15 +61,19 @@ pub struct LtxTextEncoder {
 
 impl LtxTextEncoder {
     /// Build the **video-only** encoder from the Gemma weights + the LTX `connector.safetensors`.
-    /// `dtype` = the compute dtype (bf16 to match the reference).
+    /// `dtype` = the compute dtype (bf16 to match the reference). `gemma_quant` selectively quantizes
+    /// the Gemma backbone (from its snapshot `config.json`; `None` ⇒ dense bf16 — the default
+    /// `…-bf16` snapshot); the connector + feature-extractor Linear always run dense bf16 (they ship
+    /// dense in `connector.safetensors`).
     pub fn from_weights(
         gemma_w: &Weights,
         connector_w: &Weights,
         gemma_cfg: GemmaConfig,
+        gemma_quant: Option<GemmaQuant>,
         ltx_cfg: &LtxConfig,
         dtype: Dtype,
     ) -> Result<Self> {
-        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg)?;
+        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
         let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
         Ok(Self {
             gemma,
@@ -85,10 +89,11 @@ impl LtxTextEncoder {
         gemma_w: &Weights,
         connector_w: &Weights,
         gemma_cfg: GemmaConfig,
+        gemma_quant: Option<GemmaQuant>,
         ltx_cfg: &LtxConfig,
         dtype: Dtype,
     ) -> Result<Self> {
-        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg)?;
+        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
         let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
         let audio = Self::audio_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
         Ok(Self {

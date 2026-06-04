@@ -656,6 +656,58 @@ impl VocoderConfig {
     }
 }
 
+/// The `split_model.json` manifest's quantization fields. The reference `generate_av.py` drives
+/// **selective transformer quant** from these (and `convert.py` writes them): `quantized` gates it,
+/// `quantization_bits` (reference default **4**) and `quantization_group_size` (default **64**) set
+/// the packing geometry. The shipped `ltx_2_3_base_q4` / `eros` checkpoints are bits 4, `base_q8` is
+/// bits 8 — so the geometry is **read from the manifest, never hardcoded** (sc-2686). The per-Linear
+/// `_should_quantize` predicate (a layer is quantized iff its weights carry `.scales`) is applied at
+/// load in [`crate::transformer`], matching `generate_av.py`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitModel {
+    /// `quantized` — whether the transformer carries selectively-quantized Linears.
+    pub quantized: bool,
+    /// `quantization_bits` (default 4): 4 → Q4, 8 → Q8.
+    pub bits: i32,
+    /// `quantization_group_size` (default 64): the affine-quant group width.
+    pub group: i32,
+}
+
+impl SplitModel {
+    /// A non-quantized manifest (the file is absent or `quantized:false`). Bits/group hold the
+    /// reference defaults so a downstream quant geometry is always well-defined.
+    pub fn dense() -> Self {
+        SplitModel {
+            quantized: false,
+            bits: 4,
+            group: 64,
+        }
+    }
+
+    /// Parse a model directory's `split_model.json`. An absent file → [`dense`](Self::dense) (no
+    /// quant), mirroring `generate_av.py` (which only quantizes when the manifest exists and sets
+    /// `quantized:true`).
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let path = root.join("split_model.json");
+        if !path.exists() {
+            return Ok(Self::dense());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let v: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Msg(format!("ltx: parse split_model.json: {e}")))?;
+        Ok(Self::from_value(&v))
+    }
+
+    /// Parse the manifest fields from a parsed `split_model.json` value.
+    pub fn from_value(v: &Value) -> Self {
+        SplitModel {
+            quantized: get_bool(v, "quantized", false),
+            bits: get_i32(v, "quantization_bits", 4),
+            group: get_i32(v, "quantization_group_size", 64),
+        }
+    }
+}
+
 /// Parse a `[["res_x", {"num_layers": 4}], ["compress_space_res", {"multiplier": 2}], …]` list.
 fn parse_vae_blocks(v: Option<&Value>) -> Option<Vec<VaeBlock>> {
     let arr = v?.as_array()?;
@@ -806,5 +858,30 @@ mod tests {
         assert!(!cfg.apply_gated_attention);
         assert_eq!(cfg.caption_channels, 3840);
         assert!(cfg.caption_projection_first_linear);
+    }
+
+    #[test]
+    fn split_model_reads_quant_geometry() {
+        // The actual `ltx_2_3_base_q4` manifest → Q4, group 64.
+        let q4 = serde_json::json!({
+            "format": "split", "model_version": "2.3.0", "variant": "distilled",
+            "quantized": true, "quantization_bits": 4, "quantization_group_size": 64
+        });
+        let m = SplitModel::from_value(&q4);
+        assert!(m.quantized);
+        assert_eq!(m.bits, 4);
+        assert_eq!(m.group, 64);
+        // `base_q8` → Q8.
+        let q8 = serde_json::json!({"quantized": true, "quantization_bits": 8, "quantization_group_size": 64});
+        assert_eq!(SplitModel::from_value(&q8).bits, 8);
+        // Missing keys → reference defaults (bits 4, group 64); `quantized:false` → dense.
+        let dense = serde_json::json!({"quantized": false});
+        let m = SplitModel::from_value(&dense);
+        assert!(!m.quantized);
+        assert_eq!((m.bits, m.group), (4, 64));
+        assert_eq!(
+            SplitModel::dense(),
+            SplitModel::from_value(&serde_json::json!({}))
+        );
     }
 }

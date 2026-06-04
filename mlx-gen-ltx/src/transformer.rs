@@ -13,12 +13,16 @@
 //! (`LayerNorm` affine-false + final 2-row `scale_shift_table` modulated by the embedded timestep) →
 //! `proj_out → 128` velocity. `denoised = latent − σ·velocity`.
 //!
-//! **Quant.** The shipped `base_q8` transformer stores the attn/ff Linears Q8-quantized (U32 +
-//! `scales` + `biases`, group 64) — there is no dense bf16 checkpoint. [`Precision::F32Q8`] is the
-//! production path: **f32 activations × Q8 `quantized_matmul`** (the port's quality target; a single
-//! block is bit-exact to the reference at matched mlx 0.31.2). [`Precision::F32`] additionally
-//! dequantizes the Q8 weights to dense f32 — the S3a block math gate. [`Precision::Bf16Q8`] mirrors
-//! the reference's own bf16 compute, retained for diagnostics.
+//! **Quant.** The shipped transformer stores the attn/ff Linears selectively quantized (U32 +
+//! `scales` + `biases`) — there is no dense bf16 checkpoint. The **bits/group ride on the checkpoint's
+//! `split_model.json`** ([`crate::config::SplitModel`]): `base_q8`/`eros`-style at 8 bits, `base_q4`
+//! at 4 bits, group 64 — read into [`Precision`], never hardcoded (sc-2686). The per-Linear predicate
+//! (quantize iff the weights carry `.scales`) mirrors `generate_av.py`'s `_should_quantize`.
+//!
+//! [`Precision::quant_f32`] is the production quality target: **f32 activations × `quantized_matmul`**
+//! (a single block is bit-exact to the reference at matched mlx 0.31.2). [`Precision::quant_bf16`]
+//! mirrors the reference's own bf16 compute (the production-speed path). [`Precision::dense_f32`]
+//! additionally dequantizes the weights to dense f32 — the S3a block-math gate.
 
 use mlx_rs::fast::{layer_norm, rms_norm as fast_rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{
@@ -33,39 +37,72 @@ use mlx_gen::Result;
 use crate::config::LtxConfig;
 use crate::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
 
-/// Q8 quant config of the shipped transformer (`split_model.json`: bits 8, group 64).
-const QUANT_BITS: i32 = 8;
-const QUANT_GROUP: i32 = 64;
 /// adaLN-single sinusoidal timestep projection width (PixArt `Timesteps`).
 const TIME_PROJ_DIM: i32 = 256;
 
-/// Compute precision for the DiT.
+/// How to run the (selectively quantized) DiT: the activation/compute dtype, whether quantized
+/// weights stay packed (`quantized_matmul`) or are dequantized to dense, and the **checkpoint's**
+/// quant geometry (`bits`/`group` from `split_model.json` — so Q4 and Q8 both load without a code
+/// change; sc-2686). Construct via [`quant_f32`](Self::quant_f32) / [`quant_bf16`](Self::quant_bf16)
+/// / [`dense_f32`](Self::dense_f32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Precision {
-    /// f32 activations, Q8 weights **dequantized** to dense f32 — the S3a block math gate (small).
-    F32,
-    /// **f32 activations × Q8 `quantized_matmul`** (dense weights f32) — the production path and the
-    /// port's quality target. The **full 48-layer velocity is bit-exact** to the reference (mlx
-    /// 0.31.2) — required because the distilled stage-1 sampler is chaos-sensitive (any per-forward
-    /// seed amplifies to a large latent divergence; sc-2842). The bf16 alternative drifts ~3e-2 over
-    /// the 48-layer residual stream, amplified by the output LayerNorm.
-    F32Q8,
-    /// bf16 activations × Q8 `quantized_matmul` (dense bf16 elsewhere) — matches the reference's own
-    /// compute dtype; retained for reference/diagnostics.
-    Bf16Q8,
+pub struct Precision {
+    mode: Mode,
+    bits: i32,
+    group: i32,
+}
+
+/// The compute mode (independent of the quant bit-width, which rides alongside in [`Precision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// f32 activations, quantized weights **dequantized** to dense f32 — the S3a block-math gate.
+    DenseF32,
+    /// **f32 activations × `quantized_matmul`** — the production path / quality target. The full
+    /// 48-layer velocity is bit-exact to the reference (mlx 0.31.2), required because the distilled
+    /// stage-1 sampler is chaos-sensitive (sc-2842).
+    QuantF32,
+    /// bf16 activations × `quantized_matmul` — the reference's own compute dtype (production speed).
+    QuantBf16,
 }
 
 impl Precision {
-    fn dtype(self) -> Dtype {
-        match self {
-            Precision::F32 | Precision::F32Q8 => Dtype::Float32,
-            Precision::Bf16Q8 => Dtype::Bfloat16,
+    /// f32 activations, quantized weights dequantized to dense f32 (the block-math gate).
+    pub fn dense_f32(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::DenseF32,
+            bits,
+            group,
         }
     }
 
-    /// Whether Q8 weights are kept quantized (`quantized_matmul`) vs dequantized to dense f32.
+    /// f32 activations × `quantized_matmul` (the production quality target).
+    pub fn quant_f32(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::QuantF32,
+            bits,
+            group,
+        }
+    }
+
+    /// bf16 activations × `quantized_matmul` (the reference's native production-speed path).
+    pub fn quant_bf16(bits: i32, group: i32) -> Self {
+        Self {
+            mode: Mode::QuantBf16,
+            bits,
+            group,
+        }
+    }
+
+    fn dtype(self) -> Dtype {
+        match self.mode {
+            Mode::DenseF32 | Mode::QuantF32 => Dtype::Float32,
+            Mode::QuantBf16 => Dtype::Bfloat16,
+        }
+    }
+
+    /// Whether quantized weights are kept packed (`quantized_matmul`) vs dequantized to dense f32.
     fn keep_quant(self) -> bool {
-        matches!(self, Precision::F32Q8 | Precision::Bf16Q8)
+        matches!(self.mode, Mode::QuantF32 | Mode::QuantBf16)
     }
 }
 
@@ -112,22 +149,24 @@ impl Linear {
                 let q = w.require(&format!("{prefix}.weight"))?;
                 let biases = w.require(&format!("{prefix}.biases"))?;
                 if prec.keep_quant() {
-                    // Keep Q8; `quantized_matmul` dequantizes on the fly with fp32 accumulation and
-                    // is correct for f32 *or* bf16 activations (the Z-Image/Qwen Q8 path). Scales /
-                    // biases are cast to the compute dtype so the on-the-fly dequant matches the
-                    // reference's (f32 for F32Q8 — a lossless upcast of the bf16 file scales).
+                    // Keep the weights packed; `quantized_matmul` dequantizes on the fly with fp32
+                    // accumulation and is correct for f32 *or* bf16 activations (the Z-Image/Qwen Q8
+                    // path) at either bit-width. Scales / biases are cast to the compute dtype so the
+                    // on-the-fly dequant matches the reference's (f32 for the quant_f32 path — a
+                    // lossless upcast of the bf16 file scales). bits/group come from the checkpoint's
+                    // split_model.json via `prec`, so Q4 and Q8 both load unchanged.
                     Ok(Linear::Quant {
                         q: q.clone(),
                         scales: to_dtype(scales, dt)?,
                         biases: to_dtype(biases, dt)?,
                         b,
-                        group: QUANT_GROUP,
-                        bits: QUANT_BITS,
+                        group: prec.group,
+                        bits: prec.bits,
                     })
                 } else {
                     // Dequantize to dense f32 (bit-identical to the reference's mx.dequantize).
                     let dense =
-                        dequantize(q, scales, Some(biases), Some(QUANT_GROUP), Some(QUANT_BITS))?;
+                        dequantize(q, scales, Some(biases), Some(prec.group), Some(prec.bits))?;
                     Ok(Linear::Dense {
                         w: to_dtype(&dense, Dtype::Float32)?,
                         b,

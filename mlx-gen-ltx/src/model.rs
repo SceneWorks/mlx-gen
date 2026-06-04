@@ -19,27 +19,44 @@
 //! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
 //! cache (`mlx-community/gemma-3-12b-it-bf16`).
 //!
+//! **Quantization (sc-2686).** The transformer ships **selectively quantized** (attn/ff Linears
+//! packed U32 + `scales`); the **bits/group ride on the checkpoint's `split_model.json`** — `eros`
+//! and `ltx_2_3_base_q4` are **Q4**, `ltx_2_3_base_q8` is **Q8**, group 64 — read into the DiT
+//! [`Precision`], never hardcoded. `LoadSpec::quantize`, when set, only *asserts* the expected level
+//! (LTX can't re-quantize a dense checkpoint — there is no dense LTX transformer; it ships pre-packed),
+//! so a mismatch with the manifest is a load error. Connector / VAE / upsampler are dense bf16 (the
+//! reference quantizes the transformer only); the Gemma text encoder is dense bf16 by default
+//! (reference TE quant rides on the *Gemma* snapshot's `config.json`).
+//!
 //! **Precision.** Selected by `LoadSpec::precision`: `Bf16` (the default) → the reference's **native**
-//! bf16 activations × Q8 ([`Precision::Bf16Q8`]) — the production-speed path; `Fp32` →
-//! [`Precision::F32Q8`] (f32 activations × Q8) — the quality target. Both are bit-exact to their
-//! reference golden (sc-2842). The latent statistics follow the path dtype (so the upsampler + denoise
-//! run in that precision); the VAE decode stays f32 (a post-sampling quality island, pixel-parity
-//! either way), and the Gemma backbone runs bf16 as the reference does. Distilled 2-stage → **no CFG**
-//! (guidance baked in). Q4/Q8-of-everything, I2V, LoRA/LoKr, and the audio half are sibling slices.
+//! bf16 activations × quantized weights ([`Precision::quant_bf16`]) — the production-speed path;
+//! `Fp32` → [`Precision::quant_f32`] (f32 activations × quantized weights) — the quality target. Both
+//! are bit-exact to their reference golden (sc-2842). The latent statistics follow the path dtype (so
+//! the upsampler + denoise run in that precision); the VAE decode stays f32 (a post-sampling quality
+//! island, pixel-parity either way), and the Gemma backbone runs bf16 as the reference does. Distilled
+//! 2-stage → **no CFG** (guidance baked in).
+//!
+//! **I2V (sc-2685):** a single conditioning [`Conditioning::Reference`] image is VAE-encoded at both
+//! stage resolutions and injected into the **video** stream as a clean latent at frame 0 (per-frame
+//! denoise mask, `image_strength` → `1 − strength`), threaded through the joint A/V denoise via
+//! `generate_av_latents`' `video_cond` — the audio stays pure-noise, matching `generate_av.py`'s
+//! I2V+Audio. The VAE **encoder** is loaded for this. LoRA/LoKr are sibling slices.
 
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
-    default_seed, Capabilities, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Precision as LoadPrecision, Progress, Result,
-    WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
-use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, VocoderConfig};
-use crate::gemma::GemmaConfig;
-use crate::pipeline::{decode_audio_track, decode_to_frames, generate_av_latents};
+use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
+use crate::gemma::{GemmaConfig, GemmaQuant};
+use crate::pipeline::{
+    decode_audio_track, decode_to_frames, generate_av_latents, preprocess_conditioning_image,
+};
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
 use crate::tokenizer::LtxTokenizer;
@@ -62,6 +79,13 @@ const AUDIO_MEL_BINS: i32 = 16;
 const TEMPORAL_SCALE: u32 = 8;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
+/// I2V conditioning strength when neither the `Reference` nor `req.strength` supplies one (reference
+/// CLI `--image-strength` default): `1.0` = full denoise, fully pinning the conditioned frame.
+const DEFAULT_IMAGE_STRENGTH: f32 = 1.0;
+/// I2V conditioned frame index (reference CLI `--image-frame-idx` default). Single-image I2V pins the
+/// **first** latent frame; multi-keyframe / first-last-frame at other indices is parity-plus (the
+/// [`crate::conditioning`] primitive supports any index, but the reference CLI only wires one).
+const IMAGE_FRAME_IDX: i32 = 0;
 
 /// Stable identity + advertised capabilities for the LTX-2.3 AudioVideo model (produces video frames
 /// + a synchronized audio track).
@@ -72,11 +96,12 @@ pub fn descriptor() -> ModelDescriptor {
         modality: Modality::Video,
         capabilities: Capabilities {
             // Distilled 2-stage path: CFG is forced to 1.0, so no guidance / negative prompt.
-            // (I2V, LoRA, LoKr, and Q4/Q8-of-everything are sibling slices.)
+            // I2V single-image conditioning (sc-2685) is wired via `Reference`; audio is always
+            // produced (sc-2684). LoRA, LoKr, and Q4/Q8-of-everything are sibling slices.
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             samplers: Vec::new(),
@@ -134,6 +159,40 @@ fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
     newest.ok_or_else(|| Error::Msg("ltx_2_3: no gemma snapshot in the HF cache".into()))
 }
 
+/// Read the Gemma snapshot's `config.json` top-level `quantization` block — the reference TE-quant
+/// trigger (`utils.apply_quantization`). `None` for the default `…-bf16` snapshot (no block). Only the
+/// `affine` mode is consumed (the one `quantized_matmul`/`dequantize` implement); a non-affine mode is
+/// a hard error rather than a silent mis-decode.
+fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<GemmaQuant>> {
+    let path = gemma_dir.join("config.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| Error::Msg(format!("ltx_2_3: parse gemma config.json: {e}")))?;
+    let Some(q) = v.get("quantization") else {
+        return Ok(None);
+    };
+    if let Some(mode) = q.get("mode").and_then(|m| m.as_str()) {
+        if mode != "affine" {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: gemma quantization mode {mode:?} is not supported (only affine)"
+            )));
+        }
+    }
+    match (
+        q.get("group_size").and_then(|x| x.as_i64()),
+        q.get("bits").and_then(|x| x.as_i64()),
+    ) {
+        (Some(g), Some(b)) => Ok(Some(GemmaQuant {
+            group: g as i32,
+            bits: b as i32,
+        })),
+        _ => Ok(None),
+    }
+}
+
 /// Load the model from a split-weight snapshot directory (the `ltx_2_3_base*` tree). Reads
 /// `embedded_config.json`, locates the Gemma TE separately, and assembles every component.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -145,23 +204,48 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                     .into(),
             )),
         };
-    // Precision selection. `Bf16` (the [`LoadSpec`] default) → the reference's **native** bf16
-    // activations × Q8 — the production-speed path; `Fp32` → f32 activations × Q8 — the quality
-    // target. Both are bit-exact to their reference golden (sc-2842; the distilled stage-1 sampler is
-    // chaos-sensitive, so each per-forward is bit-exact). The latent statistics (the upsampler's
-    // un-/re-normalize) follow the path dtype so the whole denoise stays in that precision; the VAE
-    // decode stays f32 in both — a post-sampling quality island (pixel-parity either way).
-    let (dit_prec, stat_dt) = match spec.precision {
-        LoadPrecision::Bf16 => (Precision::Bf16Q8, Dtype::Bfloat16),
-        LoadPrecision::Fp32 => (Precision::F32Q8, Dtype::Float32),
-    };
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "ltx_2_3: Q4/Q8-of-everything is a sibling slice (sc-2686); the transformer is already \
-             shipped Q8"
-                .into(),
-        ));
+    // Quantization geometry rides on the checkpoint's `split_model.json` (sc-2686): the transformer is
+    // shipped selectively quantized (Q4 for `eros`/`base_q4`, Q8 for `base_q8`), bits/group from the
+    // manifest — never hardcoded. The per-Linear `.scales` predicate (in `transformer.rs`) then picks
+    // which Linears are quantized, matching `generate_av.py`'s `_should_quantize`.
+    let split = SplitModel::from_model_dir(root)?;
+    // `spec.quantize`, when set, only *asserts* the expected level. LTX can't re-quantize a dense
+    // checkpoint (there is no dense LTX transformer — it ships pre-packed from the reference
+    // `convert.py`, which casts f32→bf16 before quantizing), so a mismatch is a hard load error
+    // rather than a silent re-quant.
+    if let Some(q) = spec.quantize {
+        if !split.quantized {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: spec.quantize={q:?} but {} carries no split_model.json quant manifest — \
+                 LTX quant is checkpoint-driven; point at a quantized checkpoint (e.g. ltx_2_3_base_q4)",
+                root.display()
+            )));
+        }
+        if q.bits() != split.bits {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: spec.quantize={q:?} (bits {}) disagrees with the checkpoint's \
+                 split_model.json (bits {})",
+                q.bits(),
+                split.bits
+            )));
+        }
     }
+    // Precision selection. `Bf16` (the [`LoadSpec`] default) → the reference's **native** bf16
+    // activations × quantized weights — the production-speed path; `Fp32` → f32 activations ×
+    // quantized weights — the quality target. Both are bit-exact to their reference golden (sc-2842;
+    // the distilled stage-1 sampler is chaos-sensitive, so each per-forward is bit-exact). The latent
+    // statistics (the upsampler's un-/re-normalize) follow the path dtype so the whole denoise stays
+    // in that precision; the VAE decode stays f32 in both — a post-sampling quality island.
+    let (dit_prec, stat_dt) = match spec.precision {
+        LoadPrecision::Bf16 => (
+            Precision::quant_bf16(split.bits, split.group),
+            Dtype::Bfloat16,
+        ),
+        LoadPrecision::Fp32 => (
+            Precision::quant_f32(split.bits, split.group),
+            Dtype::Float32,
+        ),
+    };
     if !spec.adapters.is_empty() {
         return Err(Error::Msg(
             "ltx_2_3: LoRA/LoKr adapters are sibling slices (sc-2687 / sc-2393), not yet wired"
@@ -176,26 +260,36 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let gemma_dir = resolve_gemma_dir()?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
+    // Selectively quantize the Gemma backbone iff the snapshot's `config.json` says so (the reference
+    // `apply_quantization` path; sc-2686). The default `…-bf16` snapshot ⇒ `None` ⇒ dense bf16 TE.
+    let gemma_quant = resolve_gemma_quant(&gemma_dir)?;
     let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
     let transformer_w = Weights::from_file(root.join("transformer.safetensors"))?;
     let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
     let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
     let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
+    // The VAE **encoder** is loaded so the model can serve I2V (sc-2685): it VAE-encodes the
+    // conditioning image at both stage resolutions (pure-T2V+A requests never touch it). The reference
+    // `generate_av.py` supports I2V+Audio — the video is image-conditioned, the audio stays pure-noise.
+    let vae_enc_w = Weights::from_file(root.join("vae_encoder.safetensors"))?;
 
-    // The text encoder runs **bf16** end-to-end (the reference TE dtype; S1-validated), producing both
+    // The AudioVideo text encoder runs **bf16** activations (the reference TE dtype; S1-validated) —
+    // dense for the default `…-bf16` Gemma or selectively quantized per the snapshot — producing both
     // the video (4096) and audio (2048) embeddings. Its bf16 embeddings enter the DiT, which upcasts
     // the cross-attn context as the reference transformer does.
     let text_encoder = LtxTextEncoder::from_weights_av(
         &gemma_w,
         &connector_w,
         GemmaConfig::gemma_3_12b(),
+        gemma_quant,
         &config,
         Dtype::Bfloat16,
     )?;
     let transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
-    let vae = LtxVideoVae::from_weights(&vae_w, None, &vae_config)?;
+    // The VAE carries its encoder (Some) so the model can serve I2V conditioning.
+    let vae = LtxVideoVae::from_weights(&vae_w, Some(&vae_enc_w), &vae_config)?;
     // The audio VAE decoder + vocoder run f32 (post-sampling quality islands, gated bit-exact).
     let audio_decoder = AudioDecoder::from_weights(&audio_vae_w, &audio_vae_config)?;
     let vocoder = LtxVocoder::from_weights(&vocoder_w, &vocoder_config)?;
@@ -254,7 +348,9 @@ impl Ltx {
 
     /// The full A/V path with **injected** stage noise (the deterministic seam `generate` calls with
     /// RNG-drawn noise and the e2e parity test calls with the reference samples). Encodes the prompt
-    /// to both video + audio embeddings, then defers to
+    /// to both video + audio embeddings, resolves an optional I2V conditioning image (VAE-encoded at
+    /// both stage resolutions — the video is image-conditioned, the audio stays pure-noise, matching
+    /// `generate_av.py`'s I2V+Audio), then defers to
     /// [`generate_av_from_embeddings`](Self::generate_av_from_embeddings).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_with_noise(
@@ -268,6 +364,18 @@ impl Ltx {
     ) -> Result<GenerationOutput> {
         let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
+        // I2V: VAE-encode the conditioning image at each stage's pixel resolution (half-res + full-res).
+        let cond = match self.resolve_reference(req)? {
+            Some((image, strength)) => Some((
+                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
+                self.encode_conditioning(image, req.height, req.width)?,
+                strength,
+            )),
+            None => None,
+        };
+        let video_cond = cond
+            .as_ref()
+            .map(|(img1, img2, strength)| (img1, img2, IMAGE_FRAME_IDX, *strength));
         self.generate_av_from_embeddings(
             req,
             &video_ctx,
@@ -276,6 +384,7 @@ impl Ltx {
             video_s2,
             audio_s1,
             audio_s2,
+            video_cond,
             on_progress,
         )
     }
@@ -294,6 +403,7 @@ impl Ltx {
         video_s2: &Array,
         audio_s1: &Array,
         audio_s2: &Array,
+        video_cond: Option<(&Array, &Array, i32, f32)>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
@@ -316,6 +426,7 @@ impl Ltx {
             audio_ctx,
             &self.latent_mean,
             &self.latent_std,
+            video_cond,
             &mut |_| {
                 step += 1;
                 on_progress(Progress::Step {
@@ -345,11 +456,47 @@ impl Ltx {
             audio,
         })
     }
+
+    /// Extract the single I2V conditioning image + its strength from the request. The per-reference
+    /// strength wins over `req.strength`, falling back to [`DEFAULT_IMAGE_STRENGTH`]. LTX I2V
+    /// conditions on exactly one image (multi-keyframe / first-last-frame is parity-plus), so more
+    /// than one `Reference` is an error.
+    fn resolve_reference<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Result<Option<(&'a Image, f32)>> {
+        let mut reference = None;
+        for c in &req.conditioning {
+            if let Conditioning::Reference { image, strength } = c {
+                if reference.is_some() {
+                    return Err(Error::Msg(
+                        "ltx_2_3: multiple reference images are not supported (single-image I2V \
+                         only; multi-keyframe / first-last-frame is parity-plus, sc-2685)"
+                            .into(),
+                    ));
+                }
+                reference = Some((
+                    image,
+                    strength.or(req.strength).unwrap_or(DEFAULT_IMAGE_STRENGTH),
+                ));
+            }
+        }
+        Ok(reference)
+    }
+
+    /// VAE-encode the conditioning image at a stage's pixel resolution `(px_h, px_w)` → the f32 clean
+    /// latent `(1, 128, 1, px_h/32, px_w/32)`. The encoder is an f32 quality island (like the VAE
+    /// decode); the caller casts the latent to the path dtype.
+    fn encode_conditioning(&self, image: &Image, px_h: u32, px_w: u32) -> Result<Array> {
+        let video = preprocess_conditioning_image(image, px_w, px_h)?; // f32 (1,3,1,px_h,px_w)
+        self.vae.encode(&video)
+    }
 }
 
 /// Capability-driven request validation (weight-free, so it's unit-testable without a load):
-/// non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32), `num_frames = 1 + 8·k`.
-pub(crate) fn validate_request(req: &GenerationRequest) -> Result<()> {
+/// non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32), `num_frames = 1 + 8·k`, and
+/// only advertised conditioning kinds (I2V `Reference`; everything else is rejected).
+pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     if req.prompt.is_empty() {
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
     }
@@ -363,6 +510,21 @@ pub(crate) fn validate_request(req: &GenerationRequest) -> Result<()> {
         if frames % 8 != 1 {
             return Err(Error::Msg(format!(
                 "ltx_2_3: num_frames must be 1 + 8·k (got {frames})"
+            )));
+        }
+    }
+    for c in &req.conditioning {
+        let kind = match c {
+            Conditioning::Reference { .. } => ConditioningKind::Reference,
+            Conditioning::MultiReference { .. } => ConditioningKind::MultiReference,
+            Conditioning::ReduxRefs { .. } => ConditioningKind::ReduxRefs,
+            Conditioning::Control { .. } => ConditioningKind::Control,
+            Conditioning::Depth { .. } => ConditioningKind::Depth,
+            Conditioning::Mask { .. } => ConditioningKind::Mask,
+        };
+        if !caps.accepts(kind) {
+            return Err(Error::Msg(format!(
+                "ltx_2_3 does not accept {kind:?} conditioning (single-image I2V via Reference only)"
             )));
         }
     }
@@ -390,7 +552,7 @@ impl Generator for Ltx {
     }
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        validate_request(req)
+        validate_request(&self.descriptor.capabilities, req)
     }
 
     fn generate(
@@ -404,7 +566,8 @@ impl Generator for Ltx {
         let seed = req.seed.unwrap_or_else(default_seed);
         // Seeded noise at the path dtype (the reference seeds `normal(...).astype(model_dtype)`). RNG
         // is not portable to mlx-python, so the pixel/waveform parity gate injects the reference
-        // samples via `generate_with_noise`. Distinct keys per stage/modality.
+        // samples via `generate_with_noise`. Distinct keys per stage/modality. I2V conditioning (when
+        // a `Reference` is supplied) + the audio decode are handled inside `generate_with_noise`.
         let normal = |key: u64, shape: &[i32]| -> Result<Array> {
             let k = random::key(key)?;
             Ok(random::normal::<f32>(shape, None, None, Some(&k))?.as_dtype(self.stat_dt)?)
@@ -456,6 +619,7 @@ mod tests {
 
     #[test]
     fn validate_request_enforces_constraints() {
+        let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a".into(),
             width: 512,
@@ -463,22 +627,86 @@ mod tests {
             frames: Some(33),
             ..Default::default()
         };
-        assert!(validate_request(&base).is_ok());
-        assert!(validate_request(&GenerationRequest {
-            prompt: String::new(),
-            ..base.clone()
-        })
+        assert!(validate_request(&caps, &base).is_ok());
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                prompt: String::new(),
+                ..base.clone()
+            }
+        )
         .is_err());
-        assert!(validate_request(&GenerationRequest {
-            width: 500,
-            ..base.clone()
-        })
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                width: 500,
+                ..base.clone()
+            }
+        )
         .is_err());
-        assert!(validate_request(&GenerationRequest {
-            frames: Some(32),
-            ..base.clone()
-        })
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                frames: Some(32),
+                ..base.clone()
+            }
+        )
         .is_err());
+    }
+
+    #[test]
+    fn validate_request_conditioning() {
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a".into(),
+            width: 512,
+            height: 512,
+            frames: Some(9),
+            ..Default::default()
+        };
+        let img = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        };
+        // A single I2V `Reference` is accepted.
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                conditioning: vec![Conditioning::Reference {
+                    image: img.clone(),
+                    strength: Some(0.8),
+                }],
+                ..base.clone()
+            }
+        )
+        .is_ok());
+        // Unsupported conditioning (e.g. Depth) is rejected.
+        assert!(validate_request(
+            &caps,
+            &GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img.clone() }],
+                ..base.clone()
+            }
+        )
+        .is_err());
+        // More than one `Reference` is rejected at resolve time (single-image I2V only).
+        let two = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img.clone(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img,
+                    strength: None,
+                },
+            ],
+            ..base
+        };
+        // resolve_reference needs an `Ltx`; assert the capability check passes but resolve errors is
+        // covered by the integration path — here just confirm the kinds are individually accepted.
+        assert!(validate_request(&caps, &two).is_ok());
     }
 
     #[test]

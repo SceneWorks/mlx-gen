@@ -13,7 +13,7 @@ use mlx_rs::ops::{abs, max as max_op, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::transformer::{Precision, VideoBlock};
 
 const GOLDEN: &str = concat!(
@@ -41,10 +41,17 @@ fn peak_rel(got: &Array, want: &Array) -> f32 {
 fn block_matches_reference() {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
     let w =
         Weights::from_file(dir.join("transformer.safetensors")).expect("transformer.safetensors");
-    let block =
-        VideoBlock::load(&w, "transformer_blocks.0", &cfg, Precision::F32).expect("build block");
+    // The block-math gate: dequantize the checkpoint's Q8 weights to dense f32.
+    let block = VideoBlock::load(
+        &w,
+        "transformer_blocks.0",
+        &cfg,
+        Precision::dense_f32(split.bits, split.group),
+    )
+    .expect("build block");
 
     let g = Weights::from_file(GOLDEN).expect("golden (run tools/dump_ltx_block_golden.py)");
     let x = g.require("x").unwrap();

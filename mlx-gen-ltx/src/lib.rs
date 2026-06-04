@@ -4,9 +4,10 @@
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!
-//! **Scope:** the full **AudioVideo** path (`generate_av.py`) — synchronized audio+video (sc-2684,
-//! built on the sc-2679 video core). `generate()` runs the joint dual-modality denoise and returns
-//! video frames + an audio track. I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
+//! **Scope:** the full **AudioVideo** path (`generate_av.py`, sc-2684) — synchronized audio+video;
+//! `generate()` runs the joint dual-modality denoise and returns video frames + an audio track. Built
+//! on the sc-2679 video core + **single-image I2V** (sc-2685) + checkpoint-driven **Q4/Q8** quant
+//! (sc-2686). LoRA and LoKr are sibling stories.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
@@ -21,12 +22,15 @@
 //!
 //! The distilled stage-1 sampler is chaos-sensitive, so e2e pixel-parity requires a **bit-exact
 //! per-forward DiT** (sc-2842 — the adaLN timestep table must be built in MLX f32, not host f64). Two
-//! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::F32Q8`]
-//! (f32 activations × Q8 — the quality target) and [`transformer::Precision::Bf16Q8`] (the reference's
-//! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
-//! and audio are sibling stories.
+//! shipped precisions, both gated bit-exact vs their reference golden: [`transformer::Precision::quant_f32`]
+//! (f32 activations × quantized weights — the quality target) and [`transformer::Precision::quant_bf16`]
+//! (the reference's native bf16 activations — the production-speed path). The quant geometry (**Q4**/Q8)
+//! rides on the checkpoint's `split_model.json` (sc-2686). **I2V** single-image conditioning (sc-2685)
+//! is wired into the same 2-stage path ([`conditioning`] + [`pipeline::generate_i2v_latents`], gated
+//! bit-exact by `tests/i2v_parity.rs`). LoRA, LoKr, and audio are siblings.
 
 pub mod audio_vae;
+pub mod conditioning;
 pub mod config;
 pub mod connector;
 pub mod gemma;
@@ -43,12 +47,14 @@ pub mod vae;
 pub mod vocoder;
 
 pub use audio_vae::AudioDecoder;
+pub use conditioning::{apply_conditioning, apply_denoise_mask, I2vConditioning};
 pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use pipeline::{
-    decode_audio_track, decode_to_frames, denoise, denoise_av, generate_av_latents, generate_t2v,
-    generate_t2v_latents, renoise, to_uint8_frames, STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_audio_track, decode_to_frames, denoise, denoise_av, generate_av_latents,
+    generate_i2v_latents, generate_t2v, generate_t2v_latents, preprocess_conditioning_image,
+    renoise, to_uint8_frames, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config

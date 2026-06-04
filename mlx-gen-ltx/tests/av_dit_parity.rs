@@ -15,7 +15,7 @@ use mlx_rs::ops::{abs, max as max_op, subtract, sum};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen_ltx::config::LtxConfig;
+use mlx_gen_ltx::config::{LtxConfig, SplitModel};
 use mlx_gen_ltx::transformer::{AvDiT, Precision};
 
 const GOLDEN: &str = concat!(
@@ -52,9 +52,16 @@ fn mean_rel(got: &Array, want: &Array) -> f32 {
     num.item::<f32>() / den.item::<f32>().max(1e-12)
 }
 
-fn run(prec: Precision, golden: &str) {
+fn run(bf16: bool, golden: &str) {
     let dir = base_dir();
     let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    // Quant geometry (bits/group) rides on `split_model.json` (sc-2686).
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
+    let prec = if bf16 {
+        Precision::quant_bf16(split.bits, split.group)
+    } else {
+        Precision::quant_f32(split.bits, split.group)
+    };
     let w =
         Weights::from_file(dir.join("transformer.safetensors")).expect("transformer.safetensors");
     let dit = AvDiT::from_weights(&w, &cfg, prec).expect("build AvDiT");
@@ -96,11 +103,11 @@ fn run(prec: Precision, golden: &str) {
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
 fn av_dit_velocity_matches_reference() {
-    run(Precision::F32Q8, GOLDEN);
+    run(false, GOLDEN);
 }
 
 #[test]
 #[ignore = "needs ltx_2_3_base_q8 transformer.safetensors (~20 GB)"]
 fn av_dit_velocity_matches_reference_bf16() {
-    run(Precision::Bf16Q8, GOLDEN_BF16);
+    run(true, GOLDEN_BF16);
 }

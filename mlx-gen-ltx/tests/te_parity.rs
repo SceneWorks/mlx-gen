@@ -61,6 +61,7 @@ fn full_text_encoder_matches_reference() {
         &gemma_w,
         &conn_w,
         GemmaConfig::gemma_3_12b(),
+        None, // dense bf16 Gemma (the default snapshot)
         &cfg,
         Dtype::Bfloat16,
     )
@@ -106,6 +107,7 @@ fn full_text_encoder_av_matches_reference() {
         &gemma_w,
         &conn_w,
         GemmaConfig::gemma_3_12b(),
+        None, // dense bf16 Gemma (the default snapshot)
         &cfg,
         Dtype::Bfloat16,
     )
