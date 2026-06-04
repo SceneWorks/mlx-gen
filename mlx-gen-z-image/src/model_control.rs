@@ -276,6 +276,11 @@ impl Generator for ZImageTurboControl {
             } else {
                 noise
             };
+            // sc-2963 (rollout of sc-2957): compiled elementwise glue in the control denoise loop too
+            // — SwiGLU, gated residuals, RoPE rotation, and the control-branch hint injection
+            // (`x+hint·scale`). Bit-exact, and the mixed-precision dtype flow (bf16 base, f32
+            // control_context, sc-2720) is preserved. Enabled at the production boundary; idempotent.
+            crate::set_compile_glue(true);
             let latents = denoise_control_with_progress(
                 &self.transformer,
                 &scheduler,

@@ -256,6 +256,11 @@ impl Generator for ZImageTurbo {
             } else {
                 noise
             };
+            // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue (SwiGLU, gated
+            // residuals, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Enabled
+            // here at the production boundary (not inside `denoise_with_progress`, which the
+            // stage-wise parity tests reuse and must keep running eager). Process-global, idempotent.
+            crate::set_compile_glue(true);
             let latents = denoise_with_progress(
                 &self.transformer,
                 &scheduler,

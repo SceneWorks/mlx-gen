@@ -3,8 +3,10 @@
 //! Whole-block fp32 parity vs the Python reference is covered by `tests/z_image_block.rs`.
 
 use mlx_rs::{
+    error::Exception,
     fast::rms_norm,
     ops::{add, multiply, split, tanh},
+    transforms::compile::compile,
     Array,
 };
 
@@ -14,6 +16,21 @@ use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+
+/// Gated residual `x + gate·normed` — one fused kernel (multiply + add) when the sc-2963 glue toggle
+/// is on; the `mx.fast` RMSNorm that produces `normed` stays eager. Dtype-preserving, bit-identical
+/// to the eager form (the mixed-precision flow, sc-2720, is untouched: the compiled closure casts
+/// nothing).
+fn gated(x: &Array, gate: &Array, normed: &Array) -> Result<Array> {
+    let f = |(x, g, n): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(g, n)?)
+    };
+    if crate::compile_glue() {
+        Ok(compile(f, true)((x, gate, normed))?)
+    } else {
+        Ok(f((x, gate, normed))?)
+    }
+}
 
 /// Shape of one Z-Image transformer block.
 #[derive(Debug, Clone, Copy)]
@@ -85,21 +102,14 @@ impl ZImageTransformerBlock {
         // Modulated attention residual.
         let s1 = multiply(&rms_norm(x, &self.attention_norm1, self.eps)?, &scale_msa)?;
         let attn_out = self.attention.forward(&s1, freqs_cis)?;
-        let x1 = add(
-            x,
-            &multiply(
-                &gate_msa,
-                &rms_norm(&attn_out, &self.attention_norm2, self.eps)?,
-            )?,
-        )?;
+        let attn_normed = rms_norm(&attn_out, &self.attention_norm2, self.eps)?;
+        let x1 = gated(x, &gate_msa, &attn_normed)?;
 
         // Modulated SwiGLU FFN residual.
         let s2 = multiply(&rms_norm(&x1, &self.ffn_norm1, self.eps)?, &scale_mlp)?;
         let ffn_out = self.feed_forward.forward(&s2)?;
-        Ok(add(
-            &x1,
-            &multiply(&gate_mlp, &rms_norm(&ffn_out, &self.ffn_norm2, self.eps)?)?,
-        )?)
+        let ffn_normed = rms_norm(&ffn_out, &self.ffn_norm2, self.eps)?;
+        gated(&x1, &gate_mlp, &ffn_normed)
     }
 }
 

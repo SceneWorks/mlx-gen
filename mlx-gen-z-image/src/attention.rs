@@ -9,8 +9,10 @@
 //! mask to wire (see `transformer.rs`).
 
 use mlx_rs::{
+    error::Exception,
     fast::{rms_norm, scaled_dot_product_attention},
     ops::{add, multiply, split, stack_axis, subtract},
+    transforms::compile::compile,
     Array,
 };
 
@@ -134,10 +136,30 @@ impl ZImageAttention {
         let fp = split(&fc5, 2, 4)?;
         let cos = fp[0].reshape(&[1, s, 1, half])?;
         let sin = fp[1].reshape(&[1, s, 1, half])?;
-        let out_r = subtract(&multiply(&xr, &cos)?, &multiply(&xi, &sin)?)?;
-        let out_i = add(&multiply(&xr, &sin)?, &multiply(&xi, &cos)?)?;
+        let (out_r, out_i) = rope_rotate(&xr, &xi, &cos, &sin)?;
         Ok(stack_axis(&[out_r, out_i], 4)?.reshape(&[b, s, h, hd])?)
     }
+}
+
+/// The complex RoPE rotation `(xr + xi·i)·(cos + sin·i)` → `(out_r, out_i)`. Fused into one kernel
+/// when the sc-2963 glue toggle is on (vs 6 eager ops, applied to q and k every block);
+/// dtype-preserving, bit-identical to the eager form.
+fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
+        let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
+        Ok(vec![out_r, out_i])
+    };
+    let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
+    let mut out = if crate::compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out_i = out.pop().unwrap();
+    let out_r = out.pop().unwrap();
+    Ok((out_r, out_i))
 }
 
 impl AdaptableHost for ZImageAttention {

@@ -16,8 +16,10 @@
 //! None` the forward delegates to the base transformer verbatim; with `control_context_scale = 0`
 //! the hints contribute zero — both reproduce the base output exactly (the parity self-check).
 
+use mlx_rs::error::Exception;
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use crate::control_transformer_block::ZImageControlBlock;
@@ -324,9 +326,48 @@ impl AdaptableHost for ZImageControlTransformer {
     }
 }
 
-/// `x + hint · scale`, broadcasting the scalar scale over `[1, seq, dim]`.
+/// `x + hint · scale`, broadcasting the scalar scale over `[1, seq, dim]`. Fused into one kernel
+/// (multiply + add) when the sc-2963 glue toggle is on. The `scale` is passed as an array arg (not
+/// baked into the trace), and dtype is preserved — bit-identical to the eager form. The f32 `hint`
+/// promotes the bf16 base stream to f32 here exactly as before (the sc-2720 mixed-precision flow).
 fn add_hint(x: &Array, hint: &Array, scale: f32) -> Result<Array> {
-    Ok(add(x, &multiply(hint, scalar(scale))?)?)
+    let sc = scalar(scale);
+    let f = |(x, h, sc): (&Array, &Array, &Array)| -> std::result::Result<Array, Exception> {
+        add(x, &multiply(h, sc)?)
+    };
+    if crate::compile_glue() {
+        Ok(compile(f, true)((x, hint, &sc))?)
+    } else {
+        Ok(f((x, hint, &sc))?)
+    }
+}
+
+#[cfg(test)]
+mod sc2963 {
+    use super::*;
+    use mlx_rs::{random, Dtype};
+
+    // sc-2720 guard: `add_hint` mixes a bf16 base stream `x` with an f32 `hint` — the f32 hint must
+    // promote the result to f32 (the fork's mixed-precision flow), and compiled must equal eager.
+    #[test]
+    fn compiled_add_hint_mixed_precision_matches_eager() {
+        let k = random::key(0).unwrap();
+        let x = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k))
+            .unwrap()
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap(); // bf16 base stream
+        let hint = random::normal::<f32>(&[1, 16, 64], None, None, Some(&k)).unwrap(); // f32 control hint
+        crate::set_compile_glue(false);
+        let e = add_hint(&x, &hint, 0.8).unwrap();
+        crate::set_compile_glue(true);
+        let c = add_hint(&x, &hint, 0.8).unwrap();
+        crate::set_compile_glue(false);
+        assert_eq!(e.dtype(), Dtype::Float32, "f32 hint promotes bf16 → f32");
+        assert_eq!(c.dtype(), Dtype::Float32, "compiled preserves the promotion");
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(&c, &e).unwrap()).unwrap();
+        let m = mlx_rs::ops::max(&d, None).unwrap().item::<f32>();
+        assert_eq!(m, 0.0, "add_hint compiled vs eager");
+    }
 }
 
 /// The control-stack hint index for base-layer `i` (the fork's `*_mapping[i]`), or `None` when no

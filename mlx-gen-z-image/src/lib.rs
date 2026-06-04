@@ -55,3 +55,25 @@ pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the DiT's fusable elementwise *glue* —
+/// the SwiGLU FFN activation (`silu(h1)·h3`), the gated residuals (`x+gate·norm(out)`), the complex
+/// RoPE rotation, and the control-branch hint injection (`x+hint·scale`) — runs through `mx.compile`
+/// so MLX fuses each chain into a single Metal kernel (vs one kernel per primitive op when eager).
+/// The big GEMMs / SDPA / `mx.fast` RMSNorms stay eager, and the tiny adaLN scale/gate ops are left
+/// eager (no fusion to win). **Bit-exact** to the eager form. **Enabled by the production denoise
+/// loops** (turbo + control, [`pipeline`]); left **off by default** so the reference-parity gates run
+/// eager. The **mixed-precision dtype flow is preserved** — base bf16, f32 `control_context` (sc-2720):
+/// the compiled closures cast nothing the eager form didn't, so dtype flows from inputs unchanged.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
