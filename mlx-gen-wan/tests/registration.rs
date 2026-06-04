@@ -1,19 +1,20 @@
-//! Registry wiring + config-driven `load` for both Wan models.
+//! Registry wiring + config-driven `load` for all Wan models.
 //!
-//! Verifies that `wan2_2_ti2v_5b` (dense 5B, `generate` still a WIP stub — sc-2680) and
-//! `wan2_2_t2v_14b` (dual-expert MoE, `generate` fully wired) each self-register with the right
-//! descriptor, that `load` reads the model's `config.json` (5B preset / dual-expert detection), that
-//! the 14B loader rejects a non-dual config, and that the not-yet-wired sibling features (quant /
-//! adapters / single-file source / precision override) are rejected for both.
+//! Verifies that `wan2_2_ti2v_5b` (dense 5B, `generate` still a WIP stub — sc-2680),
+//! `wan2_2_t2v_14b` (dual-expert MoE T2V, `generate` fully wired) and `wan2_2_i2v_14b` (dual-expert
+//! MoE channel-concat I2V, `generate` fully wired) each self-register with the right descriptor, that
+//! `load` reads the model's `config.json` (5B preset / dual-expert / i2v detection), that the 14B
+//! loaders reject a mismatched config, and that the not-yet-wired sibling features (quant / adapters
+//! / single-file source / precision override) are rejected for all.
 
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, AdapterKind, AdapterSpec, GenerationRequest, LoadSpec, Modality, Precision, Quant,
-    WeightsSource,
+    registry, AdapterKind, AdapterSpec, Conditioning, GenerationRequest, Image, LoadSpec, Modality,
+    Precision, Quant, WeightsSource,
 };
 
-use mlx_gen_wan::{MODEL_ID, MODEL_ID_T2V_14B};
+use mlx_gen_wan::{MODEL_ID, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B};
 
 /// The 5B's serialized `config.json` (the `convert_wan.py` schema; model_type ti2v + dim 3072).
 const TI2V_5B_CONFIG: &str = r#"{
@@ -57,6 +58,30 @@ const T2V_14B_CONFIG: &str = r#"{
   "sample_fps": 16,
   "frame_num": 81,
   "max_area": 0
+}"#;
+
+/// The I2V-A14B's serialized `config.json` (`convert_wan.py` schema; dual-expert channel-concat,
+/// in_dim 36, boundary 0.9, guide (3.5, 3.5), max_area 704×1280, z16 VAE).
+const I2V_14B_CONFIG: &str = r#"{
+  "model_type": "i2v",
+  "model_version": "2.2",
+  "patch_size": [1, 2, 2],
+  "in_dim": 36,
+  "dim": 5120,
+  "ffn_dim": 13824,
+  "out_dim": 16,
+  "num_heads": 40,
+  "num_layers": 40,
+  "vae_z_dim": 16,
+  "vae_stride": [4, 8, 8],
+  "dual_model": true,
+  "boundary": 0.9,
+  "sample_shift": 5.0,
+  "sample_steps": 40,
+  "sample_guide_scale": [3.5, 3.5],
+  "sample_fps": 16,
+  "frame_num": 81,
+  "max_area": 901120
 }"#;
 
 /// A throwaway model dir holding just `config.json` (`load` only reads config; `generate`'s heavy
@@ -259,6 +284,136 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
     }];
     assert!(registry::load(
         MODEL_ID_T2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
+    )
+    .is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wan_i2v_14b_is_registered() {
+    let reg = registry::generators()
+        .find(|r| (r.descriptor)().id == MODEL_ID_I2V_14B)
+        .expect("wan2_2_i2v_14b not registered");
+    let d = (reg.descriptor)();
+    assert_eq!(d.id, "wan2_2_i2v_14b");
+    assert_eq!(d.family, "wan");
+    assert_eq!(d.modality, Modality::Video);
+    // Dual-expert CFG + negative prompt + KV cache; a single image reference (channel-concat).
+    assert!(d.capabilities.supports_guidance);
+    assert!(d.capabilities.supports_negative_prompt);
+    assert!(d.capabilities.supports_kv_cache);
+    assert_eq!(
+        d.capabilities.conditioning,
+        vec![mlx_gen::ConditioningKind::Reference]
+    );
+    assert_eq!(d.capabilities.max_count, 1);
+    assert!(!d.capabilities.supports_lora);
+    assert_eq!(d.capabilities.min_size, 16);
+}
+
+/// A tiny solid-color RGB reference image for I2V validate tests.
+fn dummy_image() -> Image {
+    Image {
+        width: 64,
+        height: 64,
+        pixels: vec![128u8; 64 * 64 * 3],
+    }
+}
+
+#[test]
+fn load_i2v_14b_reads_config_validates_and_wires_generate() {
+    let dir = temp_model_dir_with("i2v14b", I2V_14B_CONFIG);
+    let g = registry::load(
+        MODEL_ID_I2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())),
+    )
+    .expect("load should succeed (reads i2v config.json)");
+    assert_eq!(g.descriptor().id, MODEL_ID_I2V_14B);
+
+    let with_ref = |extra: fn(&mut GenerationRequest)| {
+        let mut req = GenerationRequest {
+            width: 512,
+            height: 512,
+            frames: Some(81),
+            conditioning: vec![Conditioning::Reference {
+                image: dummy_image(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        extra(&mut req);
+        req
+    };
+
+    // Accepts a 16-aligned 1+4k-frame request WITH a reference image.
+    assert!(g.validate(&with_ref(|_| {})).is_ok());
+    // Rejects a request WITHOUT a reference image (I2V requires the first frame).
+    let no_ref = GenerationRequest {
+        width: 512,
+        height: 512,
+        frames: Some(81),
+        ..Default::default()
+    };
+    assert!(g.validate(&no_ref).is_err());
+    // Rejects trim_first_frames (the conditioning `y` is built from num_frames).
+    assert!(g
+        .validate(&with_ref(|r| r.trim_first_frames = Some(1)))
+        .is_err());
+    // Still rejects sub-tile + bad frame counts.
+    assert!(g.validate(&with_ref(|r| r.width = 8)).is_err());
+    assert!(g.validate(&with_ref(|r| r.frames = Some(80))).is_err());
+
+    // generate IS wired — it errors only by trying to open the absent weight files (or, here, by
+    // requiring the reference at run time), NOT with a "not yet wired" WIP message.
+    let mut noop = |_p| {};
+    let err = g
+        .generate(&with_ref(|_| {}), &mut noop)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !err.contains("not yet wired") && !err.contains("S1"),
+        "i2v generate must be wired (got a WIP stub message): {err}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
+    // A T2V (non-channel-concat) config is rejected by the i2v loader.
+    let t2v = temp_model_dir_with("i2v14b_t2v", T2V_14B_CONFIG);
+    assert!(registry::load(
+        MODEL_ID_I2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(t2v.clone()))
+    )
+    .is_err());
+    std::fs::remove_dir_all(&t2v).ok();
+
+    let dir = temp_model_dir_with("i2v14b_reject", I2V_14B_CONFIG);
+    // Single-file source.
+    assert!(registry::load(
+        MODEL_ID_I2V_14B,
+        &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
+    )
+    .is_err());
+    // Quantization (sc-2682) + precision override + adapters (sc-2683 / sc-2393).
+    assert!(registry::load(
+        MODEL_ID_I2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
+    )
+    .is_err());
+    let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
+    spec.precision = Precision::Fp32;
+    assert!(registry::load(MODEL_ID_I2V_14B, &spec).is_err());
+    let adapters = vec![AdapterSpec {
+        path: dir.join("x.safetensors"),
+        scale: 1.0,
+        kind: AdapterKind::Lora,
+    }];
+    assert!(registry::load(
+        MODEL_ID_I2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
     )
     .is_err());
