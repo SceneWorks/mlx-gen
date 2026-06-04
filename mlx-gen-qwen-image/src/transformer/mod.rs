@@ -22,9 +22,30 @@ pub use norm_out::AdaLayerNormContinuous;
 pub use rope::QwenRope3d;
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+
+/// sc-2963 (rollout of the Wan sc-2957 template): when on, the MMDiT's fusable elementwise *glue* —
+/// adaLN affine (`x·(1+scale)+shift`), gated residual (`x+gate·y`), the tanh-GELU FFN activation, and
+/// the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into a single Metal
+/// kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast` norms stay
+/// eager. **Bit-exact** to the eager form (`tests/compile_parity.rs` gates `max|Δ|=0`). **Enabled by
+/// the production denoise loops** (T2I + Edit, [`crate::pipeline`]); left **off by default** so the
+/// reference-parity gates run eager and `compile_parity` can A/B both. The dtype flow (bf16 weights,
+/// f32 latents) is preserved — the compiled closures cast nothing the eager form didn't.
+static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
+
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+pub fn set_compile_glue(on: bool) {
+    COMPILE_GLUE.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn compile_glue() -> bool {
+    COMPILE_GLUE.load(Ordering::Relaxed)
+}
 
 /// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
 /// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole
@@ -45,5 +66,34 @@ pub(crate) fn join(prefix: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{prefix}.{name}")
+    }
+}
+
+/// sc-2963 shared helpers for the per-module compiled-glue bit-exactness tests (each submodule's
+/// private compiled chain — `modulate`/`gated` in [`block`], `gelu_ffn` in [`feed_forward`],
+/// `rope_rotate` in [`attention`] — is gated `max|Δ|=0` compiled-vs-eager at its real dtypes).
+#[cfg(test)]
+pub(crate) mod compile_test_util {
+    use mlx_rs::{random, Array, Dtype};
+
+    pub(crate) fn rnd(shape: &[i32], dt: Dtype) -> Array {
+        let k = random::key(0).unwrap();
+        let x = random::normal::<f32>(shape, None, None, Some(&k)).unwrap();
+        let x = if dt == Dtype::Float32 {
+            x
+        } else {
+            x.as_dtype(dt).unwrap()
+        };
+        mlx_rs::transforms::eval([&x]).unwrap();
+        x
+    }
+
+    pub(crate) fn max_abs(a: &Array, b: &Array) -> f32 {
+        let d = mlx_rs::ops::abs(mlx_rs::ops::subtract(a, b).unwrap()).unwrap();
+        mlx_rs::ops::max(&d, None)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap()
+            .item::<f32>()
     }
 }

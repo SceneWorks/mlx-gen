@@ -4,15 +4,17 @@
 //! two streams and projected (`attn_to_out.0` / `to_add_out`). All eight projections are
 //! [`AdaptableLinear`] (Q8-quantizable); the q/k RMSNorm weights stay dense.
 
+use mlx_rs::error::Exception;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, linear_from};
+use super::{compile_glue, join, linear_from};
 
 const RMS_EPS: f32 = 1e-6;
 
@@ -177,8 +179,53 @@ fn apply_rope_qwen(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
     let xi = parts[1].reshape(&[b, seq, heads, half])?;
     let cos = cos.reshape(&[1, seq, 1, half])?;
     let sin = sin.reshape(&[1, seq, 1, half])?;
-    let out_r = subtract(&multiply(&xr, &cos)?, &multiply(&xi, &sin)?)?;
-    let out_i = add(&multiply(&xr, &sin)?, &multiply(&xi, &cos)?)?;
+    let (out_r, out_i) = rope_rotate(&xr, &xi, &cos, &sin)?;
     let stacked = concatenate_axis(&[&out_r.expand_dims(4)?, &out_i.expand_dims(4)?], 4)?;
     Ok(stacked.reshape(&[b, seq, heads, hd])?)
+}
+
+/// The complex RoPE rotation `(xr + xi·i)·(cos + sin·i)` → `(out_r, out_i)`. Fused into one kernel
+/// when the sc-2963 glue toggle is on (vs 6 eager ops, applied to img/txt q and k every block);
+/// dtype-preserving, bit-identical to the eager form.
+fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Array, Array)> {
+    let f = |inp: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
+        let (xr, xi, cos, sin) = (&inp[0], &inp[1], &inp[2], &inp[3]);
+        let out_r = subtract(&multiply(xr, cos)?, &multiply(xi, sin)?)?;
+        let out_i = add(&multiply(xr, sin)?, &multiply(xi, cos)?)?;
+        Ok(vec![out_r, out_i])
+    };
+    let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
+    let mut out = if compile_glue() {
+        compile(f, true)(&args)?
+    } else {
+        f(&args)?
+    };
+    let out_i = out.pop().unwrap();
+    let out_r = out.pop().unwrap();
+    Ok((out_r, out_i))
+}
+
+#[cfg(test)]
+mod sc2963 {
+    use super::*;
+    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use crate::transformer::set_compile_glue;
+    use mlx_rs::Dtype::Float32;
+
+    // sc-2963: the compiled RoPE rotation is bit-identical to eager (`max|Δ|=0`).
+    #[test]
+    fn compiled_rope_rotate_bit_identical_to_eager() {
+        let (b, seq, heads, half) = (2i32, 16i32, 2i32, 64i32);
+        let xr = rnd(&[b, seq, heads, half], Float32);
+        let xi = rnd(&[b, seq, heads, half], Float32);
+        let cos = rnd(&[1, seq, 1, half], Float32);
+        let sin = rnd(&[1, seq, 1, half], Float32);
+        set_compile_glue(false);
+        let (er, ei) = rope_rotate(&xr, &xi, &cos, &sin).unwrap();
+        set_compile_glue(true);
+        let (cr, ci) = rope_rotate(&xr, &xi, &cos, &sin).unwrap();
+        set_compile_glue(false);
+        assert_eq!(max_abs(&cr, &er), 0.0, "rope_rotate real");
+        assert_eq!(max_abs(&ci, &ei), 0.0, "rope_rotate imag");
+    }
 }

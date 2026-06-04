@@ -225,6 +225,10 @@ pub fn denoise_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
+    // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
+    // compile_parity.rs) and a per-step win at production geometry. Process-global, idempotent.
+    crate::transformer::set_compile_glue(true);
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total = (sampler.num_steps() - start_step) as u32;
@@ -276,6 +280,9 @@ pub fn denoise_edit_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
+    // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
+    // `denoise_with_progress`. Bit-exact, process-global, idempotent.
+    crate::transformer::set_compile_glue(true);
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total = sampler.num_steps() as u32;
