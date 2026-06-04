@@ -51,6 +51,90 @@ pub fn is_lokr(w: &Weights) -> bool {
         .unwrap_or(false)
 }
 
+/// A parsed LoKr file: the global `(alpha, rank)` from metadata plus every module's Kronecker
+/// factors grouped by path. The factor map is keyed by the bare factor name (`lokr_w1`,
+/// `lokr_w1_a`, `lokr_w1_b`, `lokr_w2`, `lokr_w2_a`, `lokr_w2_b`); a module is full or low-rank.
+///
+/// This is the format-parsing half of a LoKr install, factored out of [`apply_lokr`] so the video
+/// providers (LTX/Wan) — which install onto their crate-local `Linear`s as a forward-time residual
+/// or an in-place weight merge, rather than the core [`AdaptableHost`] — reuse the exact same factor
+/// grouping + metadata read and differ only in the install step. Each provider then maps the bare
+/// module `path` through its own key→module table and calls [`reconstruct_lokr_delta`].
+#[derive(Debug)]
+pub struct LokrFile {
+    pub alpha: f32,
+    pub rank: f32,
+    /// `module path → { factor name → tensor }`.
+    pub groups: BTreeMap<String, BTreeMap<String, Array>>,
+}
+
+impl LokrFile {
+    /// `alpha/rank` — the scale the fork bakes into the reconstructed delta (PEFT default `alpha=rank`
+    /// ⇒ 1.0). The per-adapter user `strength` multiplies this separately at the residual/merge site.
+    pub fn delta_scale(&self) -> f32 {
+        self.alpha / self.rank
+    }
+
+    /// Reconstruct one module's `[out,in]` delta at `out_dtype` from its grouped factors, baking in
+    /// `alpha/rank` (the user `strength` is applied separately). `base_shape` is the target linear's
+    /// logical weight shape. Returns the [`reconstruct_lokr_delta`] result.
+    pub fn delta(
+        &self,
+        factors: &BTreeMap<String, Array>,
+        base_shape: &[i32],
+        out_dtype: Dtype,
+    ) -> Result<Array> {
+        reconstruct_lokr_delta(
+            self.alpha,
+            self.rank,
+            base_shape,
+            factors.get("lokr_w1"),
+            factors.get("lokr_w1_a"),
+            factors.get("lokr_w1_b"),
+            factors.get("lokr_w2"),
+            factors.get("lokr_w2_a"),
+            factors.get("lokr_w2_b"),
+            out_dtype,
+        )
+    }
+}
+
+/// Parse a LoKr `.safetensors` into [`LokrFile`]: read `rank`/`alpha` from metadata (alpha defaults
+/// to rank, i.e. scale 1.0, matching PEFT) and group every `‹path›.lokr_*` tensor by module path.
+/// Shared by [`apply_lokr`] (core `AdaptableHost` install) and the video providers' crate-local
+/// residual/merge installers.
+pub fn parse_lokr(w: &Weights) -> Result<LokrFile> {
+    let rank = w
+        .metadata("rank")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    // alpha defaults to rank (scale 1.0) when absent, matching PEFT.
+    let alpha = w
+        .metadata("alpha")
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(rank);
+
+    let keys: Vec<String> = w.keys().map(str::to_string).collect();
+    let mut groups: BTreeMap<String, BTreeMap<String, Array>> = BTreeMap::new();
+    for key in &keys {
+        for suffix in LOKR_SUFFIXES {
+            if let Some(path) = key.strip_suffix(suffix) {
+                let factor = suffix[1..].to_string(); // drop the leading '.'
+                groups
+                    .entry(path.to_string())
+                    .or_default()
+                    .insert(factor, w.require(key)?.clone());
+                break;
+            }
+        }
+    }
+    Ok(LokrFile {
+        alpha,
+        rank,
+        groups,
+    })
+}
+
 /// Read a scalar adapter value (an `alpha`) as `f32`, regardless of its on-disk dtype. Trained
 /// adapters store `alpha` in their compute dtype: real kohya/BFL FLUX LoRAs ship it **bf16** (sc-2657),
 /// and `Array::as_slice::<f32>()` `unwrap`s a hard dtype-mismatch (it never casts), so reading a bf16
@@ -74,55 +158,19 @@ pub struct ApplyReport {
 /// Install a LoKr adapter file onto `host`. `scale` is the user-facing strength (the
 /// `alpha/rank` factor is baked into the reconstructed delta, mirroring the fork).
 pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Result<ApplyReport> {
-    let rank = w
-        .metadata("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    // alpha defaults to rank (scale 1.0) when absent, matching PEFT.
-    let alpha = w
-        .metadata("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
-
-    // Group every lokr_* tensor by the module path preceding the suffix.
-    let keys: Vec<String> = w.keys().map(str::to_string).collect();
-    let mut grouped: BTreeMap<String, BTreeMap<&str, &Array>> = BTreeMap::new();
-    for key in &keys {
-        for suffix in LOKR_SUFFIXES {
-            if let Some(path) = key.strip_suffix(suffix) {
-                let factor = &suffix[1..]; // drop the leading '.'
-                grouped
-                    .entry(path.to_string())
-                    .or_default()
-                    .insert(factor, w.require(key)?);
-                break;
-            }
-        }
-    }
-
+    let file = parse_lokr(w)?;
     let mut report = ApplyReport::default();
-    for (path, factors) in grouped {
+    for (path, factors) in &file.groups {
         let parts: Vec<&str> = path.split('.').collect();
         match host.adaptable_mut(&parts) {
             Some(lin) => {
                 let base_shape = lin.base_shape();
-                let delta = reconstruct_lokr_delta(
-                    alpha,
-                    rank,
-                    &base_shape,
-                    factors.get("lokr_w1").copied(),
-                    factors.get("lokr_w1_a").copied(),
-                    factors.get("lokr_w1_b").copied(),
-                    factors.get("lokr_w2").copied(),
-                    factors.get("lokr_w2_a").copied(),
-                    factors.get("lokr_w2_b").copied(),
-                    // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
-                    Dtype::Bfloat16,
-                )?;
+                // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
+                let delta = file.delta(factors, &base_shape, Dtype::Bfloat16)?;
                 lin.push(Adapter::Lokr { delta, scale });
                 report.applied += 1;
             }
-            None => report.unmatched_paths.push(path),
+            None => report.unmatched_paths.push(path.clone()),
         }
     }
     Ok(report)

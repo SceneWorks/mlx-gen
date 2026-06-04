@@ -102,10 +102,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_guidance: false,
             supports_true_cfg: false,
             conditioning: vec![ConditioningKind::Reference],
-            // LoRA in generate (sc-2687): forward-time residuals + per-pass strength over the full
-            // video+audio+cross-modal surface. LoKr = sc-2393.
+            // LoRA (sc-2687) + LoKr (sc-2393) in generate: forward-time residuals + per-pass
+            // strength over the full video+audio+cross-modal surface.
             supports_lora: true,
-            supports_lokr: false,
+            supports_lokr: true,
             samplers: Vec::new(),
             schedulers: Vec::new(),
             // height/width must be divisible by 64 (stage-1 runs at //2//32).
@@ -283,11 +283,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         Dtype::Bfloat16,
     )?;
     let mut transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
-    // LoRA in generate (sc-2687): forward-time residuals over the (quantized/dense) base, applied on
-    // the still-mutable transformer — the load-time seam. Routes the full video+audio+cross-modal
-    // surface. `pass_scales` (per-adapter) carries one strength per distilled denoise pass; the
-    // pipeline selects the active pass per stage. No-op when `spec.adapters` is empty; LoKr rejected
-    // (sc-2393).
+    // LoRA (sc-2687) + LoKr (sc-2393) in generate: forward-time residuals over the (quantized/dense)
+    // base, applied on the still-mutable transformer — the load-time seam. Routes the full
+    // video+audio+cross-modal surface. `pass_scales` (per-adapter) carries one strength per distilled
+    // denoise pass; the pipeline selects the active pass per stage. No-op when `spec.adapters` empty.
     if !spec.adapters.is_empty() {
         crate::adapters::apply_ltx_adapters(
             &mut transformer,

@@ -14,8 +14,11 @@
 //! per-module `.alpha` (default = rank); real LTX-2.3 files ship PEFT, bf16, `diffusion_model.`-prefixed.
 //! `scale = alpha/rank` (the reference `LoRAWeights.scale`).
 //!
-//! **LoKr is out of scope** (sc-2393) — the reference `lora/` is LoRA-only. A LoKr file is rejected
-//! loudly rather than silently mis-applied; sc-2393 reuses this same key→module map.
+//! **LoKr** (sc-2393) is net-new — the reference `lora/` is LoRA-only, so this is parity-PLUS. A LoKr
+//! file (`networkType=lokr`, `‹path›.lokr_w1/w2[_a/_b]`) is parsed by the core `parse_lokr`, its
+//! per-module `[out,in]` delta reconstructed via `reconstruct_lokr_delta` (`alpha/rank` folded in),
+//! mapped through this same LTX key→module table, and installed as a forward-time residual carrying
+//! the same per-pass strength as LoRA.
 //!
 //! **Skips, never errors-on-skip.** Mirrors the reference (`apply_loras_to_weights` counts skipped
 //! modules, never raises): audio / `av_ca` / `a2v` targets (the video-only port has no such modules)
@@ -26,7 +29,7 @@ use std::collections::BTreeMap;
 
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::loader::is_lokr;
+use mlx_gen::adapters::loader::{is_lokr, parse_lokr};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -106,14 +109,13 @@ fn read_alpha(a: &Array) -> Result<f32> {
     Ok(a.as_dtype(Dtype::Float32)?.as_slice::<f32>()[0])
 }
 
-/// Per-pass effective scales for one resolved module: `(alpha/rank)·strength`, with `strength` from
-/// `spec.pass_scales` (one per distilled stage, validated to `num_passes`) or `spec.scale` (uniform,
-/// a length-1 vec the forward clamps into). `alpha/rank·strength` is computed in f64 then f32,
-/// matching the reference's Python-float `scale * strength`.
-fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> Result<Vec<f32>> {
-    let eff = |strength: f32| ((alpha as f64 / rank as f64) * strength as f64) as f32;
+/// Per-pass user strengths for one adapter: `spec.pass_scales` (one per distilled stage, validated
+/// to `num_passes`) or `spec.scale` (uniform — a length-1 vec the forward clamps into). The `strength`
+/// is the user knob; `alpha/rank` is folded in separately (into B for LoRA via [`pass_scales`], into
+/// the delta for LoKr via `reconstruct_lokr_delta`).
+fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
     match &spec.pass_scales {
-        None => Ok(vec![eff(spec.scale)]),
+        None => Ok(vec![spec.scale]),
         Some(v) => {
             if v.len() != num_passes {
                 return Err(Error::Msg(format!(
@@ -123,9 +125,21 @@ fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> 
                     v.len()
                 )));
             }
-            Ok(v.iter().map(|&s| eff(s)).collect())
+            Ok(v.clone())
         }
     }
+}
+
+/// LoRA per-pass effective scales for one resolved module: `(alpha/rank)·strength`. `strength` comes
+/// from [`pass_strengths`]; the `alpha/rank·strength` product is computed in f64 then f32, matching
+/// the reference's Python-float `scale * strength`. (LoKr bakes `alpha/rank` into the delta, so it
+/// uses [`pass_strengths`] directly — no fold here.)
+fn pass_scales(spec: &AdapterSpec, alpha: f32, rank: f32, num_passes: usize) -> Result<Vec<f32>> {
+    let eff = |strength: f32| ((alpha as f64 / rank as f64) * strength as f64) as f32;
+    Ok(pass_strengths(spec, num_passes)?
+        .into_iter()
+        .map(eff)
+        .collect())
 }
 
 /// Install one LoRA file's residuals onto `host` at `spec`'s strength, accumulating into `report`.
@@ -177,9 +191,42 @@ fn apply_one(
     Ok(())
 }
 
-/// Install every LoRA in `specs` onto the LTX transformer, stacking in order (sc-2687). `num_passes`
-/// is the distilled pipeline's denoise-pass count (for validating + expanding `pass_scales`). Errors
-/// if a LoKr file is supplied (sc-2393) or if a non-empty spec list matched no target module
+/// Install one LoKr file's residuals onto `host` at `spec`'s per-pass strength (sc-2393 — net-new,
+/// the reference `lora/` has no LoKr). Each module's `[out,in]` delta is reconstructed from its
+/// Kronecker factors via the core `reconstruct_lokr_delta` (`alpha/rank` baked in), keyed at the
+/// target linear's base shape, then installed as a forward-time residual carrying the raw per-pass
+/// strengths (no further alpha/rank fold). Skips/surfaces a path that resolves to no module, like
+/// the LoRA path (audio/av_ca/a2v on the video-only port).
+fn apply_one_lokr(
+    host: &mut impl LtxAdaptable,
+    w: &Weights,
+    spec: &AdapterSpec,
+    num_passes: usize,
+    report: &mut LtxLoraReport,
+) -> Result<()> {
+    let file = parse_lokr(w)?;
+    let strengths = pass_strengths(spec, num_passes)?;
+    for (raw_path, factors) in &file.groups {
+        let path = normalize_ltx_key(raw_path);
+        let segs: Vec<&str> = path.split('.').collect();
+        match host.adaptable_mut(&segs) {
+            Some(lin) => {
+                // Residual path keeps the delta bf16 (PARITY-BF16) like the core LoKr install; the
+                // forward casts it to the activation dtype.
+                let delta = file.delta(factors, &lin.base_shape(), Dtype::Bfloat16)?;
+                lin.push_lokr(delta, strengths.clone());
+                report.applied += 1;
+            }
+            None => report.skipped.push(path),
+        }
+    }
+    Ok(())
+}
+
+/// Install every adapter in `specs` onto the LTX transformer, stacking in order (sc-2687 LoRA /
+/// sc-2393 LoKr). `num_passes` is the distilled pipeline's denoise-pass count (for validating +
+/// expanding `pass_scales`). LoRA (PEFT/kohya) and LoKr (`networkType=lokr`) are dispatched by the
+/// file's metadata / the spec kind. Errors only if a non-empty spec list matched no target module
 /// (a format/prefix misconfiguration); per-key skips are reported, not fatal.
 pub fn apply_ltx_adapters(
     host: &mut impl LtxAdaptable,
@@ -189,20 +236,20 @@ pub fn apply_ltx_adapters(
     let mut report = LtxLoraReport::default();
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
+        // The file's metadata is authoritative; the spec kind is an additional hint. A spec that
+        // declares Lora but whose file says `networkType=lokr` is a caller error (the LoRA loader
+        // would find no `lora_A/B` and apply nothing) — route by the file so it is never mis-applied.
         if spec.kind == AdapterKind::Lokr || is_lokr(&w) {
-            return Err(Error::Msg(format!(
-                "ltx_2_3 adapter {}: LoKr is not yet supported (sc-2393); the reference lora/ is \
-                 LoRA-only",
-                spec.path.display()
-            )));
+            apply_one_lokr(host, &w, spec, num_passes, &mut report)?;
+        } else {
+            apply_one(host, &w, spec, num_passes, &mut report)?;
         }
-        apply_one(host, &w, spec, num_passes, &mut report)?;
     }
     if !specs.is_empty() && report.applied == 0 {
         return Err(Error::Msg(format!(
             "ltx_2_3 adapters: no target modules matched across {} file(s) — check the format \
-             (expected PEFT `lora_A/B` or kohya `lora_down/up` with `diffusion_model.` / \
-             `transformer_blocks.*` naming)",
+             (expected PEFT `lora_A/B` or kohya `lora_down/up`, or LoKr `lokr_w1/w2`, with \
+             `diffusion_model.` / `transformer_blocks.*` naming)",
             specs.len()
         )));
     }

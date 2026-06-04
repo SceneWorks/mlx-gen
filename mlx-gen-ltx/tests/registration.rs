@@ -65,11 +65,11 @@ fn ltx_is_registered() {
     assert_eq!(d.id, "ltx_2_3");
     assert_eq!(d.family, "ltx");
     assert_eq!(d.modality, Modality::Video);
-    // Distilled core: no guidance / negative prompt. LoRA in generate is wired (sc-2687); LoKr is the
-    // sibling sc-2393, still off.
+    // Distilled core: no guidance / negative prompt. LoRA (sc-2687) + LoKr (sc-2393) in generate are
+    // both wired.
     assert!(!d.capabilities.supports_guidance);
     assert!(d.capabilities.supports_lora);
-    assert!(!d.capabilities.supports_lokr);
+    assert!(d.capabilities.supports_lokr);
     assert!(!d.capabilities.requires_sigma_shift);
 }
 
