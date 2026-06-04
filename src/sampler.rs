@@ -424,6 +424,68 @@ impl TcdSampler {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Flow-match — the rectified-flow world (FLUX.1 / Qwen-Image), distinct from the DDPM
+// `alphas_cumprod` samplers above. FLUX's denoise is a plain forward Euler integration of the
+// learned velocity field over a precomputed sigma schedule: `x ← x + v·(σ_{i+1} − σ_i)`, the model
+// embedding `σ_i` directly as its timestep (no `scale_model_input`, no DDPM re-noise). Few-step
+// FLUX acceleration (Hyper-FLUX, FLUX-Turbo) reuses THIS schedule unchanged — it is purely a
+// distilled LoRA + a reduced step count (the diffusers/mflux reference has no Hyper-specific
+// scheduler), so a single `FlowMatchSampler` drives both the base render and the `hyper` profile;
+// the profile only changes the step count and guidance (sc-2908, follow-on to sc-2769).
+// ---------------------------------------------------------------------------------------------
+
+/// A flow-match (rectified-flow) Euler sampler driven by a precomputed sigma schedule. The schedule
+/// is built by the model family (FLUX's `build_linear_sigmas` = mflux's `LinearScheduler`: the
+/// `linspace(1, 1/n, n)` sigmas + the dev mu-shift, trailing `0.0`), so this sampler is
+/// family-neutral — it owns only the flow-match update, not the schedule construction. The model is
+/// velocity-prediction, the latents stay f32, and the prior is unit noise (`init_noise_sigma = 1`).
+pub struct FlowMatchSampler {
+    /// The flow-match sigmas, length `num_steps + 1` with a trailing `0.0` (so the last step
+    /// integrates down to σ=0). `sigmas[i]` is both the model's conditioning timestep at step `i`
+    /// and the integration node.
+    sigmas: Vec<f32>,
+}
+
+impl FlowMatchSampler {
+    /// Build from a precomputed sigma schedule (length `num_steps + 1`, trailing `0.0`). Panics if
+    /// fewer than two entries are supplied (a schedule needs at least one step + the terminal `0`).
+    pub fn new(sigmas: Vec<f32>) -> Self {
+        assert!(
+            sigmas.len() >= 2,
+            "FlowMatchSampler needs sigmas of length num_steps+1 (>= 2), got {}",
+            sigmas.len()
+        );
+        Self { sigmas }
+    }
+}
+
+impl DiffusionSampler for FlowMatchSampler {
+    fn num_steps(&self) -> usize {
+        self.sigmas.len() - 1
+    }
+
+    fn timestep(&self, i: usize) -> f32 {
+        // FLUX feeds the sigma straight in as the timestep (its `TimeTextEmbed` scales by 1000
+        // internally); flow-match has no separate discrete timestep index.
+        self.sigmas[i]
+    }
+
+    fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
+        // init_noise_sigma = 1.0 — the flow-match prior is unit noise. (FLUX seeds its own f32 noise
+        // via `create_noise`; this is the trait-complete identity for callers that route through it.)
+        Ok(noise.as_dtype(Dtype::Float32)?)
+    }
+
+    fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array> {
+        // Forward Euler on the velocity field: `x + v·dt`, dt = σ_{i+1} − σ_i (negative; the schedule
+        // descends to 0). Computed in the latents' dtype (f32) exactly like the fork's
+        // `LinearScheduler.step` and the proven inline FLUX loop — byte-identical, no upcast.
+        let dt = self.sigmas[i + 1] - self.sigmas[i];
+        Ok(add(x, &multiply(model_output, scalar(dt))?)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +588,36 @@ mod tests {
         let s = TcdSampler::new(sdxl_sched(), 1000, 50, 4, 0.0, Dtype::Float32);
         let pn = s.pred_noised(&scalar1(0.7), &scalar1(0.3), 0).unwrap();
         assert!((val(&pn) - (-0.651_963_8)).abs() < 1e-4, "got {}", val(&pn));
+    }
+
+    // Flow-match (FLUX): the sampler must reproduce the proven inline FLUX loop `x + v·(σ_{i+1}−σ_i)`
+    // exactly, with `timestep(i)=σ_i` and `num_steps = len-1`. Schnell-style 4-step linear sigmas.
+    #[test]
+    fn flow_match_step_matches_inline_euler() {
+        let sigmas = vec![1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let s = FlowMatchSampler::new(sigmas.clone());
+        assert_eq!(s.num_steps(), 4);
+        for (i, &sig) in sigmas.iter().take(4).enumerate() {
+            assert_eq!(s.timestep(i), sig);
+        }
+        // step 0: x=0.3, v=0.7 → 0.3 + 0.7·(0.75−1.0) = 0.125 (the exact inline-loop arithmetic).
+        let out = s.step(&scalar1(0.7), &scalar1(0.3), 0).unwrap();
+        assert!((val(&out) - 0.125).abs() < 1e-6, "got {}", val(&out));
+        // last step integrates to σ=0: dt = 0.0 − 0.25 = −0.25.
+        let last = s.step(&scalar1(0.4), &scalar1(0.2), 3).unwrap();
+        assert!((val(&last) - (0.2 - 0.1)).abs() < 1e-6, "got {}", val(&last));
+    }
+
+    #[test]
+    fn flow_match_initial_noise_is_unit_identity_f32() {
+        let s = FlowMatchSampler::new(vec![1.0_f32, 0.5, 0.0]);
+        let n = Array::from_slice(&[0.3_f32, -0.7, 1.1], &[3]);
+        let scaled = s.scale_initial_noise(&n).unwrap();
+        // init_noise_sigma = 1 → identity (×1), dtype f32.
+        assert_eq!(scaled.dtype(), Dtype::Float32);
+        let got = scaled.as_slice::<f32>();
+        for (a, b) in got.iter().zip([0.3_f32, -0.7, 1.1]) {
+            assert!((a - b).abs() < 1e-7);
+        }
     }
 }

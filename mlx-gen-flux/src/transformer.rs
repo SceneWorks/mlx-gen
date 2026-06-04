@@ -896,17 +896,21 @@ fn join(prefix: &str, suffix: &str) -> String {
 // ---- LoRA/LoKr adapter routing (sc-2657) ------------------------------------------------------
 //
 // The Rust analog of the fork's `FluxLoRAMapping`: map trained-file module paths to the crate's
-// `AdaptableLinear` fields across the FULL fork surface — joint (`transformer_blocks`) and single
-// (`single_transformer_blocks`) block linears, INCLUDING the adaLN modulation linears (`norm1.linear`,
-// `norm1_context.linear`, single-block `norm.linear`), which `FluxLoRAMapping` targets and a real kohya
-// FLUX LoRA carries (`*_mod_lin`/`modulation_lin`). The top-level embedders / `time_text_embed` /
-// `norm_out` / `proj_out` are NOT fork LoRA targets and are intentionally omitted. The VAE + T5/CLIP
-// text encoders are not adapter targets. `adaptable_mut` accepts the diffusers checkpoint spelling AND
-// the fork's renamed `model_path` spelling where they differ (`ff.net.0.proj` ≡ `ff.linear1`,
-// `to_out.0` ≡ `to_out`), since the fork's `possible_*_patterns` list both. Per-file LoKr/LoRA dispatch,
-// prefix detection, kohya flattening, BFL fused→split, stacking, and the strict no-silent-drop policy
-// are the shared core seam (sc-2534/2618/2743), exactly as Z-Image (sc-2602), Qwen (sc-2528), and
-// FLUX.2 (sc-2646) use it.
+// `AdaptableLinear` fields. Joint (`transformer_blocks`) and single (`single_transformer_blocks`) block
+// linears — INCLUDING the adaLN modulation linears (`norm1.linear`, `norm1_context.linear`, single-block
+// `norm.linear`), which `FluxLoRAMapping` targets and a real kohya FLUX LoRA carries
+// (`*_mod_lin`/`modulation_lin`) — PLUS the top-level global projections: `x_embedder`,
+// `context_embedder`, `proj_out`, `norm_out.linear`, and the three `time_text_embed.*_embedder.linear_{1,2}`.
+// The fork's `FluxLoRAMapping` omits those globals, but the production few-step acceleration LoRAs (e.g.
+// ByteDance Hyper-FLUX, PEFT/diffusers format) DO train them — so covering them makes the Rust strictly
+// more capable than the fork, the same correctness-over-parity call as SDXL Complete coverage (sc-2671);
+// under the strict no-silent-drop policy a Hyper-FLUX file would otherwise error on the unmatched global
+// keys (sc-2908). The VAE + T5/CLIP text encoders are not adapter targets. `adaptable_mut` accepts the
+// diffusers checkpoint spelling AND the fork's renamed `model_path` spelling where they differ
+// (`ff.net.0.proj` ≡ `ff.linear1`, `to_out.0` ≡ `to_out`), since the fork's `possible_*_patterns` list
+// both. Per-file LoKr/LoRA dispatch, prefix detection, kohya flattening, BFL fused→split, stacking, and
+// the strict no-silent-drop policy are the shared core seam (sc-2534/2618/2743), exactly as Z-Image
+// (sc-2602), Qwen (sc-2528), and FLUX.2 (sc-2646) use it.
 
 impl AdaptableHost for FeedForward {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
@@ -1023,6 +1027,45 @@ impl AdaptableHost for SingleBlock {
     }
 }
 
+impl AdaptableHost for MlpEmbedder {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["linear_1"] => Some(&mut self.linear_1),
+            ["linear_2"] => Some(&mut self.linear_2),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["linear_1", "linear_2"]
+            .into_iter()
+            .map(String::from)
+            .collect()
+    }
+}
+
+impl AdaptableHost for TimeTextEmbed {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["timestep_embedder", rest @ ..] => self.timestep.adaptable_mut(rest),
+            ["text_embedder", rest @ ..] => self.text.adaptable_mut(rest),
+            // `guidance_embedder` exists only on dev (Hyper-FLUX is a dev LoRA); on schnell it is
+            // absent, so a guidance_embedder key correctly fails to resolve.
+            ["guidance_embedder", rest @ ..] => self.guidance.as_mut()?.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("timestep_embedder", &self.timestep);
+        out.extend(prefixed_paths("text_embedder", &self.text));
+        if let Some(g) = &self.guidance {
+            out.extend(prefixed_paths("guidance_embedder", g));
+        }
+        out
+    }
+}
+
 impl AdaptableHost for FluxTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
@@ -1034,13 +1077,20 @@ impl AdaptableHost for FluxTransformer {
                 .single_blocks
                 .get_mut(n.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
-            // Top-level embedders / time_text_embed / norm_out / proj_out are not fork LoRA targets.
+            // Top-level global projections — fork-omitted but trained by PEFT acceleration LoRAs
+            // (Hyper-FLUX), sc-2908. `norm_out` is the final adaLN-continuous modulation linear.
+            ["x_embedder"] => Some(&mut self.x_embedder),
+            ["context_embedder"] => Some(&mut self.context_embedder),
+            ["proj_out"] => Some(&mut self.proj_out),
+            ["norm_out", "linear"] => Some(&mut self.norm_out.linear),
+            ["time_text_embed", rest @ ..] => self.time_text_embed.adaptable_mut(rest),
             _ => None,
         }
     }
 
     /// kohya-reachable targets (sc-2618): the diffusers-named joint + single block linears (incl. the
-    /// adaLN modulation linears). The fork's `FluxLoRAMapping` itself lists no diffusers-flattened
+    /// adaLN modulation linears) plus the top-level global projections (sc-2908). The fork's
+    /// `FluxLoRAMapping` itself lists no diffusers-flattened
     /// `lora_unet_transformer_blocks_*` pattern (its kohya `lora_unet_` patterns are all the BFL fused
     /// form below), so this is the core's cross-family diffusers-flattened-kohya superset — proven
     /// generically by the core `kohya_equiv_to_peft_bit_exact` gate + the drift/collision tests, and
@@ -1054,6 +1104,12 @@ impl AdaptableHost for FluxTransformer {
         for (i, b) in self.single_blocks.iter().enumerate() {
             out.extend(prefixed_paths(&format!("single_transformer_blocks.{i}"), b));
         }
+        // Top-level global projections (sc-2908): fork-omitted, trained by PEFT acceleration LoRAs.
+        out.push("x_embedder".into());
+        out.push("context_embedder".into());
+        out.push("proj_out".into());
+        out.push("norm_out.linear".into());
+        out.extend(prefixed_paths("time_text_embed", &self.time_text_embed));
         out
     }
 
@@ -1347,12 +1403,24 @@ mod tests {
                 assert!(resolves(&mut t, &p), "expected {p} to resolve");
             }
         }
+        // sc-2908: the top-level global projections now resolve (fork-omitted, trained by PEFT
+        // acceleration LoRAs like Hyper-FLUX). The file path uses the `*_embedder` spelling.
         for p in [
-            "x_embedder",                              // top-level embedder — not a fork LoRA target
-            "context_embedder",                        // ditto
-            "proj_out",                                // top-level output proj — not a target
-            "norm_out.linear",                         // continuous adaLN — not a target
-            "time_text_embed.timestep.linear_1",       // conditioning MLP — not a target
+            "x_embedder",
+            "context_embedder",
+            "proj_out",
+            "norm_out.linear",
+            "time_text_embed.timestep_embedder.linear_1",
+            "time_text_embed.timestep_embedder.linear_2",
+            "time_text_embed.text_embedder.linear_1",
+            "time_text_embed.text_embedder.linear_2",
+            "time_text_embed.guidance_embedder.linear_1",
+            "time_text_embed.guidance_embedder.linear_2",
+        ] {
+            assert!(resolves(&mut t, p), "expected global {p} to resolve (sc-2908)");
+        }
+        for p in [
+            "time_text_embed.timestep.linear_1",       // internal field name, not the file's *_embedder
             "transformer_blocks.19.attn.to_q",         // out of range (19 joint blocks: 0..18)
             "single_transformer_blocks.38.proj_out",   // out of range (38 single blocks: 0..37)
             "transformer_blocks.0.attn.add_q",         // internal field, not the file's add_q_proj
@@ -1364,12 +1432,14 @@ mod tests {
     }
 
     /// `adaptable_paths()` (the kohya-reachable surface) drift guard: every enumerated path resolves,
-    /// flattens to a collision-free stem, and the count matches the full surface (19×14 + 38×6 = 494).
+    /// flattens to a collision-free stem, and the count matches the full surface — 19×14 + 38×6 = 494
+    /// block linears + 10 top-level globals (x_embedder, context_embedder, proj_out, norm_out.linear,
+    /// and the 3 `time_text_embed.*_embedder.linear_{1,2}` pairs), sc-2908.
     #[test]
     fn adaptable_paths_resolve_and_flatten_uniquely() {
         let t = test_transformer(19, 38);
         let paths = t.adaptable_paths();
-        assert_eq!(paths.len(), 19 * 14 + 38 * 6, "full kohya surface count");
+        assert_eq!(paths.len(), 19 * 14 + 38 * 6 + 10, "full kohya surface count (blocks + globals)");
         let mut probe = test_transformer(19, 38);
         for p in &paths {
             assert!(

@@ -10,6 +10,15 @@ pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
 pub const DEFAULT_GUIDANCE: f32 = 3.5;
 
+/// The base flow-match sampler name in the capability surface (sc-2908). An unset `req.sampler`
+/// resolves to this — the standard FLUX flow-match Euler denoise over `build_linear_sigmas`.
+pub const DEFAULT_SAMPLER: &str = "flow_match";
+/// The Hyper-FLUX few-step acceleration profile (sc-2908): the SAME flow-match schedule at a reduced
+/// step count (8) and guidance 3.5, paired with the ByteDance Hyper-FLUX 8-step LoRA loaded at
+/// `scale≈0.125` (`spec.adapters`). FLUX.1-dev-only — it is a dev LoRA, so schnell never advertises
+/// it. Selecting it without the LoRA loaded just runs 8 base steps (undertrained noise).
+pub const HYPER_SAMPLER: &str = "hyper";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FluxVariant {
     Schnell,
@@ -66,7 +75,13 @@ impl FluxVariant {
                 conditioning: vec![ConditioningKind::Reference],
                 supports_lora: true,
                 supports_lokr: true,
-                samplers: Vec::new(),
+                // The base flow-match sampler plus, for dev, the Hyper-FLUX few-step profile
+                // (sc-2908). schnell is already a distilled 4-step checkpoint, so it advertises only
+                // the base sampler — Hyper-FLUX is a FLUX.1-dev LoRA.
+                samplers: match self {
+                    Self::Dev => vec![DEFAULT_SAMPLER, HYPER_SAMPLER],
+                    Self::Schnell => vec![DEFAULT_SAMPLER],
+                },
                 schedulers: vec!["linear"],
                 min_size: 256,
                 max_size: 2048,

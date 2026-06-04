@@ -3,14 +3,14 @@
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    WeightsSource,
 };
 use mlx_gen_z_image::vae::Vae;
-use mlx_rs::ops::{add, multiply};
 use mlx_rs::Dtype;
 
-use crate::config::FluxVariant;
+use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
 use crate::loader;
 use crate::pipeline::{build_linear_sigmas, create_noise, unpack_latents};
 use crate::text_encoder::FluxTextEncoders;
@@ -168,9 +168,16 @@ impl Generator for Flux1 {
         let transformer = self.transformer()?;
         let vae = self.vae()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.unwrap_or_else(|| self.variant.default_steps()) as usize;
+        // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
+        // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
+        // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
+        // loads at `scale≈0.125` via `spec.adapters`, not a different scheduler). An unset sampler is
+        // the base flow-match path; `validate_request` rejects any name not in the descriptor.
+        let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
+        let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
+        let steps = req.steps.unwrap_or(def_steps) as usize;
         let guidance = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE)
+            req.guidance.unwrap_or(def_guidance)
         } else {
             0.0
         };
@@ -189,32 +196,35 @@ impl Generator for Flux1 {
             req.height,
             self.variant.requires_sigma_shift(),
         )?;
+        // Drive the denoise through the swappable `DiffusionSampler` seam (sc-2769). FLUX's impl is the
+        // flow-match Euler sampler over these sigmas: `scale_model_input` is identity, `timestep(t)` is
+        // `sigmas[t]` (fed straight to the transformer), and `step` is `x + v·(σ_{t+1}−σ_t)` — exactly
+        // the proven inline loop, so the base render stays bit-exact (guarded by the e2e parity test).
+        let sampler = FlowMatchSampler::new(sigmas);
+        let n_steps = sampler.num_steps();
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
             let mut latents = create_noise(seed, req.width, req.height)?;
-            for t in 0..steps {
+            for t in 0..n_steps {
                 if req.cancel.is_cancelled() {
                     return Err(Error::Msg("generation cancelled".into()));
                 }
+                let x_in = sampler.scale_model_input(&latents, t)?;
                 let velocity = transformer.forward(
-                    &latents,
+                    &x_in,
                     &prompt_embeds,
                     &pooled_prompt_embeds,
-                    sigmas[t],
+                    sampler.timestep(t),
                     guidance,
                     req.width,
                     req.height,
                 )?;
-                let dt = sigmas[t + 1] - sigmas[t];
-                latents = add(
-                    &latents,
-                    &multiply(&velocity, mlx_rs::Array::from_slice(&[dt], &[1]))?,
-                )?;
+                latents = sampler.step(&velocity, &latents, t)?;
                 on_progress(Progress::Step {
                     current: t as u32 + 1,
-                    total: steps as u32,
+                    total: n_steps as u32,
                 });
             }
 
@@ -227,9 +237,31 @@ impl Generator for Flux1 {
     }
 }
 
+/// Few-step profile defaults `(steps, guidance)` applied when the request omits them (sc-2908). The
+/// base flow-match path uses the variant's own defaults; the `hyper` profile (Hyper-FLUX.1-dev) is 8
+/// steps at guidance 3.5 — paired with the ByteDance Hyper-FLUX 8-step LoRA loaded at `scale≈0.125`
+/// (the documented `lora_scale`) via `spec.adapters`. `hyper` is dev-only (it is a FLUX.1-dev LoRA)
+/// and schnell never advertises it, so it never reaches here for schnell.
+fn profile_defaults(variant: FluxVariant, sampler: &str) -> (u32, f32) {
+    match sampler {
+        HYPER_SAMPLER => (8, crate::config::DEFAULT_GUIDANCE),
+        _ => (variant.default_steps(), crate::config::DEFAULT_GUIDANCE),
+    }
+}
+
 fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
+    }
+    // Reject a sampler the variant does not advertise (e.g. `hyper` on schnell, or any typo) rather
+    // than silently falling back to the base flow-match path.
+    if let Some(s) = &req.sampler {
+        if !desc.capabilities.samplers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "{}: unsupported sampler {s:?} (supported: {:?})",
+                desc.id, desc.capabilities.samplers
+            )));
+        }
     }
     if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
@@ -333,5 +365,82 @@ mod tests {
     fn constants_match_expected_ids() {
         assert_eq!(FluxVariant::Schnell.id(), FLUX1_SCHNELL_ID);
         assert_eq!(FluxVariant::Dev.id(), FLUX1_DEV_ID);
+    }
+
+    // ---- sc-2908: sampler capability surface + few-step profile -----------------------------
+
+    #[test]
+    fn dev_advertises_hyper_schnell_does_not() {
+        // Hyper-FLUX is a FLUX.1-dev LoRA: dev exposes the base + `hyper` samplers; schnell (already
+        // a distilled 4-step checkpoint) exposes only the base flow-match sampler.
+        let dev = descriptor_for(FluxVariant::Dev).capabilities.samplers;
+        assert_eq!(dev, vec![DEFAULT_SAMPLER, HYPER_SAMPLER]);
+        let schnell = descriptor_for(FluxVariant::Schnell).capabilities.samplers;
+        assert_eq!(schnell, vec![DEFAULT_SAMPLER]);
+    }
+
+    #[test]
+    fn validate_accepts_base_and_hyper_on_dev() {
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        for s in [DEFAULT_SAMPLER, HYPER_SAMPLER] {
+            let req = GenerationRequest {
+                prompt: "a red fox".into(),
+                guidance: Some(3.5),
+                sampler: Some(s.into()),
+                ..Default::default()
+            };
+            assert!(model.validate(&req).is_ok(), "sampler {s:?} should be accepted on dev");
+        }
+        // An unset sampler is the base flow-match path.
+        let req = GenerationRequest {
+            prompt: "a red fox".into(),
+            guidance: Some(3.5),
+            ..Default::default()
+        };
+        assert!(model.validate(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_hyper_on_schnell_and_unknown_samplers() {
+        // `hyper` is dev-only — schnell does not advertise it, so it is rejected, not downgraded.
+        let schnell = Flux1::new_for_tests(FluxVariant::Schnell);
+        let err = schnell
+            .validate(&GenerationRequest {
+                prompt: "a red fox".into(),
+                sampler: Some(HYPER_SAMPLER.into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported sampler"), "got: {err}");
+        // Any unknown sampler name is rejected on dev too.
+        let dev = Flux1::new_for_tests(FluxVariant::Dev);
+        for bad in ["lcm", "lightning", "euler", "nonsense"] {
+            let err = dev
+                .validate(&GenerationRequest {
+                    prompt: "a red fox".into(),
+                    guidance: Some(3.5),
+                    sampler: Some(bad.into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unsupported sampler"), "sampler {bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn hyper_profile_defaults_are_eight_steps_guidance_3_5() {
+        // The few-step profile: 8 steps at guidance 3.5 (the Hyper-FLUX.1-dev recommendation).
+        assert_eq!(profile_defaults(FluxVariant::Dev, HYPER_SAMPLER), (8, 3.5));
+        // The base path keeps the variant's own defaults (dev 25, schnell 4).
+        assert_eq!(
+            profile_defaults(FluxVariant::Dev, DEFAULT_SAMPLER),
+            (FluxVariant::Dev.default_steps(), crate::config::DEFAULT_GUIDANCE)
+        );
+        assert_eq!(
+            profile_defaults(FluxVariant::Schnell, DEFAULT_SAMPLER),
+            (FluxVariant::Schnell.default_steps(), crate::config::DEFAULT_GUIDANCE)
+        );
     }
 }

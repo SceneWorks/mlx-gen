@@ -155,11 +155,19 @@ fn routing_map_covers_full_fork_surface() {
             assert!(resolves(&mut t, &p), "expected {p} to resolve");
         }
     }
+    // sc-2908: the top-level global projections now resolve (fork-omitted, trained by PEFT
+    // acceleration LoRAs like Hyper-FLUX).
     for p in [
         "x_embedder",
         "context_embedder",
         "norm_out.linear",
         "proj_out",
+        "time_text_embed.timestep_embedder.linear_1",
+        "time_text_embed.guidance_embedder.linear_2",
+    ] {
+        assert!(resolves(&mut t, p), "expected global {p} to resolve (sc-2908)");
+    }
+    for p in [
         "transformer_blocks.19.attn.to_q",
         "single_transformer_blocks.38.proj_out",
         "transformer_blocks.0.attn.add_q",
@@ -167,7 +175,7 @@ fn routing_map_covers_full_fork_surface() {
         assert!(!resolves(&mut t, p), "expected {p} NOT to resolve");
     }
     println!(
-        "✓ routing covers the full FluxLoRAMapping surface (19×14 + 38×6) and rejects off-surface"
+        "✓ routing covers the full block surface (19×14 + 38×6) + the top-level globals (sc-2908)"
     );
 }
 

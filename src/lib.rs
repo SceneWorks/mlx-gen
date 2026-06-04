@@ -39,7 +39,9 @@ pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
     WeightsSource,
 };
-pub use sampler::{AlphaSchedule, DiffusionSampler, LcmSampler, LightningSampler, TcdSampler};
+pub use sampler::{
+    AlphaSchedule, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, TcdSampler,
+};
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};
 pub use transform::{
