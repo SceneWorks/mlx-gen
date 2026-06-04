@@ -24,39 +24,48 @@
 //! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
 //! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, addmm, concatenate_axis, cos, multiply, sigmoid, sin, split};
+use mlx_rs::ops::{add, concatenate_axis, cos, multiply, sigmoid, sin, split};
 use mlx_rs::{Array, Dtype};
 
-use crate::config::WanModelConfig;
+use crate::config::{WanModelConfig, WanQuant};
 use crate::patchify::{patchify, unpatchify};
 use crate::rope::RopeTable;
 use crate::text_encoder::gelu_tanh;
 
-/// A `[out, in]` weight + bias (every DiT `nn.Linear` is biased). `forward` mirrors MLX's
-/// `nn.Linear`: a **fused** `addmm(bias, x, Wᵀ)` — accumulate `x·Wᵀ`, add bias, round once. Using a
-/// separate `matmul` + `add` instead double-rounds in bf16 (matmul→bf16, then bias add→bf16), which
-/// is a ~bf16-ULP (~1.4e-3) error per layer that compounds over the 30 blocks — exactly the gap that
-/// localized to `q_proj`. `forward` is dtype-agnostic: the result dtype follows `x` (bf16 in → bf16;
-/// f32 in → f32-promoted, where the fusion is a no-op since nothing rounds to bf16 mid-op).
-struct Linear {
-    w: Array,
-    b: Array,
-}
-
-impl Linear {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
+/// Load a biased `[out, in]` Linear as a core [`AdaptableLinear`] (every Wan DiT `nn.Linear` is
+/// biased). The dense base mirrors MLX's `nn.Linear` exactly — a **fused** `addmm(bias, x, Wᵀ)`
+/// (accumulate `x·Wᵀ`, add bias, round once) — so it is bit-for-bit identical to the previous
+/// hand-rolled `Linear::forward` on every existing path (a separate `matmul`+`add` double-rounds in
+/// bf16, ~1.4e-3/layer, the gap that once localized to `q_proj`; the fusion is a no-op under f32
+/// activations). Using `AdaptableLinear` makes the base **quantizable in place** ([`quantize`](
+/// AdaptableLinear::quantize), sc-2682) and adapter-ready (sc-2683 / sc-2393) without changing the
+/// dense numerics. `forward` is dtype-agnostic: the result dtype follows `x`.
+///
+/// When `quant` is `Some` (a **pre-quantized snapshot** — the `config.json` `quantization` block) and
+/// this Linear carries packed weights on disk (`.scales` present), build the base **quantized
+/// directly** from the on-disk parts (the `loading.py` consume path) instead of loading dense bf16.
+/// `.scales` presence is the per-Linear signal (only the `_quantize_predicate` Linears are packed;
+/// embeddings/norms/head stay dense), exactly mirroring the reference's predicate.
+fn load_linear(w: &Weights, prefix: &str, quant: Option<WanQuant>) -> Result<AdaptableLinear> {
+    if let (Some(q), Some(scales)) = (quant, w.get(&format!("{prefix}.scales"))) {
+        return Ok(AdaptableLinear::from_quantized_parts(
+            w.require(&format!("{prefix}.weight"))?.clone(),
+            scales.clone(),
+            w.require(&format!("{prefix}.biases"))?.clone(),
+            w.get(&format!("{prefix}.bias")).cloned(),
+            q.group_size,
+            q.bits,
+        ));
     }
-    fn forward(&self, x: &Array) -> Result<Array> {
-        Ok(addmm(&self.b, x, self.w.t(), 1.0, 1.0)?)
-    }
+    Ok(AdaptableLinear::dense(
+        w.require(&format!("{prefix}.weight"))?.clone(),
+        Some(w.require(&format!("{prefix}.bias"))?.clone()),
+    ))
 }
 
 /// SiLU `x·σ(x)` (the reference `nn.SiLU`), bit-exact and dtype-preserving.
@@ -78,10 +87,10 @@ fn ln(x: &Array, eps: f32) -> Result<Array> {
 }
 
 struct SelfAttention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     norm_q: Array, // qk-RMSNorm over the full dim
     norm_k: Array,
     num_heads: usize,
@@ -93,11 +102,12 @@ struct SelfAttention {
 impl SelfAttention {
     fn load(w: &Weights, prefix: &str, cfg: &WanModelConfig) -> Result<Self> {
         let head_dim = cfg.dim / cfg.num_heads;
+        let q = cfg.quantization;
         Ok(Self {
-            q: Linear::load(w, &format!("{prefix}.q"))?,
-            k: Linear::load(w, &format!("{prefix}.k"))?,
-            v: Linear::load(w, &format!("{prefix}.v"))?,
-            o: Linear::load(w, &format!("{prefix}.o"))?,
+            q: load_linear(w, &format!("{prefix}.q"), q)?,
+            k: load_linear(w, &format!("{prefix}.k"), q)?,
+            v: load_linear(w, &format!("{prefix}.v"), q)?,
+            o: load_linear(w, &format!("{prefix}.o"), q)?,
             norm_q: w.require(&format!("{prefix}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{prefix}.norm_k.weight"))?.clone(),
             num_heads: cfg.num_heads,
@@ -105,6 +115,15 @@ impl SelfAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
         })
+    }
+
+    /// Quantize the four projections to Q4/Q8 in place (`_quantize_predicate`'s `.self_attn.{q,k,v,o}`).
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.q.quantize(bits, group)?;
+        self.k.quantize(bits, group)?;
+        self.v.quantize(bits, group)?;
+        self.o.quantize(bits, group)?;
+        Ok(())
     }
 
     /// `x_mod`: `[1, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[1, L, dim]` bf16.
@@ -143,10 +162,10 @@ impl SelfAttention {
 }
 
 struct CrossAttention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
     num_heads: usize,
@@ -158,11 +177,12 @@ struct CrossAttention {
 impl CrossAttention {
     fn load(w: &Weights, prefix: &str, cfg: &WanModelConfig) -> Result<Self> {
         let head_dim = cfg.dim / cfg.num_heads;
+        let q = cfg.quantization;
         Ok(Self {
-            q: Linear::load(w, &format!("{prefix}.q"))?,
-            k: Linear::load(w, &format!("{prefix}.k"))?,
-            v: Linear::load(w, &format!("{prefix}.v"))?,
-            o: Linear::load(w, &format!("{prefix}.o"))?,
+            q: load_linear(w, &format!("{prefix}.q"), q)?,
+            k: load_linear(w, &format!("{prefix}.k"), q)?,
+            v: load_linear(w, &format!("{prefix}.v"), q)?,
+            o: load_linear(w, &format!("{prefix}.o"), q)?,
             norm_q: w.require(&format!("{prefix}.norm_q.weight"))?.clone(),
             norm_k: w.require(&format!("{prefix}.norm_k.weight"))?.clone(),
             num_heads: cfg.num_heads,
@@ -170,6 +190,15 @@ impl CrossAttention {
             scale: (head_dim as f32).powf(-0.5),
             eps: cfg.eps as f32,
         })
+    }
+
+    /// Quantize the four projections to Q4/Q8 in place (`_quantize_predicate`'s `.cross_attn.{q,k,v,o}`).
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.q.quantize(bits, group)?;
+        self.k.quantize(bits, group)?;
+        self.v.quantize(bits, group)?;
+        self.o.quantize(bits, group)?;
+        Ok(())
     }
 
     /// Cached K/V from the (bf16) text context `[1, L_ctx, dim]` — computed once, reused per step.
@@ -206,8 +235,8 @@ struct Block {
     cross_attn: CrossAttention,
     norm3_w: Array, // cross-attn norm (affine LayerNorm)
     norm3_b: Array,
-    ffn_fc1: Linear,
-    ffn_fc2: Linear,
+    ffn_fc1: AdaptableLinear,
+    ffn_fc2: AdaptableLinear,
     eps: f32,
 }
 
@@ -220,10 +249,20 @@ impl Block {
             cross_attn: CrossAttention::load(w, &format!("{p}.cross_attn"), cfg)?,
             norm3_w: f32(w.require(&format!("{p}.norm3.weight"))?)?,
             norm3_b: f32(w.require(&format!("{p}.norm3.bias"))?)?,
-            ffn_fc1: Linear::load(w, &format!("{p}.ffn.fc1"))?,
-            ffn_fc2: Linear::load(w, &format!("{p}.ffn.fc2"))?,
+            ffn_fc1: load_linear(w, &format!("{p}.ffn.fc1"), cfg.quantization)?,
+            ffn_fc2: load_linear(w, &format!("{p}.ffn.fc2"), cfg.quantization)?,
             eps: cfg.eps as f32,
         })
+    }
+
+    /// Quantize this block's `_quantize_predicate` surface (self/cross attn `q/k/v/o` + `ffn.fc1/fc2`)
+    /// to Q4/Q8 in place. The modulation table, `norm3`, and the qk-RMSNorm weights stay dense.
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.self_attn.quantize(bits, group)?;
+        self.cross_attn.quantize(bits, group)?;
+        self.ffn_fc1.quantize(bits, group)?;
+        self.ffn_fc2.quantize(bits, group)?;
+        Ok(())
     }
 
     fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
@@ -267,15 +306,15 @@ impl Block {
 
 /// The Wan DiT (5B dense T2V). Holds the loaded weights + the precomputed RoPE table.
 pub struct WanTransformer {
-    patch_embedding: Linear,
-    text_embedding_0: Linear,
-    text_embedding_1: Linear,
-    time_embedding_0: Linear,
-    time_embedding_1: Linear,
-    time_projection: Linear,
+    patch_embedding: AdaptableLinear,
+    text_embedding_0: AdaptableLinear,
+    text_embedding_1: AdaptableLinear,
+    time_embedding_0: AdaptableLinear,
+    time_embedding_1: AdaptableLinear,
+    time_projection: AdaptableLinear,
     blocks: Vec<Block>,
     head_modulation: Array, // [1, 2, dim]
-    head: Linear,
+    head: AdaptableLinear,
     rope: RopeTable,
     inv_freq: Array, // [freq_dim/2] f32, for the sinusoidal time embedding
     cfg: WanModelConfig,
@@ -291,20 +330,42 @@ impl WanTransformer {
         let inv: Vec<f32> = (0..half)
             .map(|j| (10000.0_f64.powf(-(j as f64) / half as f64)) as f32)
             .collect();
+        // The patch/text/time embeddings, time_projection, and head are NOT in the reference's
+        // `_quantize_predicate` (precision-sensitive) → always dense, even in a pre-quantized snapshot
+        // (they carry no `.scales`), so `None`. Only the per-block attn/FFN Linears consume packed
+        // weights, gated by `cfg.quantization` inside `Block::load`/`SelfAttention::load`.
         Ok(Self {
-            patch_embedding: Linear::load(w, "patch_embedding_proj")?,
-            text_embedding_0: Linear::load(w, "text_embedding_0")?,
-            text_embedding_1: Linear::load(w, "text_embedding_1")?,
-            time_embedding_0: Linear::load(w, "time_embedding_0")?,
-            time_embedding_1: Linear::load(w, "time_embedding_1")?,
-            time_projection: Linear::load(w, "time_projection")?,
+            patch_embedding: load_linear(w, "patch_embedding_proj", None)?,
+            text_embedding_0: load_linear(w, "text_embedding_0", None)?,
+            text_embedding_1: load_linear(w, "text_embedding_1", None)?,
+            time_embedding_0: load_linear(w, "time_embedding_0", None)?,
+            time_embedding_1: load_linear(w, "time_embedding_1", None)?,
+            time_projection: load_linear(w, "time_projection", None)?,
             blocks,
             head_modulation: f32(w.require("head.modulation")?)?,
-            head: Linear::load(w, "head.head")?,
+            head: load_linear(w, "head.head", None)?,
             rope: RopeTable::new(cfg.dim / cfg.num_heads),
             inv_freq: Array::from_slice(&inv, &[half as i32]),
             cfg: cfg.clone(),
         })
+    }
+
+    /// Quantize the transformer-only attention + FFN Linears to Q4/Q8 **in place** — the reference's
+    /// `_quantize_predicate` surface: every block's self/cross-attention `q/k/v/o` and `ffn.fc1/fc2`.
+    /// The patch/text/time embeddings, `time_projection`, modulation tables, qk/`norm3` norms, and the
+    /// output head stay dense (small + precision-sensitive — the reference skips them). Mirrors
+    /// `convert_wan.py::_quantize_predicate` + `loading.py` (sc-2682).
+    ///
+    /// `group` is the quantization group size; `None` ⇒ the mflux/reference default of 64. The core
+    /// [`AdaptableLinear::quantize`] casts weight+bias to bf16 before packing so the group scales
+    /// byte-match the reference's — a **no-op** for Wan, whose converted DiT is bf16-native (so the
+    /// [[zimage-q8-f32-checkpoint-scales-sc2604]] chokepoint applies but never bites). Per-step compute
+    /// then runs `quantized_matmul` (fp32-accumulate) on the bf16 activations the blocks already feed.
+    pub fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        for block in &mut self.blocks {
+            block.quantize(bits, group)?;
+        }
+        Ok(())
     }
 
     /// Embed a single T5 prompt embedding `[L_text, text_dim]` → `[1, text_len, dim]` (bf16),

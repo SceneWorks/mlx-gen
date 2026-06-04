@@ -187,6 +187,32 @@ impl AdaptableLinear {
         }
     }
 
+    /// Build a quantized base from **already-packed** parts read off disk — a *pre-quantized*
+    /// checkpoint (group-wise affine `weight` u32 codes + `scales` + `biases`, optional dense
+    /// `bias`). The consume-side counterpart to [`quantize`](Self::quantize): no re-quantization
+    /// happens, the on-disk scales are used as-is. Mirrors the fork's `loading.py` — `nn.quantize`
+    /// stubs then `load_weights` of the packed tensors — but as a direct construction. `group_size`
+    /// and `bits` come from the checkpoint's manifest (e.g. Wan's `config.json` `quantization` block).
+    pub fn from_quantized_parts(
+        weight: Array,
+        scales: Array,
+        biases: Array,
+        bias: Option<Array>,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        Self::from_quantized(QuantizedLinear {
+            group_size,
+            bits,
+            scales: Param::new(scales),
+            biases: Param::new(biases),
+            inner: Linear {
+                weight: Param::new(weight),
+                bias: Param::new(bias),
+            },
+        })
+    }
+
     /// Stack a new adapter (LoRA or LoKr) on top of any already installed.
     pub fn push(&mut self, adapter: Adapter) {
         self.adapters.push(adapter);

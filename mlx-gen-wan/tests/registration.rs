@@ -84,6 +84,32 @@ const I2V_14B_CONFIG: &str = r#"{
   "max_area": 901120
 }"#;
 
+/// A **pre-quantized** T2V-A14B `config.json` — the dense config plus a `quantization` block
+/// (`convert_wan.py` writes this when it packs the transformer). `load` must accept it (the snapshot
+/// ships packed weights consumed by `from_weights`) without a `spec.quantize` override.
+const T2V_14B_Q4_CONFIG: &str = r#"{
+  "model_type": "t2v",
+  "model_version": "2.2",
+  "patch_size": [1, 2, 2],
+  "in_dim": 16,
+  "dim": 5120,
+  "ffn_dim": 13824,
+  "out_dim": 16,
+  "num_heads": 40,
+  "num_layers": 40,
+  "vae_z_dim": 16,
+  "vae_stride": [4, 8, 8],
+  "dual_model": true,
+  "boundary": 0.875,
+  "sample_shift": 12.0,
+  "sample_steps": 40,
+  "sample_guide_scale": [3.0, 4.0],
+  "sample_fps": 16,
+  "frame_num": 81,
+  "max_area": 0,
+  "quantization": {"group_size": 64, "bits": 4}
+}"#;
+
 /// A throwaway model dir holding just `config.json` (`load` only reads config; `generate`'s heavy
 /// weights aren't touched until called).
 fn temp_model_dir(tag: &str) -> PathBuf {
@@ -160,7 +186,8 @@ fn load_rejects_unwired_features() {
         &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
     )
     .is_err());
-    // Quantization (sc-2682).
+    // Quantization (sc-2682) is wired at the transformer level (WanTransformer::quantize) but the
+    // 5B generate pipeline is still stubbed (sc-2680), so load() rejects a quant spec it cannot run.
     assert!(registry::load(
         MODEL_ID,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
@@ -269,12 +296,14 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
         &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
     )
     .is_err());
-    // Quantization (sc-2682) + adapters (sc-2683 / sc-2393) + precision override.
+    // Quantization (sc-2682) is now WIRED: Q4/Q8 is accepted at load (each expert is quantized
+    // lazily in generate). The e2e numerics are gated by tests/quant_e2e_parity.rs.
     assert!(registry::load(
         MODEL_ID_T2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
     )
-    .is_err());
+    .is_ok());
+    // Precision override (the experts run bf16 GEMMs over an f32 residual) is still rejected.
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
     assert!(registry::load(MODEL_ID_T2V_14B, &spec).is_err());
@@ -287,6 +316,33 @@ fn load_t2v_14b_rejects_non_dual_config_and_unwired_features() {
     assert!(registry::load(
         MODEL_ID_T2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(adapters)
+    )
+    .is_err());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn load_t2v_14b_accepts_prequantized_snapshot_and_reconciles_spec() {
+    // A pre-quantized snapshot (config.json carries a `quantization` block) loads WITHOUT a
+    // spec.quantize override — `from_weights` builds the experts from the on-disk packed weights.
+    let dir = temp_model_dir_with("t2v14b_q4", T2V_14B_Q4_CONFIG);
+    assert!(registry::load(
+        MODEL_ID_T2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone()))
+    )
+    .is_ok());
+    // A matching spec.quantize is fine (redundant with the manifest).
+    assert!(registry::load(
+        MODEL_ID_T2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q4)
+    )
+    .is_ok());
+    // A conflicting spec.quantize (Q8 vs the manifest's Q4) is rejected — the on-disk manifest is
+    // authoritative; we never silently re-quantize at a different width.
+    assert!(registry::load(
+        MODEL_ID_T2V_14B,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
     )
     .is_err());
 
@@ -400,12 +456,14 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         &LoadSpec::new(WeightsSource::File(dir.join("config.json")))
     )
     .is_err());
-    // Quantization (sc-2682) + precision override + adapters (sc-2683 / sc-2393).
+    // Quantization (sc-2682) is now WIRED: Q4/Q8 is accepted at load (each expert is quantized
+    // lazily in generate). The e2e numerics are gated by tests/quant_e2e_parity.rs.
     assert!(registry::load(
         MODEL_ID_I2V_14B,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_quant(Quant::Q8)
     )
-    .is_err());
+    .is_ok());
+    // Precision override (the experts run bf16 GEMMs over an f32 residual) is still rejected.
     let mut spec = LoadSpec::new(WeightsSource::Dir(dir.clone()));
     spec.precision = Precision::Fp32;
     assert!(registry::load(MODEL_ID_I2V_14B, &spec).is_err());
@@ -413,6 +471,7 @@ fn load_i2v_14b_rejects_non_i2v_config_and_unwired_features() {
         path: dir.join("x.safetensors"),
         scale: 1.0,
         kind: AdapterKind::Lora,
+        pass_scales: None,
     }];
     assert!(registry::load(
         MODEL_ID_I2V_14B,

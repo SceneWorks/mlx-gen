@@ -51,7 +51,7 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
-pub use config::{GuideScale, WanModelConfig, SAMPLE_NEG_PROMPT};
+pub use config::{GuideScale, WanModelConfig, WanQuant, SAMPLE_NEG_PROMPT};
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
     MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,

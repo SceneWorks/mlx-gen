@@ -48,6 +48,17 @@ impl GuideScale {
     }
 }
 
+/// A pre-quantized snapshot's quantization manifest (`config.json`'s `quantization` block, written by
+/// `convert_wan.py`). When present, the transformer's `_quantize_predicate` Linears ship **packed**
+/// on disk (`.scales`/`.biases`/u32 `.weight`) at this bit-width + group, and the loader builds them
+/// quantized directly (no load-time re-quantize) — the `loading.py` consume path. `None` ⇒ a dense
+/// bf16 snapshot (the loader may still quantize at load via `spec.quantize`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WanQuant {
+    pub bits: i32,
+    pub group_size: i32,
+}
+
 /// Configuration for a Wan T2V / I2V / TI2V model (2.1 and 2.2). Mirrors `WanModelConfig`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WanModelConfig {
@@ -94,6 +105,10 @@ pub struct WanModelConfig {
     pub t5_num_heads: usize,
     pub t5_num_layers: usize,
     pub t5_num_buckets: usize,
+
+    /// Pre-quantized snapshot manifest (`config.json`'s `quantization` block), or `None` for a dense
+    /// bf16 snapshot. Drives the [`crate::transformer`] consume path (sc-2682).
+    pub quantization: Option<WanQuant>,
 }
 
 impl WanModelConfig {
@@ -158,6 +173,7 @@ impl WanModelConfig {
             t5_num_heads: 64,
             t5_num_layers: 24,
             t5_num_buckets: 32,
+            quantization: None,
         }
     }
 
@@ -335,6 +351,14 @@ impl WanModelConfig {
         set_usize(v, "t5_num_heads", &mut self.t5_num_heads);
         set_usize(v, "t5_num_layers", &mut self.t5_num_layers);
         set_usize(v, "t5_num_buckets", &mut self.t5_num_buckets);
+        // Pre-quantized snapshot manifest: `"quantization": {"bits": 4, "group_size": 64}` (written
+        // by convert_wan.py). Defaults match mflux/the reference (group 64) if a key is omitted.
+        if let Some(q) = v.get("quantization").filter(|q| q.is_object()) {
+            self.quantization = Some(WanQuant {
+                bits: q.get("bits").and_then(Value::as_i64).unwrap_or(4) as i32,
+                group_size: q.get("group_size").and_then(Value::as_i64).unwrap_or(64) as i32,
+            });
+        }
     }
 }
 
@@ -485,5 +509,35 @@ mod tests {
             }
         );
         assert!(c.dual_model);
+    }
+
+    #[test]
+    fn config_json_parses_quantization_manifest() {
+        // A dense bf16 snapshot carries no `quantization` block.
+        let dense = serde_json::json!({"model_type": "t2v", "dim": 5120, "dual_model": true});
+        assert_eq!(WanModelConfig::from_config_json(&dense).quantization, None);
+
+        // A pre-quantized snapshot (convert_wan.py) carries `{bits, group_size}`.
+        let q4 = serde_json::json!({
+            "model_type": "t2v", "dim": 5120, "dual_model": true,
+            "quantization": {"group_size": 64, "bits": 4}
+        });
+        assert_eq!(
+            WanModelConfig::from_config_json(&q4).quantization,
+            Some(WanQuant {
+                bits: 4,
+                group_size: 64
+            })
+        );
+
+        // Missing keys fall back to the reference/mflux defaults (group 64, 4-bit).
+        let bare = serde_json::json!({"model_type": "t2v", "quantization": {}});
+        assert_eq!(
+            WanModelConfig::from_config_json(&bare).quantization,
+            Some(WanQuant {
+                bits: 4,
+                group_size: 64
+            })
+        );
     }
 }
