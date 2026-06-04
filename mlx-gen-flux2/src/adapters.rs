@@ -13,8 +13,8 @@ use mlx_gen::Result;
 
 /// Apply every adapter in `specs` onto a FLUX.2 transformer `host` (stacked, mixed LoRA/LoKr), via
 /// the core [`apply_adapters_strict`] — errors, never silently drops, on an unmatched target. The
-/// adapter residuals run f32 (the crate's activation dtype; also dodges the dense 16-bit Metal GEMM
-/// bug on the rank-K matmul, per the core `Adapter::residual`).
+/// core `Adapter::residual` runs in the natural (fork-faithful) dtype — f32 here, since FLUX.2's
+/// activations are f32 — so this change is dtype-invariant for the crate (sc-2718).
 pub fn apply_flux2_adapters(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],

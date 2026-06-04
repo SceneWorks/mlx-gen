@@ -117,6 +117,35 @@ fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u
     }
 }
 
+/// Count RGB8 pixels differing by >8 between two buffers.
+fn px_gt8(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b)
+        .filter(|(x, y)| (**x as i32 - **y as i32).abs() > 8)
+        .count()
+}
+
+/// The base (no-adapter) render's px>8 vs the fork base golden, at the SAME config as the `kind`
+/// adapter golden — the inherited bf16 toolchain drift floor the adapter render sits on. The base
+/// golden (`qwen_image_golden.safetensors`) MUST be dumped at the adapter golden's
+/// (seed, steps, size); a mismatch is a hard error (it would yield a bogus floor).
+fn base_floor_px(kind: &str) -> usize {
+    let ag =
+        Weights::from_file(golden_dir().join(format!("qwen_{kind}_golden.safetensors"))).unwrap();
+    let bg = Weights::from_file(golden_dir().join("qwen_image_golden.safetensors"))
+        .expect("base golden qwen_image_golden.safetensors (dump it at the adapter config)");
+    for k in ["seed", "steps", "width", "height"] {
+        assert_eq!(
+            ag.metadata(k),
+            bg.metadata(k),
+            "base golden {k} != adapter golden {k} — regenerate qwen_image_golden.safetensors at the adapter config"
+        );
+    }
+    let pixels = render(None, kind);
+    let bimg = decoded_to_image(bg.require("decoded").unwrap()).unwrap();
+    px_gt8(&pixels, &bimg.pixels)
+}
+
 fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
     let pixels = render(
         Some((&format!("qwen_{kind}_adapter.safetensors"), my_kind, 1.0)),
@@ -125,54 +154,55 @@ fn assert_matches_golden(kind: &str, my_kind: AdapterKind) {
     let g =
         Weights::from_file(golden_dir().join(format!("qwen_{kind}_golden.safetensors"))).unwrap();
     let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
-    let differ = pixels
-        .iter()
-        .zip(&gimg.pixels)
-        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
-        .count();
-    let frac = differ as f64 / pixels.len() as f64;
+    let differ = px_gt8(&pixels, &gimg.pixels);
+
+    // Floor-relative gate (sc-2718): the adapter render must not diverge from the fork by materially
+    // more than the BASE render does — the inherited bf16 toolchain drift floor — i.e. the adapter
+    // itself adds ~zero divergence (the residual is fork-faithful; scale-0 is bit-exact). The
+    // `2×floor + 0.5%` cap allows the stronger-perturbation adapter image's larger content floor
+    // while staying FAR tighter than a flat %. Measured @512²: Qwen base 0.05% / LoRA 0.02% /
+    // LoKr 0.02%. (Replaces the old flat 5% guard, which was sized for the inflated 256² floor —
+    // a small latent lets bf16 drift flip a large *fraction* of the few pixels; the floor collapses
+    // ~30× at 512², so the goldens are now dumped at 512².)
+    let base = base_floor_px(kind);
+    let cap = base * 2 + pixels.len() / 200;
+    let pct = |n: usize| n as f64 / pixels.len() as f64 * 100.0;
     println!(
-        "✓ qwen {kind} adapter render: {differ}/{} px differ by >8 from the fork ({:.4}%)",
-        pixels.len(),
-        frac * 100.0
+        "✓ qwen {kind} adapter render: {differ} px>8 ({:.4}%); base floor {base} ({:.4}%); cap {cap} ({:.4}%)",
+        pct(differ),
+        pct(base),
+        pct(cap),
     );
     assert!(
-        differ < pixels.len() / 20,
-        "qwen {kind} adapter render diverges from the fork: {differ} px ({:.3}%)",
-        frac * 100.0
+        differ <= cap,
+        "qwen {kind} adapter render diverges beyond the base floor: {differ} px ({:.3}%) > cap {cap} px (base {base})",
+        pct(differ),
     );
 }
 
 #[test]
-#[ignore = "needs real Qwen-Image weights + adapter golden"]
+#[ignore = "needs real Qwen-Image weights + adapter & base goldens (same config)"]
 fn lora_render_matches_fork_golden() {
     assert_matches_golden("lora", AdapterKind::Lora);
 }
 
 #[test]
-#[ignore = "needs real Qwen-Image weights + adapter golden"]
+#[ignore = "needs real Qwen-Image weights + adapter & base goldens (same config)"]
 fn lokr_render_matches_fork_golden() {
     assert_matches_golden("lokr", AdapterKind::Lokr);
 }
 
 /// Diagnostic (per the divergence-is-not-rounding rule): the Rust base render (no adapter) vs the
-/// fork base golden at the SAME 256² config — the floor the LoRA/LoKr px>8 numbers inherit. Needs
-/// `QWEN_W=256 QWEN_H=256 dump_qwen_image_golden.py` (gitignored base golden).
+/// fork base golden at the adapter golden's config — the floor the LoRA/LoKr px>8 numbers inherit
+/// and the `assert_matches_golden` cap is derived from. Needs `qwen_image_golden.safetensors`
+/// dumped at the adapter config (`tools/dump_qwen_image_golden.py`; default 512²).
 #[test]
-#[ignore = "needs real Qwen-Image weights + base golden @256"]
+#[ignore = "needs real Qwen-Image weights + base golden at the adapter config"]
 fn base_render_drift_attributes_adapter_gap() {
-    let pixels = render(None, "lora"); // config (256², seed 42, 4 steps) read from the lora golden
-    let g = Weights::from_file(golden_dir().join("qwen_image_golden.safetensors")).unwrap();
-    let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
-    let differ = pixels
-        .iter()
-        .zip(&gimg.pixels)
-        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
-        .count();
+    // The inherited bf16 toolchain floor (also folded into assert_matches_golden's cap).
     println!(
-        "qwen base (no adapter) vs fork base @256²: {differ}/{} px>8 ({:.4}%)",
-        pixels.len(),
-        differ as f64 / pixels.len() as f64 * 100.0
+        "qwen base (no adapter) vs fork base: {} px>8",
+        base_floor_px("lora")
     );
 }
 

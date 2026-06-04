@@ -27,8 +27,11 @@ os.makedirs(_GOLDEN_DIR, exist_ok=True)
 SEED = 42
 PROMPT = "a fox sitting in a forest, photorealistic"
 STEPS = 4
-H = int(os.environ.get("QWEN_H", "256"))
-W = int(os.environ.get("QWEN_W", "256"))
+# 512² by default: the adapter parity gate (tests/adapter_real_weights.rs) is floor-relative, and
+# the bf16 toolchain floor is ~30× lower at 512² than the inflated 256² floor (sc-2718). Dump the
+# base golden (dump_qwen_image_golden.py) at the SAME size for the gate's base-floor comparison.
+H = int(os.environ.get("QWEN_H", "512"))
+W = int(os.environ.get("QWEN_W", "512"))
 GUIDANCE = 4.0
 LORA_STD = float(os.environ.get("QWEN_LORA_STD", "0.02"))
 LOKR_STD = float(os.environ.get("QWEN_LOKR_STD", "0.05"))

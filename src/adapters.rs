@@ -67,27 +67,37 @@ pub enum Adapter {
 }
 
 impl Adapter {
+    /// One adapter's forward-time contribution `scale · …`, replicating the fork's `LoRALinear`
+    /// / `LoKrLinear` `.residual` **byte-for-byte** (sc-2718). No dtype is forced: the earlier f32
+    /// upcast (sc-2602/2719) was a workaround for the NAX 16-bit dense GEMM returning garbage on the
+    /// low-rank `[seq,r]·[r,out]` matmul (`K = rank ≤ 512`, `M ≥ 2`); that GEMM is now correct at the
+    /// toolchain level (sc-2772 — Metal target ≥ 26.2), so the math runs in the natural promoted
+    /// dtype exactly as the fork does — restoring parity (the f32 forcing was the DEVIATION):
+    ///   * LoRA — `scale · (x·A)·B` with `A`/`B` kept at their loaded (file) dtype. The fork never
+    ///     casts the factors, so a bf16 `x` against f32 factors (the goldens ship f32) promotes to
+    ///     f32; a bf16-factor file runs bf16 (the formerly-buggy shape, now safe).
+    ///   * LoKr — `scale · x·ΔWᵀ` with `ΔW` (stored bf16) cast to the **activation dtype** — bf16 on
+    ///     the bf16 path — mirroring the fork's `delta.astype(x.dtype)`.
+    ///
+    /// The result is NOT cast back: `base(x) + residual` promotes just as the fork's `out + residual`
+    /// does. An f32-activation target is unchanged (FLUX.2; Qwen's f32 image stream; SDXL merges
+    /// instead) — the residual was f32 before and stays f32. A bf16-activation target now runs the
+    /// residual in bf16 like the fork (Z-Image's latents; Qwen's bf16 text stream); validated against
+    /// the fork goldens (Z-Image / Qwen LoRA+LoKr) — px>8 byte-identical to the old forced-f32 path,
+    /// i.e. the dtype change is sub-threshold while restoring fork-faithfulness (sc-2718). `scale` is
+    /// applied through a dtype-matched scalar so the multiply preserves the residual's dtype, matching
+    /// the fork's weak Python-float `scale * …` (a strong f32 scalar would wrongly promote a bf16
+    /// residual to f32; verified against MLX).
     pub fn residual(&self, x: &Array) -> Result<Array> {
-        // Adapter math runs in f32. LoRA's low-rank second matmul is `[seq,r]·[r,out]` with
-        // `K = rank ≤ 512` — exactly the dense 16-bit×16-bit Metal GEMM the NAX build mis-runs
-        // (M≥2 & K≤512; see `mlx-gen-qwen-image/tests/bf16_matmul_sweep.rs`). On the bf16 txt2img
-        // path that GEMM would get bf16 activations and return garbage. f32 sidesteps the bug, is
-        // strictly more accurate, and still matches the fork's (bug-free wheel) bf16 residual
-        // within tolerance once cast back. The result is returned in the activation dtype so
-        // `base(x) + residual` stays in the base dtype (PARITY-BF16 on the bf16 path; f32 base → f32).
-        let xf = x.as_dtype(Dtype::Float32)?;
-        let r = match self {
-            Adapter::Lora { a, b, scale } => {
-                let a = a.as_dtype(Dtype::Float32)?;
-                let b = b.as_dtype(Dtype::Float32)?;
-                multiply(&matmul(&matmul(&xf, &a)?, &b)?, scalar(*scale))?
-            }
+        let (r, scale) = match self {
+            Adapter::Lora { a, b, scale } => (matmul(&matmul(x, a)?, b)?, *scale),
             Adapter::Lokr { delta, scale } => {
-                let d = delta.as_dtype(Dtype::Float32)?;
-                multiply(&matmul(&xf, d.t())?, scalar(*scale))?
+                let d = delta.as_dtype(x.dtype())?;
+                (matmul(x, d.t())?, *scale)
             }
         };
-        Ok(r.as_dtype(x.dtype())?)
+        // Dtype-matched scalar → preserves the residual's dtype (the fork's weak-float `scale * …`).
+        Ok(multiply(&r, &scalar(scale).as_dtype(r.dtype())?)?)
     }
 }
 
@@ -406,37 +416,30 @@ mod tests {
     }
 
     #[test]
-    fn residual_in_bf16_runs_f32_and_returns_activation_dtype() {
-        // The LoRA second matmul `[seq,r]·[r,out]` (K=rank=4≤512, M=seq=4≥2) is the dense 16-bit
-        // GEMM the NAX build mis-runs; `residual` must compute it in f32 and return the activation
-        // dtype. So a bf16-input residual must (a) be bf16 and (b) match the f32 reference within
-        // bf16 rounding — NOT diverge (which is what the buggy bf16 GEMM would produce).
-        let a32 = Array::from_slice(
-            &(0..8).map(|i| i as f32 * 0.1 - 0.4).collect::<Vec<_>>(),
-            &[2, 4],
-        );
-        let b32 = Array::from_slice(
-            &(0..8).map(|i| i as f32 * 0.05).collect::<Vec<_>>(),
-            &[4, 2],
-        );
+    fn lokr_residual_runs_in_activation_dtype() {
+        // sc-2718: the f32 bug-workaround is gone (NAX 16-bit dense GEMM fixed at the toolchain
+        // level, sc-2772). A LoKr residual now runs in the ACTIVATION dtype — bf16 on the bf16 path
+        // — mirroring the fork's `scale · matmul(x, delta.astype(x.dtype).T)`. So a bf16-input LoKr
+        // residual must (a) return bf16 and (b) match the f32 reference within bf16 rounding — NOT
+        // diverge (which is what the old buggy bf16 GEMM produced and the f32 detour avoided).
+        let delta = lokr_2x2(); // bf16
         let x32 = Array::from_slice(&[1.0f32, -2.0, 0.5, 0.25, -1.0, 2.0], &[3, 2]);
-        let lora = Adapter::Lora {
-            a: a32.as_dtype(Dtype::Bfloat16).unwrap(),
-            b: b32.as_dtype(Dtype::Bfloat16).unwrap(),
+        let lokr = Adapter::Lokr {
+            delta: delta.clone(),
             scale: 0.5,
         };
-        let got = lora
+
+        let got = lokr
             .residual(&x32.as_dtype(Dtype::Bfloat16).unwrap())
             .unwrap();
         assert_eq!(
             got.dtype(),
             Dtype::Bfloat16,
-            "residual returns the activation dtype"
+            "bf16-input LoKr residual runs in the activation dtype"
         );
 
-        // f32 reference, rounded to bf16 the way `residual` casts its result back.
         let want = multiply(
-            matmul(matmul(&x32, &a32).unwrap(), &b32).unwrap(),
+            matmul(&x32, delta.as_dtype(Dtype::Float32).unwrap().t()).unwrap(),
             scalar(0.5),
         )
         .unwrap()
@@ -446,7 +449,79 @@ mod tests {
             all_close(&got, &want, 5e-2, 5e-2, false)
                 .unwrap()
                 .item::<bool>(),
-            "bf16 residual diverged from the f32 reference (bf16 GEMM bug?)"
+            "bf16 LoKr residual diverged from the f32 reference (bf16 GEMM bug?)"
+        );
+    }
+
+    #[test]
+    fn lora_residual_is_fork_faithful_no_forced_dtype() {
+        // sc-2718: LoRA factors keep their loaded dtype and the result is NOT cast back, replicating
+        // the fork's `scale · matmul(matmul(x, lora_A), lora_B)` byte-for-byte.
+        let a32 = Array::from_slice(
+            &(0..8).map(|i| i as f32 * 0.1 - 0.4).collect::<Vec<_>>(),
+            &[2, 4],
+        );
+        let b32 = Array::from_slice(
+            &(0..8).map(|i| i as f32 * 0.05).collect::<Vec<_>>(),
+            &[4, 2],
+        );
+        let x_bf16 = Array::from_slice(&[1.0f32, -2.0, 0.5, 0.25, -1.0, 2.0], &[3, 2])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+
+        // f32 factors (the goldens' dtype): a bf16 `x` promotes the residual to f32 — and it is
+        // byte-exact to the fork's `scale · (x·A)·B` (no forced dtype, no cast-back).
+        let lora_f32 = Adapter::Lora {
+            a: a32.clone(),
+            b: b32.clone(),
+            scale: 0.5,
+        };
+        let got_f32 = lora_f32.residual(&x_bf16).unwrap();
+        assert_eq!(
+            got_f32.dtype(),
+            Dtype::Float32,
+            "f32 factors promote the residual to f32 (fork-faithful, not forced)"
+        );
+        let want_f32 = multiply(
+            matmul(matmul(&x_bf16, &a32).unwrap(), &b32).unwrap(),
+            scalar(0.5),
+        )
+        .unwrap();
+        assert!(
+            array_eq(&got_f32, &want_f32, false).unwrap().item::<bool>(),
+            "LoRA residual must be byte-exact to the fork's scale·(x·A)·B"
+        );
+
+        // bf16 factors: the residual runs bf16 — the `[seq,r]·[r,out]` (K=rank=4≤512, M=seq=3≥2)
+        // shape the NAX build mis-ran before sc-2772 — and matches the f32 reference within bf16
+        // rounding (NOT garbage), proving the GEMM bug is gone so the f32 detour is unneeded.
+        let lora_bf16 = Adapter::Lora {
+            a: a32.as_dtype(Dtype::Bfloat16).unwrap(),
+            b: b32.as_dtype(Dtype::Bfloat16).unwrap(),
+            scale: 0.5,
+        };
+        let got_bf16 = lora_bf16.residual(&x_bf16).unwrap();
+        assert_eq!(
+            got_bf16.dtype(),
+            Dtype::Bfloat16,
+            "bf16 factors keep the residual in the activation dtype"
+        );
+        let want_bf16 = multiply(
+            matmul(
+                matmul(x_bf16.as_dtype(Dtype::Float32).unwrap(), &a32).unwrap(),
+                &b32,
+            )
+            .unwrap(),
+            scalar(0.5),
+        )
+        .unwrap()
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        assert!(
+            all_close(&got_bf16, &want_bf16, 5e-2, 5e-2, false)
+                .unwrap()
+                .item::<bool>(),
+            "bf16 LoRA residual diverged from the f32 reference (bf16 GEMM bug?)"
         );
     }
 
