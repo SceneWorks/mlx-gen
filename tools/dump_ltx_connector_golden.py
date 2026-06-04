@@ -106,14 +106,51 @@ additive = (mask01.astype(mx.float32) - 1.0).reshape(1, 1, 1, SEQ) * 1e9
 video_embeddings, _ = conn(features, additive)
 mx.eval(video_embeddings)
 
+# --- Audio connector (sc-2684): dim 2048 = 32 heads × 64 head_dim, same 8 layers / 128 regs. ---
+AUDIO_DIM, AUDIO_HEADS, AUDIO_HEAD_DIM = 2048, 32, 64
+audio_conn = Embeddings1DConnector(
+    dim=AUDIO_DIM,
+    num_heads=AUDIO_HEADS,
+    head_dim=AUDIO_HEAD_DIM,
+    num_layers=LAYERS,
+    num_learnable_registers=REGISTERS,
+    positional_embedding_max_pos=MAX_POS,
+    apply_gated_attention=True,
+)
+aprefix = "audio_embeddings_connector."
+amapped, aregisters = {}, None
+for k, v in raw.items():
+    if not k.startswith(aprefix):
+        continue
+    sub = k[len(aprefix):]
+    v = v.astype(mx.float32)
+    if sub == "learnable_registers":
+        aregisters = v
+        continue
+    sub = sub.replace(".ff.net.0.proj.", ".ff.proj_in.")
+    sub = sub.replace(".ff.net.2.", ".ff.proj_out.")
+    sub = sub.replace(".to_out.0.", ".to_out.")
+    amapped[sub] = v
+audio_conn.load_weights(list(amapped.items()), strict=False)
+if aregisters is not None:
+    audio_conn.learnable_registers = aregisters
+mx.eval(audio_conn.parameters())
+
+audio_features = mx.random.normal((1, SEQ, AUDIO_DIM)).astype(mx.float32)
+audio_embeddings, _ = audio_conn(audio_features, additive)
+mx.eval(audio_embeddings)
+
 tensors = {
     "features": features,
     "mask01": mask01.astype(mx.int32),
     "video_embeddings": video_embeddings.astype(mx.float32),
+    "audio_features": audio_features,
+    "audio_embeddings": audio_embeddings.astype(mx.float32),
 }
-meta = {"seq": str(SEQ), "num_valid": str(NUM_VALID), "dim": str(DIM)}
+meta = {"seq": str(SEQ), "num_valid": str(NUM_VALID), "dim": str(DIM), "audio_dim": str(AUDIO_DIM)}
 out = fixture("mlx-gen-ltx/tests/fixtures/ltx_connector_golden.safetensors")
 Path(out).parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(out, tensors, metadata=meta)
 print(f"wrote {out}")
 print(f"  features {features.shape}  video_embeddings {video_embeddings.shape}")
+print(f"  audio_features {audio_features.shape}  audio_embeddings {audio_embeddings.shape}")

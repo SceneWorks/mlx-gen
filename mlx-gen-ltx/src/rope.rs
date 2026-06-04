@@ -21,24 +21,26 @@ use mlx_gen::Result;
 
 /// Precompute the SPLIT RoPE `(cos, sin)` tables in double precision.
 ///
-/// * `positions` — the f32 position grid `(B, 3, T, 2)` from [`crate::positions`].
-/// * `dim` — RoPE dimension = the transformer **inner dim** (`heads · head_dim`).
+/// * `positions` — the f32 position grid `(B, n_pos_dims, T, 2)` from [`crate::positions`]. The
+///   video stream uses `n_pos_dims=3`; the audio stream + the cross-modal q/k tables use a 1-D grid
+///   (`n_pos_dims=1`, the time axis).
+/// * `dim` — RoPE dimension = the **inner dim** (`heads · head_dim`); 2048 for audio / cross-modal.
 /// * `theta` — base frequency (10000).
-/// * `max_pos` — per-axis maxima `[20, 2048, 2048]`.
-/// * `num_attention_heads` — heads to fold the freqs into (32).
+/// * `max_pos` — per-axis maxima (`[20, 2048, 2048]` video, `[20]` audio/cross); `len == n_pos_dims`.
+/// * `num_attention_heads` — heads to fold the freqs into.
 ///
 /// Returns `(cos, sin)`, each f32 `(B, num_attention_heads, T, dim/2/heads)`.
 pub fn precompute_split_freqs_cis(
     positions: &Array,
     dim: i32,
     theta: f64,
-    max_pos: [i32; 3],
+    max_pos: &[i32],
     num_attention_heads: i32,
 ) -> Result<(Array, Array)> {
     let shape = positions.shape();
-    debug_assert_eq!(shape.len(), 4, "positions must be (B, 3, T, 2)");
+    debug_assert_eq!(shape.len(), 4, "positions must be (B, n_pos_dims, T, 2)");
     let batch = shape[0] as usize;
-    let n_pos_dims = shape[1] as usize; // 3
+    let n_pos_dims = shape[1] as usize;
     let seq = shape[2] as usize; // T
     debug_assert_eq!(shape[3], 2);
     debug_assert_eq!(n_pos_dims, max_pos.len());
@@ -159,7 +161,7 @@ mod tests {
         // inner_dim 4096, 32 heads → head_half 64; T from a small grid.
         let pos = create_position_grid(1, 2, 2, 2); // 8 patches
         let (cos, sin) =
-            precompute_split_freqs_cis(&pos, 4096, 10000.0, [20, 2048, 2048], 32).expect("rope");
+            precompute_split_freqs_cis(&pos, 4096, 10000.0, &[20, 2048, 2048], 32).expect("rope");
         assert_eq!(cos.shape(), &[1, 32, 8, 64]);
         assert_eq!(sin.shape(), &[1, 32, 8, 64]);
 
@@ -181,7 +183,7 @@ mod tests {
         // The half-rotation is orthogonal per (a,b) pair → preserves L2 norm.
         let pos = create_position_grid(1, 1, 2, 2); // 4 patches
         let (cos, sin) =
-            precompute_split_freqs_cis(&pos, 4096, 10000.0, [20, 2048, 2048], 32).unwrap();
+            precompute_split_freqs_cis(&pos, 4096, 10000.0, &[20, 2048, 2048], 32).unwrap();
         // x: (1, 32, 4, 128) ones.
         let x = Array::ones::<f32>(&[1, 32, 4, 128]).unwrap();
         let y = apply_split_rotary_emb(&x, &cos, &sin).unwrap();

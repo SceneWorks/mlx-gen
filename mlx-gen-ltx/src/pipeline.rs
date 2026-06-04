@@ -23,11 +23,14 @@
 use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::media::AudioTrack;
 use mlx_gen::Result;
 
-use crate::transformer::{to_denoised, LtxDiT};
+use crate::audio_vae::AudioDecoder;
+use crate::transformer::{to_denoised, AvDiT, LtxDiT};
 use crate::upsampler::{upsample_latents, LatentUpsampler};
 use crate::vae::LtxVideoVae;
+use crate::vocoder::LtxVocoder;
 
 /// Distilled stage-1 sigmas (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps).
 pub const STAGE1_SIGMAS: [f32; 9] = [
@@ -205,6 +208,139 @@ pub fn generate_t2v(
         on_step,
     )?;
     decode_to_frames(vae, &latents)
+}
+
+// ===================================================================================================
+// AudioVideo pipeline (sc-2684) — the joint `denoise_av` loop + audio decode → waveform.
+// ===================================================================================================
+
+/// One stage's **joint** video+audio denoise loop (`denoise_av`). Distilled T2V+A: no CFG, legacy
+/// Euler, audio always enabled (the cross-modal attention couples the streams every step). Audio init
+/// is pure noise (no audio I2V).
+///
+/// * `video` — `(B, 128, F, H, W)` NCFHW; `audio` — `(B, 8, T, 16)` NCTF.
+/// * `*_ctx` — the video (4096) / audio (2048) text embeddings.
+/// * `*_pos` — the video `(B,3,Sv,2)` / audio `(B,1,Ta,2)` position grids.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_av(
+    dit: &AvDiT,
+    video: &Array,
+    audio: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    video_pos: &Array,
+    audio_pos: &Array,
+    sigmas: &[f32],
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(Array, Array)> {
+    let dt = video.dtype();
+    let v = video.shape();
+    let (vb, vc, vf, vh, vw) = (v[0], v[1], v[2], v[3], v[4]);
+    let v_tokens = vf * vh * vw;
+    let a = audio.shape();
+    let (ab, ac, at, af) = (a[0], a[1], a[2], a[3]);
+
+    let mut vlat = video.clone();
+    let mut alat = audio.clone();
+    for i in 0..sigmas.len() - 1 {
+        let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
+        // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F).
+        let vflat = vlat.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;
+        let aflat = alat
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[ab, at, ac * af])?;
+        let vts = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[vb, v_tokens])?;
+        let ats = broadcast_to(&scalar(sigma).as_dtype(dt)?, &[ab, at])?;
+        let (vvel, avel) = dit.forward(
+            &vflat, &vts, video_ctx, None, video_pos, &aflat, &ats, audio_ctx, None, audio_pos,
+        )?;
+        let vvel = vvel
+            .transpose_axes(&[0, 2, 1])?
+            .reshape(&[vb, vc, vf, vh, vw])?;
+        let avel = avel
+            .reshape(&[ab, at, ac, af])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let sig = scalar(sigma).as_dtype(dt)?;
+        let vden = to_denoised(&vlat, &vvel, &sig)?;
+        let aden = to_denoised(&alat, &avel, &sig)?;
+        vlat = euler_step(&vlat, &vden, sigma, sigma_next)?;
+        alat = euler_step(&alat, &aden, sigma, sigma_next)?;
+        mlx_rs::transforms::eval([&vlat, &alat])?;
+        on_step(i + 1);
+    }
+    Ok((vlat, alat))
+}
+
+/// The full 2-stage **AudioVideo** latent pipeline: joint stage-1 denoise → 2× upsample the **video**
+/// (audio is not upsampled) → re-noise both → joint stage-2 denoise. Returns `(video_latents (B,128,
+/// F,H,W), audio_latents (B,8,T,16))`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_av_latents(
+    dit: &AvDiT,
+    upsampler: &LatentUpsampler,
+    video_s1_noise: &Array,
+    video_pos1: &Array,
+    video_s2_noise: &Array,
+    video_pos2: &Array,
+    audio_s1_noise: &Array,
+    audio_s2_noise: &Array,
+    audio_pos: &Array,
+    video_ctx: &Array,
+    audio_ctx: &Array,
+    latent_mean: &Array,
+    latent_std: &Array,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<(Array, Array)> {
+    let (v, a) = denoise_av(
+        dit,
+        video_s1_noise,
+        audio_s1_noise,
+        video_ctx,
+        audio_ctx,
+        video_pos1,
+        audio_pos,
+        &STAGE1_SIGMAS,
+        on_step,
+    )?;
+    let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
+    let v = renoise(&v, video_s2_noise, STAGE2_SIGMAS[0])?;
+    let a = renoise(&a, audio_s2_noise, STAGE2_SIGMAS[0])?;
+    denoise_av(
+        dit,
+        &v,
+        &a,
+        video_ctx,
+        audio_ctx,
+        video_pos2,
+        audio_pos,
+        &STAGE2_SIGMAS,
+        on_step,
+    )
+}
+
+/// Decode audio latents → an interleaved-PCM [`AudioTrack`]: `audio_decoder` → mel `(B,2,T',64)` →
+/// `vocoder` → waveform `(B,2,samples)` → interleaved `f32`. `decode_audio = audio_decoder → vocoder`.
+pub fn decode_audio_track(
+    decoder: &AudioDecoder,
+    vocoder: &LtxVocoder,
+    audio_latents: &Array,
+    sample_rate: u32,
+) -> Result<AudioTrack> {
+    let mel = decoder.decode(audio_latents)?;
+    let wav = vocoder.forward(&mel)?; // (B, channels, samples)
+    let sh = wav.shape();
+    let (channels, samples) = (sh[1] as usize, sh[2]);
+    // (1, C, S) → (S, C) → interleaved.
+    let interleaved = contiguous(
+        &wav.reshape(&[channels as i32, samples])?
+            .transpose_axes(&[1, 0])?,
+    )?
+    .as_dtype(Dtype::Float32)?;
+    Ok(AudioTrack {
+        samples: interleaved.as_slice::<f32>().to_vec(),
+        sample_rate,
+        channels: channels as u16,
+    })
 }
 
 #[cfg(test)]

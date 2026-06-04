@@ -4,8 +4,9 @@
 //! `mlx-video-with-audio` package's LTX video path (`generate_av.py`, `models/ltx/*`,
 //! `models/ltx/video_vae/*`) onto Rust + `mlx-rs`.
 //!
-//! **Scope:** the **video-only** T2V core (sc-2679). The audio half (`generate_av.py`'s AudioVideo
-//! path), I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
+//! **Scope:** the full **AudioVideo** path (`generate_av.py`) — synchronized audio+video (sc-2684,
+//! built on the sc-2679 video core). `generate()` runs the joint dual-modality denoise and returns
+//! video frames + an audio track. I2V, Q4/Q8-of-everything, LoRA, and LoKr are sibling stories.
 //!
 //! This crate self-registers `ltx_2_3` into the `mlx-gen` model registry; load it with
 //! `mlx_gen::load("ltx_2_3", spec)`.
@@ -25,6 +26,7 @@
 //! native bf16 activations × Q8 — the production-speed path). Q4/Q8-of-everything, I2V, LoRA, LoKr,
 //! and audio are sibling stories.
 
+pub mod audio_vae;
 pub mod config;
 pub mod connector;
 pub mod gemma;
@@ -38,19 +40,23 @@ pub mod tokenizer;
 pub mod transformer;
 pub mod upsampler;
 pub mod vae;
+pub mod vocoder;
 
-pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
+pub use audio_vae::AudioDecoder;
+pub use config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
 pub use connector::Connector;
 pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use pipeline::{
-    decode_to_frames, denoise, generate_t2v, generate_t2v_latents, renoise, to_uint8_frames,
-    STAGE1_SIGMAS, STAGE2_SIGMAS,
+    decode_audio_track, decode_to_frames, denoise, denoise_av, generate_av_latents, generate_t2v,
+    generate_t2v_latents, renoise, to_uint8_frames, STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 pub use text_encoder::LtxTextEncoder;
 // Tiling moved to `mlx_gen` core (shared with the Wan VAE — sc-2808). Re-export the module + config
 // so `mlx_gen_ltx::tiling::*` / `mlx_gen_ltx::TilingConfig` keep resolving for existing callers.
+pub use config::{VocoderConfig, VocoderGenConfig};
 pub use mlx_gen::tiling::{self, TilingConfig};
 pub use tokenizer::LtxTokenizer;
-pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
+pub use transformer::{to_denoised, AvDiT, LtxDiT, Precision, VideoBlock};
 pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
+pub use vocoder::{Generator, LtxVocoder, VocoderWithBwe};
