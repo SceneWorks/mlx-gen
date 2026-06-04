@@ -104,7 +104,7 @@ fn transformer_pipeline_vae_matches_fork() {
     let noise = g.require("noise").unwrap().clone();
     let pos = g.require("prompt_embeds").unwrap();
     let neg = g.require("negative_prompt_embeds").unwrap();
-    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT));
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT).sigmas);
     let latents = denoise_with_progress(
         &transformer,
         &sampler,
@@ -181,7 +181,7 @@ fn q_pipeline_matches_fork(golden_path: &str, bits: i32, max_latent_mean: f32, m
     let noise = g.require("noise").unwrap().clone();
     let pos = g.require("prompt_embeds").unwrap();
     let neg = g.require("negative_prompt_embeds").unwrap();
-    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT));
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, WIDTH, HEIGHT).sigmas);
     let latents = denoise_with_progress(
         &transformer,
         &sampler,

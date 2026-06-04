@@ -26,7 +26,7 @@ use crate::model::{validate_request, LIGHTNING_SAMPLER};
 use crate::pipeline::{
     create_noise, decoded_to_image, denoise_edit_with_progress, qwen_scheduler, unpack_latents,
 };
-use crate::sampler::FlowMatchSampler;
+use crate::sampler::{lightning, FlowMatchSampler};
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
 use crate::transformer::QwenTransformer;
@@ -238,9 +238,9 @@ impl Generator for QwenImageEdit {
         // Build the sampler once (seed-independent): the static-shift Lightning schedule, or the
         // production `qwen_scheduler` (resolution-dependent).
         let sampler = if is_lightning {
-            FlowMatchSampler::lightning(steps)
+            lightning(steps)
         } else {
-            FlowMatchSampler::new(qwen_scheduler(steps, out_w, out_h))
+            FlowMatchSampler::new(qwen_scheduler(steps, out_w, out_h).sigmas)
         };
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {

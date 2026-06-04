@@ -136,7 +136,7 @@ fn edit_pipeline_matches_fork() {
     let static_lat = g.require("static_image_latents").unwrap();
     let pos = g.require("pos_embeds").unwrap();
     let neg = g.require("neg_embeds").unwrap();
-    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h));
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h).sigmas);
 
     let latents = denoise_edit_with_progress(
         &transformer,
@@ -468,7 +468,7 @@ fn edit_pipeline_q8_matches_fork() {
     let static_lat = g.require("static_image_latents").unwrap();
     let pos = g.require("pos_embeds").unwrap();
     let neg = g.require("neg_embeds").unwrap();
-    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h));
+    let sampler = FlowMatchSampler::new(qwen_scheduler(STEPS, w, h).sigmas);
 
     let latents = denoise_edit_with_progress(
         &transformer,

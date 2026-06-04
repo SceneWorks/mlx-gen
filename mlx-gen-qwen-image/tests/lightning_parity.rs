@@ -4,7 +4,7 @@
 //! trait. The frozen fork has no dedicated Qwen Lightning sampler, so (as with the SDXL accel work,
 //! sc-2769) the reference is the official lightx2v recipe as realized in diffusers'
 //! `FlowMatchEulerDiscreteScheduler`. This gate feeds the SAME synthetic `(velocity, sample)` tensors
-//! diffusers saw at each step and requires the Rust `FlowMatchSampler::lightning(n)` schedule + Euler
+//! diffusers saw at each step and requires the Rust `sampler::lightning(n)` schedule + Euler
 //! step to match diffusers to ~1e-6 (torch-f32 vs MLX-f32) — validating the Lightning sigmas free of
 //! the transformer-backend confound. The end-to-end render (which DOES exercise the transformer +
 //! LoRA) is a separate, qualitative gate (`tests/lightning_render_real_weights.rs`).
@@ -15,7 +15,7 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen::DiffusionSampler;
-use mlx_gen_qwen_image::FlowMatchSampler;
+use mlx_gen_qwen_image::lightning;
 use mlx_rs::{Array, Dtype};
 
 const GOLDEN: &str = concat!(
@@ -40,7 +40,7 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 fn lightning_schedule_matches_diffusers() {
     let g = Weights::from_file(GOLDEN).unwrap();
     for n in [4usize, 8] {
-        let sampler = FlowMatchSampler::lightning(n);
+        let sampler = lightning(n);
         let key = format!("lightning_{n}");
 
         // 1. The sigma schedule (n + 1 entries incl. the trailing 0).

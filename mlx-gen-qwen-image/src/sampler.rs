@@ -1,13 +1,16 @@
-//! Qwen-Image flow-match sampler under the core [`mlx_gen::DiffusionSampler`] seam (sc-2909).
+//! Qwen-Image flow-match Lightning schedule (sc-2909), built on the core
+//! [`mlx_gen::FlowMatchSampler`] seam (deduped onto that one wrapper in sc-2950).
 //!
 //! Qwen-Image is **flow-match**, so the DDPM `alphas_cumprod`-world acceleration samplers shipped
-//! with sc-2769 (`LcmSampler`/`LightningSampler`/`TcdSampler`) do not apply. Instead this wraps the
-//! crate's [`FlowMatchEuler`] schedule as a [`DiffusionSampler`], so both the production schedule
-//! (`qwen_scheduler`) and the few-step **Lightning** schedule drive the same generic denoise loop.
+//! with sc-2769 (`LcmSampler`/`LightningSampler`/`TcdSampler`) do not apply. Both the production
+//! schedule (`qwen_scheduler`, the fork's `LinearScheduler`) and the few-step **Lightning** schedule
+//! drive the generic denoise loop through the same core [`mlx_gen::FlowMatchSampler`] (forward Euler over a
+//! precomputed sigma schedule, `x + v·(σ_{i+1} − σ_i)`). Only the *schedule construction* differs per
+//! family — FLUX builds its `linspace(1, 1/n, n)` mu-shift sigmas, Qwen builds the two below — so this
+//! module owns just the Qwen-specific sigma builders; the wrapper type itself lives in core.
 //!
-//! - [`FlowMatchSampler::new`] wraps an arbitrary schedule (the production `qwen_scheduler`, i.e. the
-//!   fork's `LinearScheduler`: terminal-shift 0.02, resolution-dependent μ).
-//! - [`FlowMatchSampler::lightning`] builds the **official lightx2v Qwen-Image-Lightning** schedule,
+//! - Production: `FlowMatchSampler::new(qwen_scheduler(..).sigmas)` (resolution-dependent μ).
+//! - Lightning: [`lightning`] builds the **official lightx2v Qwen-Image-Lightning** schedule,
 //!   reproducing diffusers' `FlowMatchEulerDiscreteScheduler` under that LoRA's model-card config: a
 //!   static flow-match shift of `3.0` (`base_shift = max_shift = ln 3`, which collapses dynamic
 //!   shifting to a resolution-independent constant) with **no terminal rescale** (`shift_terminal =
@@ -19,12 +22,10 @@
 //!
 //! Timestep convention: Qwen feeds the **raw sigma** as the model timestep — the transformer's
 //! `QwenTimesteps` time-proj scales by ×1000 internally (so `embed(sigma·1000)` matches diffusers'
-//! `timesteps = sigmas·1000` fed to a scale-1 embedding). Hence [`DiffusionSampler::timestep`]
-//! returns `sigmas[i]`, exactly what the pixel-parity production loop already passes.
+//! `timesteps = sigmas·1000` fed to a scale-1 embedding). The core [`mlx_gen::FlowMatchSampler`]'s
+//! `timestep` already returns `sigmas[i]`, exactly what the pixel-parity production loop passes.
 
-use mlx_rs::Array;
-
-use mlx_gen::{DiffusionSampler, FlowMatchEuler, Result};
+pub use mlx_gen::FlowMatchSampler;
 
 /// The official lightx2v Qwen-Image-Lightning flow-match shift (`exp(μ)`, μ = `ln 3`). The model
 /// card sets `base_shift = max_shift = ln 3`, so the per-resolution dynamic shift collapses to this
@@ -35,6 +36,13 @@ pub const LIGHTNING_SHIFT: f32 = 3.0;
 /// Flow-match training timesteps (diffusers `num_train_timesteps`) — the Lightning sigma span runs
 /// down to `1/LIGHTNING_NUM_TRAIN_TIMESTEPS`, the full diffusers minimum (not the mflux `1/n`).
 const LIGHTNING_NUM_TRAIN_TIMESTEPS: f32 = 1000.0;
+
+/// Build the few-step **Lightning** [`mlx_gen::FlowMatchSampler`] for `num_steps` (typically 4 or 8,
+/// matching the loaded distillation LoRA): the official diffusers Lightning sigmas (see
+/// `lightning_sigmas`), wrapped in the core flow-match Euler sampler.
+pub fn lightning(num_steps: usize) -> FlowMatchSampler {
+    FlowMatchSampler::new(lightning_sigmas(num_steps))
+}
 
 /// Build the Lightning sigmas, reproducing diffusers' `FlowMatchEulerDiscreteScheduler.set_timesteps`
 /// under the official config: exponential time-shift `exp(μ)/(exp(μ) + (1/σ − 1))` with `exp(μ) =
@@ -60,70 +68,18 @@ fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
     sigmas
 }
 
-/// A [`FlowMatchEuler`] schedule adapted to the generic [`DiffusionSampler`] seam.
-///
-/// Flow-match has no model-input scaling and a unit-noise prior, so [`DiffusionSampler::scale_model_input`]
-/// (the trait default) and [`DiffusionSampler::scale_initial_noise`] are identity — the Qwen pipeline
-/// prepares the f32 noise (and the img2img blend) itself. The per-step update is the schedule's Euler
-/// step, identical to the pre-trait production loop, so routing the production path through this
-/// wrapper is bit-for-bit unchanged.
-pub struct FlowMatchSampler {
-    sched: FlowMatchEuler,
-}
-
-impl FlowMatchSampler {
-    /// Wrap an existing schedule (the production `qwen_scheduler`).
-    pub fn new(sched: FlowMatchEuler) -> Self {
-        Self { sched }
-    }
-
-    /// Build the few-step **Lightning** schedule for `num_steps` (typically 4 or 8, matching the
-    /// loaded distillation LoRA): the official diffusers Lightning sigmas (see [`lightning_sigmas`]).
-    pub fn lightning(num_steps: usize) -> Self {
-        Self::new(FlowMatchEuler {
-            sigmas: lightning_sigmas(num_steps),
-        })
-    }
-
-    /// The schedule sigma at step `i` (length `num_steps + 1`, trailing `0.0`). Used by the img2img
-    /// noise blend, which seeds the loop at `sigma(start_step)`.
-    pub fn sigma(&self, i: usize) -> f32 {
-        self.sched.sigmas[i]
-    }
-}
-
-impl DiffusionSampler for FlowMatchSampler {
-    fn num_steps(&self) -> usize {
-        self.sched.num_steps()
-    }
-
-    fn timestep(&self, i: usize) -> f32 {
-        // Raw sigma — the transformer's time-proj applies the ×1000 scale (see module docs).
-        self.sched.sigmas[i]
-    }
-
-    fn scale_initial_noise(&self, noise: &Array) -> Result<Array> {
-        // Flow-match prior is unit noise; the pipeline owns noise creation + the img2img blend.
-        Ok(noise.clone())
-    }
-
-    fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array> {
-        // Euler flow-match update: x + (sigma[i+1] - sigma[i]) · velocity.
-        self.sched.step(x, model_output, i)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pipeline::qwen_scheduler;
+    use mlx_gen::DiffusionSampler;
 
     #[test]
     fn lightning_4step_sigmas_match_diffusers() {
         // The official recipe as realized in diffusers FlowMatchEulerDiscreteScheduler (shift=3.0,
         // shift_terminal=None) over linspace(1, 1/1000, 4): bit-exact values from
         // `tools/dump_qwen_lightning_golden.py` (the tight cross-impl gate is `tests/lightning_parity.rs`).
-        let s = FlowMatchSampler::lightning(4);
+        let s = lightning(4);
         assert_eq!(s.num_steps(), 4);
         let expected = [1.0_f32, 0.857_326_5, 0.600_719_4, 0.002_994_012, 0.0];
         for (i, want) in expected.iter().enumerate() {
@@ -139,7 +95,7 @@ mod tests {
 
     #[test]
     fn lightning_8step_sigmas_match_diffusers() {
-        let s = FlowMatchSampler::lightning(8);
+        let s = lightning(8);
         assert_eq!(s.num_steps(), 8);
         let expected = [
             1.0_f32,
@@ -164,8 +120,8 @@ mod tests {
     #[test]
     fn lightning_is_resolution_independent() {
         // base_shift == max_shift ⇒ μ is constant ⇒ the schedule ignores width/height.
-        let a = FlowMatchSampler::lightning(8);
-        let b = FlowMatchSampler::lightning(8);
+        let a = lightning(8);
+        let b = lightning(8);
         for i in 0..=8 {
             assert_eq!(a.sigma(i), b.sigma(i));
         }
@@ -175,7 +131,7 @@ mod tests {
     fn timestep_is_raw_sigma() {
         // The model timestep is the raw sigma (the time-proj scales ×1000), matching the production
         // loop; NOT FlowMatchEuler::timestep's `1 - sigma` (used by other families).
-        let s = FlowMatchSampler::lightning(4);
+        let s = lightning(4);
         for i in 0..4 {
             assert_eq!(s.timestep(i), s.sigma(i));
         }
@@ -183,11 +139,11 @@ mod tests {
 
     #[test]
     fn wrapping_production_scheduler_preserves_sigmas() {
-        // Routing the production `qwen_scheduler` through the wrapper must expose the identical
+        // Routing the production `qwen_scheduler` through the core wrapper must expose the identical
         // schedule (the base path stays bit-for-bit unchanged).
         let sched = qwen_scheduler(8, 1024, 1024);
         let sigmas = sched.sigmas.clone();
-        let s = FlowMatchSampler::new(sched);
+        let s = FlowMatchSampler::new(sched.sigmas);
         assert_eq!(s.num_steps(), 8);
         for (i, want) in sigmas.iter().enumerate() {
             assert_eq!(s.sigma(i), *want);

@@ -12,7 +12,7 @@
 //! Qwen2.5-VL vision transformer + reference-latent conditioning (Edit), and transformer-only
 //! Q4/Q8 quantization (sc-2565; the fork keeps the text encoder + VAE dense). Also wired: LoRA/LoKr
 //! consumption (sc-2528), multi-image Edit (sc-2529), T2I img2img (sc-2530), and few-step
-//! **Lightning** acceleration — the `lightning` sampler ([`sampler::FlowMatchSampler`], sc-2909): the
+//! **Lightning** acceleration — the `lightning` sampler ([`sampler::lightning`], sc-2909): the
 //! official lightx2v recipe (static flow-match shift 3.0, CFG-off single forward) for both T2I and
 //! Edit, requiring the matching distillation LoRA via `spec.adapters`.
 
@@ -41,7 +41,7 @@ pub use pipeline::{
     denoise_edit_with_progress, denoise_with_progress, encode_init_latents, init_time_step,
     pack_latents, preprocess_init_image, qwen_scheduler, unpack_latents,
 };
-pub use sampler::{FlowMatchSampler, LIGHTNING_SHIFT};
+pub use sampler::{lightning, FlowMatchSampler, LIGHTNING_SHIFT};
 pub use text_encoder::{QwenTextEncoder, QwenTextEncoderConfig};
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 pub use vae::QwenVae;

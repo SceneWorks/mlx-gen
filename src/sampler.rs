@@ -13,8 +13,9 @@
 //!   [`crate::scheduler::FlowMatchEuler`]), so they share an [`AlphaSchedule`] built from the model's
 //!   `scaled_linear` betas.
 //!
-//! The trait is intentionally minimal and family-neutral so FLUX-MLX / Qwen-MLX acceleration (their
-//! own flow-match few-step schedules) can implement it later (sc-2908 / sc-2909).
+//! The trait is intentionally minimal and family-neutral. FLUX-MLX and Qwen-MLX acceleration both
+//! drive the shared [`FlowMatchSampler`] below (sc-2908 / sc-2909); the Qwen-specific Lightning sigma
+//! schedule is built in `mlx-gen-qwen-image` and wrapped in this same sampler (deduped in sc-2950).
 
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -432,14 +433,17 @@ impl TcdSampler {
 // FLUX acceleration (Hyper-FLUX, FLUX-Turbo) reuses THIS schedule unchanged — it is purely a
 // distilled LoRA + a reduced step count (the diffusers/mflux reference has no Hyper-specific
 // scheduler), so a single `FlowMatchSampler` drives both the base render and the `hyper` profile;
-// the profile only changes the step count and guidance (sc-2908, follow-on to sc-2769).
+// the profile only changes the step count and guidance (sc-2908, follow-on to sc-2769). Qwen-Image
+// (base + Lightning, sc-2909) drives this same sampler — only its sigma schedule differs (built in
+// `mlx-gen-qwen-image`'s `sampler` module; deduped onto this type in sc-2950).
 // ---------------------------------------------------------------------------------------------
 
 /// A flow-match (rectified-flow) Euler sampler driven by a precomputed sigma schedule. The schedule
 /// is built by the model family (FLUX's `build_linear_sigmas` = mflux's `LinearScheduler`: the
-/// `linspace(1, 1/n, n)` sigmas + the dev mu-shift, trailing `0.0`), so this sampler is
-/// family-neutral — it owns only the flow-match update, not the schedule construction. The model is
-/// velocity-prediction, the latents stay f32, and the prior is unit noise (`init_noise_sigma = 1`).
+/// `linspace(1, 1/n, n)` sigmas + the dev mu-shift, trailing `0.0`; Qwen's `qwen_scheduler` and its
+/// Lightning builder), so this sampler is family-neutral — it owns only the flow-match update, not
+/// the schedule construction. The model is velocity-prediction, the latents stay f32, and the prior
+/// is unit noise (`init_noise_sigma = 1`).
 pub struct FlowMatchSampler {
     /// The flow-match sigmas, length `num_steps + 1` with a trailing `0.0` (so the last step
     /// integrates down to σ=0). `sigmas[i]` is both the model's conditioning timestep at step `i`
@@ -458,6 +462,13 @@ impl FlowMatchSampler {
         );
         Self { sigmas }
     }
+
+    /// The schedule sigma at step `i` (length `num_steps + 1`, trailing `0.0`). For flow-match this
+    /// equals [`DiffusionSampler::timestep`]; img2img seeds its noise blend at `sigma(start_step)`
+    /// (the fork's `config.scheduler.sigmas[init_time_step]`).
+    pub fn sigma(&self, i: usize) -> f32 {
+        self.sigmas[i]
+    }
 }
 
 impl DiffusionSampler for FlowMatchSampler {
@@ -466,8 +477,8 @@ impl DiffusionSampler for FlowMatchSampler {
     }
 
     fn timestep(&self, i: usize) -> f32 {
-        // FLUX feeds the sigma straight in as the timestep (its `TimeTextEmbed` scales by 1000
-        // internally); flow-match has no separate discrete timestep index.
+        // FLUX and Qwen both feed the sigma straight in as the model timestep (their time embedding /
+        // time-proj scales it ×1000 internally); flow-match has no separate discrete timestep index.
         self.sigmas[i]
     }
 

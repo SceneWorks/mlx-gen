@@ -23,7 +23,7 @@ use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
     encode_init_latents, init_time_step, qwen_scheduler, unpack_latents,
 };
-use crate::sampler::FlowMatchSampler;
+use crate::sampler::{lightning, FlowMatchSampler};
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
@@ -247,9 +247,9 @@ impl Generator for QwenImage {
         // production `qwen_scheduler` (resolution-dependent; img2img indexes `sigma(start_step)` for
         // the blend, so it must match the fork's `config.scheduler.sigmas`).
         let sampler = if is_lightning {
-            FlowMatchSampler::lightning(steps)
+            lightning(steps)
         } else {
-            FlowMatchSampler::new(qwen_scheduler(steps, req.width, req.height))
+            FlowMatchSampler::new(qwen_scheduler(steps, req.width, req.height).sigmas)
         };
 
         let mut images = Vec::with_capacity(req.count as usize);
