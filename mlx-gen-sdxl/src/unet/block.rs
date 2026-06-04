@@ -7,7 +7,7 @@
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -19,10 +19,10 @@ use super::transformer::Transformer2D;
 pub struct UNetBlock2D {
     resnets: Vec<ResnetBlock2D>,
     attentions: Option<Vec<Transformer2D>>,
-    /// Downsample conv (stride 2, pad 1) on NHWC.
-    downsample: Option<(Array, Array)>,
-    /// Upsample conv (stride 1, pad 1) applied after a nearest-2× resize.
-    upsample: Option<(Array, Array)>,
+    /// Downsample conv (stride 2, pad 1) on NHWC — a conv-layer LoRA target (sc-2919).
+    downsample: Option<AdaptableConv2d>,
+    /// Upsample conv (stride 1, pad 1) applied after a nearest-2× resize — a conv-layer LoRA target.
+    upsample: Option<AdaptableConv2d>,
 }
 
 /// Per-block construction parameters resolved from [`crate::config::UNetConfig`].
@@ -61,19 +61,23 @@ impl UNetBlock2D {
             None
         };
         let downsample = if spec.add_downsample {
-            Some((
+            Some(AdaptableConv2d::new(
                 nchw_to_nhwc(w.require(&format!("{}.downsamplers.0.conv.weight", spec.prefix))?)?,
-                w.require(&format!("{}.downsamplers.0.conv.bias", spec.prefix))?
-                    .clone(),
+                Some(
+                    w.require(&format!("{}.downsamplers.0.conv.bias", spec.prefix))?
+                        .clone(),
+                ),
             ))
         } else {
             None
         };
         let upsample = if spec.add_upsample {
-            Some((
+            Some(AdaptableConv2d::new(
                 nchw_to_nhwc(w.require(&format!("{}.upsamplers.0.conv.weight", spec.prefix))?)?,
-                w.require(&format!("{}.upsamplers.0.conv.bias", spec.prefix))?
-                    .clone(),
+                Some(
+                    w.require(&format!("{}.upsamplers.0.conv.bias", spec.prefix))?
+                        .clone(),
+                ),
             ))
         } else {
             None
@@ -123,12 +127,12 @@ impl UNetBlock2D {
             }
             output_states.push(x.clone());
         }
-        if let Some((w, b)) = &self.downsample {
-            x = conv2d(&x, w, Some(b), 2, 1)?;
+        if let Some(c) = &self.downsample {
+            x = conv2d(&x, c.weight(), c.bias(), 2, 1)?;
             output_states.push(x.clone());
         }
-        if let Some((w, b)) = &self.upsample {
-            x = conv2d(&upsample_nearest(&x, 2)?, w, Some(b), 1, 1)?;
+        if let Some(c) = &self.upsample {
+            x = conv2d(&upsample_nearest(&x, 2)?, c.weight(), c.bias(), 1, 1)?;
             output_states.push(x.clone());
         }
         Ok((x, output_states))
@@ -156,6 +160,20 @@ impl UNetBlock2D {
             }
         }
     }
+
+    /// Emit this block's conv-layer LoRA targets (sc-2919): each resnet's convs plus the
+    /// down/up-sampler's `conv` (`downsamplers.0.conv` / `upsamplers.0.conv`).
+    pub fn conv_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        for (j, r) in self.resnets.iter().enumerate() {
+            r.conv_target_paths(&format!("{prefix}.resnets.{j}"), out);
+        }
+        if self.downsample.is_some() {
+            out.push(format!("{prefix}.downsamplers.0.conv"));
+        }
+        if self.upsample.is_some() {
+            out.push(format!("{prefix}.upsamplers.0.conv"));
+        }
+    }
 }
 
 impl AdaptableHost for UNetBlock2D {
@@ -170,6 +188,18 @@ impl AdaptableHost for UNetBlock2D {
                 .as_mut()?
                 .get_mut(j.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableConv2d> {
+        match path {
+            ["resnets", j, rest @ ..] => self
+                .resnets
+                .get_mut(j.parse::<usize>().ok()?)?
+                .adaptable_conv_mut(rest),
+            ["downsamplers", "0", "conv"] => self.downsample.as_mut(),
+            ["upsamplers", "0", "conv"] => self.upsample.as_mut(),
             _ => None,
         }
     }

@@ -57,6 +57,45 @@ pub fn reconstruct_lokr_delta(
     Ok(delta.reshape(base_shape)?.as_dtype(out_dtype)?)
 }
 
+/// Fuse a **conv-layer** LoRA pair into a single conv-weight delta, returned in the trained-file
+/// NCHW `[out, in, kH, kW]` layout (sc-2919). Conv LoRAs decompose a conv into a spatial `down`
+/// (`lora_down`, `[rank, in, kH, kW]`) followed by a 1×1 `up` (`lora_up`, `[out, rank, 1, 1]`); the
+/// fused weight is the composition of those two convs:
+///   `δ[o, i, y, x] = Σ_r up[o, r] · down[r, i, y, x]`,
+/// which is exactly `up[out, rank] @ down[rank, in·kH·kW]` reshaped back to `[out, in, kH, kW]` —
+/// bit-identical to PEFT/diffusers' `Conv2d` LoRA fusion (`F.conv2d(down.permute(1,0,2,3), up)`),
+/// and uniform across 1×1 and k×k kernels. Then scaled by `(alpha/rank)·scale`.
+///
+/// Precision mirrors the SDXL Linear `lora_delta`: the `up @ down` matmul runs in **f32** (correct,
+/// and avoids the former NAX 16-bit-GEMM bug — now fixed at the toolchain level, sc-2772) and is
+/// rounded back through the factors' source dtype (f16 for community/accel LoRAs), so the result is
+/// the same value an f16 reference fusion would produce, returned as f32 for the caller to cast to
+/// the conv weight's dtype on merge. The merge itself is the chaos-safe `W += δ` (the SDXL ancestral
+/// sampler needs a merged weight, not a forward-time residual — cf. [`AdaptableLinear::merge_dense_delta`]).
+pub fn conv_lora_delta(
+    down: &Array,
+    up: &Array,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+) -> Result<Array> {
+    let src = up.dtype(); // f16 for kohya/community LoRAs; f32 makes the round-trip a no-op.
+    let ds = down.shape(); // [rank, in, kH, kW]
+    let us = up.shape(); // [out, rank, 1, 1]
+    let (r, cin, kh, kw) = (ds[0], ds[1], ds[2], ds[3]);
+    let out = us[0];
+    let down2 = down.reshape(&[r, cin * kh * kw])?; // [rank, in·kH·kW]
+    let up2 = up.reshape(&[out, r])?; // [out, rank]
+    let ba = matmul(
+        &up2.as_dtype(Dtype::Float32)?,
+        &down2.as_dtype(Dtype::Float32)?,
+    )?;
+    let ba = ba.as_dtype(src)?.as_dtype(Dtype::Float32)?;
+    // effective_scale in f64 then f32, matching a reference's Python-float arithmetic.
+    let eff = ((alpha as f64 / rank as f64) * scale as f64) as f32;
+    Ok(multiply(&ba, scalar(eff))?.reshape(&[out, cin, kh, kw])?)
+}
+
 /// One adapter's contribution WITHOUT the base, so a host can sum stacked adapters over
 /// a single base application.
 pub enum Adapter {
@@ -338,11 +377,64 @@ impl AdaptableLinear {
     }
 }
 
+/// A dense Conv2d weight (mlx NHWC `[out, kH, kW, in]`) plus its optional bias, that can have a
+/// conv-layer LoRA delta merged into it (sc-2919). Convs in this codebase are **merge-only**: they
+/// are never quantized and never carry a forward-time residual, so unlike [`AdaptableLinear`] there
+/// is no adapter stack or quantized variant — just the mergeable weight and the accessors a forward
+/// pass needs. The merge takes a delta in the trained-file NCHW layout and folds it in chaos-safely
+/// (`W += δ`), the conv analog of [`AdaptableLinear::merge_dense_delta`].
+pub struct AdaptableConv2d {
+    /// NHWC `[out, kH, kW, in]` — the layout `mlx_gen::nn::conv2d` expects.
+    weight: Array,
+    bias: Option<Array>,
+}
+
+impl AdaptableConv2d {
+    /// Wrap an already-NHWC conv weight (`[out, kH, kW, in]`) and optional bias.
+    pub fn new(weight_nhwc: Array, bias: Option<Array>) -> Self {
+        Self {
+            weight: weight_nhwc,
+            bias,
+        }
+    }
+
+    /// The NHWC `[out, kH, kW, in]` weight, to feed `mlx_gen::nn::conv2d`.
+    pub fn weight(&self) -> &Array {
+        &self.weight
+    }
+
+    /// The optional conv bias.
+    pub fn bias(&self) -> Option<&Array> {
+        self.bias.as_ref()
+    }
+
+    /// Merge a conv LoRA `delta` — given in the **trained-file NCHW** `[out, in, kH, kW]` layout (what
+    /// [`conv_lora_delta`] returns) — into the stored NHWC weight: transpose NCHW→NHWC, cast to the
+    /// weight's dtype, and add (`W += δ`). Reproduces a reference's merged-weight conv forward
+    /// bit-for-bit (a residual would differ by ~1 ULP and cascade on the chaos sampler — see
+    /// [`AdaptableLinear::merge_dense_delta`]). A zero delta is a bit-exact no-op (`W + 0 == W`).
+    pub fn merge_conv_delta(&mut self, delta_nchw: &Array) -> Result<()> {
+        // [out, in, kH, kW] → [out, kH, kW, in] to match the stored NHWC weight.
+        let delta_nhwc = delta_nchw.transpose_axes(&[0, 2, 3, 1])?;
+        self.weight = add(&self.weight, &delta_nhwc.as_dtype(self.weight.dtype())?)?;
+        Ok(())
+    }
+}
+
 /// A module tree that can resolve a dotted parameter path (split into segments) to the
 /// [`AdaptableLinear`] living there, so an adapter can be installed onto it. This is the
 /// hand-written form of the macro the full adapter framework (sc-2343) will generate.
 pub trait AdaptableHost {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear>;
+
+    /// Resolve a dotted path to the [`AdaptableConv2d`] living there, for conv-layer LoRA merging
+    /// (sc-2919) — the conv analog of [`adaptable_mut`](Self::adaptable_mut). The default is empty:
+    /// only the SDXL U-Net (the one conv-bearing adapter host) overrides it; DiT/MMDiT families
+    /// (Z-Image, Qwen, FLUX) have no conv adapter targets (their only convs live in the un-adapted
+    /// VAE / patch-embed), so a conv-shaped key applied to them surfaces as skipped, never merged.
+    fn adaptable_conv_mut(&mut self, _path: &[&str]) -> Option<&mut AdaptableConv2d> {
+        None
+    }
 
     /// Enumerate every adapter target reachable through the kohya `lora_unet_` convention, as
     /// dotted paths in the trained-file (diffusers) naming that [`adaptable_mut`](Self::adaptable_mut)
@@ -674,6 +766,109 @@ mod tests {
         assert!(lin3
             .merge_dense_delta(&Array::from_slice(&[0.0f32; 4096], &[64, 64]))
             .is_err());
+    }
+
+    #[test]
+    fn conv_lora_delta_one_by_one_matches_hand_fold() {
+        // sc-2919: a 1×1 conv LoRA (rank 2, in 2, out 2). down/up are `[*, *, 1, 1]`; the fused
+        // delta is `Σ_r up[o,r]·down[r,i]`, scaled by alpha/rank. Hand-computed independently:
+        //   down2 = [[1,2],[3,4]] (rank,in); up2 = [[5,6],[7,8]] (out,rank)
+        //   δ[0,0]=5·1+6·3=23  δ[0,1]=5·2+6·4=34  δ[1,0]=7·1+8·3=31  δ[1,1]=7·2+8·4=46
+        //   eff = alpha/rank = 4/2 = 2 → [[46,68],[62,92]]
+        let down = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2, 1, 1]);
+        let up = Array::from_slice(&[5.0f32, 6.0, 7.0, 8.0], &[2, 2, 1, 1]);
+        let delta = conv_lora_delta(&down, &up, 4.0, 2.0, 1.0).unwrap();
+        assert_eq!(delta.shape(), &[2, 2, 1, 1]);
+        let want = Array::from_slice(&[46.0f32, 68.0, 62.0, 92.0], &[2, 2, 1, 1]);
+        assert!(all_close(&delta, &want, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    #[test]
+    fn conv_lora_delta_kxk_rank1_broadcasts_spatial_kernel() {
+        // sc-2919: a 3×3-shaped (here 2×2) conv LoRA with rank 1 reduces to `δ[o,i,y,x] =
+        // up[o]·down[0,i,y,x]` — proving the spatial kernel is preserved (not collapsed). in=1, out=2.
+        //   down[0,0,:,:] = [[1,2],[3,4]]; up = [10, 20]
+        //   δ[0] = 10·[1,2,3,4] = [10,20,30,40];  δ[1] = 20·[...] = [20,40,60,80]
+        let down = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[1, 1, 2, 2]);
+        let up = Array::from_slice(&[10.0f32, 20.0], &[2, 1, 1, 1]);
+        let delta = conv_lora_delta(&down, &up, 1.0, 1.0, 1.0).unwrap();
+        assert_eq!(delta.shape(), &[2, 1, 2, 2]);
+        let want = Array::from_slice(
+            &[10.0f32, 20.0, 30.0, 40.0, 20.0, 40.0, 60.0, 80.0],
+            &[2, 1, 2, 2],
+        );
+        assert!(all_close(&delta, &want, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+        // The user scale composes multiplicatively (scale 0 ⇒ a zero delta ⇒ no-op merge).
+        let zero = conv_lora_delta(&down, &up, 1.0, 1.0, 0.0).unwrap();
+        assert!(
+            array_eq(&zero, Array::zeros::<f32>(&[2, 1, 2, 2]).unwrap(), false)
+                .unwrap()
+                .item::<bool>()
+        );
+    }
+
+    #[test]
+    fn merge_conv_delta_transposes_nchw_and_adds() {
+        // sc-2919: NHWC weight `[out=1, kH=1, kW=1, in=2]` = [1, 2]; a 1×1 NCHW delta
+        // `[out=1, in=2, kH=1, kW=1]` = [0.5, 0.25] transposes to NHWC [0.5, 0.25] and adds → [1.5, 2.25].
+        let w = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 1, 2]);
+        let mut conv = AdaptableConv2d::new(w.clone(), None);
+        let delta = Array::from_slice(&[0.5f32, 0.25], &[1, 2, 1, 1]);
+        conv.merge_conv_delta(&delta).unwrap();
+        let want = Array::from_slice(&[1.5f32, 2.25], &[1, 1, 1, 2]);
+        assert!(array_eq(conv.weight(), &want, false)
+            .unwrap()
+            .item::<bool>());
+
+        // A zero delta is a bit-exact no-op.
+        let mut conv2 = AdaptableConv2d::new(w.clone(), None);
+        conv2
+            .merge_conv_delta(&Array::zeros::<f32>(&[1, 2, 1, 1]).unwrap())
+            .unwrap();
+        assert!(array_eq(conv2.weight(), &w, false).unwrap().item::<bool>());
+    }
+
+    #[test]
+    fn merge_conv_delta_kxk_zero_is_noop_and_nonzero_lands_in_nhwc() {
+        // sc-2919 regression: with a k×k (here 3×3, out≠in) kernel the NCHW→NHWC transpose is a real
+        // permutation (not the trivial 1×1 case), so a zero delta must STILL be a bit-exact no-op — i.e.
+        // the merge must not permute/scramble the weight. NHWC weight [out=2, kH=3, kW=3, in=4].
+        let n = 2 * 3 * 3 * 4;
+        let wv: Vec<f32> = (0..n).map(|i| i as f32 * 0.01 - 0.3).collect();
+        let w = Array::from_slice(&wv, &[2, 3, 3, 4]);
+
+        let mut conv = AdaptableConv2d::new(w.clone(), None);
+        conv.merge_conv_delta(&Array::zeros::<f32>(&[2, 4, 3, 3]).unwrap())
+            .unwrap();
+        assert_eq!(
+            conv.weight().as_slice::<f32>(),
+            w.as_slice::<f32>(),
+            "a zero k×k conv delta must be a bit-exact no-op (no permutation/scramble)"
+        );
+
+        // A nonzero NCHW delta must land at the matching NHWC position: δ_nchw[o,i,y,x] adds to
+        // weight_nhwc[o,y,x,i]. Put a single spike at nchw (o=1,i=2,y=0,x=2) → nhwc (1,0,2,2).
+        let mut spike = vec![0f32; n];
+        // nchw flat index for [2,4,3,3] at (1,2,0,2) = ((1*4+2)*3+0)*3+2 = 56.
+        spike[56] = 5.0;
+        let mut conv2 = AdaptableConv2d::new(w.clone(), None);
+        conv2
+            .merge_conv_delta(&Array::from_slice(&spike, &[2, 4, 3, 3]))
+            .unwrap();
+        // nhwc flat index for [2,3,3,4] at (1,0,2,2) = ((1*3+0)*3+2)*4+2 = 46.
+        let nhwc_idx = 46usize;
+        let got = conv2.weight().as_slice::<f32>();
+        for (j, (&g, &b)) in got.iter().zip(&wv).enumerate() {
+            let want = if j == nhwc_idx { b + 5.0 } else { b };
+            assert_eq!(
+                g, want,
+                "conv delta landed at wrong NHWC index (got change at {j})"
+            );
+        }
     }
 
     #[test]

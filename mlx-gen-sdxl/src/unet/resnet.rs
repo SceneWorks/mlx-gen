@@ -7,7 +7,7 @@
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -21,15 +21,18 @@ const GN_EPS: f32 = 1e-5;
 pub struct ResnetBlock2D {
     norm1_w: Array,
     norm1_b: Array,
-    conv1_w: Array,
-    conv1_b: Array,
+    /// 3×3 conv (NHWC) — a conv-layer LoRA target (sc-2919).
+    conv1: AdaptableConv2d,
     norm2_w: Array,
     norm2_b: Array,
-    conv2_w: Array,
-    conv2_b: Array,
+    /// 3×3 conv (NHWC) — a conv-layer LoRA target (sc-2919).
+    conv2: AdaptableConv2d,
     /// Time-embedding projection — `Some` for UNet resnets, `None` for VAE resnets (no temb).
     time_emb_proj: Option<AdaptableLinear>,
-    /// 1×1-conv-as-Linear residual projection when in≠out channels.
+    /// 1×1-conv-as-Linear residual projection when in≠out channels. A conv-shortcut LoRA (sc-2919)
+    /// merges here via a 1×1 `[out,in,1,1]→[out,in]` reshape (kept a Linear so its forward — a
+    /// matmul over NHWC channels — is unchanged; switching to `conv2d` would risk a 1-ULP shift on
+    /// the chaos-sensitive ancestral sampler).
     shortcut: Option<AdaptableLinear>,
 }
 
@@ -57,13 +60,11 @@ impl ResnetBlock2D {
         Ok(Self {
             norm1_w: g("norm1.weight")?,
             norm1_b: g("norm1.bias")?,
-            conv1_w: nchw_to_nhwc(&g("conv1.weight")?)?,
-            conv1_b: g("conv1.bias")?,
+            conv1: AdaptableConv2d::new(nchw_to_nhwc(&g("conv1.weight")?)?, Some(g("conv1.bias")?)),
             time_emb_proj,
             norm2_w: g("norm2.weight")?,
             norm2_b: g("norm2.bias")?,
-            conv2_w: nchw_to_nhwc(&g("conv2.weight")?)?,
-            conv2_b: g("conv2.bias")?,
+            conv2: AdaptableConv2d::new(nchw_to_nhwc(&g("conv2.weight")?)?, Some(g("conv2.bias")?)),
             shortcut,
         })
     }
@@ -81,7 +82,7 @@ impl ResnetBlock2D {
     /// `x`: NHWC `[B, H, W, in]`; `temb`: `Some([B, temb_dim])` for the UNet, `None` for the VAE.
     pub fn forward(&self, x: &Array, temb: Option<&Array>) -> Result<Array> {
         let y = group_norm(x, &self.norm1_w, &self.norm1_b, GN_GROUPS, GN_EPS)?;
-        let mut y = conv2d(&silu(&y)?, &self.conv1_w, Some(&self.conv1_b), 1, 1)?;
+        let mut y = conv2d(&silu(&y)?, self.conv1.weight(), self.conv1.bias(), 1, 1)?;
         // Add the projected time embedding (UNet only), broadcast over H,W.
         if let (Some(proj), Some(t)) = (&self.time_emb_proj, temb) {
             let tp = proj.forward(&silu(t)?)?;
@@ -89,7 +90,7 @@ impl ResnetBlock2D {
             y = add(&y, &tp.reshape(&[tb[0], 1, 1, tb[1]])?)?;
         }
         let y = group_norm(&y, &self.norm2_w, &self.norm2_b, GN_GROUPS, GN_EPS)?;
-        let y = conv2d(&silu(&y)?, &self.conv2_w, Some(&self.conv2_b), 1, 1)?;
+        let y = conv2d(&silu(&y)?, self.conv2.weight(), self.conv2.bias(), 1, 1)?;
 
         let residual = match &self.shortcut {
             Some(sc) => sc.forward(x)?,
@@ -98,12 +99,23 @@ impl ResnetBlock2D {
         Ok(add(&residual, &y)?)
     }
 
-    /// The one LoRA-targetable Linear on a U-Net resnet — `time_emb_proj`. `conv_shortcut` is a
-    /// 1×1 conv in the fork (4-D conv LoRAs target it, which the vendored Linear-only merge skips),
-    /// so it is intentionally not a target.
+    /// The one LoRA-targetable **Linear** on a U-Net resnet — `time_emb_proj`. The convs
+    /// (`conv1`/`conv2`/`conv_shortcut`) are conv-layer targets, enumerated by
+    /// [`conv_target_paths`](Self::conv_target_paths) instead (sc-2919).
     pub fn lora_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
         if self.time_emb_proj.is_some() {
             out.push(format!("{prefix}.time_emb_proj"));
+        }
+    }
+
+    /// This resnet's conv-layer LoRA targets (sc-2919): `conv1`, `conv2`, and — when present —
+    /// `conv_shortcut`. Merged only under [`crate::adapters::LoraCoverage::Complete`]; the
+    /// Linear-only vendored coverage drops them (preserving byte-parity with the retired Python path).
+    pub fn conv_target_paths(&self, prefix: &str, out: &mut Vec<String>) {
+        out.push(format!("{prefix}.conv1"));
+        out.push(format!("{prefix}.conv2"));
+        if self.shortcut.is_some() {
+            out.push(format!("{prefix}.conv_shortcut"));
         }
     }
 }
@@ -112,6 +124,17 @@ impl AdaptableHost for ResnetBlock2D {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["time_emb_proj"] => self.time_emb_proj.as_mut(),
+            // conv_shortcut is a 1×1 conv stored as a Linear; a conv LoRA merges into it as a
+            // reshaped 2-D delta (sc-2919, routed by the SDXL adapter's conv path).
+            ["conv_shortcut"] => self.shortcut.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableConv2d> {
+        match path {
+            ["conv1"] => Some(&mut self.conv1),
+            ["conv2"] => Some(&mut self.conv2),
             _ => None,
         }
     }

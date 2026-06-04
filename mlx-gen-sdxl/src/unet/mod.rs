@@ -11,7 +11,7 @@ mod transformer;
 use mlx_rs::ops::{add, concatenate_axis};
 use mlx_rs::Array;
 
-use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -34,8 +34,8 @@ pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
 
 /// The SDXL conditional U-Net.
 pub struct UNet2DConditionModel {
-    conv_in_w: Array,
-    conv_in_b: Array,
+    /// Input conv stem (NHWC) — a conv-layer LoRA target (sc-2919).
+    conv_in: AdaptableConv2d,
     timesteps: SinusoidalPositionalEncoding,
     time_embedding: TimestepEmbedding,
     add_time_proj: SinusoidalPositionalEncoding,
@@ -47,8 +47,8 @@ pub struct UNet2DConditionModel {
     up_blocks: Vec<UNetBlock2D>,
     conv_norm_out_w: Array,
     conv_norm_out_b: Array,
-    conv_out_w: Array,
-    conv_out_b: Array,
+    /// Output conv head (NHWC) — a conv-layer LoRA target (sc-2919).
+    conv_out: AdaptableConv2d,
 }
 
 impl UNet2DConditionModel {
@@ -112,8 +112,10 @@ impl UNet2DConditionModel {
         }
 
         Ok(Self {
-            conv_in_w: nchw_to_nhwc(w.require("conv_in.weight")?)?,
-            conv_in_b: w.require("conv_in.bias")?.clone(),
+            conv_in: AdaptableConv2d::new(
+                nchw_to_nhwc(w.require("conv_in.weight")?)?,
+                Some(w.require("conv_in.bias")?.clone()),
+            ),
             timesteps: SinusoidalPositionalEncoding::timestep(temb_dim_src)?,
             time_embedding: TimestepEmbedding::from_weights(w, "time_embedding")?,
             add_time_proj: SinusoidalPositionalEncoding::timestep(
@@ -127,8 +129,10 @@ impl UNet2DConditionModel {
             up_blocks,
             conv_norm_out_w: w.require("conv_norm_out.weight")?.clone(),
             conv_norm_out_b: w.require("conv_norm_out.bias")?.clone(),
-            conv_out_w: nchw_to_nhwc(w.require("conv_out.weight")?)?,
-            conv_out_b: w.require("conv_out.bias")?.clone(),
+            conv_out: AdaptableConv2d::new(
+                nchw_to_nhwc(w.require("conv_out.weight")?)?,
+                Some(w.require("conv_out.bias")?.clone()),
+            ),
         })
     }
 
@@ -185,7 +189,7 @@ impl UNet2DConditionModel {
         temb = add(&temb, &emb)?;
 
         // Conv stem.
-        let mut x = conv2d(x, &self.conv_in_w, Some(&self.conv_in_b), 1, 1)?;
+        let mut x = conv2d(x, self.conv_in.weight(), self.conv_in.bias(), 1, 1)?;
 
         // Down path — collect skip residuals (starting with the stem output).
         let mut residuals: Vec<Array> = vec![x.clone()];
@@ -215,7 +219,7 @@ impl UNet2DConditionModel {
             GN_EPS,
         )?;
         let x = silu(&x)?;
-        conv2d(&x, &self.conv_out_w, Some(&self.conv_out_b), 1, 1)
+        conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
     }
 
     /// Every LoRA-targetable Linear's diffusers dotted path, matching the vendored `lora.py`
@@ -243,7 +247,9 @@ impl UNet2DConditionModel {
     /// (`ff.net.0.proj`, `ff.net.2`) of every cross-attention transformer (down + mid + up). Used to
     /// build the kohya lookup table when complete coverage is requested; `mid_block`/`ff` deltas are
     /// reachable through [`AdaptableHost::adaptable_mut`] (the merge layer row-splits a `ff.net.0.proj`
-    /// delta into `linear1`/`linear2`). Conv-layer LoRAs remain out of scope (they are not Linears).
+    /// delta into `linear1`/`linear2`). This list is **Linear-only**; the conv-layer LoRA targets are
+    /// enumerated separately by [`conv_target_paths`](Self::conv_target_paths) (sc-2919) and folded
+    /// into the same complete table by the adapter merge.
     pub fn lora_target_paths_complete(&self) -> Vec<String> {
         let mut out = self.lora_target_paths();
         // mid_block attention + proj (the +82 the vendored path can't reach) and the two mid resnet
@@ -262,6 +268,28 @@ impl UNet2DConditionModel {
             .lora_target_paths_ff("mid_block.attentions.0", &mut out);
         for (k, b) in self.up_blocks.iter().enumerate() {
             b.lora_target_paths_ff(&format!("up_blocks.{k}"), &mut out);
+        }
+        out
+    }
+
+    /// Every **conv-layer** LoRA target (sc-2919), as diffusers dotted paths: `conv_in`, `conv_out`,
+    /// each resnet's `conv1`/`conv2`/`conv_shortcut` (down / mid / up), and each down/up-sampler's
+    /// `conv`. These are merged only under [`crate::adapters::LoraCoverage::Complete`] — the
+    /// Linear-only vendored coverage drops them. Used to extend the kohya `flattened → dotted`
+    /// lookup table so conv keys (`lora_unet_..._conv1`, `..._downsamplers_0_conv`, `conv_in`, …)
+    /// resolve; the merge layer dispatches each to [`AdaptableHost::adaptable_conv_mut`] (or, for
+    /// the 1×1 `conv_shortcut`, the reshaped Linear merge).
+    pub fn conv_target_paths(&self) -> Vec<String> {
+        let mut out = vec!["conv_in".to_string(), "conv_out".to_string()];
+        for (i, b) in self.down_blocks.iter().enumerate() {
+            b.conv_target_paths(&format!("down_blocks.{i}"), &mut out);
+        }
+        self.mid_resnet0
+            .conv_target_paths("mid_block.resnets.0", &mut out);
+        self.mid_resnet1
+            .conv_target_paths("mid_block.resnets.1", &mut out);
+        for (k, b) in self.up_blocks.iter().enumerate() {
+            b.conv_target_paths(&format!("up_blocks.{k}"), &mut out);
         }
         out
     }
@@ -284,6 +312,27 @@ impl AdaptableHost for UNet2DConditionModel {
             ["mid_block", "attentions", "0", rest @ ..] => self.mid_transformer.adaptable_mut(rest),
             ["mid_block", "resnets", "0", rest @ ..] => self.mid_resnet0.adaptable_mut(rest),
             ["mid_block", "resnets", "1", rest @ ..] => self.mid_resnet1.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Conv-layer LoRA routing (sc-2919) — the conv analog of [`adaptable_mut`](Self::adaptable_mut).
+    /// `conv_in`/`conv_out` resolve directly; the resnet/sampler convs delegate into the down / up /
+    /// mid sub-hosts. (The 1×1 `conv_shortcut` is a Linear, reached through `adaptable_mut`.)
+    fn adaptable_conv_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableConv2d> {
+        match path {
+            ["conv_in"] => Some(&mut self.conv_in),
+            ["conv_out"] => Some(&mut self.conv_out),
+            ["down_blocks", i, rest @ ..] => self
+                .down_blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .adaptable_conv_mut(rest),
+            ["up_blocks", k, rest @ ..] => self
+                .up_blocks
+                .get_mut(k.parse::<usize>().ok()?)?
+                .adaptable_conv_mut(rest),
+            ["mid_block", "resnets", "0", rest @ ..] => self.mid_resnet0.adaptable_conv_mut(rest),
+            ["mid_block", "resnets", "1", rest @ ..] => self.mid_resnet1.adaptable_conv_mut(rest),
             _ => None,
         }
     }

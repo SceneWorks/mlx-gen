@@ -297,7 +297,16 @@ def dump_renders():
         cfg=1.0,
         step_kwargs={"eta": 0.0},
     )
-    render("lcm", lcm_lora, None, _lcm_sched(base), steps=4, cfg=1.0)
+    # Pass the explicit weight file (not the snapshot dir): under HF_HUB_OFFLINE diffusers cannot
+    # guess a directory's LoRA weight name, so a bare dir aborts the run before lightning_linonly.
+    render(
+        "lcm",
+        os.path.join(lcm_lora, "pytorch_lora_weights.safetensors"),
+        None,
+        _lcm_sched(base),
+        steps=4,
+        cfg=1.0,
+    )
     # Linear-only Lightning (conv LoRA stripped) — matches the Rust Linear-only merge, to confirm the
     # accel gap vs full fusion is exactly the dropped conv-layer LoRA (sc-2639 boundary).
     render(

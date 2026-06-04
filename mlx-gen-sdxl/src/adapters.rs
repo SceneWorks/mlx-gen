@@ -21,23 +21,26 @@
 //!   what `peft.save_pretrained()` / SceneWorks' `_SdxlLoraBackend` emit. The dotted path resolves
 //!   directly. (kohya `lora_down`/`lora_up` == PEFT `lora_A`/`lora_B`.)
 //!
-//! Linear-only. Two coverage modes (see [`LoraCoverage`]):
-//! - [`LoraCoverage::Complete`] (sc-2671) — **the `model::load` default** (Michael's
+//! Two coverage modes (see [`LoraCoverage`]):
+//! - [`LoraCoverage::Complete`] (sc-2671 + sc-2919) — **the `model::load` default** (Michael's
 //!   correctness-over-parity call, 2026-06-03): applies SDXL LoRAs in **full**, matching diffusers.
-//!   On top of the vendored-reachable set it routes `mid_block.attentions.0` (attention + proj) and
-//!   the GEGLU feed-forward (`ff.net.0.proj` row-split into the value/gate halves `linear1`/`linear2`,
-//!   `ff.net.2` → `linear3`) of every cross-attention transformer — signal the vendored merge silently
-//!   drops. The per-module merge math is the same proven-bit-exact primitive; only the *reachable set*
-//!   grows (plus the FF row-split, a bit-exact gather of the `B@A` delta).
+//!   On top of the vendored-reachable set it routes `mid_block.attentions.0` (attention + proj), the
+//!   GEGLU feed-forward (`ff.net.0.proj` row-split into the value/gate halves `linear1`/`linear2`,
+//!   `ff.net.2` → `linear3`) of every cross-attention transformer, **and the conv-layer LoRAs**
+//!   (sc-2919) — resnet `conv1`/`conv2`/`conv_shortcut`, the down/up-samplers, `conv_in`/`conv_out`.
+//!   Conv deltas are fused with [`conv_lora_delta`] and folded into the conv weights; everything else
+//!   uses the same proven-bit-exact Linear merge (plus the FF row-split, a bit-exact gather of `B@A`).
 //! - [`LoraCoverage::Vendored`] matches the vendored reachable surface **exactly** (515 modules on
 //!   LCM-LoRA): down/up attention (`to_q/k/v`, `to_out.0`), `proj_in`/`proj_out`, resnet
 //!   `time_emb_proj`. No `mid_block` (the vendored mlx-examples UNet names it `mid_blocks.1.…` so
-//!   diffusers keys miss it), no ff/GEGLU, no conv, no text-encoder. `model::load` selects this only
-//!   when `SDXL_LORA_VENDORED` is set — the escape hatch for byte-parity with the retired Python path.
+//!   diffusers keys miss it), no ff/GEGLU, **no conv**, no text-encoder. `model::load` selects this
+//!   only when `SDXL_LORA_VENDORED` is set — the escape hatch for byte-parity with the retired Python
+//!   (Linear-only) path.
 //!
-//! Either way, conv-shaped and out-of-surface keys are counted as skipped and surfaced in the
-//! returned [`SdxlLoraReport`] — never silently dropped. **LoKr stays at the vendored-equivalent
-//! surface regardless of coverage** (sc-2671 is LoRA-only; sc-2640 covered LoKr at that surface).
+//! Either way, out-of-surface keys (and, under vendored coverage, conv-shaped keys) are counted as
+//! skipped and surfaced in the returned [`SdxlLoraReport`] — never silently dropped. **LoKr stays at
+//! the vendored-equivalent (Linear) surface regardless of coverage** (sc-2671/sc-2919 are LoRA-only;
+//! sc-2640 covered LoKr at that surface).
 
 use std::collections::BTreeMap;
 
@@ -45,7 +48,7 @@ use mlx_rs::ops::{matmul, multiply};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::loader::is_lokr;
-use mlx_gen::adapters::{reconstruct_lokr_delta, AdaptableHost};
+use mlx_gen::adapters::{conv_lora_delta, reconstruct_lokr_delta, AdaptableHost};
 use mlx_gen::array::scalar;
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
@@ -98,9 +101,10 @@ pub enum LoraCoverage {
     /// Byte-parity with the retired Python SDXL path — the `model::load` escape hatch
     /// (`SDXL_LORA_VENDORED`), no longer the default.
     Vendored,
-    /// Strictly more correct than the vendored path (sc-2671): also routes `mid_block.attentions.0`
-    /// and the GEGLU feed-forward of every cross-attention transformer. **The `model::load` default**
-    /// — applies SDXL LoRAs in full (matching diffusers).
+    /// Strictly more correct than the vendored path (sc-2671 + sc-2919): also routes
+    /// `mid_block.attentions.0`, the GEGLU feed-forward of every cross-attention transformer, and the
+    /// **conv-layer LoRAs** (resnet convs, samplers, `conv_in`/`conv_out`). **The `model::load`
+    /// default** — applies SDXL LoRAs in full (matching diffusers).
     Complete,
 }
 
@@ -175,6 +179,37 @@ fn merge_lora_routed(
         return merge_into(unet, &format!("{prefix}.ff.linear3"), delta, report);
     }
     merge_into(unet, path, delta, report)
+}
+
+/// Route a fused conv-layer LoRA `delta` (trained-file NCHW `[out, in, kH, kW]`) into the U-Net
+/// (sc-2919). Most conv stems (`conv_in`/`conv_out`, resnet `conv1`/`conv2`, the down/up-sampler
+/// `conv`) resolve to an [`mlx_gen::adapters::AdaptableConv2d`] and merge in NHWC. The lone exception
+/// is `conv_shortcut`: a 1×1 conv stored as a Linear (`[out,in]`), so its `[out,in,1,1]` delta is
+/// reshaped to `[out,in]` and merged via the dense-Linear path. A path that resolves to neither is
+/// surfaced as skipped.
+fn merge_conv_routed(
+    unet: &mut UNet2DConditionModel,
+    path: &str,
+    delta_nchw: &Array,
+    report: &mut SdxlLoraReport,
+) -> Result<()> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if let Some(conv) = unet.adaptable_conv_mut(&parts) {
+        conv.merge_conv_delta(delta_nchw)?;
+        report.merged += 1;
+        return Ok(());
+    }
+    // conv_shortcut (1×1) is a Linear: fold the [out,in,1,1] delta to [out,in].
+    let sh = delta_nchw.shape();
+    if sh[2] == 1 && sh[3] == 1 {
+        if let Some(lin) = unet.adaptable_mut(&parts) {
+            lin.merge_dense_delta(&delta_nchw.reshape(&[sh[0], sh[1]])?)?;
+            report.merged += 1;
+            return Ok(());
+        }
+    }
+    report.skipped_keys += 1;
+    Ok(())
 }
 
 /// Map one safetensors key to `(diffusers_dotted_path, role)`, or `None` if it targets a module
@@ -269,8 +304,26 @@ fn merge_one(
             report.skipped_keys += 1;
             continue;
         };
-        // Conv-shaped (4-D) LoRAs are not Linear merges (matches the vendored `ndim != 2` skip).
+        // Conv-shaped (4-D) LoRAs (`down [rank,in,kH,kW]`, `up [out,rank,1,1]`): merge under
+        // Complete coverage (sc-2919), where they fold into the conv weights (resnet conv1/conv2,
+        // conv_shortcut, the down/up-samplers, conv_in/conv_out). Under the Linear-only vendored
+        // coverage they stay dropped — preserving byte-parity with the retired Python `lora.py` path
+        // (the vendored merge is Linear-only). This single gate covers both on-disk formats: a kohya
+        // conv key only resolves to a dotted path when the complete table carries the conv stems, and
+        // a PEFT conv key (dotted) is gated here.
+        if down.ndim() == 4 || up.ndim() == 4 {
+            if coverage != LoraCoverage::Complete {
+                report.skipped_keys += 2;
+                continue;
+            }
+            let rank = down.shape()[0] as f32;
+            let alpha = t.alpha.unwrap_or(rank);
+            let delta = conv_lora_delta(&down, &up, alpha, rank, scale)?;
+            merge_conv_routed(unet, &path, &delta, report)?;
+            continue;
+        }
         if down.ndim() != 2 || up.ndim() != 2 {
+            // Neither 2-D (Linear) nor 4-D (conv) — an unexpected shape; surface it.
             report.skipped_keys += 2;
             continue;
         }
@@ -410,9 +463,15 @@ pub fn apply_sdxl_adapters_with(
         return Ok(SdxlLoraReport::default());
     }
     // LoKr is always merged against the vendored-equivalent surface; LoRA uses the coverage table.
+    // The complete LoRA table also carries the conv-layer stems (sc-2919) so kohya conv keys
+    // (`lora_unet_..._conv1`, `..._downsamplers_0_conv`, `conv_in`, …) resolve to a dotted path and
+    // reach the conv merge; the vendored table omits them (Linear-only byte-parity).
     let vendored_table = build_table(unet.lora_target_paths());
-    let complete_table = (coverage == LoraCoverage::Complete)
-        .then(|| build_table(unet.lora_target_paths_complete()));
+    let complete_table = (coverage == LoraCoverage::Complete).then(|| {
+        let mut paths = unet.lora_target_paths_complete();
+        paths.extend(unet.conv_target_paths());
+        build_table(paths)
+    });
     let lora_table = complete_table.as_ref().unwrap_or(&vendored_table);
 
     let mut report = SdxlLoraReport::default();
@@ -441,7 +500,8 @@ pub fn apply_sdxl_adapters_with(
             "sdxl: no adapter target modules matched across {} file(s) — check the format \
              (expected kohya `lora_unet_` with diffusers block naming, PEFT \
              `base_model.model.unet.`, or LoKr `<module>.lokr_w1/w2` + networkType=lokr; \
-             original-SD `lora_unet_input_blocks_*` and conv/ff-only adapters are not supported)",
+             original-SD `lora_unet_input_blocks_*` is not supported, and conv-layer LoRAs merge \
+             only under Complete coverage — i.e. not when `SDXL_LORA_VENDORED` is set)",
             specs.len()
         )));
     }

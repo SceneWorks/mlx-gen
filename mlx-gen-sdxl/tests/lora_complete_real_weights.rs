@@ -1,5 +1,6 @@
-//! sc-2671: SDXL **complete-coverage** LoRA — mid_block + GEGLU feed-forward, strictly beyond the
-//! vendored 515-module surface (sc-2639).
+//! sc-2671 + sc-2919: SDXL **complete-coverage** LoRA — mid_block + GEGLU feed-forward + the
+//! **conv-layer** LoRAs (resnet convs, samplers, conv_in/out), strictly beyond the vendored
+//! 515-module Linear-only surface (sc-2639).
 //!
 //! `#[ignore]`d — needs the real SDXL snapshot + a real kohya LoRA (`latent-consistency/lcm-lora-sdxl`
 //! in the HF cache). **No golden file is needed:** the per-module merge math is the sc-2639-proven
@@ -12,21 +13,26 @@
 //! Gates:
 //! - `complete_strictly_exceeds_vendored_and_count_matches_table` — complete coverage merges strictly
 //!   more than the vendored 515, and the exact merge count equals an independent path-level derivation
-//!   from the LoRA file (proving nothing reachable is dropped and the GEGLU 2× split is counted).
+//!   from the LoRA file (Linear + conv stems; proving nothing reachable is dropped and the GEGLU 2×
+//!   split is counted). LCM-LoRA: vendored 515 → complete 858 (809 Linear + 49 conv).
 //! - `complete_deltas_match_reference_byte_exact` — the merged mid_block + GEGLU weights byte-match an
 //!   independently computed reference (`base + lora_delta`, with the value/gate row-split), proving the
 //!   delta lands on the right Linear and the right half.
-//! - `complete_scale_zero_is_bit_exact_noop` — a scale-0 complete merge leaves the weights untouched.
-//! - `complete_render_differs_from_vendored_and_is_sane` — the extra mid/ff signal actually changes the
-//!   rendered image (and the render is a full, non-empty buffer).
+//! - `complete_conv_deltas_match_reference_byte_exact` (sc-2919) — the merged conv weights byte-match
+//!   `base + conv_lora_delta` for a 3×3 resnet conv, a down/up-sampler conv (NHWC), and a 1×1
+//!   conv_shortcut (Linear reshape), proving the conv fold + NCHW→NHWC routing land correctly.
+//! - `complete_scale_zero_is_bit_exact_noop` / `complete_conv_scale_zero_is_bit_exact_noop` — a scale-0
+//!   complete merge leaves the Linear / conv weights untouched.
+//! - `complete_render_differs_from_vendored_and_is_sane` — the extra mid/ff/conv signal actually
+//!   changes the rendered image (and the render is a full, non-empty buffer).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use mlx_rs::ops::add;
+use mlx_rs::ops::{add, array_eq};
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableHost;
+use mlx_gen::adapters::{conv_lora_delta, AdaptableHost};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource,
@@ -97,13 +103,10 @@ fn rows(a: &Array, lo: i32, hi: i32) -> Array {
     a.take_axis(&idx, 0).unwrap()
 }
 
-/// The full LoRA delta for one kohya module stem (flattened, incl. the `lora_unet_` prefix), scale 1.
-fn delta_for(lora: &Weights, flat: &str) -> Array {
-    let down = lora.require(&format!("{flat}.lora_down.weight")).unwrap();
-    let up = lora.require(&format!("{flat}.lora_up.weight")).unwrap();
-    let rank = down.shape()[0] as f32;
-    let alpha = lora
-        .get(&format!("{flat}.alpha"))
+/// Read the LoRA-file alpha for a flattened stem (defaults to `rank` when absent), matching the
+/// merge code's `t.alpha.unwrap_or(rank)`.
+fn alpha_for(lora: &Weights, flat: &str, rank: f32) -> f32 {
+    lora.get(&format!("{flat}.alpha"))
         .map(|a| {
             a.as_dtype(Dtype::Float32)
                 .unwrap()
@@ -111,8 +114,40 @@ fn delta_for(lora: &Weights, flat: &str) -> Array {
                 .unwrap()
                 .as_slice::<f32>()[0]
         })
-        .unwrap_or(rank);
-    lora_delta(down, up, alpha, rank, 1.0).unwrap()
+        .unwrap_or(rank)
+}
+
+/// The full LoRA delta for one kohya module stem (flattened, incl. the `lora_unet_` prefix), scale 1.
+fn delta_for(lora: &Weights, flat: &str) -> Array {
+    let down = lora.require(&format!("{flat}.lora_down.weight")).unwrap();
+    let up = lora.require(&format!("{flat}.lora_up.weight")).unwrap();
+    let rank = down.shape()[0] as f32;
+    lora_delta(down, up, alpha_for(lora, flat, rank), rank, 1.0).unwrap()
+}
+
+/// The fused **conv** LoRA delta (trained-file NCHW `[out, in, kH, kW]`) for one kohya conv stem.
+fn conv_delta_for(lora: &Weights, flat: &str) -> Array {
+    let down = lora.require(&format!("{flat}.lora_down.weight")).unwrap();
+    let up = lora.require(&format!("{flat}.lora_up.weight")).unwrap();
+    let rank = down.shape()[0] as f32;
+    conv_lora_delta(down, up, alpha_for(lora, flat, rank), rank, 1.0).unwrap()
+}
+
+/// Read (a clone of) the current NHWC `[out, kH, kW, in]` weight of the conv at `dotted` (sc-2919).
+fn conv_weight_at(unet: &mut UNet2DConditionModel, dotted: &str) -> Array {
+    let parts: Vec<&str> = dotted.split('.').collect();
+    unet.adaptable_conv_mut(&parts)
+        .unwrap_or_else(|| panic!("{dotted} should be a routable conv under complete coverage"))
+        .weight()
+        .clone()
+}
+
+/// Logical (stride-respecting) element-wise equality. Conv weights are loaded as a strided
+/// `nchw_to_nhwc` *transpose view*, while a merged weight is the contiguous output of `add`; their
+/// raw `as_slice()` buffers are in different physical orders even when the logical tensors are equal,
+/// so conv comparisons must use `array_eq` (mlx compares by logical index, not buffer order).
+fn logical_eq(a: &Array, b: &Array) -> bool {
+    array_eq(a, b, false).unwrap().item::<bool>()
 }
 
 #[test]
@@ -133,7 +168,10 @@ fn complete_strictly_exceeds_vendored_and_count_matches_table() {
 
     let unet0 = load_unet(&snapshot()).unwrap();
     let vendored: BTreeSet<String> = unet0.lora_target_paths().into_iter().collect();
-    let complete_paths = unet0.lora_target_paths_complete();
+    // The complete surface is the Linear targets (sc-2671) PLUS the conv-layer targets (sc-2919);
+    // `apply_sdxl_adapters_with(Complete)` merges both, so the count derivation must too.
+    let mut complete_paths = unet0.lora_target_paths_complete();
+    complete_paths.extend(unet0.conv_target_paths());
     let complete_set: BTreeSet<String> = complete_paths.iter().cloned().collect();
     let complete_table: BTreeMap<String, String> = complete_paths
         .into_iter()
@@ -141,8 +179,8 @@ fn complete_strictly_exceeds_vendored_and_count_matches_table() {
         .collect();
 
     // Independent, path-level derivation of the expected complete merge count: every LoRA stem that
-    // maps into the complete surface contributes 1 Linear update, except a GEGLU `ff.net.0.proj`,
-    // which row-splits across `linear1`+`linear2` (2). No matmul — purely the routing contract.
+    // maps into the complete surface (Linear or conv) contributes 1 weight update, except a GEGLU
+    // `ff.net.0.proj`, which row-splits across `linear1`+`linear2` (2). No matmul — purely routing.
     let mut expected = 0usize;
     for s in &stems {
         let flat = s.strip_prefix("lora_unet_").unwrap_or(s);
@@ -258,6 +296,91 @@ fn complete_deltas_match_reference_byte_exact() {
         "value and gate halves must differ"
     );
     println!("✓ mid_block (attn/proj/resnet) + GEGLU (linear1/2/3) merged weights are byte-exact");
+}
+
+#[test]
+#[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
+fn complete_conv_deltas_match_reference_byte_exact() {
+    // sc-2919: the conv-layer LoRA merge. Three representative conv kinds, each checked
+    // build-independently (no torch golden): the merged conv weight must byte-match an
+    // independently computed `base + δ`, where δ = `conv_lora_delta` (NCHW) routed into the conv's
+    // own layout. Covers (a) a 3×3 resnet conv1, (b) a 3×3 down-sampler conv (both NHWC
+    // `AdaptableConv2d`), and (c) a 1×1 `conv_shortcut` (a Linear, merged via a reshaped 2-D delta).
+    let lora = Weights::from_file(lora_path()).unwrap();
+
+    // (a)/(b): NHWC convs. expected = base_nhwc + transpose([out,in,kH,kW]→[out,kH,kW,in]) of δ.
+    let nhwc_cases = [
+        "down_blocks.0.resnets.0.conv1",
+        "down_blocks.0.downsamplers.0.conv",
+        "up_blocks.0.upsamplers.0.conv",
+    ];
+    let mut base = load_unet(&snapshot()).unwrap();
+    let nhwc_expected: Vec<Array> = nhwc_cases
+        .iter()
+        .map(|dotted| {
+            let b = conv_weight_at(&mut base, dotted);
+            let flat = format!("lora_unet_{}", dotted.replace('.', "_"));
+            let d_nhwc = conv_delta_for(&lora, &flat)
+                .transpose_axes(&[0, 2, 3, 1])
+                .unwrap();
+            add(&b, &d_nhwc).unwrap()
+        })
+        .collect();
+
+    // (c): conv_shortcut is a Linear `[out,in]`; the 1×1 δ folds `[out,in,1,1]→[out,in]`.
+    let sc = "down_blocks.1.resnets.0.conv_shortcut";
+    let base_sc = weight_at(&mut base, sc);
+    let sc_flat = format!("lora_unet_{}", sc.replace('.', "_"));
+    let d_sc = conv_delta_for(&lora, &sc_flat);
+    let ss = d_sc.shape();
+    let exp_sc = add(&base_sc, d_sc.reshape(&[ss[0], ss[1]]).unwrap()).unwrap();
+
+    let mut unet = load_unet(&snapshot()).unwrap();
+    apply_sdxl_adapters_with(&mut unet, &[lora_spec(1.0)], LoraCoverage::Complete).unwrap();
+
+    for (dotted, expected) in nhwc_cases.iter().zip(&nhwc_expected) {
+        let got = conv_weight_at(&mut unet, dotted);
+        assert_eq!(
+            got.shape(),
+            expected.shape(),
+            "conv {dotted} shape changed under merge"
+        );
+        assert!(
+            logical_eq(&got, expected),
+            "merged conv weight at {dotted} must byte-match base + transpose(conv_lora_delta)"
+        );
+    }
+    let got_sc = weight_at(&mut unet, sc);
+    assert!(
+        logical_eq(&got_sc, &exp_sc),
+        "merged conv_shortcut at {sc} must byte-match base + reshaped conv δ"
+    );
+    println!(
+        "✓ conv merge byte-exact: resnet conv1 + down/up-sampler conv (NHWC) + conv_shortcut (1×1 Linear)"
+    );
+}
+
+#[test]
+#[ignore = "needs the real SDXL snapshot + LCM-LoRA"]
+fn complete_conv_scale_zero_is_bit_exact_noop() {
+    // sc-2919: a scale-0 complete merge must leave the conv weights bit-identical (δ·0 ⇒ W+0).
+    let mut base = load_unet(&snapshot()).unwrap();
+    let conv = "down_blocks.0.resnets.0.conv1";
+    let sc = "down_blocks.1.resnets.0.conv_shortcut";
+    let base_conv = conv_weight_at(&mut base, conv);
+    let base_sc = weight_at(&mut base, sc);
+
+    let mut unet = load_unet(&snapshot()).unwrap();
+    apply_sdxl_adapters_with(&mut unet, &[lora_spec(0.0)], LoraCoverage::Complete).unwrap();
+    assert!(
+        logical_eq(&conv_weight_at(&mut unet, conv), &base_conv),
+        "scale-0 conv merge must be a bit-exact no-op"
+    );
+    assert!(
+        logical_eq(&weight_at(&mut unet, sc), &base_sc),
+        "scale-0 conv_shortcut merge must be a bit-exact no-op"
+    );
+    println!("✓ scale-0 complete conv merge is a bit-exact no-op (conv1 + conv_shortcut)");
 }
 
 #[test]
