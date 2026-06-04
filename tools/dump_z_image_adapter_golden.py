@@ -34,8 +34,11 @@ os.makedirs(_GOLDEN_DIR, exist_ok=True)
 PROMPT = os.environ.get("ZIMAGE_PROMPT", "a fox")
 SEED = int(os.environ.get("ZIMAGE_SEED", "42"))
 STEPS = int(os.environ.get("ZIMAGE_STEPS", "4"))
-W = int(os.environ.get("ZIMAGE_W", "256"))
-H = int(os.environ.get("ZIMAGE_H", "256"))
+# 512² by default: the adapter parity gate (tests/adapter_real_weights.rs) is floor-relative, and
+# the bf16 toolchain floor is ~30× lower at 512² than the inflated 256² floor (sc-2718). Dump the
+# base golden (dump_z_image_golden.py) at the SAME size for the gate's base-floor comparison.
+W = int(os.environ.get("ZIMAGE_W", "512"))
+H = int(os.environ.get("ZIMAGE_H", "512"))
 # Adapter magnitudes (env-overridable for tuning a visible-but-non-destructive effect).
 LORA_STD = float(os.environ.get("ZIMAGE_LORA_STD", "0.03"))
 LOKR_STD = float(os.environ.get("ZIMAGE_LOKR_STD", "0.06"))
