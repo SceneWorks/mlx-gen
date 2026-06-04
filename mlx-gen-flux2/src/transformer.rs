@@ -1265,6 +1265,7 @@ mod tests {
                 scale: 1.0,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .unwrap();
@@ -1387,6 +1388,7 @@ mod tests {
                 scale: 0.8,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .unwrap();
@@ -1437,6 +1439,7 @@ mod tests {
                 scale: 0.8,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .unwrap();
@@ -1504,6 +1507,7 @@ mod tests {
                 scale: 1.0,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .unwrap();

@@ -107,17 +107,26 @@ pub struct AdapterSpec {
     /// schedule, so it is net-new. Like [`LoadSpec::control`], it is a model-specific knob on the
     /// shared spec: **only LTX reads it**; every other model ignores it (its denoise is single-pass).
     pub pass_scales: Option<Vec<f32>>,
+    /// Which expert of a dual-expert MoE model (Wan2.2 A14B) this adapter targets (sc-2683).
+    /// `None` = shared: merged onto **both** the high- and low-noise experts (the reference
+    /// `--lora` file → `(loras)+(loras_high/low)`); `Some(High)`/`Some(Low)` = one expert only
+    /// (`--lora-high` / `--lora-low`). Like [`pass_scales`](Self::pass_scales), this is a
+    /// model-specific knob on the shared spec: **only the Wan MoE models read it**; every
+    /// single-stream model ignores it (a `Some(_)` there is surfaced, not silently honored).
+    pub moe_expert: Option<MoeExpert>,
 }
 
 impl AdapterSpec {
     /// A uniform-strength adapter (the common case): [`scale`](Self::scale) on every denoise pass,
-    /// no per-pass override. Equivalent to a literal with `pass_scales: None`.
+    /// no per-pass override, shared across both MoE experts. Equivalent to a literal with
+    /// `pass_scales: None, moe_expert: None`.
     pub fn new(path: PathBuf, scale: f32, kind: AdapterKind) -> Self {
         Self {
             path,
             scale,
             kind,
             pass_scales: None,
+            moe_expert: None,
         }
     }
 
@@ -126,12 +135,28 @@ impl AdapterSpec {
         self.pass_scales = Some(pass_scales);
         self
     }
+
+    /// Builder-style MoE expert target (Wan2.2 A14B only — see [`moe_expert`](Self::moe_expert)).
+    pub fn with_moe_expert(mut self, expert: MoeExpert) -> Self {
+        self.moe_expert = Some(expert);
+        self
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdapterKind {
     Lora,
     Lokr,
+}
+
+/// One expert of a dual-expert MoE denoiser (Wan2.2 A14B), naming which checkpoint an adapter
+/// merges onto. The A14B splits denoising at a noise `boundary` between a **high**-noise expert
+/// (early, noisy steps) and a **low**-noise expert (late steps); a trained Wan MoE LoRA ships as a
+/// high/low pair (e.g. `*_wan22_high` + `*_wan22_low`). See [`AdapterSpec::moe_expert`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeExpert {
+    High,
+    Low,
 }
 
 /// Cooperative cancellation handle threaded into a request; a model checks it between steps

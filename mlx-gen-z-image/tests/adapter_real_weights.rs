@@ -126,6 +126,7 @@ fn render_with_adapter(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &
             scale,
             kind,
             pass_scales: None,
+            moe_expert: None,
         }]);
     }
     let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
@@ -342,6 +343,7 @@ fn kohya_matches_peft_on_real_tree() {
             scale: 0.8,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
@@ -360,6 +362,7 @@ fn kohya_matches_peft_on_real_tree() {
             scale: 0.8,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
@@ -409,6 +412,7 @@ fn kohya_matches_peft_on_real_tree() {
                 scale: 1.0,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .is_err(),

@@ -45,6 +45,7 @@ fn spec(g: &Weights, key: &str, scale: f32, kind: AdapterKind) -> AdapterSpec {
         scale,
         kind,
         pass_scales: None,
+        moe_expert: None,
     }
 }
 

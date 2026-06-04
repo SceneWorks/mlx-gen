@@ -55,6 +55,7 @@ fn lora_spec(g: &Weights, scale: f32) -> AdapterSpec {
         scale,
         kind: AdapterKind::Lora,
         pass_scales: None,
+        moe_expert: None,
     }
 }
 
@@ -221,6 +222,7 @@ fn peft_format_merges_end_to_end() {
             scale: 1.0,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();

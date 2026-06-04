@@ -127,6 +127,7 @@ fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u
             scale,
             kind,
             pass_scales: None,
+            moe_expert: None,
         }]);
     }
     let generator = mlx_gen::load("flux2_klein_9b", &spec).unwrap();
@@ -316,6 +317,7 @@ fn kohya_matches_peft_on_real_tree() {
             scale: 0.8,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
@@ -334,6 +336,7 @@ fn kohya_matches_peft_on_real_tree() {
             scale: 0.8,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
@@ -463,6 +466,7 @@ fn bfl_resolves_and_matches_diffusers_split_on_real_tree() {
             scale: 0.8,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
@@ -497,6 +501,7 @@ fn bfl_resolves_and_matches_diffusers_split_on_real_tree() {
                 scale: 0.8,
                 kind: AdapterKind::Lora,
                 pass_scales: None,
+                moe_expert: None,
             }],
         )
         .unwrap();
