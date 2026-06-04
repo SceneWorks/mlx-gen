@@ -75,6 +75,7 @@ fn lora_spec(scale: f32) -> AdapterSpec {
         scale,
         kind: AdapterKind::Lora,
         pass_scales: None,
+        moe_expert: None,
     }
 }
 

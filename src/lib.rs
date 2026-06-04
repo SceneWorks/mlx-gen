@@ -35,7 +35,8 @@ pub use generator::{
 pub use media::{AudioTrack, Image};
 pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Precision, Progress, Quant, WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
+    WeightsSource,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};

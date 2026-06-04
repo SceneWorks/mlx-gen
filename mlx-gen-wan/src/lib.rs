@@ -41,6 +41,7 @@
 //! `mlx_video`-reference golden on matched injected noise (`tests/s6_real_parity.rs`, `#[ignore]` —
 //! the 54 GB weights live outside CI; the tiny S1–S5 gates carry CI).
 
+pub mod adapters;
 pub mod config;
 pub mod model;
 pub mod patchify;
@@ -51,6 +52,7 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+pub use adapters::{merge_wan_adapters, WanLoraReport};
 pub use config::{GuideScale, WanModelConfig, WanQuant, SAMPLE_NEG_PROMPT};
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,

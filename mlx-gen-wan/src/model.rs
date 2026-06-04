@@ -18,12 +18,13 @@ use std::path::PathBuf;
 use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    MoeExpert, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 
+use crate::adapters::merge_wan_adapters;
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
     align_dim, best_output_size, build_i2v_y, decode_to_frames, denoise_moe, frames_to_images,
@@ -113,8 +114,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }
     if !spec.adapters.is_empty() {
         return Err(Error::Msg(
-            "wan2_2_ti2v_5b: LoRA/LoKr adapters are sibling slices (sc-2683 / sc-2393), not yet \
-             wired"
+            "wan2_2_ti2v_5b: adapters are moot until the dense 5B denoise/generate lands (sc-2680); \
+             LoRA-in-generate is wired for the live A14B experts (sc-2683)"
                 .into(),
         ));
     }
@@ -190,9 +191,9 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: Vec::new(),
-            // Q4/Q8 quantization (sc-2682) is wired via `spec.quantize`; LoRA/LoKr (sc-2683 /
-            // sc-2393) are sibling slices.
-            supports_lora: false,
+            // LoRA merges per-expert at load time (sc-2683, PEFT/kohya, MoE high/low); Q4/Q8 (sc-2682)
+            // loads via `spec.quantize` or a pre-quantized snapshot. LoKr is the sibling sc-2393.
+            supports_lora: true,
             supports_lokr: false,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
@@ -216,9 +217,13 @@ pub struct Wan14b {
     descriptor: ModelDescriptor,
     config: WanModelConfig,
     root: PathBuf,
-    /// Optional Q4/Q8 quantization for the transformer experts (sc-2682). `None` = dense bf16. When
-    /// set, [`Wan14b::generate`] quantizes **each** expert independently after load (transformer-only:
-    /// the reference's attn `q/k/v/o` + `ffn.fc1/fc2`; T5 + VAE stay f32).
+    /// LoRA adapters merged onto the experts at generate time (sc-2683). Empty for a plain load;
+    /// `moe_expert`-tagged specs route to the high/low expert (shared = both).
+    adapters: Vec<AdapterSpec>,
+    /// Optional Q4/Q8 quantization for the transformer experts (sc-2682). `None` = dense bf16 (or a
+    /// pre-quantized snapshot, which `from_weights` builds packed from its `config.json` manifest —
+    /// see [`resolve_load_time_quant`]). When `Some`, [`Wan14b::generate`] quantizes **each** expert
+    /// independently after load (transformer-only: attn `q/k/v/o` + `ffn.fc1/fc2`; T5 + VAE stay f32).
     quant: Option<Quant>,
 }
 
@@ -227,6 +232,65 @@ impl Wan14b {
     pub fn config(&self) -> &WanModelConfig {
         &self.config
     }
+
+    /// Merge the load-time LoRA adapters onto the two expert weight maps in place (sc-2683), before
+    /// the [`WanTransformer`]s are built. No-op when no adapters were supplied (the no-adapter path
+    /// is byte-identical). Shared specs merge onto both experts, `moe_expert`-tagged specs onto their
+    /// own (the reference `(loras)+(loras_high/low)` split). Errors if a non-empty adapter set matched
+    /// no module across *either* expert (a format/prefix misconfiguration); per-key skips (a target
+    /// absent from this checkpoint) are surfaced as a warning, not fatal, mirroring the reference.
+    fn merge_adapters(&self, low_w: &mut Weights, high_w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        // A LoRA delta folds into the *dense* bf16 weight (then that may be quantized at load). On a
+        // pre-quantized snapshot the experts ship packed (u32 codes + scales), so there is no dense
+        // weight to merge into — the reference's dequantize-then-merge path (sc-2682's `loading.py`
+        // LoRA branch) is a follow-on, not wired. Surface it rather than corrupt the packed weights.
+        if self.config.quantization.is_some() {
+            return Err(Error::Msg(format!(
+                "{}: LoRA adapters on a pre-quantized snapshot need dequantize-then-merge (the \
+                 reference loading.py path), not yet wired — load a dense bf16 snapshot (LoRA merges, \
+                 then `spec.quantize` quantizes the merged weights), or drop the adapters",
+                self.descriptor.id
+            )));
+        }
+        let low = merge_wan_adapters(low_w, &self.adapters, MoeExpert::Low)?;
+        let high = merge_wan_adapters(high_w, &self.adapters, MoeExpert::High)?;
+        if low.applied + high.applied == 0 {
+            return Err(Error::Msg(format!(
+                "{}: {} LoRA file(s) matched no module across either expert — check the format \
+                 (expected PEFT `lora_A/B` or kohya `lora_down/up`, `diffusion_model.`-prefixed Wan \
+                 module names)",
+                self.descriptor.id,
+                self.adapters.len()
+            )));
+        }
+        let mut skipped = low.skipped;
+        skipped.extend(high.skipped);
+        skipped.sort();
+        skipped.dedup();
+        if !skipped.is_empty() {
+            eprintln!(
+                "{}: {} LoRA target(s) not present in this checkpoint, skipped: {skipped:?}",
+                self.descriptor.id,
+                skipped.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Validate the adapter specs accepted by the dual-expert loaders: LoRA only (LoKr is the sibling
+/// sc-2393, rejected loudly) and quantization-free (Q4/Q8 is sc-2682 — the merge folds into the
+/// dense bf16 expert weights). `id` names the model in the error.
+fn validate_adapters(id: &str, spec: &LoadSpec) -> Result<()> {
+    if spec.adapters.iter().any(|a| a.kind == AdapterKind::Lokr) {
+        return Err(Error::Msg(format!(
+            "{id}: LoKr adapters are a sibling slice (sc-2393), not yet wired; supply LoRA adapters"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve the **load-time** quantization to apply in [`Wan14b::generate`], reconciling the requested
@@ -269,8 +333,9 @@ fn solver_kind(sampler: Option<&str>) -> SolverKind {
 
 /// Load the Wan2.2 T2V-A14B from a converted MLX snapshot directory (`convert_wan.py` output:
 /// `low_noise_model.safetensors` + `high_noise_model.safetensors` + `t5_encoder.safetensors` +
-/// `vae.safetensors` + `tokenizer.json` + `config.json`). Honors `spec.quantize` (Q4/Q8, sc-2682);
-/// LoRA/LoKr adapters are sibling slices.
+/// `vae.safetensors` + `tokenizer.json` + `config.json`). LoRA adapters merge per-expert at generate
+/// time (sc-2683); Q4/Q8 (sc-2682) loads via `spec.quantize` or a pre-quantized snapshot. LoKr is the
+/// sibling sc-2393.
 pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -287,13 +352,7 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "wan2_2_t2v_14b: LoRA/LoKr adapters are sibling slices (sc-2683 / sc-2393), not yet \
-             wired"
-                .into(),
-        ));
-    }
+    validate_adapters("wan2_2_t2v_14b", spec)?;
 
     let config = WanModelConfig::from_model_dir(&root)?;
     if !config.dual_model {
@@ -308,6 +367,7 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor_t2v_14b(),
         config,
         root,
+        adapters: spec.adapters.clone(),
         quant,
     }))
 }
@@ -447,14 +507,19 @@ impl Generator for Wan14b {
 
         // --- Stage 2: load both experts, embed per-expert, dual-expert MoE denoise (→ freed) ---
         let latents = {
-            let low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
-            let high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
+            let mut low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
+            let mut high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
+            // Merge LoRA adapters per expert (sc-2683) on the dense bf16 weights — no-op without
+            // adapters. This runs BEFORE quantization (the fork order: a LoRA folds into the dense
+            // weight, then that is quantized; load rejects LoRA on an already-pre-quantized snapshot).
+            self.merge_adapters(&mut low_w, &mut high_w)?;
             // Q4/Q8 (sc-2682), two routes, both transformer-only (attn q/k/v/o + ffn.fc1/fc2; T5
             // above + VAE below stay f32 — the reference's quant scope):
             //   • pre-quantized snapshot (config.json `quantization` block) → `from_weights` already
             //     built the experts quantized from the on-disk packed weights (`self.quant` is None,
             //     resolved in load), so they load at the reduced ~Q4/Q8 size — the low-peak path;
-            //   • dense bf16 snapshot + `spec.quantize` → quantize each expert in-memory after load.
+            //   • dense bf16 snapshot + `spec.quantize` → quantize each expert in-memory after the
+            //     (optional) LoRA merge.
             // Either way both experts are quantized independently.
             let mut low_dit = WanTransformer::from_weights(&low_w, cfg)?;
             let mut high_dit = WanTransformer::from_weights(&high_w, cfg)?;
@@ -558,9 +623,9 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supports_true_cfg: false,
             // A single image is channel-concatenated as the first-frame conditioning (in_dim 36).
             conditioning: vec![ConditioningKind::Reference],
-            // Q4/Q8 quantization (sc-2682) is wired via `spec.quantize`; LoRA/LoKr (sc-2683 /
-            // sc-2393) are sibling slices.
-            supports_lora: false,
+            // LoRA merges per-expert at load time (sc-2683, PEFT/kohya, MoE high/low); Q4/Q8 (sc-2682)
+            // loads via `spec.quantize` or a pre-quantized snapshot. LoKr is the sibling sc-2393.
+            supports_lora: true,
             supports_lokr: false,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
@@ -577,8 +642,9 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
 
 /// Load the Wan2.2 I2V-A14B from a converted MLX snapshot directory (same layout as the T2V-A14B:
 /// `low_noise_model` + `high_noise_model` + `t5_encoder` + `vae` (with encoder) + `tokenizer.json` +
-/// `config.json`). Requires `model_type == "i2v"` (in_dim 36) and a dual-expert checkpoint.
-/// Honors `spec.quantize` (Q4/Q8, sc-2682); LoRA/LoKr adapters are sibling slices.
+/// `config.json`). Requires `model_type == "i2v"` (in_dim 36) and a dual-expert checkpoint. LoRA
+/// adapters merge per-expert at generate time (sc-2683); Q4/Q8 (sc-2682) loads via `spec.quantize`
+/// or a pre-quantized snapshot. LoKr is the sibling sc-2393.
 pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -595,13 +661,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "wan2_2_i2v_14b: LoRA/LoKr adapters are sibling slices (sc-2683 / sc-2393), not yet \
-             wired"
-                .into(),
-        ));
-    }
+    validate_adapters("wan2_2_i2v_14b", spec)?;
 
     let config = WanModelConfig::from_model_dir(&root)?;
     if !config.is_i2v_concat() {
@@ -624,6 +684,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor_i2v_14b(),
         config,
         root,
+        adapters: spec.adapters.clone(),
         quant,
     }))
 }

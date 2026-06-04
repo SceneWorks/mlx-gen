@@ -75,6 +75,7 @@ fn render(adapter: Option<(PathBuf, AdapterKind, f32)>) -> Vec<u8> {
             scale,
             kind,
             pass_scales: None,
+            moe_expert: None,
         }]);
     }
     let generator = mlx_gen::load("flux1_dev", &spec).unwrap();
@@ -184,6 +185,7 @@ fn real_zhibi_resolves_full_surface_no_unmatched() {
             scale: 1.0,
             kind: AdapterKind::Lora,
             pass_scales: None,
+            moe_expert: None,
         }],
     )
     .unwrap();
