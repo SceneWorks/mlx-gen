@@ -40,8 +40,11 @@ fn q8_forward_close_to_dense() {
         lin.quantize(8, None).unwrap();
         let q32 = lin.forward(&x32).unwrap();
         let q16 = lin.forward(&x16).unwrap();
-        // Both quantized outputs are compared to the f32 dense ground truth; with the bf16→f32
-        // upcast in the quantized forward, q16 and q32 must also agree.
+        // Both quantized outputs are compared to the f32 dense ground truth. The quantized forward
+        // now feeds activations to `quantized_matmul` as-is (the bf16→f32 upcast was removed in
+        // sc-2719), so q16 carries bf16-rounded inputs and need not match q32 exactly — but both
+        // must stay within tolerance of the dense ground truth (`quantized_matmul` accumulates fp32,
+        // correct at every activation dtype). `q16-vs-q32` is printed to characterize that gap.
         let r32 = rel(&q32, &d32);
         let r16 = rel(&q16, &d32);
         let r1632 = rel(&q16, &q32);

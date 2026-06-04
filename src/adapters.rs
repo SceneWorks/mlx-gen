@@ -118,21 +118,16 @@ impl LinearBase {
                 }
             }
             LinearBase::Quantized(q) => {
-                // Belt-and-suspenders upcast for the NAX 16-bit-GEMM bug (present on both pinned
-                // MLX builds, 0.30.6 and 0.31.1; see `tests/bf16_matmul_sweep.rs`). The buggy op is
-                // the *dense* 16-bit×16-bit Metal GEMM (M≥2 & K≤512, or very large M) — NOT
-                // `quantized_matmul`, which accumulates in fp32 (mlx#963) and is correct at every
-                // shape/dtype. So this bf16→f32 upcast guards a non-bug here and is not strictly
-                // load-bearing; it is kept as a cheap, uniform "16-bit activations never reach a
-                // 16-bit/quant Linear" invariant (and to keep `q8_smoke.rs` green) while the
-                // underlying GEMM bug persists. Weights stay Q4/Q8 throughout.
-                let xf = if x.dtype() == Dtype::Bfloat16 {
-                    x.as_dtype(Dtype::Float32)?
-                } else {
-                    x.clone()
-                };
+                // Activations are fed to `quantized_matmul` AS-IS — no dtype upcast. `quantized_matmul`
+                // accumulates in fp32 (mlx#963) and is correct at every activation shape/dtype, so it
+                // was never the buggy op: the NAX 16-bit-GEMM bug lived in the *dense* 16-bit×16-bit
+                // Metal GEMM, and that is now fixed at the toolchain level (sc-2772 — metal target ≥26.2).
+                // The former bf16→f32 upcast here (sc-2719) guarded a proven non-bug and is removed:
+                // feeding bf16 activations straight in matches the fork's own quantized compute dtype
+                // (bf16 latents → `quantized_matmul` → bf16), so it is strictly *more* faithful, not less.
+                // Weights stay Q4/Q8 throughout. (`q8_smoke.rs` exercises the bf16-activation path.)
                 let mut y = quantized_matmul(
-                    &xf,
+                    x,
                     &q.inner.weight.value,
                     &q.scales.value,
                     &q.biases.value,
