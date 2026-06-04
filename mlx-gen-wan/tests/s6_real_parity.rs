@@ -151,6 +151,7 @@ fn wan_a14b_real_weight_e2e_matches_reference() {
         steps,
         shift,
         noise,
+        None,
         &mut |i| println!("  step {i}/{steps}"),
     )
     .expect("denoise_moe");

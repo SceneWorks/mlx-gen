@@ -96,6 +96,7 @@ fn wan_moe_denoise_matches_reference() {
         4,
         5.0,
         init_noise,
+        None,
         &mut |_| {},
     )
     .expect("denoise_moe");

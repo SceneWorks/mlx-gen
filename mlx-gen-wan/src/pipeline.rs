@@ -11,11 +11,12 @@
 //! uncond as two B=1 forwards (bit-identical to the reference's batched B=2, since attention never
 //! mixes batch elements — see the `forward` docs).
 
-use mlx_rs::ops::{add, maximum, minimum, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::TilingConfig;
-use mlx_gen::{Image, Result};
+use mlx_gen::{Error, Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
@@ -54,6 +55,37 @@ pub fn seq_len(latent: [i32; 4], patch_size: (usize, usize, usize)) -> usize {
     (per_frame * t_lat as f64).ceil() as usize
 }
 
+/// The largest `(width, height)` that fits within `max_area` while preserving the input aspect ratio
+/// and staying aligned to the `(dw, dh)` grid (= `patch · vae_stride`). Port of `generate_wan.py`'s
+/// `_best_output_size`: it derives the ideal `(ow, oh)` from `√(max_area·ratio)`, then tries
+/// width-first and height-first alignment and keeps whichever distorts the aspect ratio less. Applied
+/// only when `config.max_area > 0` and the requested area exceeds it (I2V-14B / TI2V-5B cap, 704×1280).
+pub fn best_output_size(width: u32, height: u32, dw: u32, dh: u32, max_area: usize) -> (u32, u32) {
+    let (w, h, dw_f, dh_f) = (width as f64, height as f64, dw as f64, dh as f64);
+    let area = max_area as f64;
+    let ratio = w / h;
+    let ow = (area * ratio).sqrt();
+    let oh = area / ow;
+
+    // Option 1: align width first, derive height from the remaining area. (`int(x // d * d)`.)
+    let ow1 = (ow / dw_f).floor() * dw_f;
+    let oh1 = (area / ow1 / dh_f).floor() * dh_f;
+    let ratio1 = ow1 / oh1;
+
+    // Option 2: align height first, derive width.
+    let oh2 = (oh / dh_f).floor() * dh_f;
+    let ow2 = (area / oh2 / dw_f).floor() * dw_f;
+    let ratio2 = ow2 / oh2;
+
+    let dist1 = (ratio / ratio1).max(ratio1 / ratio);
+    let dist2 = (ratio / ratio2).max(ratio2 / ratio);
+    if dist1 < dist2 {
+        (ow1 as u32, oh1 as u32)
+    } else {
+        (ow2 as u32, oh2 as u32)
+    }
+}
+
 /// Classifier-free guidance combine: `uncond + gs·(cond − uncond)`.
 fn cfg_combine(cond: &Array, uncond: &Array, gs: f32) -> Result<Array> {
     Ok(add(
@@ -65,6 +97,12 @@ fn cfg_combine(cond: &Array, uncond: &Array, gs: f32) -> Result<Array> {
 /// One denoise prediction: the CFG batched forward (`uncond + gs·(cond − uncond)`) when
 /// `ctx_uncond` is `Some`, else the B=1 cond-only forward. `ctx_*` are
 /// [`WanTransformer::embed_text`] outputs (`[1, text_len, dim]`, bf16).
+///
+/// `y` is the optional I2V channel-concat conditioning `[20, F, H, W]` (mirrors `WanModel.__call__`'s
+/// `y`): when `Some`, it is concatenated **onto the channel axis after** the `[16, …]` noise latent —
+/// `[noise(16), mask(4), z_video(16)]` → `[36, F, H, W]` — before patchify, exactly the channel order
+/// the I2V-14B `patch_embedding` (in_dim 36) was trained on. The DiT prediction stays `out_dim = 16`,
+/// so the scheduler step still consumes/produces the 16-channel latent.
 fn predict(
     transformer: &WanTransformer,
     latents: &Array,
@@ -72,14 +110,19 @@ fn predict(
     ctx_cond: &Array,
     ctx_uncond: Option<&Array>,
     guidance: f32,
+    y: Option<&Array>,
 ) -> Result<Array> {
+    let x = match y {
+        Some(y) => concatenate_axis(&[latents, y], 0)?,
+        None => latents.clone(),
+    };
     match ctx_uncond {
         Some(uncond_ctx) => {
-            let cond = transformer.forward(latents, t, ctx_cond)?;
-            let uncond = transformer.forward(latents, t, uncond_ctx)?;
+            let cond = transformer.forward(&x, t, ctx_cond)?;
+            let uncond = transformer.forward(&x, t, uncond_ctx)?;
             cfg_combine(&cond, &uncond, guidance)
         }
-        None => transformer.forward(latents, t, ctx_cond),
+        None => transformer.forward(&x, t, ctx_cond),
     }
 }
 
@@ -106,7 +149,15 @@ pub fn denoise(
 
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
-        let pred = predict(transformer, &latents, t, ctx_cond, ctx_uncond, guidance)?;
+        let pred = predict(
+            transformer,
+            &latents,
+            t,
+            ctx_cond,
+            ctx_uncond,
+            guidance,
+            None,
+        )?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
         // per-step `mx.eval(latents)`).
@@ -134,6 +185,10 @@ pub struct Expert<'a> {
 /// `0.875 · 1000 = 875`) and the **low-noise** expert below it — switching the transformer, the
 /// per-expert contexts, and the per-expert guidance together. Reduces to [`denoise`] when both
 /// experts are the same model.
+///
+/// `y` is the optional I2V-14B channel-concat conditioning `[20, F, H, W]` ([`build_i2v_y`]),
+/// concatenated onto each forward's noise latent (see [`predict`]); `None` for T2V. It is constant
+/// across steps and shared by both experts (the conditioning doesn't change with the noise level).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_moe(
     low: &Expert,
@@ -144,6 +199,7 @@ pub fn denoise_moe(
     steps: usize,
     shift: f32,
     init_noise: &Array,
+    y: Option<&Array>,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
@@ -160,6 +216,7 @@ pub fn denoise_moe(
             &e.ctx_cond,
             e.ctx_uncond.as_ref(),
             e.guidance,
+            y,
         )?;
         latents = sched.step(&pred, &latents)?;
         mlx_rs::transforms::eval([&latents])?;
@@ -224,6 +281,107 @@ fn prepend1(shape: &[i32]) -> Vec<i32> {
     s
 }
 
+// ===========================================================================================
+// I2V-14B channel-concat conditioning (port of `generate_wan.py`'s `is_i2v_channel_concat` setup)
+// ===========================================================================================
+
+/// Python `round()` — round half to **even** (banker's rounding), matching `round(img.width * scale)`
+/// in the reference's image preprocessing. (Rust `f64::round` rounds half away from zero, which would
+/// differ on exact `.5` derived sizes.)
+fn py_round(x: f64) -> usize {
+    let floor = x.floor();
+    let frac = x - floor;
+    // Round up on frac > 0.5, or on an exact tie (frac == 0.5) when `floor` is odd (→ even).
+    let round_up = frac > 0.5 || (frac == 0.5 && (floor as i64) % 2 != 0);
+    (if round_up { floor + 1.0 } else { floor }) as usize
+}
+
+/// Preprocess an I2V conditioning image to `[3, height, width]` f32 in `[-1, 1]` (CHW), matching the
+/// reference's inline pipeline: **cover-fit** LANCZOS resize (`scale = max(W/iw, H/ih)`, new dims
+/// `round(·)`), **center-crop** to the target, then `px/255·2 − 1`. The resize is the core PIL-exact
+/// fixed-point integer LANCZOS ([`resize_lanczos_u8`]), so it's bit-identical to PIL's `Image.LANCZOS`.
+pub fn preprocess_i2v_image(image: &Image, width: u32, height: u32) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (width as usize, height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "i2v image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    // Cover-fit: scale so the image covers the target, then round to integer dims (PIL `round`).
+    let scale = (tw as f64 / iw as f64).max(th as f64 / ih as f64);
+    let nw = py_round(iw as f64 * scale).max(tw);
+    let nh = py_round(ih as f64 * scale).max(th);
+    let resized: Vec<f32> = if (nh, nw) == (ih, iw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, nh, nw)
+    };
+    // Center-crop the (integer-valued) resized HWC buffer to (th, tw), then normalize → CHW [-1,1].
+    let x1 = (nw - tw) / 2;
+    let y1 = (nh - th) / 2;
+    let mut chw = vec![0f32; 3 * th * tw];
+    let plane = th * tw;
+    for yy in 0..th {
+        for xx in 0..tw {
+            let src = ((y1 + yy) * nw + (x1 + xx)) * 3;
+            for c in 0..3 {
+                chw[c * plane + yy * tw + xx] = 2.0 * (resized[src + c] / 255.0) - 1.0;
+            }
+        }
+    }
+    Ok(Array::from_slice(&chw, &[3, th as i32, tw as i32]))
+}
+
+/// The I2V-14B 4-channel temporal mask `[4, T_lat, h_lat, w_lat]` (f32): `1.0` for the first latent
+/// temporal frame (all 4 channels, all spatial), `0.0` elsewhere. The reference builds this via a
+/// `ones`/`zeros` → `repeat(first,4)` → `reshape(·,T_lat,4,·,·)` → `transpose` dance over the
+/// `[1, F, h_lat, w_lat]` per-frame mask (first frame 1, rest 0); the result is exactly this pattern
+/// (the per-frame mask collapses to "the first 4 of `F+3` temporal slots", which is latent frame 0).
+fn build_i2v_mask(t_lat: usize, h_lat: usize, w_lat: usize) -> Array {
+    let plane = h_lat * w_lat;
+    let mut data = vec![0f32; 4 * t_lat * plane];
+    for c in 0..4 {
+        let base = c * t_lat * plane; // temporal index 0 of channel c
+        for p in 0..plane {
+            data[base + p] = 1.0;
+        }
+    }
+    Array::from_slice(&data, &[4, t_lat as i32, h_lat as i32, w_lat as i32])
+}
+
+/// Build the I2V-14B channel-concat conditioning `y = [mask(4), z_video(16)]` → `[20, T_lat, h_lat,
+/// w_lat]` (f32). Port of `generate_wan.py`'s `is_i2v_channel_concat` branch: a conditioning video
+/// (first frame = the preprocessed image, the remaining `frames−1` zero) is encoded by the 2.1 z16
+/// `WanVae` → `z_video [16, T_lat, …]`, and concatenated under the temporal mask. `vae` must carry
+/// encoder weights. The result is `Some(y)` fed to [`denoise_moe`].
+pub fn build_i2v_y(
+    vae: &WanVae,
+    image: &Image,
+    frames: usize,
+    height: u32,
+    width: u32,
+    vae_stride: (usize, usize, usize),
+) -> Result<Array> {
+    let (h, w) = (height as i32, width as i32);
+    // Conditioning video [3, F, H, W]: first frame = image, rest zeros.
+    let first = preprocess_i2v_image(image, width, height)?.reshape(&[3, 1, h, w])?;
+    let rest = Array::zeros::<f32>(&[3, frames as i32 - 1, h, w])?;
+    let video = concatenate_axis(&[&first, &rest], 1)?; // [3, F, H, W]
+
+    // VAE-encode → [1, 16, T_lat, h_lat, w_lat], drop the batch axis → [16, T_lat, h_lat, w_lat].
+    let z_video = vae.encode(&video.reshape(&[1, 3, frames as i32, h, w])?)?;
+    let z_video = z_video.reshape(&z_video.shape()[1..])?;
+
+    let t_lat = (frames - 1) / vae_stride.0 + 1;
+    let h_lat = height as usize / vae_stride.1;
+    let w_lat = width as usize / vae_stride.2;
+    let mask = build_i2v_mask(t_lat, h_lat, w_lat);
+
+    Ok(concatenate_axis(&[&mask, &z_video], 0)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +412,33 @@ mod tests {
         let got = cfg_combine(&cond, &uncond, 3.0).unwrap();
         // 1 + 3*(2-1) = 4 ; 1 + 3*(4-1) = 10
         assert_eq!(got.as_slice::<f32>(), &[4.0, 10.0]);
+    }
+
+    #[test]
+    fn py_round_is_half_to_even() {
+        assert_eq!(py_round(19.2), 19);
+        assert_eq!(py_round(16.0), 16);
+        assert_eq!(py_round(0.5), 0); // half → even (down)
+        assert_eq!(py_round(1.5), 2); // half → even (up)
+        assert_eq!(py_round(2.5), 2); // half → even (down)
+        assert_eq!(py_round(2.500001), 3); // just over half → up
+    }
+
+    #[test]
+    fn best_output_size_caps_area_and_aligns() {
+        // 1280×720 over the I2V/TI2V 704×1280 cap, 16-px grid → width-first wins (less distortion).
+        let (w, h) = best_output_size(1280, 720, 16, 16, 704 * 1280);
+        assert_eq!((w, h), (1264, 704));
+        assert!((w * h) as usize <= 704 * 1280, "must fit within max_area");
+        assert_eq!(w % 16, 0);
+        assert_eq!(h % 16, 0);
+    }
+
+    #[test]
+    fn build_i2v_mask_is_one_at_first_latent_frame() {
+        // [4, T_lat=2, 1, 1]: channel-major, temporal index 0 → 1.0, index 1 → 0.0.
+        let m = build_i2v_mask(2, 1, 1);
+        assert_eq!(m.shape(), &[4, 2, 1, 1]);
+        assert_eq!(m.as_slice::<f32>(), &[1., 0., 1., 0., 1., 0., 1., 0.]);
     }
 }

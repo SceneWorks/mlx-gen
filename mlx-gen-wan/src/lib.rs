@@ -9,10 +9,12 @@
 //! patchify, the flow-match solvers, the T2V pipeline) is the Wan core (sc-2678); the dense/MoE
 //! 14B variants reuse it via additional configs + dual-expert routing.
 //!
-//! This crate self-registers two models into the `mlx-gen` registry: **`wan2_2_t2v_14b`** (the
+//! This crate self-registers three models into the `mlx-gen` registry: **`wan2_2_t2v_14b`** (the
 //! dual-expert MoE T2V, fully wired — `mlx_gen::load("wan2_2_t2v_14b", spec)` runs the complete
-//! pipeline) and **`wan2_2_ti2v_5b`** (the dense 5B, whose z48 VAE + dense denoise are sc-2680, so
-//! its `generate` still stubs).
+//! pipeline), **`wan2_2_i2v_14b`** (the dual-expert MoE channel-concat image→video, fully wired —
+//! shares the T2V pipeline with the 20-channel `y` conditioning + in_dim-36 patch-embed, sc-2681) and
+//! **`wan2_2_ti2v_5b`** (the dense 5B, whose z48 VAE + dense denoise are sc-2680, so its `generate`
+//! still stubs).
 //!
 //! ## Status (S0–S6)
 //! S0 — foundation: registry + config (`config.json`-driven, all Wan presets) + the three
@@ -50,8 +52,14 @@ pub mod transformer;
 pub mod vae;
 
 pub use config::{GuideScale, WanModelConfig, SAMPLE_NEG_PROMPT};
-pub use model::{descriptor, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID, MODEL_ID_T2V_14B};
-pub use pipeline::{decode_to_frames, denoise, denoise_moe, frames_to_images, Expert};
+pub use model::{
+    descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,
+    MODEL_ID_I2V_14B, MODEL_ID_T2V_14B,
+};
+pub use pipeline::{
+    best_output_size, build_i2v_y, decode_to_frames, denoise, denoise_moe, frames_to_images,
+    preprocess_i2v_image, Expert,
+};
 pub use rope::{rope_apply, RopeTable};
 pub use scheduler::{
     compute_sigmas, make_scheduler, FlowDpmpp2m, FlowMatchEuler, FlowUniPC, SolverKind,

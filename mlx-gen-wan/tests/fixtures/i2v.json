@@ -1,0 +1,63 @@
+{
+  "steps": 4,
+  "shift": 5.0,
+  "guide_low": 3.5,
+  "guide_high": 3.5,
+  "boundary": 0.9,
+  "boundary_timestep": 900.0,
+  "num_train_timesteps": 1000,
+  "in_dim": 36,
+  "frames": 5,
+  "height": 16,
+  "width": 16,
+  "img_h": 40,
+  "img_w": 48,
+  "seq_len": 2,
+  "grid": [
+    2,
+    1,
+    1
+  ],
+  "vae_stride": [
+    4,
+    8,
+    8
+  ],
+  "routing": [
+    [
+      "high",
+      999.0
+    ],
+    [
+      "high",
+      937.0
+    ],
+    [
+      "low",
+      833.0
+    ],
+    [
+      "low",
+      624.0
+    ]
+  ],
+  "y_shape": [
+    20,
+    2,
+    2,
+    2
+  ],
+  "final_latents_shape": [
+    16,
+    2,
+    2,
+    2
+  ],
+  "video_shape": [
+    1,
+    3,
+    8,
+    16,
+    16
+  ]
+}
