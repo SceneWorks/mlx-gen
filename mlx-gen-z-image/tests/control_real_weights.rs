@@ -162,8 +162,10 @@ fn control_scale0_is_inert() {
     );
 }
 
-/// Gate B: the single control forward (first step) reproduces the fork's `v0`. f32 inputs rule out
-/// a bf16-only divergence; the golden `v0` is the fork's bf16 control forward.
+/// Gate B: the single control forward (first step) reproduces the fork's `v0`, using the fork's exact
+/// **mixed-precision** inputs — bf16 latents + bf16 `cap_feats`, but **f32** `control_context` (the
+/// fork feeds the control context as f32, so the whole control branch promotes to f32; sc-2720).
+/// Matching that dtype flow drops the single-forward error to the embedding bf16 floor.
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local control golden"]
 fn control_single_forward_matches_golden() {
@@ -174,10 +176,10 @@ fn control_single_forward_matches_golden() {
 
     let v = transformer
         .forward(
-            g.require("init").unwrap(),
+            &bf16(g.require("init").unwrap()),
             1.0 - sigmas[0],
-            g.require("cap_feats").unwrap(),
-            Some(g.require("control_context").unwrap()),
+            &bf16(g.require("cap_feats").unwrap()),
+            Some(g.require("control_context").unwrap()), // f32, like the fork
             scale,
         )
         .unwrap();
@@ -185,20 +187,22 @@ fn control_single_forward_matches_golden() {
     assert_eq!(v.shape(), golden.shape(), "v0 shape");
     let pr = peak_rel(&v, golden);
     println!(
-        "control single forward: v0 peak_rel={pr:.2e} shape={:?}",
+        "control single forward (mixed bf16/f32): v0 peak_rel={pr:.2e} shape={:?}",
         v.shape()
     );
+    // Measured 1.51e-3 (embedding bf16 floor). 5e-3 catches a regression to the wrong pure-bf16
+    // control path (3.3e-3) while leaving headroom.
     assert!(
-        pr < 5e-2,
+        pr < 5e-3,
         "control single forward diverged: peak_rel {pr:.2e}"
     );
 }
 
-/// Gate C: the full control denoise loop reproduces the fork's final latents. The Rust control path
-/// runs **f32** (the fork's bf16 path plus the source-MLX-vs-wheel toolchain residual otherwise
-/// compounds over 8 steps; f32 lands closer — see `control_dtype_diag`), seeded from the fork's
-/// exact bf16 noise. The latent peak-rel is a single-outlier metric (the real gate is px>8 below);
-/// the 8-step control accumulation runs ~0.15, so the bound is looser than the base's 4-step 0.1.
+/// Gate C: the full control denoise loop reproduces the fork's final latents, using the fork's exact
+/// **mixed-precision** inputs (bf16 latents + bf16 cap, **f32** control_context — sc-2720). The
+/// latents start bf16 and become f32 after step 0 (the f32 control velocity promotes them), exactly
+/// like the fork's loop. The latent peak-rel is a single-outlier metric (the real gate is px>8 in
+/// `control_full_pipeline_matches_fork`).
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local control golden"]
 fn control_denoise_loop_matches_golden() {
@@ -208,11 +212,9 @@ fn control_denoise_loop_matches_golden() {
     let scheduler = FlowMatchEuler { sigmas };
     let transformer = load_control_transformer(&snapshot(), &control_source(&g)).unwrap();
 
-    // f32 path, seeded from the fork's bf16 noise (bf16-round → f32), matching `generate`.
-    let init = bf16(g.require("init").unwrap())
-        .as_dtype(Dtype::Float32)
-        .unwrap();
-    let cap = g.require("cap_feats").unwrap().clone();
+    // The fork's mixed precision, matching `generate`: bf16 noise + bf16 cap + f32 control context.
+    let init = bf16(g.require("init").unwrap());
+    let cap = bf16(g.require("cap_feats").unwrap());
     let cc = g.require("control_context").unwrap().clone();
     let out = denoise_control_with_progress(
         &transformer,
@@ -233,13 +235,87 @@ fn control_denoise_loop_matches_golden() {
     assert_eq!(out.shape(), golden.shape(), "final latents shape");
     let pr = peak_rel(&out, golden);
     println!(
-        "control denoise: final_latents peak_rel={pr:.2e} shape={:?}",
+        "control denoise (mixed): final_latents peak_rel={pr:.2e} shape={:?}",
         out.shape()
     );
+    // Measured 0.135 (single-outlier metric). 2e-1 catches a regression to pure-bf16 (0.227).
     assert!(
         pr < 2e-1,
         "control final latents diverged: peak_rel {pr:.2e}"
     );
+}
+
+/// DIAGNOSTIC (sc-2720): control denoise under three input-dtype regimes on the same build, vs the
+/// fork's golden — documenting WHY the dtype matters. The fork runs **mixed precision**: bf16 latents
+/// and cap_feats, but **f32 control_context** (verified against the fork), so the control branch
+/// promotes to f32 and the latents become f32 after step 0. Reproducing that (the `mixed` row) is
+/// what `generate` does and is the closest to the fork. `pure f32` (the old whole-path forcing) is
+/// close but runs the base embeddings in f32 too. `pure bf16` (forcing the control branch to bf16,
+/// which the fork never does) diverges badly — that was the wrong reading of "the fork runs bf16".
+/// No assertion (it documents the dtype-flow finding).
+#[test]
+#[ignore = "diagnostic; needs real Z-Image + control weights and the control golden"]
+fn control_dtype_compare() {
+    let g = Weights::from_file(GOLDEN).unwrap();
+    let sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
+    let scale = meta_f32(&g, "control_scale");
+    let scheduler = FlowMatchEuler { sigmas };
+    let transformer = load_control_transformer(&snapshot(), &control_source(&g)).unwrap();
+    let vae = load_vae(&snapshot()).unwrap();
+    let golden_lat = g.require("final_latents").unwrap();
+    let gimg = decoded_to_image(g.require("decoded").unwrap()).unwrap();
+
+    // (init, cap, cc) dtypes. Seeded from the fork's exact bf16 noise either way (bf16 → optionally
+    // promoted to f32), matching `generate`'s seed→sample mapping.
+    let run = |init_dt: Dtype, cap_dt: Dtype, cc_dt: Dtype| -> (f32, f32) {
+        let init = bf16(g.require("init").unwrap()).as_dtype(init_dt).unwrap();
+        let cap = g.require("cap_feats").unwrap().as_dtype(cap_dt).unwrap();
+        let cc = g
+            .require("control_context")
+            .unwrap()
+            .as_dtype(cc_dt)
+            .unwrap();
+        let out = denoise_control_with_progress(
+            &transformer,
+            &scheduler,
+            init,
+            &cap,
+            &cc,
+            scale,
+            0,
+            &Default::default(),
+            &mut |_| {},
+        )
+        .unwrap()
+        .as_dtype(Dtype::Float32)
+        .unwrap();
+        let pr = peak_rel(&out, golden_lat);
+        let unpacked = unpack_latents(&out).unwrap();
+        let sh = unpacked.shape();
+        let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]]).unwrap();
+        let decoded = vae
+            .decode(&latent5)
+            .unwrap()
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let img = decoded_to_image(&decoded).unwrap();
+        let differ = img
+            .pixels
+            .iter()
+            .zip(&gimg.pixels)
+            .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
+            .count();
+        (pr, differ as f32 / img.pixels.len() as f32 * 100.0)
+    };
+
+    let (bf, f3) = (Dtype::Bfloat16, Dtype::Float32);
+    let (m_pr, m_px) = run(bf, bf, f3); // fork-faithful mixed (== generate)
+    let (f_pr, f_px) = run(f3, f3, f3); // old whole-path f32 forcing
+    let (b_pr, b_px) = run(bf, bf, bf); // pure bf16 (forces the control branch to bf16 — diverges)
+    println!("control denoise dtype compare (vs fork golden):");
+    println!("  mixed (fork: bf16 latents+cap, f32 control): latent peak_rel={m_pr:.3e}  px>8={m_px:.3}%");
+    println!("  pure f32  (old whole-path forcing)         : latent peak_rel={f_pr:.3e}  px>8={f_px:.3}%");
+    println!("  pure bf16 (control branch forced to bf16)  : latent peak_rel={b_pr:.3e}  px>8={b_px:.3}%");
 }
 
 /// Q8 control gate (sc-2257 Q8 control branch): proves the control port adds **zero** error to the
@@ -686,13 +762,16 @@ fn full_pipeline(golden_path: &str, quant: Option<Quant>, bits_label: &str, max_
     );
 }
 
-/// The integration proof: dense control render vs the fork's control golden.
+/// The integration proof: dense control render vs the fork's control golden. Runs the fork's exact
+/// **mixed precision** — bf16 latents + bf16 cap_feats, f32 control_context (sc-2720).
 #[test]
 #[ignore = "needs real Z-Image + control weights and the local control golden"]
 fn control_full_pipeline_matches_fork() {
-    // Measured (1024², 8-step, scale 1.0): 0.166% px>8 (the source-MLX-vs-wheel toolchain residual
-    // accumulated over the loop). 1% leaves headroom for run variance.
-    full_pipeline(GOLDEN, None, "", 0.01);
+    // Measured (1024², 8-step, scale 1.0): 0.363% px>8 — the production re-encoding floor (VAE-encode
+    // the control image + text-encode the prompt, vs the golden's stored intermediates). The denoise
+    // itself, fed the golden's intermediates, is 0.039% (`control_dtype_compare`). 0.7% guards a
+    // regression toward the wrong pure-bf16 control path (1.6%) without false-failing.
+    full_pipeline(GOLDEN, None, "", 0.007);
 }
 
 /// sc-2257 Q8 control branch: the **full public Q8 path** (`with_quant(Q8)`) vs the fork's Q8

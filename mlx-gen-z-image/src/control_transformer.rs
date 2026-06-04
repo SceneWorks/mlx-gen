@@ -18,7 +18,7 @@
 
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply};
-use mlx_rs::{Array, Dtype};
+use mlx_rs::Array;
 
 use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
@@ -208,19 +208,19 @@ impl ZImageControlTransformer {
         // Control refiner pass: build the control context embedding (reusing the image's pad mask /
         // RoPE), run the parallel control refiner, collect the per-block hints + threaded state.
         let c_tokens = patchify_control(cc, cfg.patch_size, cfg.f_patch_size)?;
-        // The control patch embedder is `K = 33·p²·pf` (e.g. 132): K ≤ 512 with large M, which is
-        // the garbage zone of the pmetal NAX 16-bit dense GEMM (see `bf16_matmul_sweep` — a bf16
-        // control forward returns ~0.49 peak-rel garbage there, vs 1.5e-3 in f32). Run *only* this
-        // GEMM in f32 (`matmul(f32, bf16-weight)` promotes to the correct f32 kernel), then return
-        // to the image stream's dtype, so the rest of the control branch stays bf16 (its block
-        // GEMMs are K=3840, safe; adaLN is M=1 gemv, safe). The base `x_embedder` (K=64) is
-        // empirically fine in bf16 (the base txt2img path is parity-proven), so it is left alone.
-        let stream_dtype = x_emb.dtype();
-        let c_tokens = c_tokens.as_dtype(Dtype::Float32)?;
-        let mut c_emb = self
-            .control_x_embedder
-            .forward(&c_tokens)?
-            .as_dtype(stream_dtype)?;
+        // The control patch embedder runs at the control context's dtype and the embedding is NOT
+        // recast — exactly like the fork (`c_emb = control_all_x_embedder(c_tokens)`, no cast). The
+        // fork feeds `control_context` as **f32** (only the latents + cap_feats are bf16), so the
+        // whole control branch promotes to f32, and its f32 hints promote the bf16 image/caption
+        // stream to f32 when added — i.e. the control path is **mixed precision** (bf16 base
+        // embeddings, f32 control branch), NOT pure bf16. Reproducing that dtype flow is what
+        // matches the fork (sc-2720); forcing the branch to bf16 diverges (~1.6% px>8 vs ~0.04%).
+        //
+        // (This GEMM was once forced to f32 to dodge the pmetal NAX 16-bit dense-GEMM miscompile — a
+        // Metal compile-target bug fixed at the macOS-26.2 target, sc-2772. That forcing is gone; the
+        // dtype now flows from the caller's `control_context`, which is f32, so the branch is f32
+        // regardless — but it is no longer *forced*, and a bf16 control_context would run bf16.)
+        let mut c_emb = self.control_x_embedder.forward(&c_tokens)?;
         c_emb = apply_pad(&c_emb, &patched.x_keep, &self.base.x_pad_token)?;
         let c_emb = c_emb.expand_dims(0)?;
         record!("c_emb", c_emb);

@@ -239,25 +239,32 @@ impl Generator for ZImageTurboControl {
         };
         let is_img2img = start_step > 0;
 
-        // Prompt → cap_feats (f32). The control path runs **f32** throughout (like img2img): the
-        // control branch's patch embedder is a K≤512 dense GEMM that the pmetal NAX build mis-runs
-        // in bf16, and f32 also sidesteps the bf16-kernel toolchain residual (source-built MLX vs
-        // the fork's wheel) that otherwise compounds over the 8-step loop — f32 lands materially
-        // closer to the fork's golden (latent peak-rel 0.14 vs 0.27 for bf16). Seeded noise is still
-        // bf16-rounded to reproduce the fork's exact seeded sample, then promoted to f32.
+        // Prompt → cap_feats. The fork's control path is **mixed precision**, NOT pure bf16: it feeds
+        // the latents (`x`) and `cap_feats` as bf16 but `control_context` as **f32** (sc-2720, verified
+        // against the fork). The f32 control branch then promotes the bf16 image/caption stream to f32
+        // when its hints are added, and `latents += dt·velocity` makes the latents f32 after step 0 —
+        // so most of the loop runs f32. We match that exactly: bf16 cap (txt2img) + f32 control_context
+        // below. (img2img keeps f32 cap, mirroring the base img2img; the DiT promotes per-op either way.)
         let cap = self.encode_prompt(&req.prompt)?;
+        let cap = if is_img2img {
+            cap
+        } else {
+            // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's cap_feats.
+            cap.as_dtype(Dtype::Bfloat16)?
+        };
 
         // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once.
         let scheduler = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
 
-        // The 33ch control context is constant across steps + the batch — build once (f32).
+        // The 33ch control context is constant across steps + the batch — build once. It stays **f32**
+        // (the fork feeds it f32, which promotes the whole control branch to f32 — see the forward).
         let control_context =
             encode_control_context(&self.vae, control_image, req.width, req.height)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
-            // bf16-round to match the fork's seeded sample exactly, then promote to f32 for the loop.
+            // Seeded noise as bf16 (the fork's `create_noise` casts to model precision).
             // PARITY-BF16 (sc-2609): bf16 matches the fork's seed→image mapping; f32 is a different
             // (higher-precision) realization, not just sharper. Revisit with the other f32 flips.
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
@@ -267,7 +274,7 @@ impl Generator for ZImageTurboControl {
                 let sigma = scheduler.sigmas[start_step];
                 add_noise_by_interpolation(&clean, &noise, sigma)?
             } else {
-                noise.as_dtype(Dtype::Float32)?
+                noise
             };
             let latents = denoise_control_with_progress(
                 &self.transformer,
