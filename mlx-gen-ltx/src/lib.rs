@@ -25,6 +25,7 @@ pub mod schedule;
 pub mod text_encoder;
 pub mod tiling;
 pub mod transformer;
+pub mod upsampler;
 pub mod vae;
 
 pub use config::{LtxConfig, LtxVaeConfig, RopeType, VaeBlock};
@@ -33,4 +34,5 @@ pub use model::{descriptor, load, Ltx, MODEL_ID};
 pub use text_encoder::LtxTextEncoder;
 pub use tiling::TilingConfig;
 pub use transformer::{to_denoised, LtxDiT, Precision, VideoBlock};
+pub use upsampler::{upsample_latents, LatentUpsampler};
 pub use vae::LtxVideoVae;
