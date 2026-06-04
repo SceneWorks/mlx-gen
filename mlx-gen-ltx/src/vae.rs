@@ -37,7 +37,7 @@ use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{Error, Result};
 
 use crate::config::{LtxVaeConfig, VaeBlock};
-use crate::tiling::TilingConfig;
+use mlx_gen::tiling::{TilingConfig, VaeTiling};
 
 /// Decoder inline `pixel_norm` epsilon (`decoder.py` `ResnetBlock3DSimple.pixel_norm`).
 const DEC_NORM_EPS: f32 = 1e-8;
@@ -564,10 +564,10 @@ impl LtxVideoVae {
     pub fn decode_tiled(&self, latent: &Array, cfg: &TilingConfig) -> Result<Array> {
         let sh = latent.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
-        if !cfg.needs_tiling(f, h, w) {
+        if !cfg.needs_tiling(VaeTiling::LTX, f, h, w) {
             return self.decode(latent);
         }
-        let plan = cfg.plan(f, h, w);
+        let plan = cfg.plan(VaeTiling::LTX, f, h, w);
 
         // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
         // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.

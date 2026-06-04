@@ -14,6 +14,7 @@
 use mlx_rs::ops::{add, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::{Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
@@ -168,10 +169,20 @@ pub fn denoise_moe(
 }
 
 /// Decode denoised latents `[C, F, H, W]` → an RGB video tensor `[F_out, H_out, W_out, 3]` of
-/// `uint8` (the reference's `(video + 1)/2 · 255`, clamped). Uses the Wan 2.1 z16 VAE (S2).
-pub fn decode_to_frames(vae: &WanVae, latents: &Array) -> Result<Array> {
-    // WanVae::decode expects/returns a leading batch dim: [1, 3, F, H, W] in [-1, 1].
-    let video = vae.decode(&latents.reshape(&prepend1(latents.shape()))?)?;
+/// `uint8` (the reference's `(video + 1)/2 · 255`, clamped). Uses the Wan 2.1 z16 VAE (S2). When
+/// `tiling` is `Some`, decodes via [`WanVae::decode_tiled`] (memory-bounded for large/long video;
+/// it falls back to a single pass when the config doesn't fire); `None` is always single-pass.
+pub fn decode_to_frames(
+    vae: &WanVae,
+    latents: &Array,
+    tiling: Option<&TilingConfig>,
+) -> Result<Array> {
+    // WanVae::decode[_tiled] expect/return a leading batch dim: [1, 3, F, H, W] in [-1, 1].
+    let z = latents.reshape(&prepend1(latents.shape()))?;
+    let video = match tiling {
+        Some(cfg) => vae.decode_tiled(&z, cfg)?,
+        None => vae.decode(&z)?,
+    };
     // [1,3,F,H,W] → [F,H,W,3]
     let sh = video.shape(); // [1,3,F,H,W]
     let (f, h, w) = (sh[2], sh[3], sh[4]);

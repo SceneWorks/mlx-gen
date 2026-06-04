@@ -111,7 +111,7 @@ fn wan_t2v_pipeline_matches_reference() {
     assert!(vid_mr < 2e-2, "video diverged: mean_rel={vid_mr:.3e}");
 
     // decode_to_frames yields uint8 [F, H, W, 3] of the right shape.
-    let frames = decode_to_frames(&vae, &latents).unwrap();
+    let frames = decode_to_frames(&vae, &latents, None).unwrap();
     let vsh = exp_vid.shape(); // [1,3,F,H,W]
     assert_eq!(
         frames.shape(),

@@ -14,7 +14,7 @@ use mlx_rs::Array;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_ltx::config::LtxVaeConfig;
-use mlx_gen_ltx::tiling::TilingConfig;
+use mlx_gen_ltx::tiling::{TilingConfig, VaeTiling};
 use mlx_gen_ltx::vae::LtxVideoVae;
 
 const GOLDEN: &str = concat!(
@@ -90,7 +90,10 @@ fn decode_tiled_matches_reference() {
     let sp_in = g.require("sp_in").unwrap();
     let sp_want = g.require("sp_out").unwrap();
     let sp_cfg = TilingConfig::spatial_only(64, 32);
-    assert!(sp_cfg.needs_tiling(1, 4, 4), "spatial cfg should tile 4×4");
+    assert!(
+        sp_cfg.needs_tiling(VaeTiling::LTX, 1, 4, 4),
+        "spatial cfg should tile 4×4"
+    );
     let sp_got = vae
         .decode_tiled(sp_in, &sp_cfg)
         .expect("decode_tiled spatial");
@@ -107,7 +110,7 @@ fn decode_tiled_matches_reference() {
     let tp_want = g.require("tp_out").unwrap();
     let tp_cfg = TilingConfig::temporal_only(16, 8);
     assert!(
-        tp_cfg.needs_tiling(3, 2, 2),
+        tp_cfg.needs_tiling(VaeTiling::LTX, 3, 2, 2),
         "temporal cfg should tile 3 frames"
     );
     let tp_got = vae

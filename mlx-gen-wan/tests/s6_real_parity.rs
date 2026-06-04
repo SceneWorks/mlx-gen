@@ -180,7 +180,7 @@ fn wan_a14b_real_weight_e2e_matches_reference() {
     );
 
     // Also exercise the product frame-assembly path (uint8 [F,H,W,3] → Vec<Image>).
-    let frames_u8 = decode_to_frames(&vae, &latents).unwrap();
+    let frames_u8 = decode_to_frames(&vae, &latents, None).unwrap();
     let images = mlx_gen_wan::frames_to_images(&frames_u8).unwrap();
     assert_eq!(images.len(), exp_vid.shape()[2] as usize, "frame count");
     for img in &images {

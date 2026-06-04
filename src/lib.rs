@@ -22,6 +22,7 @@ pub mod quant;
 pub mod registry;
 pub mod runtime;
 pub mod scheduler;
+pub mod tiling;
 pub mod tokenizer;
 pub mod transform;
 pub mod weights;
@@ -37,6 +38,7 @@ pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, Precision, Progress, Quant, WeightsSource,
 };
 pub use scheduler::FlowMatchEuler;
+pub use tiling::{TilingConfig, VaeTiling};
 pub use transform::{
     TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
 };

@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     default_seed, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
@@ -388,10 +389,13 @@ impl Generator for Wan14b {
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
+        // Auto-select VAE decode tiling from the output dims (memory-bounded for large/long video);
+        // `None` for small outputs → single-pass. decode_to_frames re-checks `needs_tiling`.
+        let tiling = TilingConfig::auto(height as i32, width as i32, frames as i32);
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents)?
+            decode_to_frames(&vae, &latents, tiling.as_ref())?
         };
         let images = frames_to_images(&frames_u8)?;
 

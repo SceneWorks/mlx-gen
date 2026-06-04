@@ -1,0 +1,22 @@
+{
+  "dim": 4,
+  "z_dim": 16,
+  "spatial_tile_px": 64,
+  "spatial_overlap_px": 32,
+  "temporal_tile_frames": 16,
+  "temporal_overlap_frames": 8,
+  "tiled_in_shape": [
+    1,
+    16,
+    6,
+    12,
+    12
+  ],
+  "tiled_out_shape": [
+    1,
+    3,
+    24,
+    96,
+    96
+  ]
+}
