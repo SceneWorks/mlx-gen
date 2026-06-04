@@ -76,17 +76,38 @@ pub struct LtxConfig {
     pub connector_positional_embedding_max_pos: i32,
     pub connector_apply_gated_attention: bool,
 
-    // --- Audio stack (sibling sc-2684) — read here, inert for VideoOnly ---
+    // --- Audio stack (sc-2684 AudioVideo) ---
     pub audio_num_attention_heads: i32,
     pub audio_attention_head_dim: i32,
     pub audio_cross_attention_dim: i32,
     pub audio_caption_channels: i32,
+    /// Audio latent flattened channels = `latent_channels(8) × mel_bins(16)` = 128.
+    pub audio_in_channels: i32,
+    pub audio_out_channels: i32,
+    /// Audio text-feature connector dims (its own `Embeddings1DConnector`; 32 × 64 = 2048).
+    pub audio_connector_num_attention_heads: i32,
+    pub audio_connector_attention_head_dim: i32,
+    /// 1-D audio RoPE max position (`audio_positional_embedding_max_pos = [20]` → the single `[0]`).
+    pub audio_positional_embedding_max_pos: i32,
+    /// Cross-modal gate timestep multiplier (`av_ca_timestep_scale_multiplier`, 1000 in 2.3).
+    pub av_ca_timestep_scale_multiplier: i32,
 }
 
 impl LtxConfig {
     /// Video inner dimension `heads × head_dim` (4096 for LTX-2.3).
     pub fn inner_dim(&self) -> i32 {
         self.num_attention_heads * self.attention_head_dim
+    }
+
+    /// Audio inner dimension `audio_heads × audio_head_dim` (2048 for LTX-2.3).
+    pub fn audio_inner_dim(&self) -> i32 {
+        self.audio_num_attention_heads * self.audio_attention_head_dim
+    }
+
+    /// Cross-modal 1-D RoPE max position = `max(video_max_pos[0], audio_max_pos[0])`
+    /// (`LTXModel.__init__`'s `cross_pe_max_pos`). Both are 20 for LTX-2.3.
+    pub fn cross_pe_max_pos(&self) -> i32 {
+        self.positional_embedding_max_pos[0].max(self.audio_positional_embedding_max_pos)
     }
 
     /// The reference 2.0 `generate.py` defaults (non-gated, coeff-6, caption-proj present,
@@ -124,6 +145,12 @@ impl LtxConfig {
             audio_attention_head_dim: 64,
             audio_cross_attention_dim: 2048,
             audio_caption_channels: 3840,
+            audio_in_channels: 128,
+            audio_out_channels: 128,
+            audio_connector_num_attention_heads: 32,
+            audio_connector_attention_head_dim: 64,
+            audio_positional_embedding_max_pos: 20,
+            av_ca_timestep_scale_multiplier: 1000,
         }
     }
 
@@ -219,6 +246,16 @@ impl LtxConfig {
             "audio_cross_attention_dim",
             cfg.audio_cross_attention_dim,
         );
+        cfg.audio_connector_num_attention_heads = get_i32(
+            t,
+            "audio_connector_num_attention_heads",
+            cfg.audio_connector_num_attention_heads,
+        );
+        cfg.audio_connector_attention_head_dim = get_i32(
+            t,
+            "audio_connector_attention_head_dim",
+            cfg.audio_connector_attention_head_dim,
+        );
 
         // caption_channels derivation (generate_av.py lines 1484–1498).
         let no_caption_proj =
@@ -226,9 +263,8 @@ impl LtxConfig {
         if no_caption_proj {
             cfg.caption_channels =
                 cfg.connector_num_attention_heads * cfg.connector_attention_head_dim;
-            let audio_conn_heads = get_i32(t, "audio_connector_num_attention_heads", 32);
-            let audio_conn_head_dim = get_i32(t, "audio_connector_attention_head_dim", 64);
-            cfg.audio_caption_channels = audio_conn_heads * audio_conn_head_dim;
+            cfg.audio_caption_channels =
+                cfg.audio_connector_num_attention_heads * cfg.audio_connector_attention_head_dim;
         } else {
             cfg.caption_channels = get_i32(t, "caption_channels", cfg.caption_channels);
             cfg.audio_caption_channels =
@@ -377,6 +413,249 @@ impl LtxVaeConfig {
     }
 }
 
+/// The LTX-2.3 **audio** VAE decoder config (`embedded_config.json` → `audio_vae.model.params.
+/// ddconfig`). Drives the decoder structure (2-D causal-conv autoencoder, PIXEL norm, causal-on-
+/// **height/time**); channels ride on `audio_vae.safetensors`.
+///
+/// **`mid_block_add_attention` is `false`** for the shipped 2.3 checkpoint (no `mid.attn_1` weights).
+/// The reference `load_audio_decoder` *hardcodes* the `AudioDecoder` constructor and so defaults this
+/// to `true`, building a **randomly-initialized** mid attention (the checkpoint ships none) — a
+/// reference bug that makes its audio decode non-deterministic across processes (~4% of the signal).
+/// We honor the **config** (`false` → skip the mid attention), the model's intended decode. The
+/// `AttnBlock` is still implemented + config-gated, so a future `true`-with-weights checkpoint works.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioVaeConfig {
+    pub ch: i32,
+    pub out_ch: i32,
+    pub ch_mult: Vec<i32>,
+    pub num_res_blocks: i32,
+    pub z_channels: i32,
+    pub mel_bins: i32,
+    pub mid_block_add_attention: bool,
+}
+
+impl AudioVaeConfig {
+    /// The shipped 2.3 audio-VAE structure (fallback when no `embedded_config.json` is present).
+    pub fn defaults() -> Self {
+        AudioVaeConfig {
+            ch: 128,
+            out_ch: 2,
+            ch_mult: vec![1, 2, 4],
+            num_res_blocks: 2,
+            z_channels: 8,
+            mel_bins: 64,
+            mid_block_add_attention: false,
+        }
+    }
+
+    /// Number of resolution levels (`len(ch_mult)`); the decoder upsamples on levels `1..num`.
+    pub fn num_resolutions(&self) -> usize {
+        self.ch_mult.len()
+    }
+
+    /// Parse the `ddconfig` block (`audio_vae.model.params.ddconfig`).
+    pub fn from_ddconfig(v: &Value) -> Self {
+        let mut cfg = Self::defaults();
+        cfg.ch = get_i32(v, "ch", cfg.ch);
+        cfg.out_ch = get_i32(v, "out_ch", cfg.out_ch);
+        if let Some(arr) = v.get("ch_mult").and_then(Value::as_array) {
+            let parsed: Vec<i32> = arr
+                .iter()
+                .filter_map(|n| n.as_i64().map(|x| x as i32))
+                .collect();
+            if !parsed.is_empty() {
+                cfg.ch_mult = parsed;
+            }
+        }
+        cfg.num_res_blocks = get_i32(v, "num_res_blocks", cfg.num_res_blocks);
+        cfg.z_channels = get_i32(v, "z_channels", cfg.z_channels);
+        cfg.mel_bins = get_i32(v, "mel_bins", cfg.mel_bins);
+        cfg.mid_block_add_attention =
+            get_bool(v, "mid_block_add_attention", cfg.mid_block_add_attention);
+        cfg
+    }
+
+    /// Load from a model directory's `embedded_config.json` (`audio_vae.model.params.ddconfig`).
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let path = root.join("embedded_config.json");
+        if !path.exists() {
+            return Ok(Self::defaults());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let root_cfg: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
+        let dd = root_cfg
+            .get("audio_vae")
+            .and_then(|v| v.get("model"))
+            .and_then(|v| v.get("params"))
+            .and_then(|v| v.get("ddconfig"));
+        Ok(match dd {
+            Some(v) => Self::from_ddconfig(v),
+            None => Self::defaults(),
+        })
+    }
+}
+
+/// One vocoder generator's config (`embedded_config.json` → `vocoder.{vocoder,bwe}`). Drives the
+/// HiFi-GAN / BigVGAN structure: the ConvTranspose1d upsample strides + the dilated ResBlock/AMPBlock
+/// kernel sizes/dilations (channel counts ride on `vocoder.safetensors`). `is_bigvgan()` selects
+/// SnakeBeta+AMPBlock1 vs leaky-ReLU+ResBlock (`load_vocoder`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocoderGenConfig {
+    pub upsample_rates: Vec<i32>,
+    pub upsample_kernel_sizes: Vec<i32>,
+    pub resblock_kernel_sizes: Vec<i32>,
+    pub resblock_dilation_sizes: Vec<Vec<i32>>,
+    pub upsample_initial_channel: i32,
+    pub resblock: String,
+    pub activation: String,
+    pub use_tanh_at_final: bool,
+    pub use_bias_at_final: bool,
+    pub apply_final_activation: bool,
+    pub stereo: bool,
+}
+
+impl VocoderGenConfig {
+    /// The HiFi-GAN-shaped `load_vocoder` defaults (overridden by the embedded config).
+    pub fn defaults() -> Self {
+        VocoderGenConfig {
+            upsample_rates: vec![6, 5, 2, 2, 2],
+            upsample_kernel_sizes: vec![16, 15, 8, 4, 4],
+            resblock_kernel_sizes: vec![3, 7, 11],
+            resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            upsample_initial_channel: 1024,
+            resblock: "1".into(),
+            activation: "leaky_relu".into(),
+            use_tanh_at_final: true,
+            use_bias_at_final: true,
+            apply_final_activation: true,
+            stereo: true,
+        }
+    }
+
+    /// SnakeBeta + AMPBlock1 (BigVGAN) vs leaky-ReLU + ResBlock (HiFi-GAN).
+    pub fn is_bigvgan(&self) -> bool {
+        self.activation.to_lowercase() == "snakebeta" || self.resblock.to_uppercase() == "AMP1"
+    }
+
+    fn read(v: &Value, base: &VocoderGenConfig) -> Self {
+        let mut cfg = base.clone();
+        cfg.upsample_initial_channel =
+            get_i32(v, "upsample_initial_channel", cfg.upsample_initial_channel);
+        if let Some(a) = get_i32_vec(v, "upsample_rates") {
+            cfg.upsample_rates = a;
+        }
+        if let Some(a) = get_i32_vec(v, "upsample_kernel_sizes") {
+            cfg.upsample_kernel_sizes = a;
+        }
+        if let Some(a) = get_i32_vec(v, "resblock_kernel_sizes") {
+            cfg.resblock_kernel_sizes = a;
+        }
+        if let Some(a) = v.get("resblock_dilation_sizes").and_then(Value::as_array) {
+            let parsed: Vec<Vec<i32>> = a
+                .iter()
+                .filter_map(|row| {
+                    row.as_array().map(|r| {
+                        r.iter()
+                            .filter_map(|n| n.as_i64().map(|x| x as i32))
+                            .collect()
+                    })
+                })
+                .collect();
+            if !parsed.is_empty() {
+                cfg.resblock_dilation_sizes = parsed;
+            }
+        }
+        if let Some(s) = v.get("resblock").and_then(Value::as_str) {
+            cfg.resblock = s.to_string();
+        }
+        if let Some(s) = v.get("activation").and_then(Value::as_str) {
+            cfg.activation = s.to_lowercase();
+        }
+        cfg.use_tanh_at_final = get_bool(v, "use_tanh_at_final", cfg.use_tanh_at_final);
+        cfg.use_bias_at_final = get_bool(v, "use_bias_at_final", cfg.use_bias_at_final);
+        cfg.apply_final_activation =
+            get_bool(v, "apply_final_activation", cfg.apply_final_activation);
+        cfg.stereo = get_bool(v, "stereo", cfg.stereo);
+        cfg
+    }
+}
+
+/// The full vocoder config (`embedded_config.json` → `vocoder`): the core generator + an optional
+/// bandwidth-extension (BWE) stage (`VocoderWithBWE`, the shipped 2.3 path → 48 kHz).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocoderConfig {
+    pub core: VocoderGenConfig,
+    pub bwe: Option<VocoderGenConfig>,
+    /// Core generator output sample rate (`AUDIO_SAMPLE_RATE`, 24 kHz).
+    pub output_sample_rate: i32,
+    // BWE STFT params + sample rates (`VocoderWithBWE`); meaningful only when `bwe` is `Some`.
+    pub bwe_input_sample_rate: i32,
+    pub bwe_output_sample_rate: i32,
+    pub bwe_hop_length: i32,
+    pub bwe_win_length: i32,
+}
+
+impl VocoderConfig {
+    pub fn defaults() -> Self {
+        VocoderConfig {
+            core: VocoderGenConfig::defaults(),
+            bwe: None,
+            output_sample_rate: 24000,
+            bwe_input_sample_rate: 24000,
+            bwe_output_sample_rate: 24000,
+            bwe_hop_length: 80,
+            bwe_win_length: 512,
+        }
+    }
+
+    /// The audio-track sample rate: the BWE output when present, else the core output.
+    pub fn final_sample_rate(&self) -> i32 {
+        if self.bwe.is_some() {
+            self.bwe_output_sample_rate
+        } else {
+            self.output_sample_rate
+        }
+    }
+
+    /// Parse the `vocoder` block.
+    pub fn from_embedded_vocoder(v: &Value) -> Self {
+        let mut cfg = Self::defaults();
+        if let Some(core) = v.get("vocoder") {
+            cfg.core = VocoderGenConfig::read(core, &VocoderGenConfig::defaults());
+        }
+        if let Some(bwe) = v.get("bwe").filter(|b| b.is_object()) {
+            // The BWE generator's `apply_final_activation` defaults to false in `load_vocoder`.
+            let mut bwe_base = VocoderGenConfig::defaults();
+            bwe_base.use_tanh_at_final = false;
+            bwe_base.use_bias_at_final = false;
+            bwe_base.apply_final_activation = false;
+            cfg.bwe = Some(VocoderGenConfig::read(bwe, &bwe_base));
+            cfg.bwe_input_sample_rate = get_i32(bwe, "input_sampling_rate", cfg.output_sample_rate);
+            cfg.bwe_output_sample_rate =
+                get_i32(bwe, "output_sampling_rate", cfg.bwe_output_sample_rate);
+            cfg.bwe_hop_length = get_i32(bwe, "hop_length", cfg.bwe_hop_length);
+            cfg.bwe_win_length = get_i32(bwe, "win_size", cfg.bwe_win_length);
+        }
+        cfg
+    }
+
+    /// Load from a model directory's `embedded_config.json` (`vocoder` block).
+    pub fn from_model_dir(root: &Path) -> Result<Self> {
+        let path = root.join("embedded_config.json");
+        if !path.exists() {
+            return Ok(Self::defaults());
+        }
+        let text = std::fs::read_to_string(&path)?;
+        let root_cfg: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
+        Ok(match root_cfg.get("vocoder") {
+            Some(v) => Self::from_embedded_vocoder(v),
+            None => Self::defaults(),
+        })
+    }
+}
+
 /// The `split_model.json` manifest's quantization fields. The reference `generate_av.py` drives
 /// **selective transformer quant** from these (and `convert.py` writes them): `quantized` gates it,
 /// `quantization_bits` (reference default **4**) and `quantization_group_size` (default **64**) set
@@ -464,6 +743,16 @@ fn get_bool(v: &Value, key: &str, default: bool) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
+/// Read a JSON int array `key` → `Vec<i32>` (None if absent/empty).
+fn get_i32_vec(v: &Value, key: &str) -> Option<Vec<i32>> {
+    let arr = v.get(key)?.as_array()?;
+    let out: Vec<i32> = arr
+        .iter()
+        .filter_map(|n| n.as_i64().map(|x| x as i32))
+        .collect();
+    (!out.is_empty()).then_some(out)
+}
+
 fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
     match v.get(key).and_then(Value::as_array) {
         Some(a) if a.len() == 3 => {
@@ -534,6 +823,15 @@ mod tests {
         assert!(!cfg.caption_projection_second_linear);
         assert_eq!(cfg.caption_channels, 4096);
         assert_eq!(cfg.audio_caption_channels, 32 * 64);
+        // Audio stack dims (sc-2684).
+        assert_eq!(cfg.audio_inner_dim(), 2048);
+        assert_eq!(cfg.audio_connector_num_attention_heads, 32);
+        assert_eq!(cfg.audio_connector_attention_head_dim, 64);
+        assert_eq!(cfg.audio_in_channels, 128);
+        assert_eq!(cfg.audio_out_channels, 128);
+        assert_eq!(cfg.audio_positional_embedding_max_pos, 20);
+        assert_eq!(cfg.cross_pe_max_pos(), 20);
+        assert_eq!(cfg.av_ca_timestep_scale_multiplier, 1000);
         // Core dims.
         assert_eq!(cfg.inner_dim(), 4096);
         assert_eq!(cfg.num_layers, 48);

@@ -94,3 +94,44 @@ fn full_text_encoder_matches_reference() {
         "video_embeddings peak_rel {pr_emb:.3e} too high"
     );
 }
+
+#[test]
+#[ignore = "needs gemma-3-12b-it-bf16 (~24 GB) + ltx_2_3_base_q8 + tools/golden/ltx_te_golden.safetensors"]
+fn full_text_encoder_av_matches_reference() {
+    let base = base_dir();
+    let cfg = LtxConfig::from_model_dir(&base).expect("embedded_config.json");
+    let gemma_w = Weights::from_dir(gemma_dir()).expect("gemma shards");
+    let conn_w =
+        Weights::from_file(base.join("connector.safetensors")).expect("connector.safetensors");
+    let te = LtxTextEncoder::from_weights_av(
+        &gemma_w,
+        &conn_w,
+        GemmaConfig::gemma_3_12b(),
+        None, // dense bf16 Gemma (the default snapshot)
+        &cfg,
+        Dtype::Bfloat16,
+    )
+    .expect("build AV TE");
+
+    let g = Weights::from_file(GOLDEN).expect("te golden");
+    let input_ids = g.require("input_ids").unwrap();
+    let attention_mask = g.require("attention_mask").unwrap();
+
+    let (vf, af, ve, ae) = te
+        .encode_av_with_features(input_ids, attention_mask)
+        .expect("encode_av");
+
+    // Video half identical to the video-only gate (shared normed_hidden).
+    let pr_vf = peak_rel(&vf, g.require("video_features").unwrap());
+    let pr_ve = peak_rel(&ve, g.require("video_embeddings").unwrap());
+    // Audio half: same per-token-RMS feature path → tight on features, looser through the connector.
+    let pr_af = peak_rel(&af, g.require("audio_features").unwrap());
+    let pr_ae = peak_rel(&ae, g.require("audio_embeddings").unwrap());
+    eprintln!(
+        "TE/AV: video_features {pr_vf:.3e} video_emb {pr_ve:.3e} | audio_features {pr_af:.3e} audio_emb {pr_ae:.3e}"
+    );
+    assert!(pr_vf < 1.5e-2, "video_features peak_rel {pr_vf:.3e}");
+    assert!(pr_ve < 6e-2, "video_embeddings peak_rel {pr_ve:.3e}");
+    assert!(pr_af < 1.5e-2, "audio_features peak_rel {pr_af:.3e}");
+    assert!(pr_ae < 6e-2, "audio_embeddings peak_rel {pr_ae:.3e}");
+}

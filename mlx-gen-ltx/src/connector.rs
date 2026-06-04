@@ -62,12 +62,38 @@ pub struct Connector {
 }
 
 impl Connector {
-    /// Build the connector from a `Weights` map (e.g. `connector.safetensors`) under `prefix`
-    /// (`"video_embeddings_connector."`). Weights are cast to `dtype` (bf16 to match the reference
-    /// pipeline end-to-end; f32 for the isolated bit-exact gate).
+    /// Build the **video** connector from a `Weights` map (e.g. `connector.safetensors`) under
+    /// `prefix` (`"video_embeddings_connector."`). Weights are cast to `dtype` (bf16 to match the
+    /// reference pipeline end-to-end; f32 for the isolated bit-exact gate).
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &LtxConfig, dtype: Dtype) -> Result<Self> {
-        let n = cfg.connector_num_layers as usize;
-        let dim = cfg.connector_num_attention_heads * cfg.connector_attention_head_dim;
+        Self::from_weights_dims(
+            w,
+            prefix,
+            cfg.connector_num_layers,
+            cfg.connector_num_attention_heads,
+            cfg.connector_attention_head_dim,
+            cfg.positional_embedding_theta,
+            cfg.connector_positional_embedding_max_pos,
+            dtype,
+        )
+    }
+
+    /// Build a connector with **explicit** dims — used for both the video connector (32×128) and the
+    /// audio connector (32×64, sc-2684), which share the checkpoint's layer count / theta / max_pos
+    /// but differ in `head_dim` (hence `dim`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_weights_dims(
+        w: &Weights,
+        prefix: &str,
+        num_layers: i32,
+        num_heads: i32,
+        head_dim: i32,
+        theta: f64,
+        max_pos: i32,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let n = num_layers as usize;
+        let dim = num_heads * head_dim;
         let f32w = |key: &str| -> Result<Array> {
             w.get(key)
                 .ok_or_else(|| Error::MissingTensor(key.into()))?
@@ -100,10 +126,10 @@ impl Connector {
         Ok(Self {
             blocks,
             registers,
-            num_heads: cfg.connector_num_attention_heads,
-            head_dim: cfg.connector_attention_head_dim,
-            theta: cfg.positional_embedding_theta,
-            max_pos: cfg.connector_positional_embedding_max_pos,
+            num_heads,
+            head_dim,
+            theta,
+            max_pos,
             ones: Array::ones::<f32>(&[dim])?.as_dtype(dtype)?,
             dtype,
         })

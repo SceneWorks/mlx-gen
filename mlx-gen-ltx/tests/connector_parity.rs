@@ -60,3 +60,34 @@ fn connector_matches_reference() {
     // f32 Rust vs f32 reference (both f64 rope → f32, f32 sdpa) → tight.
     assert!(pr < 5e-3, "connector peak_rel {pr:.3e} too high");
 }
+
+#[test]
+#[ignore = "needs eros connector.safetensors (~6.3 GB)"]
+fn audio_connector_matches_reference() {
+    // sc-2684: the audio connector is the same architecture at audio dims (32 × 64 = 2048).
+    let dir = eros_dir();
+    let cfg = LtxConfig::from_model_dir(&dir).expect("embedded_config.json");
+    let w = Weights::from_file(dir.join("connector.safetensors")).expect("connector.safetensors");
+    let conn = Connector::from_weights_dims(
+        &w,
+        "audio_embeddings_connector.",
+        cfg.connector_num_layers,
+        cfg.audio_connector_num_attention_heads,
+        cfg.audio_connector_attention_head_dim,
+        cfg.positional_embedding_theta,
+        cfg.connector_positional_embedding_max_pos,
+        mlx_rs::Dtype::Float32,
+    )
+    .expect("build audio connector");
+
+    let g = Weights::from_file(GOLDEN).expect("golden");
+    let features = g.require("audio_features").unwrap();
+    let mask01 = g.require("mask01").unwrap();
+    let want = g.require("audio_embeddings").unwrap();
+
+    let got = conn.forward(features, mask01).expect("forward");
+    assert_eq!(got.shape(), want.shape());
+    let pr = peak_rel(&got, want);
+    eprintln!("audio connector peak_rel = {pr:.3e}");
+    assert!(pr < 5e-3, "audio connector peak_rel {pr:.3e} too high");
+}

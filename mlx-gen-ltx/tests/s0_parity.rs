@@ -71,7 +71,7 @@ fn split_rope_cos_sin_match_reference() {
     let max_pos = [mp[0], mp[1], mp[2]];
 
     let (cos, sin) =
-        precompute_split_freqs_cis(positions, dim, theta, max_pos, heads).expect("rope");
+        precompute_split_freqs_cis(positions, dim, theta, &max_pos, heads).expect("rope");
 
     let dc = max_abs_diff(&cos, g.require("rope_cos").unwrap());
     let ds = max_abs_diff(&sin, g.require("rope_sin").unwrap());

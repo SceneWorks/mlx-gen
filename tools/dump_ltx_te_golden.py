@@ -53,6 +53,8 @@ BASE = Path.home() / "Library/Application Support/SceneWorks/data/models/mlx/ltx
 HIDDEN, OUT_DIM = 3840, 4096
 # eros/base connector config.
 DIM, HEADS, HEAD_DIM, LAYERS, REGISTERS, MAX_POS = 4096, 32, 128, 8, 128, [4096]
+# Audio connector config (sc-2684): dim 2048 = 32 heads × 64 head_dim, same 8 layers / 128 regs.
+AUDIO_OUT_DIM, AUDIO_DIM, AUDIO_HEADS, AUDIO_HEAD_DIM = 2048, 2048, 32, 64
 
 gemma_golden = fixture("tools/golden/ltx_gemma_golden.safetensors")
 g = mx.load(gemma_golden)
@@ -97,14 +99,48 @@ additive = (attention_mask.astype(mx.bfloat16) - 1.0).reshape(attention_mask.sha
 video_embeddings, _ = conn(video_features, additive)
 mx.eval(video_embeddings)
 
+# --- Audio half (sc-2684): separate aggregate_embed + connector off the SAME normed_hidden. ---
+audio_rescaled = rescale_norm(normed, AUDIO_OUT_DIM, HIDDEN)
+audio_agg_w = raw["text_embedding_projection.audio_aggregate_embed.weight"].astype(mx.bfloat16)
+audio_agg_b = raw["text_embedding_projection.audio_aggregate_embed.bias"].astype(mx.bfloat16)
+audio_features = audio_rescaled @ audio_agg_w.T + audio_agg_b  # Linear(188160 -> 2048)
+
+audio_conn = Embeddings1DConnector(
+    dim=AUDIO_DIM, num_heads=AUDIO_HEADS, head_dim=AUDIO_HEAD_DIM, num_layers=LAYERS,
+    num_learnable_registers=REGISTERS, positional_embedding_max_pos=MAX_POS,
+    apply_gated_attention=True,
+)
+aprefix = "audio_embeddings_connector."
+amapped, aregisters = {}, None
+for k, v in raw.items():
+    if not k.startswith(aprefix):
+        continue
+    sub = k[len(aprefix):]
+    v = v.astype(mx.bfloat16)
+    if sub == "learnable_registers":
+        aregisters = v
+        continue
+    sub = sub.replace(".ff.net.0.proj.", ".ff.proj_in.").replace(".ff.net.2.", ".ff.proj_out.")
+    sub = sub.replace(".to_out.0.", ".to_out.")
+    amapped[sub] = v
+audio_conn.load_weights(list(amapped.items()), strict=False)
+if aregisters is not None:
+    audio_conn.learnable_registers = aregisters
+mx.eval(audio_conn.parameters())
+audio_embeddings, _ = audio_conn(audio_features, additive)
+mx.eval(audio_embeddings)
+
 tensors = {
     "input_ids": g["input_ids"],
     "attention_mask": attention_mask,
     "video_features": video_features.astype(mx.float32),
     "video_embeddings": video_embeddings.astype(mx.float32),
+    "audio_features": audio_features.astype(mx.float32),
+    "audio_embeddings": audio_embeddings.astype(mx.float32),
 }
 out = fixture("tools/golden/ltx_te_golden.safetensors")
 Path(out).parent.mkdir(parents=True, exist_ok=True)
 mx.save_safetensors(out, tensors, metadata={"hidden": str(HIDDEN), "out_dim": str(OUT_DIM)})
 print(f"wrote {out}")
 print(f"  video_features {video_features.shape}  video_embeddings {video_embeddings.shape}")
+print(f"  audio_features {audio_features.shape}  audio_embeddings {audio_embeddings.shape}")

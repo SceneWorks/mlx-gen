@@ -8,6 +8,11 @@
 //! Runs **bf16** end-to-end to match the reference (gemma-3-12b-it-bf16 + bf16 activations).
 //! `video_aggregate_embed.{weight,bias}` and the connector both live in `connector.safetensors`
 //! (`text_embedding_projection.video_aggregate_embed.*`, `video_embeddings_connector.*`).
+//!
+//! The **AudioVideo** path (sc-2684) reuses the shared Gemma hiddens + per-token-RMS `normed_hidden`
+//! and adds a parallel **audio** head: `text_embedding_projection.audio_aggregate_embed` (→ 2048) +
+//! `audio_embeddings_connector` (8 layers, dim 2048 = 32×64). Built only by [`from_weights_av`];
+//! the video-only [`from_weights`] leaves it `None`.
 
 use mlx_rs::ops::{add, mean_axes, multiply, rsqrt, stack_axis};
 use mlx_rs::{Array, Dtype};
@@ -22,23 +27,44 @@ use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 
 const RMS_EPS: f32 = 1e-6;
 
-/// The LTX-2.3 video text encoder (Gemma backbone + feature extractor + connector).
-pub struct LtxTextEncoder {
-    gemma: GemmaModel,
+/// One modality's feature-extractor head: the `aggregate_embed` Linear (188160 → out_dim) + its
+/// `rescale_norm` scalar + the `Embeddings1DConnector`.
+struct FeatureHead {
     aggregate_w: Array, // (out_dim, 188160)
     aggregate_b: Array, // (out_dim,)
+    rescale: Array,     // √(out_dim / hidden) scalar in `dtype`
     connector: Connector,
-    rescale: Array, // √(out_dim / hidden) as a scalar in `dtype`
+}
+
+impl FeatureHead {
+    /// `rescale_norm(normed) → aggregate_embed → connector`. `normed` is the shared masked
+    /// per-token-RMS `(1, L, 188160)`; `mask01` the `(1, L)` 1/0 attention mask.
+    fn forward(&self, normed: &Array, mask01: &Array) -> Result<(Array, Array)> {
+        let features = linear(
+            &multiply(normed, &self.rescale)?,
+            &self.aggregate_w,
+            &self.aggregate_b,
+        )?;
+        let embeddings = self.connector.forward(&features, mask01)?;
+        Ok((features, embeddings))
+    }
+}
+
+/// The LTX-2.3 text encoder (Gemma backbone + per-token-RMS feature extractor + connector). Carries
+/// a video head always and an optional audio head (sc-2684 AudioVideo path).
+pub struct LtxTextEncoder {
+    gemma: GemmaModel,
+    video: FeatureHead,
+    audio: Option<FeatureHead>,
     dtype: Dtype,
 }
 
 impl LtxTextEncoder {
-    /// Build from the Gemma weights + the LTX `connector.safetensors` (which carries both the
-    /// `video_aggregate_embed` feature-extractor Linear and the video connector). `dtype` = the
-    /// compute dtype (bf16 to match the reference). `gemma_quant` selectively quantizes the Gemma
-    /// backbone (from its snapshot `config.json`; `None` ⇒ dense bf16 — the default `…-bf16` snapshot);
-    /// the connector + feature-extractor Linear always run dense bf16 (the reference never quantizes
-    /// them — they ship dense in `connector.safetensors`).
+    /// Build the **video-only** encoder from the Gemma weights + the LTX `connector.safetensors`.
+    /// `dtype` = the compute dtype (bf16 to match the reference). `gemma_quant` selectively quantizes
+    /// the Gemma backbone (from its snapshot `config.json`; `None` ⇒ dense bf16 — the default
+    /// `…-bf16` snapshot); the connector + feature-extractor Linear always run dense bf16 (they ship
+    /// dense in `connector.safetensors`).
     pub fn from_weights(
         gemma_w: &Weights,
         connector_w: &Weights,
@@ -48,6 +74,42 @@ impl LtxTextEncoder {
         dtype: Dtype,
     ) -> Result<Self> {
         let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
+        let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
+        Ok(Self {
+            gemma,
+            video,
+            audio: None,
+            dtype,
+        })
+    }
+
+    /// Build the **AudioVideo** encoder (sc-2684): the video head + the audio head
+    /// (`audio_aggregate_embed` + `audio_embeddings_connector`, dim 2048 = 32 × 64).
+    pub fn from_weights_av(
+        gemma_w: &Weights,
+        connector_w: &Weights,
+        gemma_cfg: GemmaConfig,
+        gemma_quant: Option<GemmaQuant>,
+        ltx_cfg: &LtxConfig,
+        dtype: Dtype,
+    ) -> Result<Self> {
+        let gemma = GemmaModel::from_weights(gemma_w, gemma_cfg, gemma_quant)?;
+        let video = Self::video_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
+        let audio = Self::audio_head(connector_w, gemma_cfg, ltx_cfg, dtype)?;
+        Ok(Self {
+            gemma,
+            video,
+            audio: Some(audio),
+            dtype,
+        })
+    }
+
+    fn aggregate(
+        connector_w: &Weights,
+        key_prefix: &str,
+        gemma_cfg: GemmaConfig,
+        dtype: Dtype,
+    ) -> Result<(Array, Array, Array)> {
         let load = |key: &str| -> Result<Array> {
             connector_w
                 .get(key)
@@ -55,21 +117,68 @@ impl LtxTextEncoder {
                 .as_dtype(dtype)
                 .map_err(Error::from)
         };
-        let aggregate_w = load("text_embedding_projection.video_aggregate_embed.weight")?;
-        let aggregate_b = load("text_embedding_projection.video_aggregate_embed.bias")?;
+        let aggregate_w = load(&format!("{key_prefix}.weight"))?;
+        let aggregate_b = load(&format!("{key_prefix}.bias"))?;
         let out_dim = aggregate_w.shape()[0];
-        let hidden = gemma_cfg.hidden_size;
-        let rescale =
-            Array::from_slice(&[(out_dim as f32 / hidden as f32).sqrt()], &[1]).as_dtype(dtype)?;
+        let rescale = Array::from_slice(
+            &[(out_dim as f32 / gemma_cfg.hidden_size as f32).sqrt()],
+            &[1],
+        )
+        .as_dtype(dtype)?;
+        Ok((aggregate_w, aggregate_b, rescale))
+    }
+
+    fn video_head(
+        connector_w: &Weights,
+        gemma_cfg: GemmaConfig,
+        ltx_cfg: &LtxConfig,
+        dtype: Dtype,
+    ) -> Result<FeatureHead> {
+        let (aggregate_w, aggregate_b, rescale) = Self::aggregate(
+            connector_w,
+            "text_embedding_projection.video_aggregate_embed",
+            gemma_cfg,
+            dtype,
+        )?;
         let connector =
             Connector::from_weights(connector_w, "video_embeddings_connector.", ltx_cfg, dtype)?;
-        Ok(Self {
-            gemma,
+        Ok(FeatureHead {
             aggregate_w,
             aggregate_b,
-            connector,
             rescale,
+            connector,
+        })
+    }
+
+    fn audio_head(
+        connector_w: &Weights,
+        gemma_cfg: GemmaConfig,
+        ltx_cfg: &LtxConfig,
+        dtype: Dtype,
+    ) -> Result<FeatureHead> {
+        let (aggregate_w, aggregate_b, rescale) = Self::aggregate(
+            connector_w,
+            "text_embedding_projection.audio_aggregate_embed",
+            gemma_cfg,
             dtype,
+        )?;
+        // The audio connector shares the checkpoint's layer count / theta / register max-pos but
+        // runs at the audio connector dims (32 × 64 = 2048).
+        let connector = Connector::from_weights_dims(
+            connector_w,
+            "audio_embeddings_connector.",
+            ltx_cfg.connector_num_layers,
+            ltx_cfg.audio_connector_num_attention_heads,
+            ltx_cfg.audio_connector_attention_head_dim,
+            ltx_cfg.positional_embedding_theta,
+            ltx_cfg.connector_positional_embedding_max_pos,
+            dtype,
+        )?;
+        Ok(FeatureHead {
+            aggregate_w,
+            aggregate_b,
+            rescale,
+            connector,
         })
     }
 
@@ -86,16 +195,39 @@ impl LtxTextEncoder {
         attention_mask: &Array,
     ) -> Result<(Array, Array)> {
         let hiddens = self.gemma.forward(input_ids, attention_mask)?; // 49 × (1, L, 3840)
-        let video_features = self.feature_extract(&hiddens, attention_mask)?;
-        let video_embeddings = self.connector.forward(&video_features, attention_mask)?;
-        Ok((video_features, video_embeddings))
+        let normed = self.normed_hidden(&hiddens, attention_mask)?;
+        self.video.forward(&normed, attention_mask)
     }
 
-    /// `norm_and_concat_per_token_rms` + `rescale_norm` + `video_aggregate_embed`.
+    /// AudioVideo encode (sc-2684): `(video_embeddings (1,L,4096), audio_embeddings (1,L,2048))`.
+    /// Errors if this encoder was not built with [`from_weights_av`].
+    pub fn encode_av(&self, input_ids: &Array, attention_mask: &Array) -> Result<(Array, Array)> {
+        let (_, _, ve, ae) = self.encode_av_with_features(input_ids, attention_mask)?;
+        Ok((ve, ae))
+    }
+
+    /// AudioVideo encode returning `(video_features, audio_features, video_embeddings,
+    /// audio_embeddings)` — the pre-connector features included for stage localization.
+    pub fn encode_av_with_features(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+    ) -> Result<(Array, Array, Array, Array)> {
+        let audio = self.audio.as_ref().ok_or_else(|| {
+            Error::Msg("ltx_2_3: text encoder built without the audio head".into())
+        })?;
+        let hiddens = self.gemma.forward(input_ids, attention_mask)?;
+        let normed = self.normed_hidden(&hiddens, attention_mask)?;
+        let (vf, ve) = self.video.forward(&normed, attention_mask)?;
+        let (af, ae) = audio.forward(&normed, attention_mask)?;
+        Ok((vf, af, ve, ae))
+    }
+
+    /// `norm_and_concat_per_token_rms` — the shared masked per-token RMS `(1, L, 188160)`.
     /// Each `(token, layer)` slice over the 3840 hidden dim is RMS-normalized independently, the 49
-    /// layers are concatenated **dim-major / layer-minor** (`d*49 + layer`, via stack+reshape),
-    /// padded positions zeroed, scaled by `√(out/hidden)`, then projected to `out_dim`.
-    fn feature_extract(&self, hiddens: &[Array], attention_mask: &Array) -> Result<Array> {
+    /// layers are concatenated **dim-major / layer-minor** (`d*49 + layer`, via stack+reshape), and
+    /// padded positions are zeroed. The video / audio heads then rescale + aggregate this off it.
+    fn normed_hidden(&self, hiddens: &[Array], attention_mask: &Array) -> Result<Array> {
         let refs: Vec<&Array> = hiddens.iter().collect();
         let encoded = stack_axis(&refs, 3)?; // (1, L, 3840, 49)
         let sh = encoded.shape();
@@ -107,8 +239,6 @@ impl LtxTextEncoder {
         let normed = normed.reshape(&[b, l, -1])?; // (1, L, 188160), dim-major/layer-minor
                                                    // zero padded token positions (multiply by the 0/1 mask == where(mask, x, 0)).
         let mask = attention_mask.reshape(&[b, l, 1])?.as_dtype(self.dtype)?;
-        let normed = multiply(&normed, &mask)?;
-        let rescaled = multiply(&normed, &self.rescale)?;
-        linear(&rescaled, &self.aggregate_w, &self.aggregate_b)
+        Ok(multiply(&normed, &mask)?)
     }
 }

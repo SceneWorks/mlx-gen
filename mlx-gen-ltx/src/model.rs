@@ -1,10 +1,19 @@
-//! `mlx-gen-ltx` model entry: the LTX-2.3 **video-only T2V** descriptor, the config-driven `load`,
-//! the public `generate`, and registry self-registration.
+//! `mlx-gen-ltx` model entry: the LTX-2.3 **AudioVideo** descriptor, the config-driven `load`, the
+//! public `generate`, and registry self-registration.
 //!
-//! **Scope (sc-2679 S6):** the full end-to-end T2V pipeline is now wired — prompt → Gemma-3 tokenizer
-//! → [`LtxTextEncoder`] (Gemma backbone + feature extractor + connector) → seeded noise → the
-//! 2-stage distilled denoise ([`crate::pipeline`]: stage-1 half-res → 2× [`LatentUpsampler`] →
-//! re-noise → stage-2 full-res) → [`LtxVideoVae`] decode → uint8 RGB frames.
+//! **Scope (sc-2684):** the production path is the full **synchronized audio+video** generation
+//! (`generate_av.py`) — prompt → Gemma-3 tokenizer → [`LtxTextEncoder::encode_av`] (video 4096 +
+//! audio 2048 embeddings) → seeded noise → the joint 2-stage distilled denoise ([`generate_av_latents`]:
+//! both streams through the dual-modality [`AvDiT`] with cross-modal attention every step; the video is
+//! 2× upsampled between stages, the audio is not) → [`LtxVideoVae`] decode → uint8 RGB frames **plus**
+//! [`AudioDecoder`] → [`LtxVocoder`] → an [`mlx_gen::media::AudioTrack`]. The audio is always denoised
+//! (it conditions the video via cross-modal attention), so the video differs from the video-only
+//! sc-2679 building block (`LtxDiT`, audio disabled). `--no-audio` (`req.video_mode == "no_audio"`)
+//! runs the full A/V denoise but skips the audio decode (`audio: None`).
+//!
+//! 16-bit-WAV write + peak-normalize + the `ffmpeg -c:v copy -c:a aac -shortest` mux are **host-side**
+//! (the `AudioTrack` is the raw vocoder waveform — `generate_av.py`'s `audio_np` before `save_audio`),
+//! matching how MP4 video muxing already lives outside the crate (the Wan sibling).
 //!
 //! The Gemma text-encoder weights are a **separate** snapshot (the base model dir holds only the
 //! `connector`/transformer/vae); [`resolve_gemma_dir`] locates them via `$LTX_GEMMA_DIR` or the HF
@@ -28,9 +37,10 @@
 //! 2-stage → **no CFG** (guidance baked in).
 //!
 //! **I2V (sc-2685):** a single conditioning [`Conditioning::Reference`] image is VAE-encoded at both
-//! stage resolutions and injected as a clean latent at frame 0 (per-frame denoise mask, `image_strength`
-//! → `1 − strength`), driving the conditioned 2-stage denoise ([`generate_i2v_latents`]). The VAE
-//! **encoder** is loaded for this. LoRA/LoKr and the audio half are sibling slices.
+//! stage resolutions and injected into the **video** stream as a clean latent at frame 0 (per-frame
+//! denoise mask, `image_strength` → `1 − strength`), threaded through the joint A/V denoise via
+//! `generate_av_latents`' `video_cond` — the audio stays pure-noise, matching `generate_av.py`'s
+//! I2V+Audio. The VAE **encoder** is loaded for this. LoRA/LoKr are sibling slices.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -41,16 +51,19 @@ use mlx_gen::{
     Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
 
-use crate::config::{LtxConfig, LtxVaeConfig, SplitModel};
+use crate::audio_vae::AudioDecoder;
+use crate::config::{AudioVaeConfig, LtxConfig, LtxVaeConfig, SplitModel, VocoderConfig};
 use crate::gemma::{GemmaConfig, GemmaQuant};
-use crate::pipeline::decode_to_frames;
-use crate::pipeline::{generate_i2v_latents, generate_t2v_latents, preprocess_conditioning_image};
-use crate::positions::create_position_grid;
+use crate::pipeline::{
+    decode_audio_track, decode_to_frames, generate_av_latents, preprocess_conditioning_image,
+};
+use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
 use crate::tokenizer::LtxTokenizer;
-use crate::transformer::{LtxDiT, Precision};
+use crate::transformer::{AvDiT, Precision};
 use crate::upsampler::LatentUpsampler;
 use crate::vae::LtxVideoVae;
+use crate::vocoder::LtxVocoder;
 
 /// Public registry id: `mlx_gen::load("ltx_2_3", spec)`.
 pub const MODEL_ID: &str = "ltx_2_3";
@@ -59,6 +72,9 @@ pub const MODEL_ID: &str = "ltx_2_3";
 const MAX_PROMPT_TOKENS: usize = 1024;
 /// LTX-2 latent channels.
 const LATENT_CHANNELS: i32 = 128;
+/// Audio latent channels (pre-patchify) and mel bins — the audio latent is `(1, 8, T, 16)`.
+const AUDIO_LATENT_CHANNELS: i32 = 8;
+const AUDIO_MEL_BINS: i32 = 16;
 /// VAE temporal compression (8×): `latent_frames = 1 + (frames − 1) / 8`.
 const TEMPORAL_SCALE: u32 = 8;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
@@ -71,16 +87,17 @@ const DEFAULT_IMAGE_STRENGTH: f32 = 1.0;
 /// [`crate::conditioning`] primitive supports any index, but the reference CLI only wires one).
 const IMAGE_FRAME_IDX: i32 = 0;
 
-/// Stable identity + advertised capabilities for the LTX-2.3 video-only core.
+/// Stable identity + advertised capabilities for the LTX-2.3 AudioVideo model (produces video frames
+/// + a synchronized audio track).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
         family: "ltx",
         modality: Modality::Video,
         capabilities: Capabilities {
-            // Distilled 2-stage path: CFG is forced to 1.0, so no guidance / negative prompt in
-            // the core. I2V single-image conditioning (sc-2685) is wired via `Reference`. (LoRA,
-            // LoKr, Q4/Q8, and the audio half are sibling slices.)
+            // Distilled 2-stage path: CFG is forced to 1.0, so no guidance / negative prompt.
+            // I2V single-image conditioning (sc-2685) is wired via `Reference`; audio is always
+            // produced (sc-2684). LoRA, LoKr, and Q4/Q8-of-everything are sibling slices.
             supports_negative_prompt: false,
             supports_guidance: false,
             supports_true_cfg: false,
@@ -100,16 +117,24 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded LTX-2.3 model: the assembled T2V components + the cached descriptor.
+/// The loaded LTX-2.3 model: the assembled **AudioVideo** components + the cached descriptor. The
+/// production path is the joint A/V denoise (`generate_av.py`) — the audio latents are always
+/// denoised (the cross-modal attention couples them to the video every step), so the video stream
+/// differs from the video-only sc-2679 building block. Audio is decoded into the output unless
+/// `--no-audio` (`req.video_mode == "no_audio"`).
 pub struct Ltx {
     descriptor: ModelDescriptor,
     tokenizer: LtxTokenizer,
     text_encoder: LtxTextEncoder,
-    transformer: LtxDiT,
+    transformer: AvDiT,
     upsampler: LatentUpsampler,
     vae: LtxVideoVae,
+    audio_decoder: AudioDecoder,
+    vocoder: LtxVocoder,
     latent_mean: Array,
     latent_std: Array,
+    audio_sample_rate: u32,
+    stat_dt: Dtype,
 }
 
 /// Locate the Gemma-3-12B text-encoder snapshot. `$LTX_GEMMA_DIR` wins; otherwise the newest
@@ -230,6 +255,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let config = LtxConfig::from_model_dir(root)?;
     let vae_config = LtxVaeConfig::from_model_dir(root)?;
+    let audio_vae_config = AudioVaeConfig::from_model_dir(root)?;
+    let vocoder_config = VocoderConfig::from_model_dir(root)?;
 
     let gemma_dir = resolve_gemma_dir()?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
@@ -240,16 +267,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let transformer_w = Weights::from_file(root.join("transformer.safetensors"))?;
     let upsampler_w = Weights::from_file(root.join("upsampler.safetensors"))?;
     let vae_w = Weights::from_file(root.join("vae_decoder.safetensors"))?;
+    let audio_vae_w = Weights::from_file(root.join("audio_vae.safetensors"))?;
+    let vocoder_w = Weights::from_file(root.join("vocoder.safetensors"))?;
     // The VAE **encoder** is loaded so the model can serve I2V (sc-2685): it VAE-encodes the
-    // conditioning image at both stage resolutions. ~640 MB — negligible beside the 20 GB
-    // transformer, and it makes I2V available without a reload (pure-T2V requests never touch it).
+    // conditioning image at both stage resolutions (pure-T2V+A requests never touch it). The reference
+    // `generate_av.py` supports I2V+Audio — the video is image-conditioned, the audio stays pure-noise.
     let vae_enc_w = Weights::from_file(root.join("vae_encoder.safetensors"))?;
 
-    // The text encoder runs **bf16** activations (the reference TE dtype; S1-validated) — dense for the
-    // default `…-bf16` Gemma, or selectively quantized for a quantized snapshot. Its bf16
-    // `video_embeddings` enter the f32/bf16 DiT, which upcasts the cross-attn context as the reference
-    // transformer does.
-    let text_encoder = LtxTextEncoder::from_weights(
+    // The AudioVideo text encoder runs **bf16** activations (the reference TE dtype; S1-validated) —
+    // dense for the default `…-bf16` Gemma or selectively quantized per the snapshot — producing both
+    // the video (4096) and audio (2048) embeddings. Its bf16 embeddings enter the DiT, which upcasts
+    // the cross-attn context as the reference transformer does.
+    let text_encoder = LtxTextEncoder::from_weights_av(
         &gemma_w,
         &connector_w,
         GemmaConfig::gemma_3_12b(),
@@ -257,9 +286,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         &config,
         Dtype::Bfloat16,
     )?;
-    let transformer = LtxDiT::from_weights(&transformer_w, &config, dit_prec)?;
+    let transformer = AvDiT::from_weights(&transformer_w, &config, dit_prec)?;
     let upsampler = LatentUpsampler::from_weights(&upsampler_w)?;
+    // The VAE carries its encoder (Some) so the model can serve I2V conditioning.
     let vae = LtxVideoVae::from_weights(&vae_w, Some(&vae_enc_w), &vae_config)?;
+    // The audio VAE decoder + vocoder run f32 (post-sampling quality islands, gated bit-exact).
+    let audio_decoder = AudioDecoder::from_weights(&audio_vae_w, &audio_vae_config)?;
+    let vocoder = LtxVocoder::from_weights(&vocoder_w, &vocoder_config)?;
+    let audio_sample_rate = vocoder_config.final_sample_rate() as u32;
     // The VAE `per_channel_statistics` double as the upsampler's latent norm, at the path dtype.
     let latent_mean = to_dtype(vae_w.require("per_channel_statistics.mean")?, stat_dt)?;
     let latent_std = to_dtype(vae_w.require("per_channel_statistics.std")?, stat_dt)?;
@@ -271,8 +305,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         transformer,
         upsampler,
         vae,
+        audio_decoder,
+        vocoder,
         latent_mean,
         latent_std,
+        audio_sample_rate,
+        stat_dt,
     }))
 }
 
@@ -291,53 +329,104 @@ impl Ltx {
         )
     }
 
-    /// Prompt → `video_embeddings` (f32) via the Gemma tokenizer + text encoder.
-    fn encode_prompt(&self, prompt: &str) -> Result<Array> {
-        let (ids, mask) = self.tokenizer.encode(prompt, MAX_PROMPT_TOKENS)?;
-        self.text_encoder.encode(&ids, &mask)
+    /// Audio latent-frame count for the request (`compute_audio_frames(num_frames, fps)`).
+    pub(crate) fn audio_frames(req: &GenerationRequest) -> usize {
+        compute_audio_frames(
+            req.frames.unwrap_or(1).max(1) as usize,
+            req.fps.unwrap_or(24) as f64,
+        )
     }
 
-    /// The full T2V path with **injected** stage noise (the deterministic seam `generate` calls with
-    /// RNG-drawn noise and the e2e parity test calls with the reference samples). Encodes the prompt,
-    /// then defers to [`generate_from_embeddings`](Self::generate_from_embeddings).
+    /// `--no-audio` toggle: `req.video_mode == "no_audio"` runs the full A/V denoise but skips the
+    /// audio decode + returns `audio: None` (the reference `--no-audio`).
+    fn no_audio(req: &GenerationRequest) -> bool {
+        matches!(
+            req.video_mode.as_deref(),
+            Some("no_audio") | Some("video_only")
+        )
+    }
+
+    /// The full A/V path with **injected** stage noise (the deterministic seam `generate` calls with
+    /// RNG-drawn noise and the e2e parity test calls with the reference samples). Encodes the prompt
+    /// to both video + audio embeddings, resolves an optional I2V conditioning image (VAE-encoded at
+    /// both stage resolutions — the video is image-conditioned, the audio stays pure-noise, matching
+    /// `generate_av.py`'s I2V+Audio), then defers to
+    /// [`generate_av_from_embeddings`](Self::generate_av_from_embeddings).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_with_noise(
         &self,
         req: &GenerationRequest,
-        stage1_noise: &Array,
-        stage2_noise: &Array,
+        video_s1: &Array,
+        video_s2: &Array,
+        audio_s1: &Array,
+        audio_s2: &Array,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let context = self.encode_prompt(&req.prompt)?;
-        self.generate_from_embeddings(req, &context, stage1_noise, stage2_noise, on_progress)
+        let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
+        let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
+        // I2V: VAE-encode the conditioning image at each stage's pixel resolution (half-res + full-res).
+        let cond = match self.resolve_reference(req)? {
+            Some((image, strength)) => Some((
+                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
+                self.encode_conditioning(image, req.height, req.width)?,
+                strength,
+            )),
+            None => None,
+        };
+        let video_cond = cond
+            .as_ref()
+            .map(|(img1, img2, strength)| (img1, img2, IMAGE_FRAME_IDX, *strength));
+        self.generate_av_from_embeddings(
+            req,
+            &video_ctx,
+            &audio_ctx,
+            video_s1,
+            video_s2,
+            audio_s1,
+            audio_s2,
+            video_cond,
+            on_progress,
+        )
     }
 
-    /// The T2V path from **injected** text embeddings + noise — the pipeline-only seam (no text
-    /// encoder), so the parity test can gate the 2-stage pipeline + decode against the reference's
-    /// conditioning without loading the Gemma backbone. `context` is `(1, ctx, 4096)`; `stage1_noise`
-    /// `(1, 128, F, h1, w1)` and `stage2_noise` `(1, 128, F, h2, w2)`.
-    pub(crate) fn generate_from_embeddings(
+    /// The A/V path from **injected** text embeddings + noise — the pipeline-only seam (no Gemma), so
+    /// the parity test can gate the joint 2-stage pipeline + video/audio decode against the reference
+    /// conditioning. `video_ctx` `(1, ctx, 4096)`, `audio_ctx` `(1, ctx, 2048)`; video noise
+    /// `(1,128,F,h,w)` per stage; audio noise `(1,8,T,16)` per stage (`T = audio_frames`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_av_from_embeddings(
         &self,
         req: &GenerationRequest,
-        context: &Array,
-        stage1_noise: &Array,
-        stage2_noise: &Array,
+        video_ctx: &Array,
+        audio_ctx: &Array,
+        video_s1: &Array,
+        video_s2: &Array,
+        audio_s1: &Array,
+        audio_s2: &Array,
+        video_cond: Option<(&Array, &Array, i32, f32)>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
         let pos1 = create_position_grid(1, lf, h1, w1);
         let pos2 = create_position_grid(1, lf, h2, w2);
+        let audio_pos = create_audio_position_grid(1, Self::audio_frames(req));
 
         let mut step = 0usize;
-        let latents = generate_t2v_latents(
+        let (video_latents, audio_latents) = generate_av_latents(
             &self.transformer,
             &self.upsampler,
-            stage1_noise,
+            video_s1,
             &pos1,
-            stage2_noise,
+            video_s2,
             &pos2,
-            context,
+            audio_s1,
+            audio_s2,
+            &audio_pos,
+            video_ctx,
+            audio_ctx,
             &self.latent_mean,
             &self.latent_std,
+            video_cond,
             &mut |_| {
                 step += 1;
                 on_progress(Progress::Step {
@@ -348,12 +437,23 @@ impl Ltx {
         )?;
 
         on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &latents)?;
+        let frames = decode_to_frames(&self.vae, &video_latents)?;
         let images = frames_to_images(&frames)?;
+        // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
+        let audio = if Self::no_audio(req) {
+            None
+        } else {
+            Some(decode_audio_track(
+                &self.audio_decoder,
+                &self.vocoder,
+                &audio_latents,
+                self.audio_sample_rate,
+            )?)
+        };
         Ok(GenerationOutput::Video {
             frames: images,
             fps: req.fps.unwrap_or(24),
-            audio: None,
+            audio,
         })
     }
 
@@ -390,62 +490,6 @@ impl Ltx {
     fn encode_conditioning(&self, image: &Image, px_h: u32, px_w: u32) -> Result<Array> {
         let video = preprocess_conditioning_image(image, px_w, px_h)?; // f32 (1,3,1,px_h,px_w)
         self.vae.encode(&video)
-    }
-
-    /// The full I2V path with **injected** stage noise (the deterministic seam `generate` calls with
-    /// RNG-drawn noise). Encodes the prompt + the conditioning image at both stage resolutions, then
-    /// runs the 2-stage conditioned pipeline ([`generate_i2v_latents`]).
-    fn generate_i2v_with_noise(
-        &self,
-        req: &GenerationRequest,
-        image: &Image,
-        strength: f32,
-        stage1_noise: &Array,
-        stage2_noise: &Array,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<GenerationOutput> {
-        let context = self.encode_prompt(&req.prompt)?;
-        let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
-        let pos1 = create_position_grid(1, lf, h1, w1);
-        let pos2 = create_position_grid(1, lf, h2, w2);
-
-        // Encode the image at each stage's pixel resolution: stage 1 = half-res (height/2 × width/2),
-        // stage 2 = full-res. The reference resizes the original image directly to each.
-        let img1 = self.encode_conditioning(image, req.height / 2, req.width / 2)?;
-        let img2 = self.encode_conditioning(image, req.height, req.width)?;
-
-        let mut step = 0usize;
-        let latents = generate_i2v_latents(
-            &self.transformer,
-            &self.upsampler,
-            &img1,
-            stage1_noise,
-            &pos1,
-            &img2,
-            stage2_noise,
-            &pos2,
-            &context,
-            &self.latent_mean,
-            &self.latent_std,
-            IMAGE_FRAME_IDX,
-            strength,
-            &mut |_| {
-                step += 1;
-                on_progress(Progress::Step {
-                    current: step as u32,
-                    total: 11,
-                });
-            },
-        )?;
-
-        on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &latents)?;
-        let images = frames_to_images(&frames)?;
-        Ok(GenerationOutput::Video {
-            frames: images,
-            fps: req.fps.unwrap_or(24),
-            audio: None,
-        })
     }
 }
 
@@ -518,35 +562,30 @@ impl Generator for Ltx {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let (lf, h1, w1, h2, w2) = Self::latent_dims(req);
+        let af = Self::audio_frames(req) as i32;
         let seed = req.seed.unwrap_or_else(default_seed);
-        // Seeded f32 noise (the f32-activation regime). RNG is not portable to mlx-python, so the
-        // pixel-level parity gate injects the reference samples via `generate_{with,i2v_with}_noise`.
-        let k1 = random::key(seed)?;
-        let k2 = random::key(seed.wrapping_add(1))?;
-        let stage1_noise = random::normal::<f32>(
-            &[1, LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32],
-            None,
-            None,
-            Some(&k1),
-        )?;
-        let stage2_noise = random::normal::<f32>(
+        // Seeded noise at the path dtype (the reference seeds `normal(...).astype(model_dtype)`). RNG
+        // is not portable to mlx-python, so the pixel/waveform parity gate injects the reference
+        // samples via `generate_with_noise`. Distinct keys per stage/modality. I2V conditioning (when
+        // a `Reference` is supplied) + the audio decode are handled inside `generate_with_noise`.
+        let normal = |key: u64, shape: &[i32]| -> Result<Array> {
+            let k = random::key(key)?;
+            Ok(random::normal::<f32>(shape, None, None, Some(&k))?.as_dtype(self.stat_dt)?)
+        };
+        let video_s1 = normal(seed, &[1, LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32])?;
+        let video_s2 = normal(
+            seed.wrapping_add(1),
             &[1, LATENT_CHANNELS, lf as i32, h2 as i32, w2 as i32],
-            None,
-            None,
-            Some(&k2),
         )?;
-        // I2V when a single conditioning `Reference` is supplied; otherwise pure-noise T2V.
-        match self.resolve_reference(req)? {
-            Some((image, strength)) => self.generate_i2v_with_noise(
-                req,
-                image,
-                strength,
-                &stage1_noise,
-                &stage2_noise,
-                on_progress,
-            ),
-            None => self.generate_with_noise(req, &stage1_noise, &stage2_noise, on_progress),
-        }
+        let audio_s1 = normal(
+            seed.wrapping_add(2),
+            &[1, AUDIO_LATENT_CHANNELS, af, AUDIO_MEL_BINS],
+        )?;
+        let audio_s2 = normal(
+            seed.wrapping_add(3),
+            &[1, AUDIO_LATENT_CHANNELS, af, AUDIO_MEL_BINS],
+        )?;
+        self.generate_with_noise(req, &video_s1, &video_s2, &audio_s1, &audio_s2, on_progress)
     }
 }
 
