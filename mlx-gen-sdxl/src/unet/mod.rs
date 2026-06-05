@@ -158,6 +158,29 @@ impl UNet2DConditionModel {
         Ok(())
     }
 
+    /// Install IP-Adapter decoupled K/V projections (sc-3059) into the cross-attention modules, in
+    /// the diffusers `attn_processors` walk order — **down_blocks → up_blocks → mid_block** (the
+    /// empirical `ip_adapter.{1,3,…}` numeric order). `pairs` are the `to_k_ip/to_v_ip` weights, one
+    /// per cross-attention layer (70 for SDXL), in that numeric order. Errors on a count mismatch.
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+        let expected = pairs.len();
+        let mut it = pairs.into_iter();
+        for b in &mut self.down_blocks {
+            b.install_ip(&mut it)?;
+        }
+        for b in &mut self.up_blocks {
+            b.install_ip(&mut it)?;
+        }
+        self.mid_transformer.install_ip(&mut it)?;
+        let leftover = it.count();
+        if leftover != 0 {
+            return Err(mlx_gen::Error::Msg(format!(
+                "ip_adapter: {leftover} of {expected} K/V pairs unused (cross-attn count mismatch)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Predict `eps` for one denoise step.
     /// - `x`: NHWC latents `[B, H, W, 4]`.
     /// - `timestep`: the (sigma-space) time, broadcast to the batch.
@@ -171,7 +194,7 @@ impl UNet2DConditionModel {
         text_emb: &Array,
         time_ids: &Array,
     ) -> Result<Array> {
-        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None)
+        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None, None)
     }
 
     /// Like [`forward`](Self::forward) but adds a ControlNet's residuals (sc-3058): each control
@@ -186,9 +209,34 @@ impl UNet2DConditionModel {
         time_ids: &Array,
         control: &ControlResiduals,
     ) -> Result<Array> {
-        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, Some(control))
+        self.forward_core(
+            x,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            Some(control),
+            None,
+        )
     }
 
+    /// Like [`forward`](Self::forward) but injects the IP-Adapter image tokens into every
+    /// cross-attention via the decoupled branch (sc-3059). `ip = (tokens [B, N, cross_attention_dim],
+    /// scale)`. CFG handling is the caller's: pass a zeros uncond row in the batched tokens so the
+    /// negative pass contributes no IP signal.
+    pub fn forward_with_ip(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        ip: (&Array, f32),
+    ) -> Result<Array> {
+        self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None, Some(ip))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_core(
         &self,
         x: &Array,
@@ -197,6 +245,7 @@ impl UNet2DConditionModel {
         text_emb: &Array,
         time_ids: &Array,
         control: Option<&ControlResiduals>,
+        ip: Option<(&Array, f32)>,
     ) -> Result<Array> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
@@ -226,7 +275,7 @@ impl UNet2DConditionModel {
         // Down path — collect skip residuals (starting with the stem output).
         let mut residuals: Vec<Array> = vec![x.clone()];
         for block in &self.down_blocks {
-            let (out, res) = block.forward(&x, encoder_x, &temb, None)?;
+            let (out, res) = block.forward_ip(&x, encoder_x, &temb, None, ip)?;
             x = out;
             residuals.extend(res);
         }
@@ -247,7 +296,7 @@ impl UNet2DConditionModel {
 
         // Mid.
         x = self.mid_resnet0.forward(&x, Some(&temb))?;
-        x = self.mid_transformer.forward(&x, encoder_x)?;
+        x = self.mid_transformer.forward_ip(&x, encoder_x, ip)?;
         x = self.mid_resnet1.forward(&x, Some(&temb))?;
         // ControlNet: add the (scaled) control mid residual to the mid output.
         if let Some(c) = control {
@@ -256,7 +305,7 @@ impl UNet2DConditionModel {
 
         // Up path — each block pops its skip residuals.
         for block in &self.up_blocks {
-            let (out, _) = block.forward(&x, encoder_x, &temb, Some(&mut residuals))?;
+            let (out, _) = block.forward_ip(&x, encoder_x, &temb, Some(&mut residuals), ip)?;
             x = out;
         }
 

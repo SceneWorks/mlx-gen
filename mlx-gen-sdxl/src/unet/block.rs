@@ -110,7 +110,20 @@ impl UNetBlock2D {
         x: &Array,
         encoder_x: &Array,
         temb: &Array,
+        residuals: Option<&mut Vec<Array>>,
+    ) -> Result<(Array, Vec<Array>)> {
+        self.forward_ip(x, encoder_x, temb, residuals, None)
+    }
+
+    /// As [`forward`](Self::forward) but threads the IP-Adapter tokens + scale into each
+    /// cross-attention transformer (sc-3059).
+    pub fn forward_ip(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        temb: &Array,
         mut residuals: Option<&mut Vec<Array>>,
+        ip: Option<(&Array, f32)>,
     ) -> Result<(Array, Vec<Array>)> {
         let mut x = x.clone();
         let mut output_states = Vec::with_capacity(self.resnets.len() + 1);
@@ -123,7 +136,7 @@ impl UNetBlock2D {
             }
             x = self.resnets[i].forward(&x, Some(temb))?;
             if let Some(attns) = &self.attentions {
-                x = attns[i].forward(&x, encoder_x)?;
+                x = attns[i].forward_ip(&x, encoder_x, ip)?;
             }
             output_states.push(x.clone());
         }
@@ -136,6 +149,17 @@ impl UNetBlock2D {
             output_states.push(x.clone());
         }
         Ok((x, output_states))
+    }
+
+    /// Install IP-Adapter K/V projections into this block's cross-attention transformers (sc-3059),
+    /// consuming pairs in transformer/block order. A no-attention block consumes nothing.
+    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Array, Array)>) -> Result<()> {
+        if let Some(attns) = &mut self.attentions {
+            for a in attns {
+                a.install_ip(pairs)?;
+            }
+        }
+        Ok(())
     }
 
     /// Emit the diffusers paths of this block's LoRA-targetable Linears (resnet `time_emb_proj`s +

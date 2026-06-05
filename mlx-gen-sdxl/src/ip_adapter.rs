@@ -19,6 +19,38 @@ use mlx_gen::nn::gelu_exact;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+/// Load the decoupled cross-attention **K/V projection pairs** from an IP-Adapter checkpoint
+/// (`ip_adapter.{n}.to_k_ip/to_v_ip.weight`, bias-free `[hidden, cross_attention_dim]`), returned in
+/// the diffusers `ip_adapter.{1,3,…}` **numeric order** — which is the UNet cross-attention walk
+/// order ([`crate::unet::UNet2DConditionModel::install_ip_adapter`]). 70 pairs for SDXL.
+pub fn load_ip_kv_pairs(w: &Weights) -> Result<Vec<(Array, Array)>> {
+    let mut idxs: Vec<u32> = w
+        .keys()
+        .filter_map(|k| {
+            k.strip_prefix("ip_adapter.")
+                .and_then(|r| r.strip_suffix(".to_k_ip.weight"))
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .collect();
+    idxs.sort_unstable();
+    if idxs.is_empty() {
+        return Err(Error::Msg(
+            "ip_adapter: no ip_adapter.{n}.to_k_ip.weight keys found".into(),
+        ));
+    }
+    idxs.into_iter()
+        .map(|n| {
+            let k = w
+                .require(&format!("ip_adapter.{n}.to_k_ip.weight"))?
+                .clone();
+            let v = w
+                .require(&format!("ip_adapter.{n}.to_v_ip.weight"))?
+                .clone();
+            Ok((k, v))
+        })
+        .collect()
+}
+
 const LN_EPS: f32 = 1e-5;
 
 /// IP-Adapter "plus" Resampler config. Defaults are `ip-adapter-plus_sdxl_vit-h`.

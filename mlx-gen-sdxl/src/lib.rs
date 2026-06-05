@@ -38,6 +38,7 @@ pub use config::{
     BetaSchedule, ClipActivation, ClipTextConfig, DiffusionConfig, UNetConfig, VaeConfig,
 };
 pub use inpaint::{preprocess_mask, InpaintBlend};
+pub use ip_adapter::{load_ip_kv_pairs, Resampler, ResamplerConfig};
 pub use loader::{
     load_controlnet, load_text_encoder_1, load_text_encoder_1_dtype, load_text_encoder_2,
     load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype, load_vae,
@@ -53,6 +54,7 @@ pub use text_encoder::{ClipOutput, ClipTextEncoder};
 pub use tokenizer::{ClipBpeTokenizer, PAD_ID};
 pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 pub use vae::Autoencoder;
+pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

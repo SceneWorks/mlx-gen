@@ -8,6 +8,7 @@ use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, group_norm};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -27,6 +28,13 @@ struct AttentionMHA {
     num_heads: i32,
     head_dim: i32,
     scale: f32,
+    /// IP-Adapter decoupled cross-attention (sc-3059): extra bias-free K/V projections for the image
+    /// tokens, installed only on the cross-attention (`attn2`) modules. When present and IP tokens
+    /// are supplied, `o += scale · sdpa(q, to_k_ip(ip), to_v_ip(ip))` before the output projection
+    /// (ref diffusers `IPAdapterAttnProcessor2_0`). The token source is the caller's (ViT-H→Resampler
+    /// here; an ArcFace Resampler for InstantID sc-3113) — this is just the injection primitive.
+    to_k_ip: Option<AdaptableLinear>,
+    to_v_ip: Option<AdaptableLinear>,
 }
 
 impl AttentionMHA {
@@ -49,11 +57,23 @@ impl AttentionMHA {
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
+            to_k_ip: None,
+            to_v_ip: None,
         })
+    }
+
+    /// Install the IP-Adapter decoupled K/V projections (sc-3059). `k_ip`/`v_ip` are the
+    /// `ip_adapter.{n}.to_k_ip/to_v_ip` weights (`[hidden, cross_attention_dim]`, bias-free).
+    fn install_ip(&mut self, k_ip: Array, v_ip: Array) {
+        self.to_k_ip = Some(AdaptableLinear::dense(k_ip, None));
+        self.to_v_ip = Some(AdaptableLinear::dense(v_ip, None));
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         for lin in [&mut self.q, &mut self.k, &mut self.v, &mut self.out] {
+            lin.quantize(bits, None)?;
+        }
+        for lin in [&mut self.to_k_ip, &mut self.to_v_ip].into_iter().flatten() {
             lin.quantize(bits, None)?;
         }
         Ok(())
@@ -71,24 +91,37 @@ impl AttentionMHA {
     }
 
     fn forward(&self, x: &Array, context: &Array) -> Result<Array> {
+        self.forward_ip(x, context, None)
+    }
+
+    /// As [`forward`](Self::forward), plus the IP-Adapter branch when `ip = Some((tokens, scale))`
+    /// and this module has IP projections installed: `o += scale · sdpa(q, to_k_ip(tokens),
+    /// to_v_ip(tokens))`, sharing the query `q`, before the output projection.
+    fn forward_ip(&self, x: &Array, context: &Array, ip: Option<(&Array, f32)>) -> Result<Array> {
         let (b, l) = (x.shape()[0], x.shape()[1]);
         let s = context.shape()[1];
-        let q = self
-            .q
-            .forward(x)?
-            .reshape(&[b, l, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let k = self
-            .k
-            .forward(context)?
-            .reshape(&[b, s, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let v = self
-            .v
-            .forward(context)?
-            .reshape(&[b, s, self.num_heads, self.head_dim])?
-            .transpose_axes(&[0, 2, 1, 3])?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        let to_heads = |a: Array, n: i32| -> Result<Array> {
+            Ok(a.reshape(&[b, n, self.num_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?)
+        };
+        let q = to_heads(self.q.forward(x)?, l)?;
+        let k = to_heads(self.k.forward(context)?, s)?;
+        let v = to_heads(self.v.forward(context)?, s)?;
+        let mut o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+
+        // IP-Adapter decoupled cross-attention (shares the query `q`).
+        if let (Some(k_ip), Some(v_ip), Some((tokens, scale))) = (&self.to_k_ip, &self.to_v_ip, ip)
+        {
+            let n_ip = tokens.shape()[1];
+            let k_i = to_heads(k_ip.forward(tokens)?, n_ip)?;
+            let v_i = to_heads(v_ip.forward(tokens)?, n_ip)?;
+            let o_ip = scaled_dot_product_attention(&q, &k_i, &v_i, self.scale, None, None)?;
+            o = add(
+                &o,
+                &multiply(&o_ip, &scalar(scale).as_dtype(o_ip.dtype())?)?,
+            )?;
+        }
+
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, l, self.num_heads * self.head_dim])?;
@@ -170,13 +203,21 @@ impl TransformerBlock {
         Ok(())
     }
 
-    fn forward(&self, x: &Array, memory: &Array) -> Result<Array> {
+    /// Install this block's IP-Adapter K/V projections into its cross-attention (sc-3059).
+    fn install_ip(&mut self, k_ip: Array, v_ip: Array) {
+        self.attn2.install_ip(k_ip, v_ip);
+    }
+
+    /// Run the block. The cross-attention (`attn2`) also injects the IP-Adapter branch when `ip` is
+    /// supplied (sc-3059); self-attention never gets IP. (No no-IP wrapper — callers always thread
+    /// the `Option`, passing `None` when there's no IP-Adapter.)
+    fn forward_ip(&self, x: &Array, memory: &Array, ip: Option<(&Array, f32)>) -> Result<Array> {
         // Self-attention.
         let y = layer_norm(x, Some(&self.norm1_w), Some(&self.norm1_b), LN_EPS)?;
         let x = add(x, &self.attn1.forward(&y, &y)?)?;
-        // Cross-attention to the text memory.
+        // Cross-attention to the text memory (+ optional IP-Adapter branch).
         let y = layer_norm(&x, Some(&self.norm2_w), Some(&self.norm2_b), LN_EPS)?;
-        let x = add(&x, &self.attn2.forward(&y, memory)?)?;
+        let x = add(&x, &self.attn2.forward_ip(&y, memory, ip)?)?;
         // GEGLU FFN.
         let y = layer_norm(&x, Some(&self.norm3_w), Some(&self.norm3_b), LN_EPS)?;
         let y = multiply(
@@ -242,15 +283,38 @@ impl Transformer2D {
 
     /// `x`: NHWC `[B, H, W, C]`; `encoder_x`: text memory `[B, S, Dctx]`.
     pub fn forward(&self, x: &Array, encoder_x: &Array) -> Result<Array> {
+        self.forward_ip(x, encoder_x, None)
+    }
+
+    /// As [`forward`](Self::forward) but threads the IP-Adapter tokens + scale into each block's
+    /// cross-attention (sc-3059).
+    pub fn forward_ip(
+        &self,
+        x: &Array,
+        encoder_x: &Array,
+        ip: Option<(&Array, f32)>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, h, w_, c) = (sh[0], sh[1], sh[2], sh[3]);
         let y = group_norm(x, &self.norm_w, &self.norm_b, GN_GROUPS, GN_EPS)?;
         let mut y = self.proj_in.forward(&y.reshape(&[b, h * w_, c])?)?;
         for block in &self.blocks {
-            y = block.forward(&y, encoder_x)?;
+            y = block.forward_ip(&y, encoder_x, ip)?;
         }
         let y = self.proj_out.forward(&y)?.reshape(&[b, h, w_, c])?;
         Ok(add(&y, x)?)
+    }
+
+    /// Install IP-Adapter K/V projections into each block's cross-attention, consuming one
+    /// `(to_k_ip, to_v_ip)` pair per block from `pairs` (sc-3059). Pairs are consumed in block order.
+    pub fn install_ip(&mut self, pairs: &mut impl Iterator<Item = (Array, Array)>) -> Result<()> {
+        for block in &mut self.blocks {
+            let (k_ip, v_ip) = pairs
+                .next()
+                .ok_or_else(|| mlx_gen::Error::Msg("ip_adapter: not enough K/V pairs".into()))?;
+            block.install_ip(k_ip, v_ip);
+        }
+        Ok(())
     }
 
     /// LoRA-targetable Linears under this `attentions.{i}` module, by diffusers path: `proj_in`,
