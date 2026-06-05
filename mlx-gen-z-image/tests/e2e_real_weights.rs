@@ -225,14 +225,10 @@ fn e2e_vae_and_image_matches_golden() {
 
     let golden = g.require("decoded").unwrap();
     assert_eq!(decoded.shape(), golden.shape(), "decoded shape");
-    let pr = peak_rel(&decoded, golden);
-    println!("vae: decoded peak_rel={pr:.2e} shape={:?}", decoded.shape());
-    // peak_rel is a single-pixel high-dynamic-range outlier metric; the MLX 0.31.1 bump (sc-2517)
-    // nudged it from ~2.6e-2 to ~2.8e-2 (was 2e-2 pre-bump). The real guardrail is the per-pixel
-    // RGB8 diff below (and the full-pipeline px>8 test) — both confirm the decode is visually exact.
-    assert!(pr < 3.5e-2, "VAE decode diverged: peak_rel {pr:.2e}");
 
-    // RGB8 image: my decoded vs the golden decoded, both through decoded_to_image.
+    // The authoritative guardrail: the per-pixel RGB8 diff (this is what the rendered image is
+    // actually judged on). Assert it FIRST so a genuine decode regression is caught here and is
+    // neither masked by — nor able to mask — the single-pixel HDR-outlier `peak_rel` below.
     let img = decoded_to_image(&decoded).unwrap();
     let gimg = decoded_to_image(golden).unwrap();
     let differ = img
@@ -252,6 +248,16 @@ fn e2e_vae_and_image_matches_golden() {
         differ < img.pixels.len() / 50,
         "too many pixel diffs: {differ}"
     );
+
+    // Secondary HDR-outlier metric. `peak_rel = max|Δ| / max|golden|` is dominated by a single
+    // high-dynamic-range pixel, so it drifts whenever the golden latents change: 2e-2 (pre-bump) →
+    // ~2.8e-2 (MLX 0.31.1 bump, sc-2517) → 3.73e-2 after the sc-3007 golden re-dump (PR #129, which
+    // switched the golden to the production `for_static_shift(3.0)` sigmas). The RGB8 guardrail above
+    // is authoritative; this only catches a gross decode shift, so the threshold tracks the re-dump
+    // with the usual cushion (history: 2e-2 → 2.8e-2 → 3.5e-2 → 4.5e-2).
+    let pr = peak_rel(&decoded, golden);
+    println!("vae: decoded peak_rel={pr:.2e} shape={:?}", decoded.shape());
+    assert!(pr < 4.5e-2, "VAE decode diverged: peak_rel {pr:.2e}");
 }
 
 /// The integration proof: the full prompt→image pipeline through the **public** Generator API
@@ -479,7 +485,18 @@ fn q8_packing_byte_identical_to_fork() {
         env!("CARGO_MANIFEST_DIR"),
         "/../tools/golden/zq8_pack_probe.safetensors"
     );
-    let g = Weights::from_file(path).unwrap();
+    // The probe golden is a gitignored local fixture (regenerable via
+    // tools/dump_z_image_q8_pack_probe.py). Skip rather than panic-`unwrap()` when it's absent, like
+    // the other optional-golden real-weight tests — Q8 packing is also exercised end-to-end by
+    // `transformer_q8_pipeline_matches_fork`.
+    let Ok(g) = Weights::from_file(path) else {
+        eprintln!(
+            "skip q8_packing_byte_identical_to_fork: {path} not present \
+             (generate it with tools/dump_z_image_q8_pack_probe.py); \
+             Q8 packing is also covered by transformer_q8_pipeline_matches_fork"
+        );
+        return;
+    };
     // f32→bf16 of an already-bf16 value is exact, so this is the fork's exact quantized weight.
     let w = bf16(g.require("w").unwrap());
     let x = bf16(g.require("x").unwrap());
