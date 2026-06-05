@@ -1,8 +1,9 @@
 """Real-weights Z-Image **ControlNet** golden run — the reference for the mlx-gen control e2e
 (sc-2349 / sc-2257).
 
-Run from the fork (sc-2257 branch):
-    cd ~/Repos/mflux-sc2257 && uv run python ~/Repos/mlx-gen/tools/dump_z_image_control_golden.py
+Run from the mflux fork (the main fork now carries the ZImageControl variant; use the 0.31.2 venv
+for the sc-2782 golden):
+    cd ~/repos/mflux && QUANTIZE=8 .venv-0312/bin/python /path/to/mlx-gen/tools/dump_z_image_control_golden.py
 
 Loads the real `Tongyi-MAI/Z-Image-Turbo` base + the `alibaba-pai/Z-Image-Turbo-Fun-Controlnet-
 Union-2.1` control overlay (the fork's `ZImageControl`), builds the 33ch control context from a

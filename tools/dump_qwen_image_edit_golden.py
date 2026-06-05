@@ -6,10 +6,17 @@ the output dims) and *outputs* (final latents + decoded image). The Rust test fe
 through `denoise_edit_with_progress` (the dual-latent loop + transformer `cond_grids`), so the gate
 isolates the new 7a path from the tokenizer / VL encoder / VAE-encode (each separately verified).
 
-Loads the full Edit model (~40 GB+); run on a machine with enough RAM.
-Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/musing-mclaren-676094/tools/dump_qwen_image_edit_golden.py
+Loads the full Edit model (~54 GB); run on a machine with enough RAM.
+Run from the mflux fork venv (use the 0.31.2 venv for the sc-2782 golden):
+    cd ~/repos/mflux && QUANTIZE=8 .venv-0312/bin/python /path/to/mlx-gen/tools/dump_qwen_image_edit_golden.py
 Output (gitignored): tools/golden/qwen_image_edit_golden.safetensors
+
+Snapshot: defaults to `Qwen/Qwen-Image-Edit-2511` (2509 is superseded — sc-2782). The fork's
+`ModelConfig.qwen_image_edit()` still hardcodes the 2509 repo, so we pass `model_path` to point at
+2511; the architecture is identical (60 layers, in_channels 64, …). 2511's config adds
+`zero_cond_t: true`, which the fork ignores (it builds the transformer from fixed params, never
+reads that flag) — so fork and Rust both treat 2511 as the 2509 architecture and the quant parity
+is a clean fork↔Rust check. Override with `QWEN_EDIT_REPO=<repo-or-local-dir>` if needed.
 """
 
 import os
@@ -48,7 +55,10 @@ MULTI = bool(os.environ.get("MULTI"))
 image_paths = [ref_path, ref_path2] if MULTI else [ref_path]
 
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
-model = QwenImageEdit(quantize=QUANTIZE)  # defaults → Qwen-Image-Edit-2509; Q8 quantizes transformer
+# sc-2782: 2509 is superseded by 2511 (same architecture). The fork's model_config still names 2509,
+# so override the weights/tokenizer source via model_path; Q8 quantizes the transformer.
+EDIT_REPO = os.environ.get("QWEN_EDIT_REPO", "Qwen/Qwen-Image-Edit-2511")
+model = QwenImageEdit(quantize=QUANTIZE, model_path=EDIT_REPO)
 
 config, vl_w, vl_h, vae_w, vae_h = model._compute_dimensions(
     width=None,

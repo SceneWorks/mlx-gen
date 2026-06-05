@@ -1,7 +1,8 @@
 //! `QwenImageEdit` — the Qwen-Image-**Edit** implementation of [`mlx_gen::Generator`] (id
 //! `qwen_image_edit`), plus its [`descriptor`]/[`load`] entry points and `inventory` registration.
 //!
-//! [`load`] assembles the model from a `Qwen/Qwen-Image-Edit-2509` snapshot — tokenizer + Qwen2-VL
+//! [`load`] assembles the model from a `Qwen/Qwen-Image-Edit` snapshot (the validated reference is
+//! `-2511`; `-2509` is superseded — same architecture, sc-2782) — tokenizer + Qwen2-VL
 //! image processor, the Qwen2.5-VL vision-language encoder (LM + vision transformer), the 60-layer
 //! MMDiT, and the causal-Conv3d VAE. [`QwenImageEdit::generate`] runs the reference-conditioned
 //! pipeline: tokenize the edit template with the reference image → VL-encode (vision embeds spliced
@@ -89,7 +90,8 @@ pub struct QwenImageEdit {
     vae: QwenVae,
 }
 
-/// Construct a [`QwenImageEdit`] from a [`LoadSpec`] (a `Qwen/Qwen-Image-Edit-2509` snapshot dir).
+/// Construct a [`QwenImageEdit`] from a [`LoadSpec`] (a `Qwen/Qwen-Image-Edit` snapshot dir; the
+/// validated reference is `-2511`, `-2509` superseded — sc-2782).
 /// `spec.quantize` (Q4/Q8) quantizes the **transformer only** (group_size 64) after the dense bf16
 /// load — same as T2I ([`crate::model::load`]). This is the fork's full `quantize=N` scope, not a
 /// descope: the Edit variant uses the same `QwenWeightDefinition`, whose `text_encoder` component

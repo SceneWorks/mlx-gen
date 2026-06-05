@@ -58,8 +58,11 @@ fn edit_snapshot() -> PathBuf {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap();
+    // sc-2782: 2509 is superseded by 2511 (same architecture — 60 layers, in_channels 64; 2511's
+    // extra `zero_cond_t` config flag is unread by both the fork and this port). Override with
+    // QWEN_IMAGE_EDIT_SNAPSHOT to pin a different snapshot.
     let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2509/snapshots");
+        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots");
     std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir")
         .filter_map(|e| e.ok())
@@ -118,7 +121,7 @@ fn edit_rope_multi_image_matches_fork() {
 /// verified — are out of scope), loads the real transformer + VAE from the Edit snapshot, and
 /// compares the final latents + decoded image.
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2509 transformer+VAE weights + local edit golden"]
+#[ignore = "needs real Qwen-Image-Edit-2511 transformer+VAE weights + local edit golden"]
 fn edit_pipeline_matches_fork() {
     let g = Weights::from_file(EDIT_GOLDEN).unwrap();
     let root = edit_snapshot();
@@ -213,7 +216,7 @@ fn synthetic_reference2() -> Image {
 /// the fork's packed `static_image_latents`. VAE-only (no transformer/LM), so it isolates the new
 /// `encode_reference_latents` / LANCZOS code.
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2509 VAE weights + local edit golden"]
+#[ignore = "needs real Qwen-Image-Edit-2511 VAE weights + local edit golden"]
 fn edit_reference_latents_matches_fork() {
     let g = Weights::from_file(EDIT_GOLDEN).unwrap();
     let vae = loader::load_vae(&edit_snapshot()).unwrap();
@@ -356,7 +359,7 @@ fn edit_pos_embeds_matches_fork() {
 /// assert the two decoded images are BYTE-IDENTICAL. Confirms the Rust pipeline is a deterministic
 /// function (so any fork divergence is cross-implementation, not run-to-run noise / NAX chaos).
 #[test]
-#[ignore = "needs the full real Qwen-Image-Edit-2509 model"]
+#[ignore = "needs the full real Qwen-Image-Edit-2511 model"]
 fn edit_generate_is_deterministic_rust() {
     let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot()));
     let generator = model_edit::load(&spec).unwrap();
@@ -397,7 +400,7 @@ fn edit_generate_is_deterministic_rust() {
 /// VL-encode → dual-latent → edit denoise → decode → RGB8 — vs the fork's decoded edit output for
 /// the same reference + prompt + seed. The heaviest test (LM + vision + transformer + VAE).
 #[test]
-#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local edit golden"]
+#[ignore = "needs the full real Qwen-Image-Edit-2511 model + local edit golden"]
 fn edit_generate_matches_fork() {
     let g = Weights::from_file(EDIT_GOLDEN).unwrap();
     let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot()));
@@ -449,7 +452,7 @@ fn edit_generate_matches_fork() {
 /// golden inputs (so only the Q8 transformer is under test), mirroring the T2I
 /// `transformer_q8_pipeline_matches_fork` gate.
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2509 transformer+VAE weights + local Q8 edit golden"]
+#[ignore = "needs real Qwen-Image-Edit-2511 transformer+VAE weights + local Q8 edit golden"]
 fn edit_pipeline_q8_matches_fork() {
     let g = Weights::from_file(EDIT_Q8_GOLDEN).unwrap();
     let root = edit_snapshot();
@@ -507,7 +510,7 @@ fn edit_pipeline_q8_matches_fork() {
 /// conditioning (pixel-parity) + Q8 transformer — vs the fork-Q8 decoded edit output. Exercises the
 /// `model_edit::load` Q8 wiring end-to-end.
 #[test]
-#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local Q8 edit golden"]
+#[ignore = "needs the full real Qwen-Image-Edit-2511 model + local Q8 edit golden"]
 fn edit_generate_q8_matches_fork() {
     let g = Weights::from_file(EDIT_Q8_GOLDEN).unwrap();
     let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot())).with_quant(mlx_gen::Quant::Q8);
@@ -558,7 +561,7 @@ fn edit_generate_q8_matches_fork() {
 /// (`image_paths=[ref1, ref2]`, `cond_image_grid=[(1,h,w),(1,h,w)]`). Confirms the second reference
 /// is wired through the dual-latent sequence (the text/VL embeds match the single-image path).
 #[test]
-#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local multi edit golden"]
+#[ignore = "needs the full real Qwen-Image-Edit-2511 model + local multi edit golden"]
 fn edit_generate_multi_matches_fork() {
     let g = Weights::from_file(EDIT_MULTI_GOLDEN).unwrap();
     assert_eq!(
@@ -612,7 +615,7 @@ fn edit_generate_multi_matches_fork() {
 /// fork-Q8 multi-image edit golden. Exercises the dual-latent multi-ref concat through the Q8
 /// transformer end-to-end.
 #[test]
-#[ignore = "needs the full real Qwen-Image-Edit-2509 model + local multi Q8 edit golden"]
+#[ignore = "needs the full real Qwen-Image-Edit-2511 model + local multi Q8 edit golden"]
 fn edit_generate_multi_q8_matches_fork() {
     let g = Weights::from_file(EDIT_MULTI_Q8_GOLDEN).unwrap();
     assert_eq!(
