@@ -19,6 +19,7 @@
 
 pub mod adapters;
 pub mod config;
+pub mod ip_adapter;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
@@ -27,6 +28,7 @@ pub mod text_encoder;
 pub mod tokenizer;
 pub mod unet;
 pub mod vae;
+pub mod vision_encoder;
 
 pub use adapters::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, lora_delta, LoraCoverage, SdxlLoraReport,
