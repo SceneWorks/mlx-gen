@@ -11,12 +11,18 @@
 //!      as ArcFace on the *reference cv2* crop (cos ≥ 0.99999). This proves the alignment is
 //!      faithful independent of any ArcFace numerics.
 //!
-//! NOTE (sc-3081 finding, surfaced here): the native ArcFace matches onnx's canonical pure-numpy
-//! `ReferenceEvaluator` (`emb_ref`) at cos ≥ 0.998, but matches insightface's *ONNX Runtime* output
-//! (`emb_onnx`) only at ~0.98 — because ORT's MLAS kernels diverge from exact math by the same ~0.98
-//! over the 100-layer iresnet100 (ORT vs its own ReferenceEvaluator is also ~0.98). That gap is an
-//! ArcFace/ORT numerical-fidelity issue, *not* an alignment issue, so it is reported (not asserted)
-//! here. Goldens from `tools/dump_face_align_golden.py` (+ sc-3081/3082 weight goldens), gitignored.
+//! NOTE (sc-3131, corrected 2026-06-05): the native ArcFace is the *numerically correct* iresnet100
+//! forward — it matches both onnx's `ReferenceEvaluator` (`emb_ref`) AND an independent exact
+//! float32/float64 graph evaluation at cos ≥ 0.998. It matches insightface's *ONNX Runtime* output
+//! (`emb_onnx`) only at ~0.98 because **ORT is the one that diverges from exact math**, not us.
+//! That divergence is *structural, not numerical sensitivity* (f32 and f64 exact forwards are
+//! byte-identical) and is **localized**: comparing ORT to an exact forward block-by-block, ORT is
+//! bit-exact (cos 1.0) for residual blocks 0–41 (layer1/2 + most of layer3) then diverges sharply
+//! from block 42 on (last layer3 blocks + layer4) — an internal MLAS deep-conv path, CPU-specific.
+//! So `ort-cos` is reported (not asserted): matching CPU-ORT would mean replicating its approximation
+//! and is the wrong target. The real fidelity question — whether PuLID/InstantID care about the 2%
+//! — is the downstream output check (sc-3085), NOT this embedding cosine. The asserted bar is
+//! `ref-cos` (vs exact math). Goldens from `tools/dump_face_align_golden.py`, gitignored.
 //!
 //! Run:
 //!   ~/.dwpose-spike/venv/bin/python tools/dump_face_align_golden.py
