@@ -70,6 +70,44 @@ fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
 }
 
+/// STALE-GOLDEN GUARD (sc-3007). The golden is a gitignored local fixture that can silently drift
+/// from the production schedule: the per-stage `e2e_denoise_loop` / `q_pipeline_matches_fork` tests
+/// feed the golden's *own* embedded `sigmas`, so a golden dumped at the wrong time-shift passes
+/// every stage yet makes only the public-`generate` tests (which recompute the schedule) diverge
+/// — ~40% px. That is exactly how `e2e_full_pipeline_generates_fox` was failing on `main`: the dense
+/// golden was dumped pre-sc-2536 with the empirical-mu schedule (shift≈9.89) while production
+/// switched to static shift=3.0. Assert the golden's schedule matches production up front so a stale
+/// golden fails loudly with a re-dump hint instead of a cryptic pixel mismatch. (3.0 mirrors the
+/// model's `SCHEDULE_SHIFT`, which is `pub(crate)` and so not reachable from this integration test.)
+fn assert_golden_schedule_is_production(
+    g: &Weights,
+    steps: u32,
+    w: u32,
+    h: u32,
+    seed: u64,
+    prompt: &str,
+) {
+    let golden_sigmas = g.require("sigmas").unwrap().as_slice::<f32>().to_vec();
+    let prod_sigmas = FlowMatchEuler::for_static_shift(steps as usize, 3.0).sigmas;
+    assert_eq!(
+        golden_sigmas.len(),
+        prod_sigmas.len(),
+        "STALE GOLDEN (sc-3007): golden sigma count {} != production schedule length {} — re-dump",
+        golden_sigmas.len(),
+        prod_sigmas.len()
+    );
+    for (i, (gs, ps)) in golden_sigmas.iter().zip(&prod_sigmas).enumerate() {
+        assert!(
+            (gs - ps).abs() < 1e-4,
+            "STALE GOLDEN (sc-3007): golden sigma[{i}]={gs} != production for_static_shift({steps}, \
+             3.0)[{i}]={ps}. The golden was dumped at a different schedule than the public `generate` \
+             path uses — re-dump it with the current `tools/dump_z_image_golden.py` (mlx 0.31.2), e.g. \
+             `ZIMAGE_W={w} ZIMAGE_H={h} ZIMAGE_STEPS={steps} ZIMAGE_SEED={seed} ZIMAGE_PROMPT=\"{prompt}\" \
+             [QUANTIZE=N] <mflux-0.31.2-venv>/bin/python tools/dump_z_image_golden.py`"
+        );
+    }
+}
+
 #[test]
 #[ignore = "needs real Z-Image weights + local golden"]
 fn e2e_text_encoder_matches_golden() {
@@ -233,6 +271,10 @@ fn e2e_full_pipeline_generates_fox() {
     let steps: u32 = g.metadata("steps").unwrap().parse().unwrap();
     let w: u32 = g.metadata("w").unwrap().parse().unwrap();
     let h: u32 = g.metadata("h").unwrap().parse().unwrap();
+
+    // STALE-GOLDEN GUARD (sc-3007): fail fast if the golden's embedded schedule doesn't match the
+    // production `for_static_shift(steps, 3.0)` path (see `assert_golden_schedule_is_production`).
+    assert_golden_schedule_is_production(&g, steps, w, h, seed, &prompt);
 
     // Tokenizer parity: the prompt with the Qwen chat template reproduces the fork's ids exactly.
     let tok = load_tokenizer(&snap).unwrap();
@@ -508,6 +550,11 @@ fn q_full_generate_renders(golden_path: &str, quant: mlx_gen::Quant, bits: i32, 
     let steps: u32 = g.metadata("steps").unwrap().parse().unwrap();
     let w: u32 = g.metadata("w").unwrap().parse().unwrap();
     let h: u32 = g.metadata("h").unwrap().parse().unwrap();
+
+    // STALE-GOLDEN GUARD (sc-3007): same schedule-drift check as the dense full-pipeline test — the
+    // public quantized `generate` path recomputes `for_static_shift(steps, 3.0)`, so a golden dumped
+    // at a different shift would silently diverge here too.
+    assert_golden_schedule_is_production(&g, steps, w, h, seed, &prompt);
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_quant(quant);
     let generator = mlx_gen::load("z_image_turbo", &spec).unwrap();
