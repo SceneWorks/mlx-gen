@@ -11,5 +11,7 @@
 //!   and the unified `FaceAnalysis` API (sc-3085) land alongside.
 
 pub mod iresnet;
+pub mod scrfd;
 
 pub use iresnet::ArcFace;
+pub use scrfd::{Detection, Scrfd};
