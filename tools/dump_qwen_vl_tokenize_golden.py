@@ -28,7 +28,7 @@ N_IMAGE_TOKENS = 36  # prod(grid)//4 for a (1,12,12) grid
 snap = sorted(
     p
     for p in glob.glob(
-        os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2509/snapshots/*")
+        os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/*")
     )
     if os.path.isdir(p)
 )[0]

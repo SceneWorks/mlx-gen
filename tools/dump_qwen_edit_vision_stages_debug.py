@@ -22,7 +22,7 @@ pixel_values = tok["pixel_values"].astype(mx.float32)
 grid_thw = tok["image_grid_thw"]
 
 snap = sorted(
-    p for p in glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2509/snapshots/*")) if os.path.isdir(p)
+    p for p in glob.glob(os.path.expanduser("~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/*")) if os.path.isdir(p)
 )[0]
 vision_params = {}
 for shard in sorted(glob.glob(os.path.join(snap, "text_encoder", "*.safetensors"))):

@@ -16,7 +16,7 @@ use mlx_gen::Result;
 /// `(t, grid_h, grid_w)` for one image, in **patch** units (`image_px / patch_size`).
 pub type Grid = [i32; 3];
 
-/// Vision config knobs that drive the grid math (the Qwen-Image-Edit-2509 `vision_config`).
+/// Vision config knobs that drive the grid math (the Qwen-Image-Edit-2511 `vision_config`).
 #[derive(Clone, Copy, Debug)]
 pub struct VisionGridConfig {
     pub patch_size: i32,

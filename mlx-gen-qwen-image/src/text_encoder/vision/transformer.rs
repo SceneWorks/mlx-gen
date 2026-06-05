@@ -37,7 +37,7 @@ pub struct VisionConfig {
 }
 
 impl VisionConfig {
-    /// The Qwen-Image-Edit-2509 `vision_config` (depth 32, embed 1280, 16 heads × 80,
+    /// The Qwen-Image-Edit-2511 `vision_config` (depth 32, embed 1280, 16 heads × 80,
     /// mlp_ratio 2.671875 → 3420, out 3584, window 112, full-attn at `[7,15,23,31]`).
     pub fn qwen_image_edit() -> Self {
         Self {

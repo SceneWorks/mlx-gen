@@ -4,7 +4,7 @@
 
 use mlx_rs::error::Exception;
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::{add, multiply, split};
+use mlx_rs::ops::{add, multiply, split, which};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
@@ -66,27 +66,43 @@ impl QwenTransformerBlock {
     }
 
     /// Returns `(encoder_hidden_states, hidden_states)` (text, image) — matching the fork's order.
+    ///
+    /// `modulate_index` is `Some` only on the Qwen-Image-Edit-2511 `zero_cond_t` path: then
+    /// `text_embeddings` is the doubled temb `[real_t ; zero_t]` (`[2B, dim]`), the image stream
+    /// selects modulation per token by the index (`0` = noise → real `t`, `1` = conditioning image →
+    /// `t 0`), and the text stream uses only the real-timestep half. `None` (T2I / 2509) is the
+    /// original single-`temb` path, byte-for-byte unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         hidden_states: &Array,         // image [B, img_seq, dim]
         encoder_hidden_states: &Array, // text  [B, txt_seq, dim]
-        text_embeddings: &Array,       // [B, dim]
+        text_embeddings: &Array,       // [B, dim]  (or [2B, dim] under zero_cond_t)
         img_cos: &Array,
         img_sin: &Array,
         txt_cos: &Array,
         txt_sin: &Array,
         mask: Option<&Array>,
+        modulate_index: Option<&Array>,
     ) -> Result<(Array, Array)> {
-        // Both modulation projections take the same SiLU'd timestep embedding — compute it once.
+        // SiLU'd timestep embedding. Under zero_cond_t this is [2B, dim]; the image modulation uses
+        // the whole thing, the text modulation only the real-timestep half. SiLU is elementwise, so
+        // `act[:B] == silu(temb[:B])` — slicing here is bit-identical to slicing the temb first.
         let act = silu(text_embeddings)?;
         let img_mod = self.img_mod.forward(&act)?;
-        let txt_mod = self.txt_mod.forward(&act)?;
-        let img_mod = split(&img_mod, 2, 1)?; // [mod1, mod2], each [B, 3*dim]
+        let txt_act = match modulate_index {
+            Some(_) => split(&act, 2, 0)?.swap_remove(0), // real-timestep half [B, dim]
+            None => act.clone(),
+        };
+        let txt_mod = self.txt_mod.forward(&txt_act)?;
+        let img_mod = split(&img_mod, 2, 1)?; // [mod1, mod2], each [2B or B, 3*dim]
         let txt_mod = split(&txt_mod, 2, 1)?;
 
-        let (img_modulated, img_gate1) =
-            modulate(&layer_norm(hidden_states, None, None, LN_EPS)?, &img_mod[0])?;
+        let (img_modulated, img_gate1) = modulate_maybe_indexed(
+            &layer_norm(hidden_states, None, None, LN_EPS)?,
+            &img_mod[0],
+            modulate_index,
+        )?;
         let (txt_modulated, txt_gate1) = modulate(
             &layer_norm(encoder_hidden_states, None, None, LN_EPS)?,
             &txt_mod[0],
@@ -105,9 +121,10 @@ impl QwenTransformerBlock {
         let hidden_states = gated(hidden_states, &img_gate1, &img_attn)?;
         let encoder_hidden_states = gated(encoder_hidden_states, &txt_gate1, &txt_attn)?;
 
-        let (img_mod2, img_gate2) = modulate(
+        let (img_mod2, img_gate2) = modulate_maybe_indexed(
             &layer_norm(&hidden_states, None, None, LN_EPS)?,
             &img_mod[1],
+            modulate_index,
         )?;
         let img_ff = self.img_ff.forward(&img_mod2)?;
         let hidden_states = gated(&hidden_states, &img_gate2, &img_ff)?;
@@ -144,6 +161,38 @@ fn modulate(x: &Array, mod_params: &Array) -> Result<(Array, Array)> {
     } else {
         f((x, &scale, &shift))?
     };
+    Ok((out, gate))
+}
+
+/// `modulate` with optional per-token timestep selection (`zero_cond_t`, Qwen-Image-Edit-2511).
+/// With `index = None` this is exactly [`modulate`] (T2I / 2509, the compiled fast path). With
+/// `index = Some` the `mod_params` carry a doubled batch `[real_t ; zero_t]`; each image token picks
+/// the real-`t` half where `index == 0` (noise) and the `t 0` half where `index == 1` (conditioning
+/// image) — mirroring the fork's `_modulate(index)` / diffusers `_modulate`.
+fn modulate_maybe_indexed(
+    x: &Array,
+    mod_params: &Array,
+    index: Option<&Array>,
+) -> Result<(Array, Array)> {
+    let Some(index) = index else {
+        return modulate(x, mod_params);
+    };
+    let p = split(mod_params, 3, 1)?; // shift, scale, gate — each [2B, dim]
+    let one = Array::from_slice(&[1.0f32], &[1]);
+    let index_expanded = index.expand_dims(2)?; // [B, seq, 1]
+                                                // `which(cond, a, b)` selects `a` where cond is non-zero, `b` where zero — so with the 0/1 index
+                                                // as cond, the `t 0` (cond) half goes to `a` and the real-`t` (noise) half to `b`. Equivalent to
+                                                // the fork's `where(index == 0, real, zero)`; the selected values are identical (no arithmetic).
+    let pick = |arr: &Array| -> Result<Array> {
+        let halves = split(arr, 2, 0)?; // [real_t (B, dim), zero_t (B, dim)]
+        let real_t = halves[0].expand_dims(1)?; // [B, 1, dim]
+        let zero_t = halves[1].expand_dims(1)?;
+        Ok(which(&index_expanded, &zero_t, &real_t)?)
+    };
+    let shift = pick(&p[0])?;
+    let scale = pick(&p[1])?;
+    let gate = pick(&p[2])?;
+    let out = add(&multiply(x, &add(&scale, &one)?)?, &shift)?;
     Ok((out, gate))
 }
 
@@ -192,5 +241,97 @@ mod sc2963 {
         let c = gated(&x, &gate, &y).unwrap();
         set_compile_glue(false);
         assert_eq!(max_abs(&c, &e), 0.0, "gated");
+    }
+}
+
+// sc-2997: the Qwen-Image-Edit-2511 `zero_cond_t` per-token timestep selection. Weight-free, fast,
+// deterministic — proves the core `modulate_maybe_indexed` logic without the 40 GB edit e2e.
+#[cfg(test)]
+mod zero_cond_t {
+    use super::*;
+    use crate::transformer::compile_test_util::{max_abs, rnd};
+    use mlx_rs::ops::concatenate_axis;
+    use mlx_rs::Dtype::Float32;
+
+    // `modulate_maybe_indexed` selects, per token, from a doubled `[real_t ; zero_t]` mod_params:
+    // index 0 → the real-timestep half (== plain `modulate` on that half), index 1 → the zero-t half.
+    #[test]
+    fn all_zero_or_all_one_index_matches_plain_modulate() {
+        let (b, seq, dim) = (1i32, 6i32, 16i32);
+        let x = rnd(&[b, seq, dim], Float32);
+        let real = rnd(&[b, 3 * dim], Float32); // real-timestep modulation params
+        let zero = rnd(&[b, 3 * dim], Float32); // zero-timestep modulation params
+        let doubled = concatenate_axis(&[&real, &zero], 0).unwrap(); // [2B, 3·dim]
+
+        let idx0 = Array::from_slice(&vec![0i32; (b * seq) as usize], &[b, seq]);
+        let (out0, gate0) = modulate_maybe_indexed(&x, &doubled, Some(&idx0)).unwrap();
+        let (er, eg) = modulate(&x, &real).unwrap();
+        assert_eq!(
+            max_abs(&out0, &er),
+            0.0,
+            "all-zero index out == real-half modulate"
+        );
+        assert_eq!(
+            max_abs(&gate0, &eg),
+            0.0,
+            "all-zero index gate == real-half gate"
+        );
+
+        let idx1 = Array::from_slice(&vec![1i32; (b * seq) as usize], &[b, seq]);
+        let (out1, gate1) = modulate_maybe_indexed(&x, &doubled, Some(&idx1)).unwrap();
+        let (ez, egz) = modulate(&x, &zero).unwrap();
+        assert_eq!(
+            max_abs(&out1, &ez),
+            0.0,
+            "all-one index out == zero-half modulate"
+        );
+        assert_eq!(
+            max_abs(&gate1, &egz),
+            0.0,
+            "all-one index gate == zero-half gate"
+        );
+    }
+
+    // A mixed index composes per token: noise rows (0) use the real half, conditioning rows (1) use
+    // the zero half — exactly the Edit-2511 layout `[0]*noise_len + [1]*cond_len`.
+    #[test]
+    fn mixed_index_composes_per_token() {
+        let (b, dim) = (1i32, 16i32);
+        let x = rnd(&[b, 4, dim], Float32);
+        let real = rnd(&[b, 3 * dim], Float32);
+        let zero = rnd(&[b, 3 * dim], Float32);
+        let doubled = concatenate_axis(&[&real, &zero], 0).unwrap();
+        // [noise, noise, cond, cond]
+        let idx = Array::from_slice(&[0i32, 0, 1, 1], &[b, 4]);
+        let (out, gate) = modulate_maybe_indexed(&x, &doubled, Some(&idx)).unwrap();
+
+        // `er`/`ez` are the modulated activations over the full seq (splittable); the plain gates
+        // `egate`/`ezgate` are `[B, 1, dim]` (broadcast over seq) — compared via `max_abs`'s broadcast.
+        let (er, egate) = modulate(&x, &real).unwrap(); // all-real over the seq
+        let (ez, ezgate) = modulate(&x, &zero).unwrap(); // all-zero over the seq
+        let out_parts = split(&out, 2, 1).unwrap(); // [rows 0..2, rows 2..4]
+        let gate_parts = split(&gate, 2, 1).unwrap();
+        let er_noise = split(&er, 2, 1).unwrap().swap_remove(0); // real, rows 0..2
+        let ez_cond = split(&ez, 2, 1).unwrap().swap_remove(1); // zero, rows 2..4
+        assert_eq!(
+            max_abs(&out_parts[0], &er_noise),
+            0.0,
+            "noise rows use real half"
+        );
+        assert_eq!(
+            max_abs(&out_parts[1], &ez_cond),
+            0.0,
+            "cond rows use zero half"
+        );
+        assert_eq!(
+            max_abs(&gate_parts[0], &egate),
+            0.0,
+            "noise gate uses real half"
+        );
+        assert_eq!(
+            max_abs(&gate_parts[1], &ezgate),
+            0.0,
+            "cond gate uses zero half"
+        );
     }
 }

@@ -55,8 +55,9 @@ MULTI = bool(os.environ.get("MULTI"))
 image_paths = [ref_path, ref_path2] if MULTI else [ref_path]
 
 QUANTIZE = int(os.environ["QUANTIZE"]) if os.environ.get("QUANTIZE") else None
-# sc-2782: 2509 is superseded by 2511 (same architecture). The fork's model_config still names 2509,
-# so override the weights/tokenizer source via model_path; Q8 quantizes the transformer.
+# sc-2782/sc-2997: 2509 is superseded by 2511 (same architecture) and gone from the HF cache. The
+# fork's model_config still names 2509, so override the weights/tokenizer source via model_path; Q8
+# quantizes the transformer.
 EDIT_REPO = os.environ.get("QWEN_EDIT_REPO", "Qwen/Qwen-Image-Edit-2511")
 model = QwenImageEdit(quantize=QUANTIZE, model_path=EDIT_REPO)
 

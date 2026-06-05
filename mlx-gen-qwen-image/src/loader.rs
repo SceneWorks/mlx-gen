@@ -110,6 +110,14 @@ pub fn load_transformer(root: &Path) -> Result<QwenTransformer> {
     QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image())
 }
 
+/// Load the transformer for Qwen-Image-**Edit-2511** — identical to [`load_transformer`] but with
+/// `zero_cond_t` on (the conditioning-image latent tokens are modulated as clean / timestep 0).
+pub fn load_transformer_edit(root: &Path) -> Result<QwenTransformer> {
+    let mut w = Weights::from_dir(root.join("transformer"))?;
+    remap_transformer_keys(&mut w);
+    QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image_edit())
+}
+
 /// Load the causal-Conv3d VAE, applying the diffusers→internal key remap (structural renames +
 /// conv-weight transposes + RMSNorm `gamma`→1-D).
 pub fn load_vae(root: &Path) -> Result<QwenVae> {

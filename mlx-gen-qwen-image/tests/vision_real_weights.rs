@@ -151,14 +151,14 @@ fn small_vision_transformer_matches_fork() {
     assert!(peak < 1e-2, "vt peak-rel {peak:.3e}");
 }
 
-/// Locate the Qwen-Image-Edit-2509 snapshot dir (env override, else the HF cache).
+/// Locate the Qwen-Image-Edit-2511 snapshot dir (env override, else the HF cache).
 fn edit_snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("QWEN_IMAGE_EDIT_SNAPSHOT") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap();
     let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2509/snapshots");
+        .join(".cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots");
     std::fs::read_dir(&snaps)
         .expect("HF cache snapshots dir")
         .filter_map(|e| e.ok())
@@ -167,11 +167,11 @@ fn edit_snapshot() -> PathBuf {
         .expect("a snapshot dir")
 }
 
-/// Gate B: the **real** depth-32 vision transformer loaded from the Edit-2509 snapshot (bf16 weights,
+/// Gate B: the **real** depth-32 vision transformer loaded from the Edit-2511 snapshot (bf16 weights,
 /// f32 activations) vs the fork's f32 output. Validates `load_vision_encoder` (the `visual.*` remap +
 /// patch-embed transpose + merger rename) and the full-scale forward.
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2509 vision weights + local golden"]
+#[ignore = "needs real Qwen-Image-Edit-2511 vision weights + local golden"]
 fn vision_transformer_real_weights_matches_fork() {
     let g = Weights::from_file(GOLDEN).unwrap();
     let vt = load_vision_encoder(&edit_snapshot()).unwrap();
@@ -190,10 +190,10 @@ fn vision_transformer_real_weights_matches_fork() {
 }
 
 /// Gate C (slice 6b-3): the full **VL conditioning encoder** — vision embeds spliced into the text
-/// stream, 28 LM layers, drop-64 — loaded from the Edit-2509 snapshot, vs the fork's f32
+/// stream, 28 LM layers, drop-64 — loaded from the Edit-2511 snapshot, vs the fork's f32
 /// `prompt_embeds`. Validates `load_vision_language_encoder` + the splice + drop end-to-end.
 #[test]
-#[ignore = "needs real Qwen-Image-Edit-2509 weights + local VL golden"]
+#[ignore = "needs real Qwen-Image-Edit-2511 weights + local VL golden"]
 fn vl_encoder_real_weights_matches_fork() {
     let g = Weights::from_file(VL_GOLDEN).unwrap();
     let enc = load_vision_language_encoder(&edit_snapshot()).unwrap();

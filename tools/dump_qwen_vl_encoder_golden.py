@@ -1,6 +1,6 @@
 """Dump a Qwen-Image-Edit VL-encoder parity golden for the Rust port (sc-2465, slice 6b-3).
 
-Loads the real Edit-2509 weights (LM `model.*` + vision `visual.*`) into the fork's
+Loads the real Edit-2511 weights (LM `model.*` + vision `visual.*`) into the fork's
 `QwenVisionLanguageEncoder` via the same `WeightLoader`/`WeightApplier` path as `init_edit`, then runs
 it on a fixed constructed input (a 64-token template prefix + a `<|image_pad|>` run sized to the grid
 + a short prompt). Dumps only the inputs + the fork's f32 `prompt_embeds`; the Rust test loads the
@@ -20,7 +20,6 @@ import os
 import mlx.core as mx
 from mlx.utils import tree_map
 
-from mflux.models.common.config import ModelConfig
 from mflux.models.common.weights.loading.weight_applier import WeightApplier
 from mflux.models.common.weights.loading.weight_loader import WeightLoader
 from mflux.models.qwen.model.qwen_text_encoder.qwen_text_encoder import QwenTextEncoder
@@ -28,8 +27,11 @@ from mflux.models.qwen.model.qwen_text_encoder.qwen_vision_language_encoder impo
 from mflux.models.qwen.model.qwen_text_encoder.qwen_vision_transformer import VisionTransformer
 from mflux.models.qwen.weights.qwen_weight_definition import QwenWeightDefinition
 
-cfg = ModelConfig.qwen_image_edit()
-weights = WeightLoader.load(weight_definition=QwenWeightDefinition, model_path=cfg.model_name)
+# The frozen fork's model_config still pins 2509 (`ModelConfig.qwen_image_edit().model_name`), but
+# 2509 is superseded and gone from the HF cache (sc-2997). 2511 has the same VL/vision arch, so load
+# it directly here without touching the frozen fork; override with QWEN_EDIT_REPO if needed.
+model_path = os.environ.get("QWEN_EDIT_REPO") or "Qwen/Qwen-Image-Edit-2511"
+weights = WeightLoader.load(weight_definition=QwenWeightDefinition, model_path=model_path)
 
 te = QwenTextEncoder()
 te.encoder.visual = VisionTransformer()  # init_edit does this before applying weights

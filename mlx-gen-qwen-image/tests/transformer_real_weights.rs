@@ -73,6 +73,7 @@ fn dual_stream_block_matches_fork() {
             g.require("io_txt_cos").unwrap(),
             g.require("io_txt_sin").unwrap(),
             None,
+            None,
         )
         .unwrap();
     for (name, got, key) in [

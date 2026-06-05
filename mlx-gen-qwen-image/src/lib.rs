@@ -31,8 +31,8 @@ pub mod vl_tokenizer;
 pub use adapters::apply_qwen_adapters;
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
-    load_text_encoder, load_tokenizer, load_transformer, load_vae, load_vision_encoder,
-    load_vision_language_encoder,
+    load_text_encoder, load_tokenizer, load_transformer, load_transformer_edit, load_vae,
+    load_vision_encoder, load_vision_language_encoder,
 };
 pub use model::{descriptor, load, QwenImage, MODEL_ID};
 pub use model_edit::QwenImageEdit;

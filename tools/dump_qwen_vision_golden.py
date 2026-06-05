@@ -93,7 +93,7 @@ for k, v in tree_flatten(svt.parameters()):
     out[f"vt.{k}"] = v.astype(mx.float32)
 print(f"vt(small): pixel={io_pixel.shape} grid={io_grid.tolist()} -> out={io_out.shape}")
 
-# --- Gate B: the REAL depth-32 vision transformer (loads Qwen-Image-Edit-2509 `visual.*` weights). ---
+# --- Gate B: the REAL depth-32 vision transformer (loads Qwen-Image-Edit-2511 `visual.*` weights). ---
 # Confirms the actual checkpoint config + the HF->internal weight map (patch-embed transpose, merger
 # mlp.0/2 -> mlp_0/mlp_1) at full scale. The golden holds only inputs + the fork's f32 output; the
 # Rust test loads the real weights from the snapshot itself (like text_encoder_real_weights.rs).
@@ -102,7 +102,7 @@ import glob
 from mlx.utils import tree_unflatten
 
 EDIT_SNAP_GLOB = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2509/snapshots/*"
+    "~/.cache/huggingface/hub/models--Qwen--Qwen-Image-Edit-2511/snapshots/*"
 )
 snap = sorted(p for p in glob.glob(EDIT_SNAP_GLOB) if os.path.isdir(p))[0]
 shards = sorted(glob.glob(os.path.join(snap, "text_encoder", "*.safetensors")))
@@ -118,7 +118,7 @@ for shard in shards:
         leaf = leaf.replace("merger.mlp.0.", "merger.mlp_0.").replace("merger.mlp.2.", "merger.mlp_1.")
         vision_params[leaf] = v.astype(mx.float32)
 
-rvt = VisionTransformer()  # defaults == the 2509 vision_config
+rvt = VisionTransformer()  # defaults == the 2511 vision_config
 rvt.update(tree_unflatten(list(vision_params.items())))
 
 real_grid = mx.array([[1, 28, 28]], dtype=mx.int32)  # llm 14x14 — exercises larger windowing

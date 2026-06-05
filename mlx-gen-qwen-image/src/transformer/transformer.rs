@@ -8,6 +8,7 @@
 //! block parity test; the full 60-layer forward is validated end-to-end against the image golden.
 
 use mlx_rs::fast::rms_norm;
+use mlx_rs::ops::{concatenate_axis, split};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
@@ -27,6 +28,10 @@ pub struct QwenTransformerConfig {
     pub joint_attention_dim: i32,
     pub patch_size: i32,
     pub txt_norm_eps: f32,
+    /// Qwen-Image-Edit-2511 `transformer/config.json` sets `zero_cond_t: true` — the conditioning
+    /// image latent tokens are modulated as clean (timestep 0) in every block. `false` for T2I /
+    /// the superseded 2509 edit weights (then a no-op).
+    pub zero_cond_t: bool,
 }
 
 impl QwenTransformerConfig {
@@ -40,6 +45,15 @@ impl QwenTransformerConfig {
             joint_attention_dim: 3584,
             patch_size: 2,
             txt_norm_eps: 1e-6,
+            zero_cond_t: false,
+        }
+    }
+
+    /// The Qwen-Image-Edit-2511 transformer — identical to T2I but with `zero_cond_t` on.
+    pub fn qwen_image_edit() -> Self {
+        Self {
+            zero_cond_t: true,
+            ..Self::qwen_image()
         }
     }
 
@@ -58,6 +72,7 @@ pub struct QwenTransformer {
     proj_out: AdaptableLinear,
     rope: QwenRope3d,
     eps: f32,
+    zero_cond_t: bool,
 }
 
 /// The Qwen adapter key→module map — the Rust analog of the fork's `QwenLoRAMapping`. Every fork
@@ -115,6 +130,7 @@ impl QwenTransformer {
             proj_out: linear_from(w, &p("proj_out"), true)?,
             rope: QwenRope3d::qwen_image(),
             eps: cfg.txt_norm_eps,
+            zero_cond_t: cfg.zero_cond_t,
         })
     }
 
@@ -160,7 +176,21 @@ impl QwenTransformer {
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let ts = Array::from_slice(&vec![timestep; b as usize], &[b]);
-        let text_emb = self.time_text_embed.forward(&ts)?;
+
+        // zero_cond_t (Qwen-Image-Edit-2511): double the timestep -> [t, 0] so the conditioning
+        // image tokens can be modulated as clean (t 0) in every block, while the noise tokens + text
+        // stream keep the real timestep. `modulate_index` (0 = noise, 1 = cond) drives the per-token
+        // select inside each block; with no reference (T2I) the flag is a no-op.
+        let zero_cond = self.zero_cond_t && !cond_grids.is_empty();
+        let (text_emb, modulate_index) = if zero_cond {
+            let zeros = Array::from_slice(&vec![0f32; b as usize], &[b]);
+            let ts2 = concatenate_axis(&[&ts, &zeros], 0)?;
+            let emb = self.time_text_embed.forward(&ts2)?;
+            let idx = build_modulate_index(b, latent_h, latent_w, cond_grids);
+            (emb, Some(idx))
+        } else {
+            (self.time_text_embed.forward(&ts)?, None)
+        };
 
         // RoPE over the noise grid followed by each reference grid (empty for T2I).
         let mut shapes = Vec::with_capacity(1 + cond_grids.len());
@@ -180,14 +210,41 @@ impl QwenTransformer {
                 &txt_cos,
                 &txt_sin,
                 mask.as_ref(),
+                modulate_index.as_ref(),
             )?;
             encoder = e;
             hidden = h;
         }
 
-        let hidden = self.norm_out.forward(&hidden, &text_emb)?;
+        // norm_out uses only the real-timestep half of the (doubled) temb (the fork's `temb[:B]`).
+        let norm_emb = match &modulate_index {
+            Some(_) => split(&text_emb, 2, 0)?.swap_remove(0),
+            None => text_emb.clone(),
+        };
+        let hidden = self.norm_out.forward(&hidden, &norm_emb)?;
         self.proj_out.forward(&hidden)
     }
+}
+
+/// The per-token timestep selector for `zero_cond_t` (Qwen-Image-Edit-2511): `0` for the noise
+/// latent tokens (`latent_h·latent_w`), `1` for every conditioning-image token (`Σ h·w` over the
+/// reference grids). Shape `[B, img_seq]`. Matches the fork's `_build_modulate_index` /
+/// diffusers `[[0]*prod(img_shapes[0]) + [1]*Σ prod(img_shapes[1:])]`.
+fn build_modulate_index(
+    b: i32,
+    latent_h: usize,
+    latent_w: usize,
+    cond_grids: &[(usize, usize)],
+) -> Array {
+    let noise_len = latent_h * latent_w;
+    let cond_len: usize = cond_grids.iter().map(|(h, w)| h * w).sum();
+    let mut row = vec![0i32; noise_len];
+    row.extend(std::iter::repeat_n(1i32, cond_len));
+    let mut data = Vec::with_capacity(b as usize * row.len());
+    for _ in 0..b {
+        data.extend_from_slice(&row);
+    }
+    Array::from_slice(&data, &[b, (noise_len + cond_len) as i32])
 }
 
 /// Additive fill for masked-out attention keys — the fork's large-negative joint-mask value

@@ -125,7 +125,7 @@ fn edit_rope_multi_image_matches_fork() {
 fn edit_pipeline_matches_fork() {
     let g = Weights::from_file(EDIT_GOLDEN).unwrap();
     let root = edit_snapshot();
-    let transformer = loader::load_transformer(&root).unwrap();
+    let transformer = loader::load_transformer_edit(&root).unwrap();
     let vae = loader::load_vae(&root).unwrap();
 
     let dims = g.require("out_dims").unwrap();
@@ -456,7 +456,7 @@ fn edit_generate_matches_fork() {
 fn edit_pipeline_q8_matches_fork() {
     let g = Weights::from_file(EDIT_Q8_GOLDEN).unwrap();
     let root = edit_snapshot();
-    let mut transformer = loader::load_transformer(&root).unwrap();
+    let mut transformer = loader::load_transformer_edit(&root).unwrap();
     transformer.quantize(8).unwrap();
     let vae = loader::load_vae(&root).unwrap();
 
