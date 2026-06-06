@@ -1,0 +1,20 @@
+mlx-gen
+Copyright 2026 Michael Trefry and the mlx-gen contributors
+
+This product is licensed under the Apache License, Version 2.0. A copy of the
+license is provided in the LICENSE file.
+
+mlx-gen is an independent, from-scratch Rust reimplementation of on-device MLX
+inference for generative image and video models. It does not include source
+code copied from the projects listed below, but gratefully acknowledges them as
+the architectural lineage, references, and parity baselines it was developed
+against:
+
+  * Apple MLX               https://github.com/ml-explore/mlx           (MIT)
+  * mlx-rs                  https://crates.io/crates/mlx-rs             (Apache-2.0 OR MIT)
+  * mflux (Filip Strand)    https://github.com/filipstrand/mflux        (MIT)
+  * Apple mlx-examples      https://github.com/ml-explore/mlx-examples  (MIT)
+  * Hugging Face Diffusers  https://github.com/huggingface/diffusers    (Apache-2.0)
+
+Model weights are not distributed with mlx-gen and remain subject to the
+licenses of their respective providers.
