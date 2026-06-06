@@ -25,6 +25,7 @@ pub mod sampler;
 pub mod scheduler;
 pub mod tiling;
 pub mod tokenizer;
+pub mod train;
 pub mod transform;
 pub mod weights;
 
@@ -35,6 +36,7 @@ pub use generator::{
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{load, load_transform, ModelRegistration, TransformRegistration};
+pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
     WeightsSource,
@@ -44,6 +46,10 @@ pub use sampler::{
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};
+pub use train::{
+    LrSchedule, NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingItem,
+    TrainingOutput, TrainingProgress, TrainingRequest,
+};
 pub use transform::{
     TargetSize, Transform, TransformCapabilities, TransformDescriptor, TransformRequest,
 };

@@ -257,6 +257,16 @@ impl AdaptableLinear {
         self.adapters.push(adapter);
     }
 
+    /// Replace the entire adapter stack. The forward-time counterpart to [`push`](Self::push) used
+    /// by **training** (sc-3042/3039): each optimizer step produces new trainable LoRA factor arrays,
+    /// so the trainer re-injects a single fresh `Adapter::Lora` per target every step rather than
+    /// accumulating residuals. Setting the SAME `(transpose, alpha/rank fold, scale)` an inference
+    /// reload applies (`adapters::loader::install_lora_groups`) makes the trained adapter round-trip
+    /// bit-for-bit. An empty `Vec` clears the stack (back to the bare frozen base).
+    pub fn set_adapters(&mut self, adapters: Vec<Adapter>) {
+        self.adapters = adapters;
+    }
+
     pub fn adapters(&self) -> &[Adapter] {
         &self.adapters
     }

@@ -14,7 +14,6 @@ mlx-gen = { path = ".." }
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
 # Link-time self-registration into mlx-gen's model registry.
 inventory = "0.3"
-
-[dev-dependencies]
-# Save the end-to-end E2E render as a PNG for visual inspection (ignored real-weights test only).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Decode training-dataset images (LoRA training, sc-3044). PNG + JPEG cover the SceneWorks dataset
+# formats; the trainer center-crops + hands the Image to the VAE preprocess.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

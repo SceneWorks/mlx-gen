@@ -28,6 +28,7 @@ pub mod pipeline;
 pub mod rope_embedder;
 pub mod text_encoder;
 pub mod timestep_embedder;
+pub mod training;
 pub mod transformer;
 pub mod transformer_block;
 pub mod vae;
@@ -53,6 +54,7 @@ pub use pipeline::{
 };
 pub use rope_embedder::RopeEmbedder;
 pub use timestep_embedder::TimestepEmbedder;
+pub use training::{attention_targets, LoraTarget, ZImageLoraTrainer, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 

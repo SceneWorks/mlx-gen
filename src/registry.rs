@@ -8,6 +8,7 @@
 
 use crate::generator::{Generator, ModelDescriptor};
 use crate::runtime::LoadSpec;
+use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
 use crate::{Error, Result};
 
@@ -28,6 +29,15 @@ pub struct TransformRegistration {
 
 inventory::collect!(TransformRegistration);
 
+/// A trainer provider's registration (parallel to [`ModelRegistration`]) — `descriptor` for
+/// introspection, `load` to construct the trainer with its (frozen) base model from a [`LoadSpec`].
+pub struct TrainerRegistration {
+    pub descriptor: fn() -> TrainerDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn Trainer>>,
+}
+
+inventory::collect!(TrainerRegistration);
+
 /// All registered generators (one per linked provider crate).
 pub fn generators() -> impl Iterator<Item = &'static ModelRegistration> {
     inventory::iter::<ModelRegistration>.into_iter()
@@ -36,6 +46,11 @@ pub fn generators() -> impl Iterator<Item = &'static ModelRegistration> {
 /// All registered transforms.
 pub fn transforms() -> impl Iterator<Item = &'static TransformRegistration> {
     inventory::iter::<TransformRegistration>.into_iter()
+}
+
+/// All registered trainers (one per linked provider crate that supports training).
+pub fn trainers() -> impl Iterator<Item = &'static TrainerRegistration> {
+    inventory::iter::<TrainerRegistration>.into_iter()
 }
 
 /// Load a generator by model id (e.g. `"z_image_turbo"`).
@@ -51,6 +66,14 @@ pub fn load_transform(id: &str, spec: &LoadSpec) -> Result<Box<dyn Transform>> {
     let reg = transforms()
         .find(|r| (r.descriptor)().id == id)
         .ok_or_else(|| Error::Msg(format!("no transform registered for id '{id}'")))?;
+    (reg.load)(spec)
+}
+
+/// Load a trainer by model id (e.g. `"z_image_turbo"`) with its (frozen) base model.
+pub fn load_trainer(id: &str, spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    let reg = trainers()
+        .find(|r| (r.descriptor)().id == id)
+        .ok_or_else(|| Error::Msg(format!("no trainer registered for id '{id}'")))?;
     (reg.load)(spec)
 }
 
