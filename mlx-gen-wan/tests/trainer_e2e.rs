@@ -1,15 +1,16 @@
-//! sc-3046 e2e — the production `WanMoeTrainer` (the dual-expert A14B `Trainer` contract), driven
-//! through the core registry exactly as the SceneWorks worker will.
+//! Wan2.2 trainer e2e — the production `WanMoeTrainer` driven through the core registry exactly as
+//! the SceneWorks worker will, across all three Wan trainers:
+//!   * `wan2_2_t2v_14b` — dual-expert MoE (sc-3046).
+//!   * `wan2_2_i2v_14b` — dual-expert MoE, channel-concat in_dim 36 / zero-`y` pad (sc-3279).
+//!   * `wan2_2_ti2v_5b` — dense single-expert, z48 vae22 (sc-3279).
 //!
-//! `#[ignore]`d — needs a converted Wan2.2-A14B MoE snapshot (`$WAN_A14B_MODEL_DIR` or the
-//! `~/.cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16` cache: `low_noise_model` + `high_noise_model`
-//! + `t5_encoder` + `vae` + `tokenizer.json`). Run:
+//! `#[ignore]`d — each needs a converted bf16 snapshot (env-var override, else the SceneWorks /
+//! mlx-gen cache default). Run:
 //!   cargo test -p mlx-gen-wan --release --test trainer_e2e -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
-//! VAE/UMT5-encoded and cached (then the TE freed), the two experts train on their alternating
-//! noise bands, and TWO adapters (high_noise + low_noise) are written that reload through the REAL
-//! Wan inference merge (`merge_wan_adapters`) per expert.
+//! VAE/UMT5-encoded and cached (then the TE freed), the expert(s) train on their noise band(s), and
+//! the adapter(s) reload through the REAL Wan inference merge (`merge_wan_adapters`) per expert.
 
 use std::path::{Path, PathBuf};
 
@@ -20,12 +21,20 @@ use mlx_gen::{
 };
 use mlx_gen_wan::merge_wan_adapters;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("WAN_A14B_MODEL_DIR") {
+/// Resolve a snapshot dir from `$env_var`, else fall back to `default` under `$HOME`.
+fn snapshot(env_var: &str, default: &str) -> PathBuf {
+    if let Ok(p) = std::env::var(env_var) {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME").unwrap();
-    PathBuf::from(home).join(".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16")
+    PathBuf::from(std::env::var("HOME").unwrap()).join(default)
+}
+
+/// One trained expert's reload spec: its file suffix, the base weight file it merges into, and the
+/// MoE tag (`None` for the dense single-file adapter).
+struct ExpertFile {
+    suffix: &'static str,
+    weights_file: &'static str,
+    expert: Option<MoeExpert>,
 }
 
 /// Two solid-colour swatch PNGs + captions in `dir`.
@@ -48,18 +57,29 @@ fn make_dataset(dir: &Path) -> Vec<TrainingItem> {
     items
 }
 
-/// Merge a trained per-expert LoRA file into a fresh expert weight map, asserting it applies.
-fn assert_reloads(file: &Path, expert: MoeExpert, weights_file: &str, n_targets: usize) {
-    let mut w = Weights::from_file(snapshot().join(weights_file)).unwrap();
+/// Merge a trained adapter file into a fresh weight map, asserting every target applies. `expert ==
+/// None` is the dense single-file adapter (untagged; merges regardless of the expert arg).
+fn assert_reloads(
+    snapshot: &Path,
+    file: &Path,
+    expert: Option<MoeExpert>,
+    weights_file: &str,
+    n_targets: usize,
+) {
+    let mut w = Weights::from_file(snapshot.join(weights_file)).unwrap();
     let spec = AdapterSpec {
         path: file.to_path_buf(),
         scale: 1.0,
         kind: AdapterKind::Lora,
         pass_scales: None,
-        moe_expert: Some(expert),
+        moe_expert: expert,
     };
-    let report = merge_wan_adapters(&mut w, std::slice::from_ref(&spec), expert)
-        .expect("trained LoRA should merge through the inference path");
+    let report = merge_wan_adapters(
+        &mut w,
+        std::slice::from_ref(&spec),
+        expert.unwrap_or(MoeExpert::High),
+    )
+    .expect("trained LoRA should merge through the inference path");
     assert_eq!(
         report.applied, n_targets,
         "every trained {expert:?} target should merge"
@@ -71,26 +91,24 @@ fn assert_reloads(file: &Path, expert: MoeExpert, weights_file: &str, n_targets:
     );
 }
 
-#[test]
-#[ignore = "needs the converted Wan2.2-A14B MoE checkpoint"]
-fn wan_moe_trainer_trains_both_experts_and_reloads() {
-    let tmp = std::env::temp_dir().join("wan_moe_trainer_e2e");
+/// The shared lifecycle driver: load `model_id` from `snapshot`, train a tiny LoRA, assert the
+/// windowed loss falls, then reload each written adapter through `merge_wan_adapters`.
+fn run_trainer_e2e(model_id: &str, snapshot: PathBuf, experts: &[ExpertFile]) {
+    let tmp = std::env::temp_dir().join(format!("{model_id}_trainer_e2e"));
     let items = make_dataset(&tmp);
-    // Link the provider crate's `inventory::submit!` registration into this test binary.
-    assert_eq!(mlx_gen_wan::MODEL_ID_T2V_14B, "wan2_2_t2v_14b");
 
     let mut trainer = mlx_gen::load_trainer(
-        "wan2_2_t2v_14b",
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
+        model_id,
+        &LoadSpec::new(WeightsSource::Dir(snapshot.clone())),
     )
-    .expect("wan2_2_t2v_14b trainer should be registered");
+    .unwrap_or_else(|e| panic!("{model_id} trainer should load: {e}"));
 
     let config = TrainingConfig {
         rank: 8,
         alpha: 8.0,
         learning_rate: 1e-4,
-        steps: 24,       // 12 per expert (alternating)
-        resolution: 256, // bucketed to 256 -> 16x16 latent
+        steps: 24,       // dual: 12/expert (alternating); dense: 24 on the single expert
+        resolution: 256, // bucketed to 256
         save_every: 0,
         seed: 7,
         network_type: NetworkType::Lora,
@@ -120,14 +138,13 @@ fn wan_moe_trainer_trains_both_experts_and_reloads() {
     assert_eq!(losses.len(), 24);
     assert!(
         losses.iter().all(|l| l.is_finite()),
-        "no NaN/Inf losses (per-expert functional autograd is sane)"
+        "no NaN/Inf losses (functional autograd is sane)"
     );
-    // Per-step loss mixes the two experts + σ variance; compare the first vs last quarter mean.
     let q = losses.len() / 4;
     let mean = |s: &[f32]| s.iter().sum::<f32>() / s.len() as f32;
     let (first_q, last_q) = (mean(&losses[..q]), mean(&losses[losses.len() - q..]));
     println!(
-        "[wan-moe] cached {cached}; steps {}; loss-mean first-quarter {first_q:.5} -> last-quarter {last_q:.5}",
+        "[{model_id}] cached {cached}; steps {}; loss-mean first-quarter {first_q:.5} -> last-quarter {last_q:.5}",
         out.steps
     );
     assert!(
@@ -135,43 +152,104 @@ fn wan_moe_trainer_trains_both_experts_and_reloads() {
         "windowed loss-mean should fall on real data: {first_q:.5} -> {last_q:.5}"
     );
 
-    // Two adapter files written: the high_noise (returned) + low_noise pair.
-    let high = out.adapter_path.clone();
-    let low = tmp.join("out").join("swatch.low_noise.safetensors");
-    assert!(
-        high.file_name()
-            .unwrap()
-            .to_string_lossy()
-            .contains("high_noise"),
-        "primary adapter should be the high_noise file: {}",
-        high.display()
-    );
-    assert!(
-        high.exists() && low.exists(),
-        "both expert adapters should be written"
-    );
-
-    let wh = Weights::from_file(&high).unwrap();
-    assert_eq!(wh.metadata("networkType"), Some("lora"));
-    let n_targets = wh.keys().filter(|k| k.ends_with(".lora_A.weight")).count();
+    // Locate each written adapter (dense: `swatch.safetensors`; dual: `swatch.{high,low}_noise...`).
+    let out_dir = tmp.join("out");
+    let primary = out.adapter_path.clone();
+    let wp = Weights::from_file(&primary).unwrap();
+    assert_eq!(wp.metadata("networkType"), Some("lora"));
+    let n_targets = wp.keys().filter(|k| k.ends_with(".lora_A.weight")).count();
     assert!(n_targets > 0, "adapter should contain LoRA factors");
     assert!(
-        wh.keys().any(|k| k.ends_with(".self_attn.q.lora_A.weight")),
+        wp.keys().any(|k| k.ends_with(".self_attn.q.lora_A.weight")),
         "adapter should carry native Wan attention keys"
     );
 
-    // Round-trip: each expert's file merges into its own fresh weight map via the inference path.
-    assert_reloads(
-        &high,
-        MoeExpert::High,
-        "high_noise_model.safetensors",
-        n_targets,
+    for ef in experts {
+        let file = if ef.suffix.is_empty() {
+            out_dir.join("swatch.safetensors")
+        } else {
+            out_dir.join(format!("swatch.{}.safetensors", ef.suffix))
+        };
+        assert!(
+            file.exists(),
+            "expert adapter should be written: {}",
+            file.display()
+        );
+        assert_reloads(&snapshot, &file, ef.expert, ef.weights_file, n_targets);
+    }
+    println!(
+        "[{model_id}] e2e OK — {} adapter(s), {n_targets} targets/expert reload through merge_wan_adapters",
+        experts.len()
     );
-    assert_reloads(
-        &low,
-        MoeExpert::Low,
-        "low_noise_model.safetensors",
-        n_targets,
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-T2V-A14B MoE bf16 checkpoint"]
+fn wan_t2v_a14b_trainer_trains_both_experts_and_reloads() {
+    assert_eq!(mlx_gen_wan::MODEL_ID_T2V_14B, "wan2_2_t2v_14b");
+    let snap = snapshot(
+        "WAN_A14B_MODEL_DIR",
+        ".cache/mlx-gen-models/wan2_2_t2v_a14b_mlx_bf16",
     );
-    println!("[wan-moe] e2e OK — {n_targets} targets/expert reload through merge_wan_adapters");
+    run_trainer_e2e(
+        "wan2_2_t2v_14b",
+        snap,
+        &[
+            ExpertFile {
+                suffix: "high_noise",
+                weights_file: "high_noise_model.safetensors",
+                expert: Some(MoeExpert::High),
+            },
+            ExpertFile {
+                suffix: "low_noise",
+                weights_file: "low_noise_model.safetensors",
+                expert: Some(MoeExpert::Low),
+            },
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-I2V-A14B MoE bf16 checkpoint"]
+fn wan_i2v_a14b_trainer_trains_both_experts_and_reloads() {
+    assert_eq!(mlx_gen_wan::MODEL_ID_I2V_14B, "wan2_2_i2v_14b");
+    let snap = snapshot(
+        "WAN_I2V_A14B_MODEL_DIR",
+        ".cache/mlx-gen-models/wan2_2_i2v_a14b_mlx_bf16",
+    );
+    run_trainer_e2e(
+        "wan2_2_i2v_14b",
+        snap,
+        &[
+            ExpertFile {
+                suffix: "high_noise",
+                weights_file: "high_noise_model.safetensors",
+                expert: Some(MoeExpert::High),
+            },
+            ExpertFile {
+                suffix: "low_noise",
+                weights_file: "low_noise_model.safetensors",
+                expert: Some(MoeExpert::Low),
+            },
+        ],
+    );
+}
+
+#[test]
+#[ignore = "needs the converted Wan2.2-TI2V-5B dense bf16 checkpoint (with z48 vae)"]
+fn wan_ti2v_5b_trainer_trains_dense_and_reloads() {
+    assert_eq!(mlx_gen_wan::MODEL_ID, "wan2_2_ti2v_5b");
+    let snap = snapshot(
+        "WAN_TI2V_5B_MODEL_DIR",
+        "Library/Application Support/SceneWorks/data/models/mlx/wan_2_2_ti2v_5b",
+    );
+    run_trainer_e2e(
+        "wan2_2_ti2v_5b",
+        snap,
+        &[ExpertFile {
+            suffix: "",
+            weights_file: "model.safetensors",
+            expert: None,
+        }],
+    );
 }
