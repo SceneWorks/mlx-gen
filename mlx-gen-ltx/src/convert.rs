@@ -1,13 +1,13 @@
 //! Native (Rust/MLX) LTX-2.3 **single-file → split MLX** weight converter (sc-3233 / sc-3224).
 //!
-//! Community / fine-tuned LTX-2.3 checkpoints such as `TenStrip/LTX2.3-10Eros`
-//! (`10Eros_v1_bf16.safetensors`) ship as a single flat `.safetensors` holding the whole stack —
-//! transformer (`model.diffusion_model.*`, including the two embeddings connectors), the video VAE
+//! LTX-2.3 checkpoints — the base `Lightricks/LTX-2.3` distilled/dev models and fine-tunes alike —
+//! ship as a single flat `.safetensors` holding the whole stack: transformer
+//! (`model.diffusion_model.*`, including the two embeddings connectors), the video VAE
 //! (`vae.{encoder,decoder}.*`), the audio VAE (`audio_vae.*`), the vocoder (`vocoder.*`), and the
 //! text-embedding projection (`text_embedding_projection.*`). The [`crate::model::load`] path,
 //! however, consumes a **split** MLX model dir (one `.safetensors` per component, a
-//! `split_model.json` manifest, `embedded_config.json`/`config.json`, and — for the shipped eros
-//! checkpoint — a **Q4-quantized** transformer).
+//! `split_model.json` manifest, `embedded_config.json`/`config.json`, and a selectively
+//! **Q4/Q8-quantized** transformer).
 //!
 //! [`convert_and_assemble`] reproduces, in Rust/MLX, the exact transforms the (slated-for-removal,
 //! sc-3242) Python `mlx_video.convert` applied:
@@ -23,22 +23,22 @@
 //!     Linear set the reference `_quantize_ltx_predicate` selects (`*.to_q/k/v/out`, `*.ff.proj_in/
 //!     out`, `*.audio_ff.proj_in/out`), emitting `.weight`(u32)/`.scales`/`.biases`;
 //!   * **cast every float tensor to bf16** (the reference `--dtype bfloat16` default) — load-bearing
-//!     for the base `Lightricks/LTX-2.3` distilled checkpoint, which ships some adaLN
-//!     `scale_shift_table` tensors in f32 (eros is uniformly bf16, so this is a no-op there);
-//!   * **merge the latent upsampler(s)** from the base `Lightricks/LTX-2.3` repo (the eros repo
-//!     ships none) as raw component copies;
+//!     for mixed-precision checkpoints (e.g. the base `Lightricks/LTX-2.3` distilled model ships some
+//!     adaLN `scale_shift_table` tensors in f32; a no-op for uniformly-bf16 checkpoints);
+//!   * **merge the latent upsampler(s)** from the base `Lightricks/LTX-2.3` repo (when the source
+//!     checkpoint ships none of its own) as raw component copies;
 //!   * **emit** `config.json`, `embedded_config.json`, `split_model.json`, `quantize_config.json`.
 //!
-//! Validated byte-for-byte against three goldens: `ltx_2_3_eros` (Q4) and the base `ltx_2_3_base_q4`
-//! / `ltx_2_3_base_q8` (the base distilled checkpoint at Q4 and Q8) — so the converter is generic
-//! over the LTX-2.3 family (base + eros) and both quantization bit-widths.
+//! Validated byte-for-byte against the base `ltx_2_3_base_q4` / `ltx_2_3_base_q8` goldens (the base
+//! distilled checkpoint at Q4 and Q8) and a fine-tuned checkpoint — generic over the LTX-2.3 family
+//! and both quantization bit-widths.
 //!
 //! ## The one load-bearing subtlety (validated by tensor count)
 //! The reference `sanitize_transformer_weights` sweeps in the connector keys too (they live under
 //! `model.diffusion_model.`), but the downstream `model.load_weights(strict=False)` +
 //! `tree_flatten(model.parameters())` silently **drops** them from the transformer component — which
 //! is why the golden transformer carries no connector keys. We reproduce that by excluding any key
-//! containing `embeddings_connector` from the transformer component. This is exact: the golden eros
+//! containing `embeddings_connector` from the transformer component. This is exact: the golden
 //! transformer is `4444 (model.diffusion_model.*) − 258 (embeddings_connector) = 4186` sanitized
 //! tensors, of which `1344` Linear weights quantize to `.weight`/`.scales`/`.biases` → `4186 + 2·1344
 //! = 6874` tensors, matching the golden byte-for-byte.
@@ -68,8 +68,8 @@ const QUANT_SUFFIXES: &[&str] = &[
 ];
 
 /// The LTX-2.3 latent-upsampler component specs (component prefix → source filename in the base
-/// `Lightricks/LTX-2.3` repo). Each is emitted only if the source file is present (the eros golden
-/// carries just `upsampler` + `spatial_upscaler_x2_v1_1`). Raw copies — no key/shape transform.
+/// `Lightricks/LTX-2.3` repo). Each is emitted only if its source file is present in `upscaler_dir`
+/// (a given checkpoint/install may carry only a subset). Raw copies — no key/shape transform.
 const UPSCALER_SPECS_23: &[(&str, &str)] = &[
     ("upsampler", "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"),
     (
@@ -86,7 +86,8 @@ const UPSCALER_SPECS_23: &[(&str, &str)] = &[
     ),
 ];
 
-/// Conversion knobs. Defaults mirror the shipped `ltx_2_3_eros` recipe (audio + Q4 group-64).
+/// Conversion knobs. Defaults: audio-inclusive, dense (no quantization); `bits`/`group_size` hold the
+/// reference Q4/64 geometry, applied only when `quantize` is set.
 #[derive(Clone, Copy, Debug)]
 pub struct LtxConvertOpts {
     /// Include the audio VAE + vocoder components (the AudioVideo path). `false` = video-only.
@@ -111,13 +112,13 @@ impl Default for LtxConvertOpts {
 }
 
 impl LtxConvertOpts {
-    /// The `ltx_2_3_eros` recipe: audio + Q4 (group 64) — `python -m mlx_video.convert --quantize
-    /// --q-bits 4`.
-    pub fn eros_q4() -> Self {
+    /// Audio-inclusive + selective transformer quantization at `bits` (group 64) — the reference
+    /// `python -m mlx_video.convert --quantize --q-bits <bits>` recipe (Q4 or Q8).
+    pub fn audio_quant(bits: i32) -> Self {
         LtxConvertOpts {
             include_audio: true,
             quantize: true,
-            bits: 4,
+            bits,
             group_size: 64,
         }
     }
@@ -325,8 +326,8 @@ fn quantize_transformer(
 /// Cast every float tensor (f32/f16/bf16) in `map` to bf16 in place, preserving non-float tensors
 /// (e.g. quantized u32 weights). Mirrors the reference's `--dtype bfloat16` (its production / CLI
 /// default): the base `Lightricks/LTX-2.3` distilled checkpoint ships some adaLN `scale_shift_table`
-/// tensors in f32, which the reference casts to bf16 alongside everything else. (Eros ships uniformly
-/// bf16, so this is a no-op there — which is why eros parity passed without it.)
+/// tensors in f32, which the reference casts to bf16 alongside everything else. Uniformly-bf16
+/// checkpoints make this a no-op.
 fn cast_floats_bf16(map: &mut HashMap<String, Array>) -> Result<()> {
     for v in map.values_mut() {
         if matches!(v.dtype(), Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16)

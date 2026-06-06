@@ -135,7 +135,7 @@ fn eros_q4_convert_matches_golden() {
         &source,
         None::<&std::path::Path>,
         &out,
-        &LtxConvertOpts::eros_q4(),
+        &LtxConvertOpts::audio_quant(4),
     )
     .unwrap();
 
@@ -242,13 +242,13 @@ fn run_base_parity(golden_id: &str, bits: i32) {
         out.display()
     );
 
-    let opts = LtxConvertOpts {
-        include_audio: true,
-        quantize: true,
-        bits,
-        group_size: 64,
-    };
-    convert_and_assemble(&source, None::<&std::path::Path>, &out, &opts).unwrap();
+    convert_and_assemble(
+        &source,
+        None::<&std::path::Path>,
+        &out,
+        &LtxConvertOpts::audio_quant(bits),
+    )
+    .unwrap();
 
     for name in [
         "transformer",
