@@ -356,6 +356,24 @@ impl Linear {
             .push(LtxAdapter::Lokr { delta, pass_scale });
     }
 
+    /// **Training seam** (sc-3047): replace the adapter stack with a single trainable LoRA residual.
+    /// `a`/`b` are the residual-form factors (`lora_A.t()` `[in,rank]` and the `alpha/rank`-scaled
+    /// `lora_B.t()` `[rank,out]`), with a single unit pass-scale, so the forward adds
+    /// `(x·a)·b` = `(x·Aᵀ·Bᵀ)·(alpha/rank)` — the same residual the reference `_MlxLoRALinear` applies.
+    /// The trainer re-injects the freshly-traced factors each optimizer step (functional autograd),
+    /// the LTX analog of the core `AdaptableLinear::set_adapters`. Unlike [`push_lora`](Self::push_lora)
+    /// this *replaces* the stack (one residual at a time), not append.
+    pub(crate) fn set_train_lora(&mut self, a: Array, b: Array) {
+        self.lora = Some(LoraStack {
+            adapters: vec![LtxAdapter::Lora {
+                a,
+                b,
+                pass_scale: vec![1.0],
+            }],
+            pass: Cell::new(0),
+        });
+    }
+
     /// The adapter stack, created empty (pass 0) on first install.
     fn lora_stack(&mut self) -> &mut LoraStack {
         self.lora.get_or_insert_with(|| LoraStack {

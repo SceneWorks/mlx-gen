@@ -16,3 +16,6 @@ mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/ml
 inventory = "0.3"
 # embedded_config.json / config.json / split_model.json reading (config-driven loader).
 serde_json = "1"
+# Decode training-dataset images (LoRA training, sc-3047). PNG + JPEG cover the SceneWorks dataset
+# formats; the trainer center-crops + hands the Image to the VAE preprocess.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

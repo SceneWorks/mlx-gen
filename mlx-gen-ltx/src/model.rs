@@ -141,8 +141,9 @@ pub struct Ltx {
 }
 
 /// Locate the Gemma-3-12B text-encoder snapshot. `$LTX_GEMMA_DIR` wins; otherwise the newest
-/// `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF cache.
-fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
+/// `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF cache. `pub(crate)` so the trainer
+/// (sc-3047) resolves the TE snapshot exactly as inference does.
+pub(crate) fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
     if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
         return Ok(d.into());
     }
@@ -166,7 +167,7 @@ fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
 /// trigger (`utils.apply_quantization`). `None` for the default `…-bf16` snapshot (no block). Only the
 /// `affine` mode is consumed (the one `quantized_matmul`/`dequantize` implement); a non-affine mode is
 /// a hard error rather than a silent mis-decode.
-fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<GemmaQuant>> {
+pub(crate) fn resolve_gemma_quant(gemma_dir: &std::path::Path) -> Result<Option<GemmaQuant>> {
     let path = gemma_dir.join("config.json");
     if !path.exists() {
         return Ok(None);

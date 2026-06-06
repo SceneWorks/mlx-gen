@@ -589,6 +589,7 @@ dependencies = [
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
+ "image",
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
