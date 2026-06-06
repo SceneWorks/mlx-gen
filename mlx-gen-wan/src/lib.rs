@@ -59,6 +59,7 @@ pub mod pth;
 pub mod rope;
 pub mod scheduler;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 pub mod vae22;
@@ -80,6 +81,7 @@ pub use scheduler::{
     WanScheduler,
 };
 pub use text_encoder::{clean_text, load_tokenizer, umt5_tokenizer_config, Umt5Encoder};
+pub use training::{load_trainer, WanMoeTrainer};
 pub use transformer::WanTransformer;
 pub use vae::WanVae;
 pub use vae22::Wan22Vae;

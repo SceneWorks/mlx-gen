@@ -621,6 +621,7 @@ dependencies = [
 name = "mlx-gen-wan"
 version = "0.0.0"
 dependencies = [
+ "image",
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",

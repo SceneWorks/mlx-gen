@@ -26,7 +26,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -194,6 +194,17 @@ impl SelfAttention {
         Ok(())
     }
 
+    /// Route a LoRA-training target (`q`/`k`/`v`/`o`) to its [`AdaptableLinear`] (sc-3046).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["q"] => Some(&mut self.q),
+            ["k"] => Some(&mut self.k),
+            ["v"] => Some(&mut self.v),
+            ["o"] => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
     /// `x_mod`: `[B, L, dim]` (f32). `cos`/`sin`: `[L, 1, half_d]` (bf16). Returns `[B, L, dim]` bf16.
     /// Batched over `B` (the CFG cond/uncond branches) — attention never mixes batch elements, so the
     /// `B=2` result is bit-identical to two `B=1` calls (the cos/sin broadcast across batch + heads).
@@ -272,6 +283,17 @@ impl CrossAttention {
         Ok(())
     }
 
+    /// Route a LoRA-training target (`q`/`k`/`v`/`o`) to its [`AdaptableLinear`] (sc-3046).
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["q"] => Some(&mut self.q),
+            ["k"] => Some(&mut self.k),
+            ["v"] => Some(&mut self.v),
+            ["o"] => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
     /// Cached K/V from the (bf16) text context `[B, L_ctx, dim]` — computed once, reused per step.
     /// `B` is the forward batch (2 for CFG cond+uncond, 1 otherwise); returns `(k, v)` each
     /// `[B, n, L_ctx, d]`.
@@ -340,6 +362,18 @@ impl Block {
         Ok(())
     }
 
+    /// Route a LoRA-training target into this block's `self_attn`/`cross_attn` projections or its
+    /// `ffn.fc1`/`ffn.fc2` (sc-3046) — the per-block adaptable surface.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["self_attn", rest @ ..] => self.self_attn.adaptable_mut(rest),
+            ["cross_attn", rest @ ..] => self.cross_attn.adaptable_mut(rest),
+            ["ffn", "fc1"] => Some(&mut self.ffn_fc1),
+            ["ffn", "fc2"] => Some(&mut self.ffn_fc2),
+            _ => None,
+        }
+    }
+
     fn prepare_kv(&self, context: &Array) -> Result<(Array, Array)> {
         self.cross_attn.prepare_kv(context)
     }
@@ -400,6 +434,42 @@ pub struct WanTransformer {
     cfg: WanModelConfig,
 }
 
+/// LoRA **training** adapter routing (sc-3046). The Wan DiT's Linears are already core
+/// [`AdaptableLinear`]s; inference *merges* deltas into the weight map at load (`apply_wan_adapters`)
+/// rather than installing forward-time residuals, so the static generate path never needs this. The
+/// trainer does: it injects a fresh trainable `Adapter::Lora` per target each optimizer step (via
+/// [`AdaptableLinear::set_adapters`]) and the block forward applies it. Routing uses the **native**
+/// Wan checkpoint naming (`blocks.{i}.self_attn.{q,k,v,o}` / `cross_attn.{…}` / `ffn.fc1`/`fc2`) — the
+/// same names `apply_wan_adapters`' `normalize_wan_key` resolves to, so a saved adapter round-trips.
+impl AdaptableHost for WanTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["blocks", i, rest @ ..] => self
+                .blocks
+                .get_mut(i.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    /// Every per-block adaptable Linear, in native naming: the self/cross-attention `q/k/v/o` and the
+    /// FFN `fc1`/`fc2`. The trainer filters these by the configured target suffixes (default
+    /// `q`/`k`/`v`/`o` — the native analog of the reference's `to_q/k/v/to_out.0` attention surface).
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.blocks.len() * 10);
+        for i in 0..self.blocks.len() {
+            for attn in ["self_attn", "cross_attn"] {
+                for proj in ["q", "k", "v", "o"] {
+                    out.push(format!("blocks.{i}.{attn}.{proj}"));
+                }
+            }
+            out.push(format!("blocks.{i}.ffn.fc1"));
+            out.push(format!("blocks.{i}.ffn.fc2"));
+        }
+        out
+    }
+}
+
 impl WanTransformer {
     pub fn from_weights(w: &Weights, cfg: &WanModelConfig) -> Result<Self> {
         let mut blocks = Vec::with_capacity(cfg.num_layers);
@@ -446,6 +516,11 @@ impl WanTransformer {
             block.quantize(bits, group)?;
         }
         Ok(())
+    }
+
+    /// Number of transformer blocks (for the trainer's target enumeration).
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
     }
 
     /// Embed a single T5 prompt embedding `[L_text, text_dim]` → `[1, text_len, dim]` (bf16),
