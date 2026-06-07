@@ -97,6 +97,7 @@ pub fn denoise(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -125,6 +126,7 @@ pub fn denoise_inpaint(
         cancel,
         on_progress,
         Some(blend),
+        None,
         None,
         None,
     )
@@ -157,6 +159,7 @@ pub fn denoise_control(
         None,
         Some(control),
         None,
+        None,
     )
 }
 
@@ -188,6 +191,44 @@ pub fn denoise_ip(
         None,
         None,
         Some((tokens, scale)),
+        None,
+    )
+}
+
+/// Like [`denoise`] but runs the **InstantID** dual conditioning each step (sc-3113/3114): the
+/// IdentityNet ControlNet (on the kps `control` image, cross-attended to `controlnet_encoder` = the
+/// face tokens) injects its residuals, while the face IP `tokens` are injected into the UNet
+/// cross-attention at `scale`. `tokens`/`controlnet_encoder` are typically the same CFG-batched
+/// `[B, 16, cross_attention_dim]` face tokens. `scale = 0` + a `0`-scale control ⇒ identical to
+/// [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_ip_control(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    control: &ControlContext,
+    controlnet_encoder: &Array,
+    tokens: &Array,
+    scale: f32,
+) -> Result<Array> {
+    denoise_core(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        None,
+        Some(control),
+        Some((tokens, scale)),
+        Some(controlnet_encoder),
     )
 }
 
@@ -204,6 +245,7 @@ fn denoise_core(
     inpaint: Option<&InpaintBlend>,
     control: Option<&ControlContext>,
     ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
 ) -> Result<Array> {
     let steps = d.sampler.num_steps();
     // A zero-step denoise (img2img at strength ≤ 1/steps) is a no-op: return the init latents
@@ -232,32 +274,66 @@ fn denoise_core(
             x_in
         };
         let timestep = d.sampler.timestep(i);
-        let eps = if let Some((tokens, scale)) = ip {
-            // IP-Adapter (sc-3059): inject the image tokens into every cross-attention.
-            d.unet.forward_with_ip(
-                &x_unet,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                (tokens, scale),
-            )?
-        } else if let Some(cc) = control {
-            // ControlNet (sc-3058): run the branch on the model input, inject its residuals.
-            let res = cc.controlnet.forward(
-                &x_unet,
-                &cc.control_image,
-                timestep,
-                conditioning,
-                pooled,
-                time_ids,
-                cc.scale,
-            )?;
-            d.unet
-                .forward_with_control(&x_unet, timestep, conditioning, pooled, time_ids, &res)?
-        } else {
-            d.unet
-                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?
+        // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
+        // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
+        let cn_enc = control_encoder.unwrap_or(conditioning);
+        let eps = match (ip, control) {
+            (Some((tokens, scale)), Some(cc)) => {
+                // InstantID (sc-3113/3114): the IdentityNet residuals (face-token conditioned) AND the
+                // face IP tokens injected into the UNet cross-attention, in one forward.
+                let res = cc.controlnet.forward(
+                    &x_unet,
+                    &cc.control_image,
+                    timestep,
+                    cn_enc,
+                    pooled,
+                    time_ids,
+                    cc.scale,
+                )?;
+                d.unet.forward_with_ip_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                    &res,
+                )?
+            }
+            (Some((tokens, scale)), None) => {
+                // IP-Adapter (sc-3059): inject the image tokens into every cross-attention.
+                d.unet.forward_with_ip(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                )?
+            }
+            (None, Some(cc)) => {
+                // ControlNet (sc-3058): run the branch on the model input, inject its residuals.
+                let res = cc.controlnet.forward(
+                    &x_unet,
+                    &cc.control_image,
+                    timestep,
+                    cn_enc,
+                    pooled,
+                    time_ids,
+                    cc.scale,
+                )?;
+                d.unet.forward_with_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    &res,
+                )?
+            }
+            (None, None) => d
+                .unet
+                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
         };
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);

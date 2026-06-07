@@ -236,6 +236,35 @@ impl UNet2DConditionModel {
         self.forward_core(x, timestep, encoder_x, text_emb, time_ids, None, Some(ip))
     }
 
+    /// Combined decoupled-cross-attn IP tokens **and** ControlNet residuals in one forward — the
+    /// InstantID path (epic 3109, sc-3113/3114): the face IP tokens drive the cross-attention while
+    /// the IdentityNet's residuals add into the skip/mid connections. `encoder_x` is the text
+    /// conditioning (to_k/to_v); `ip = (face_tokens, ip_adapter_scale)` feeds the decoupled
+    /// to_k_ip/to_v_ip branch; `control` is the IdentityNet output (already `conditioning_scale`d, and
+    /// itself conditioned on the face tokens — see [`ControlNet::forward`]). With `ip` scale 0 and a
+    /// zero-scale `control` this is identical to [`forward`](Self::forward).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_ip_control(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        ip: (&Array, f32),
+        control: &ControlResiduals,
+    ) -> Result<Array> {
+        self.forward_core(
+            x,
+            timestep,
+            encoder_x,
+            text_emb,
+            time_ids,
+            Some(control),
+            Some(ip),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_core(
         &self,

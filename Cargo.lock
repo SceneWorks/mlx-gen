@@ -589,7 +589,10 @@ dependencies = [
 name = "mlx-gen-instantid"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
+ "mlx-gen-face",
+ "mlx-gen-sdxl",
  "pmetal-mlx-rs",
 ]
 

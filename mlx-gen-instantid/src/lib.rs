@@ -14,5 +14,9 @@
 //! handling and the canonical multi-view landmark sets.
 
 pub mod kps;
+pub mod model;
 
 pub use kps::{draw_kps, letterbox, view_angle_kps, ANGLE_SET_ORDER, VIEW_ANGLE_KPS};
+pub use model::{
+    InstantId, InstantIdPaths, InstantIdRequest, DEFAULT_CONTROLNET_SCALE, DEFAULT_IP_SCALE,
+};

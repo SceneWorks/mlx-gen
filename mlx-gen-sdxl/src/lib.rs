@@ -50,8 +50,8 @@ pub use loader::{
 pub use model::{descriptor, load, Sdxl, MODEL_ID};
 pub use pipeline::{
     decode_image, decoded_to_image, denoise, denoise_control, denoise_inpaint, denoise_ip,
-    encode_conditioning, encode_init_latents, preprocess_control_image, preprocess_init_image,
-    seeded_prior, text_time_ids, ControlContext, Denoiser,
+    denoise_ip_control, encode_conditioning, encode_init_latents, preprocess_control_image,
+    preprocess_init_image, seeded_prior, text_time_ids, ControlContext, Denoiser,
 };
 pub use sampler::EulerSampler;
 pub use text_encoder::{ClipOutput, ClipTextEncoder};
