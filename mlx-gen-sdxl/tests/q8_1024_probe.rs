@@ -1,9 +1,13 @@
-//! Diagnostic probe (epic 3109 sc-3116 follow-up): does the **stock** SDXL Q8 txt2img produce a
-//! coherent image at 1024² vs 512²? InstantID's Q8 e2e collapses to a flat image at 1024² but is fine
-//! at 512² (and fp16 is fine at 1024²); since InstantID's UNet *is* the SDXL UNet and the failure is
-//! isolated to the quantized UNet, this probe confirms whether the defect is in the base SDXL quant
-//! path (not InstantID).
+//! sc-3329 regression: the **stock** SDXL Q8/Q4 quantized U-Net must render a coherent image at
+//! 1024², not a flat/collapsed one. This started as a diagnostic probe (epic 3109 sc-3116) of an
+//! InstantID 1024² Q8 collapse; it was root-caused to the base SDXL quant path — the resnet
+//! `conv_shortcut` (a 1×1 conv stored as a Linear) was being quantized, injecting int8 error directly
+//! into the residual stream, which at 1024² compounds across the denoise loop into a runaway latent
+//! outlier that blows out the VAE. Fixed by keeping `conv_shortcut` dense (see
+//! `ResnetBlock2D::quantize`). sc-2641 validated only ≤512², where the instability stays
+//! sub-threshold, so it missed this; we now guard 1024² for both Q8 and Q4.
 //!
+//! A coherent SDXL render has high pixel variance; a collapsed one sits near-constant (std ~11).
 //! `#[ignore]`d — needs the SDXL base snapshot. Run:
 //!   cargo test -p mlx-gen-sdxl --release --test q8_1024_probe -- --ignored --nocapture
 
@@ -60,16 +64,21 @@ fn render(q: Quant, size: u32, steps: u32) -> Image {
 
 #[test]
 #[ignore = "needs the SDXL base snapshot"]
-fn base_sdxl_q8_coherent_at_512_and_1024() {
-    let s512 = std_dev(&render(Quant::Q8, 512, 12));
-    println!("[sdxl q8 probe] 512²: pixel std = {s512:.1}");
-    let s1024 = std_dev(&render(Quant::Q8, 1024, 12));
-    println!("[sdxl q8 probe] 1024²: pixel std = {s1024:.1}");
-    // A coherent SDXL render has high pixel variance; a collapsed/flat output sits near-constant
-    // (std ~10). This asserts the BASE SDXL Q8 path at 1024² — independent of InstantID.
-    assert!(
-        s1024 > 40.0,
-        "base SDXL Q8 collapsed at 1024² (std {s1024:.1}); 512² std {s512:.1} — confirms a base-SDXL \
-         quantized-UNet defect at 1024, not InstantID-specific"
-    );
+fn base_sdxl_quant_coherent_at_512_and_1024() {
+    for q in [Quant::Q8, Quant::Q4] {
+        let s512 = std_dev(&render(q, 512, 12));
+        let s1024 = std_dev(&render(q, 1024, 12));
+        println!("[sdxl {q:?} probe] 512²: std = {s512:.1}; 1024²: std = {s1024:.1}");
+        // Both resolutions must be coherent (high pixel variance). A collapsed/flat output sits
+        // near-constant (std ~11); the 1024² check is the sc-3329 regression (conv_shortcut dense).
+        assert!(
+            s512 > 40.0,
+            "base SDXL {q:?} collapsed at 512² (std {s512:.1})"
+        );
+        assert!(
+            s1024 > 40.0,
+            "base SDXL {q:?} collapsed at 1024² (std {s1024:.1}); 512² std {s512:.1} — the resnet \
+             conv_shortcut must stay dense (sc-3329)"
+        );
+    }
 }

@@ -83,6 +83,22 @@ torch+diffusers venv (e.g. `/Users/michael/Repos/mflux/.venv` after `uv pip inst
 | `sdxl_accel_sched_golden.safetensors` | `dump_sdxl_accel_golden.py` (default) | `tests/accel_sampler_parity.rs` (core crate) | **Scheduler-math isolation:** per-step deterministic outputs of `LCMScheduler` / `EulerDiscreteScheduler(trailing)` / `TCDScheduler` on fixed synthetic tensors. Validates the Rust `mlx_gen::sampler` port to ~1e-6 (torch-f32 vs MLX-f32), no model needed. Small + fast. |
 | `sdxl_accel_render_{ancestral,lightning,hyper,lcm}.safetensors` (+ implied `.png` via the test) | `dump_sdxl_accel_golden.py render` | `mlx-gen-sdxl/tests/accel_real_weights.rs` (`lightning_hyper_match_torch_teacher_forced`) | **Deterministic e2e:** torch initial latent + final RGB8 per variant. The Rust test teacher-forces the init latent and reports px>8 vs the torch render (a *qualitative* torch↔MLX backend gap, NOT bit-exact). Needs the full fp16 SDXL pipeline + accel LoRAs. |
 
+### PuLID-FLUX face-identity (`mlx-gen-pulid`, epic 3069)
+
+The reference is the **vendored torch `pulid_flux`** (SceneWorks worker `_vendor/pulid_flux/`), so
+these dump from a torch venv, not `mflux`. Run from the vendored reference dir under `pulidenv`:
+
+```sh
+cd /Users/michael/Repos/SceneWorks/apps/worker/scene_worker/_vendor/pulid_flux
+HF_HUB_OFFLINE=1 PYTHONPATH=. /private/tmp/pulidenv/bin/python /path/to/mlx-gen/tools/dump_eva_clip_golden.py
+```
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `eva_clip_golden.safetensors` | `dump_eva_clip_golden.py` | `mlx-gen-pulid/tests/eva_clip_parity.rs` | **EVA02-CLIP-L-14-336 visual tower (sc-3070).** f32 reference weights + `enc_in` + 5 hidden states + `id_cond_vit`, plus the `rope.freqs_*` buffers (weight-free RoPE-construction gate) and a 512²→336² resize/normalize case (`ffi_512`/`tf_*`). Gate is cosine-primary: torch-CPU-f32 golden vs MLX-Metal-f32 has a depth-accumulating mean-rel floor (~1e-2 by block 20), but the final `id_cond_vit` re-normalizes to cos 0.999997 (bf16 0.999945). The float antialiased bicubic matches torchvision to ~1e-6. |
+| `idformer_golden.safetensors` | `dump_idformer_golden.py` | `mlx-gen-pulid/tests/idformer_parity.rs` | **IDFormer perceiver-resampler (sc-3071).** f32 `pulid_encoder.*` weights (from `pulid_flux_v0.9.1.safetensors`) + deterministic `id_cond` [1,1280] + 5 EVA hidden states → `id_embedding` [1,32,2048]. cos 1.000000 / mean-rel 1.3e-3 (bf16 0.999999). |
+| `pulid_ca_golden.safetensors` | `dump_pulid_ca_golden.py` | `mlx-gen-pulid/tests/pulid_ca_parity.rs` | **PerceiverAttentionCA ×20 + injection schedule (sc-3072).** f32 `pulid_ca.{0..19}.*` weights + `id_embedding` [1,32,2048] + `img` [1,64,3072] + per-module outputs at ca indices {0,9,10,19}. Driving these through the `PulidCa` injector validates the CA math (cos ~1.0) and the double→single ca_idx schedule (double i→ca[i/2], single i→ca[10+i/4]) in one shot. |
+| _(reuses goldens above)_ | — | `mlx-gen-pulid/tests/pulid_flux_e2e.rs` | **PuLID-FLUX e2e (sc-3074).** No new golden: reuses `eva_clip_golden` (EVA, prefix `w`) + `scrfd_10g`/`arcface_iresnet100`/`bisenet_parsing`/`face_align_goldens` (face stack + reference face), with FLUX.1-dev from the HF cache and `pulid_flux_v0.9.1.safetensors` from `guozinan/PuLID`. Validates id_weight=0 == plain-FLUX bit-identical, id injection changes the render, and ArcFace identity cosine (0.68 @ 20-step/512²; sc-2012 baseline ≈0.80). Heavy — loads the full stack. |
 ### InstantID (`mlx-gen-sdxl`, epic 3109)
 
 | golden | dump script | consumed by | notes |

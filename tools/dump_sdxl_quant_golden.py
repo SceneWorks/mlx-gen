@@ -55,20 +55,29 @@ GROUP = 64
 PROBE = ("down_blocks", 1, "attentions", 0, "transformer_blocks", 0, "attn1", "query_proj")
 
 
+# The resnet `conv_shortcut` is a 1×1 conv stored as an `nn.Linear`; it stays DENSE (not quantized,
+# not bf16-cast), matching the Rust path which leaves it dense at the model dtype. Quantizing it
+# injects int8 error directly into the resnet residual stream, which at 1024² compounds across the
+# denoise loop into a runaway latent outlier that collapses the image (sc-3329). Both this reference
+# and Rust now exclude it. (Linear-only otherwise; embeddings/attention/FFN/proj quantize.)
+def _is_quant_linear(path, m):
+    return isinstance(m, nn.Linear) and not path.endswith("conv_shortcut")
+
+
 def bf16_cast_linears(model):
-    """Cast every nn.Linear weight + bias to bf16 in place (the Rust core quantize pre-cast)."""
-    for _name, m in model.named_modules():
-        if isinstance(m, nn.Linear):
+    """Cast each quantizable nn.Linear weight + bias to bf16 in place (the Rust core quantize
+    pre-cast). conv_shortcut is skipped — it stays dense at the model dtype (sc-3329)."""
+    for name, m in model.named_modules():
+        if _is_quant_linear(name, m):
             m.weight = m.weight.astype(mx.bfloat16)
             if "bias" in m and m.bias is not None:
                 m.bias = m.bias.astype(mx.bfloat16)
 
 
 def quantize_model(sd, bits):
-    pred = lambda _p, m: isinstance(m, nn.Linear)  # noqa: E731  (Linear-only; embeddings stay dense)
     for comp in (sd.unet, sd.text_encoder_1, sd.text_encoder_2):
         bf16_cast_linears(comp)
-        nn.quantize(comp, group_size=GROUP, bits=bits, class_predicate=pred)
+        nn.quantize(comp, group_size=GROUP, bits=bits, class_predicate=_is_quant_linear)
 
 
 def render(sd):

@@ -141,8 +141,10 @@ impl UNet2DConditionModel {
         })
     }
 
-    /// Quantize every Linear (resnets' time/shortcut projections, attention, FFN, embeddings) to
-    /// Q4/Q8. Convs (`conv_in`/`conv_out`/resnet convs/up-down samplers) stay dense.
+    /// Quantize the true Linears (resnets' `time_emb_proj`, attention, FFN, proj_in/out, embeddings)
+    /// to Q4/Q8. **Convs stay dense** — `conv_in`/`conv_out`, resnet `conv1`/`conv2`, the up/down
+    /// samplers, **and the resnet `conv_shortcut`** (a 1×1 conv stored as a Linear; quantizing it
+    /// collapses 1024² renders, sc-3329 — see [`ResnetBlock2D::quantize`]).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.time_embedding.quantize(bits)?;
         self.add_embedding.quantize(bits)?;

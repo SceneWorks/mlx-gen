@@ -608,6 +608,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-pulid"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-face",
+ "mlx-gen-flux",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-qwen-image"
 version = "0.0.0"
 dependencies = [

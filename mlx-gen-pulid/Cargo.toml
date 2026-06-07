@@ -1,0 +1,18 @@
+[package]
+name = "mlx-gen-pulid"
+version = "0.0.0"
+edition = "2021"
+description = "PuLID-FLUX face-identity provider for mlx-gen (EVA-CLIP ViT + IDFormer + FLUX cross-attn injection)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "pulid", "flux", "face"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+mlx-gen-flux = { path = "../mlx-gen-flux" }
+mlx-gen-face = { path = "../mlx-gen-face" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+# Link-time self-registration into mlx-gen's model registry (the `pulid_flux` target, sc-3074).
+inventory = "0.3"

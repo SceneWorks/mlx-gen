@@ -75,9 +75,17 @@ impl ResnetBlock2D {
         if let Some(t) = &mut self.time_emb_proj {
             t.quantize(bits, None)?;
         }
-        if let Some(s) = &mut self.shortcut {
-            s.quantize(bits, None)?;
-        }
+        // `shortcut` is the 1×1 `conv_shortcut` stored as a Linear (for the NHWC channel-matmul
+        // forward), not a true Linear — so it stays DENSE like every other conv in the U-Net
+        // (`conv_in`/`conv_out`, resnet `conv1`/`conv2`, the up/down samplers; see
+        // `UNet2DConditionModel::quantize`). It sits directly on the resnet residual/skip path, so
+        // int8 rounding error there injects straight into the residual stream and, at 1024², compounds
+        // across the denoise loop into a runaway latent outlier that blows out the VAE → a flat image
+        // (sc-3329). The defect is the int8 rounding itself, not a dtype/overflow issue (f32 scales +
+        // f32 activations reproduce it identically), and it stayed sub-threshold at ≤512² so sc-2641
+        // missed it. The `mlx_sd` reference also stores `conv_shortcut` as `nn.Linear` and quantizes
+        // it, so leaving it dense is a deliberate, correct divergence from a reference that shares the
+        // bug. (LoRA still merges into `shortcut` as a reshaped conv delta — that path is unaffected.)
         Ok(())
     }
 

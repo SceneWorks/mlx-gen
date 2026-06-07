@@ -29,3 +29,6 @@ target
 /tools/golden/*
 !/tools/golden/README.md
 !/tools/golden/CHECKSUMS.txt
+
+# Converted production model weights (e.g. tools/convert_eva_clip.py output) — large, regenerable.
+/tools/*.safetensors
