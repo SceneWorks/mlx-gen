@@ -582,6 +582,112 @@ pub fn convert_t2v_14b(
     )
 }
 
+/// Assemble a `wan_vace` snapshot dir (sc-3467) from the diffusers VACE transformer + a converted
+/// base-Wan snapshot's shared native components — **packaging, not conversion**.
+///
+/// Wan-VACE is Wan2.1-based and shares its UMT5 text encoder + z16 Wan VAE + tokenizer with the base
+/// Wan2.2 14B (the *same* components), so the only VACE-specific weights are the **transformer**,
+/// which [`crate::WanVaceTransformer`] reads directly in diffusers layout (no conversion). This
+/// combines:
+///   - `vace_transformer_dir` — the diffusers repo's `transformer/` (its `config.json` + the
+///     `diffusion_pytorch_model-*.safetensors` shards) → `<out_dir>/transformer/`, and
+///   - `base_wan_snapshot/{t5_encoder.safetensors, vae.safetensors, tokenizer.json}` (a
+///     [`convert_i2v_14b`]/[`convert_t2v_14b`] output) → `<out_dir>/`,
+///
+/// producing the dir layout `mlx_gen::load("wan_vace", WeightsSource::Dir(..))` expects
+/// (`WanVaceConfig::from_model_dir` reads `transformer/config.json`; `model_vace` reads the three
+/// shared files from the dir root).
+///
+/// `link == true` symlinks each component (fast, zero-copy — the engine's [`Weights::from_dir`]
+/// resolves symlinks); `false` copies (a portable, self-contained snapshot for packaging). The 11 GB
+/// T5 dominates, so `link` is the right default for local dev / the gated e2e. Existing entries at the
+/// targets are replaced, so assembly is idempotent.
+pub fn assemble_wan_vace_snapshot(
+    out_dir: impl AsRef<Path>,
+    vace_transformer_dir: impl AsRef<Path>,
+    base_wan_snapshot: impl AsRef<Path>,
+    link: bool,
+) -> Result<PathBuf> {
+    let out_dir = out_dir.as_ref();
+    let tf_src = vace_transformer_dir.as_ref();
+    let base = base_wan_snapshot.as_ref();
+
+    if !tf_src.join("config.json").is_file() {
+        return Err(Error::Msg(format!(
+            "assemble_wan_vace_snapshot: no config.json under {} (expected the diffusers VACE \
+             `transformer/` dir)",
+            tf_src.display()
+        )));
+    }
+    let has_shard = std::fs::read_dir(tf_src)?
+        .filter_map(|e| e.ok())
+        .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"));
+    if !has_shard {
+        return Err(Error::Msg(format!(
+            "assemble_wan_vace_snapshot: no .safetensors shards under {}",
+            tf_src.display()
+        )));
+    }
+    const SHARED: [&str; 3] = [
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+        "tokenizer.json",
+    ];
+    for name in SHARED {
+        if !base.join(name).is_file() {
+            return Err(Error::Msg(format!(
+                "assemble_wan_vace_snapshot: base snapshot {} is missing {name} (point at a converted \
+                 base-Wan dir, e.g. a convert_t2v_14b/convert_i2v_14b output)",
+                base.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(out_dir)?;
+    place_component(&out_dir.join("transformer"), tf_src, link)?;
+    for name in SHARED {
+        place_component(&out_dir.join(name), &base.join(name), link)?;
+    }
+    Ok(out_dir.to_path_buf())
+}
+
+/// Link-or-copy `src` (a file or dir) to `dst`, replacing any existing entry (idempotent assembly).
+fn place_component(dst: &Path, src: &Path, link: bool) -> Result<()> {
+    if dst.is_symlink() || dst.exists() {
+        if dst.is_dir() && !dst.is_symlink() {
+            std::fs::remove_dir_all(dst)?;
+        } else {
+            std::fs::remove_file(dst)?;
+        }
+    }
+    let src_abs = src.canonicalize()?;
+    if link {
+        std::os::unix::fs::symlink(&src_abs, dst)?;
+    } else if src_abs.is_dir() {
+        copy_dir_recursive(&src_abs, dst)?;
+    } else {
+        std::fs::copy(&src_abs, dst)?;
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory, resolving symlinked entries (e.g. the HF-cache blob links) to real
+/// files so the result is self-contained.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path().canonicalize()?;
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,5 +1003,67 @@ mod tests {
         use crate::config::WanModelConfig;
         let cfg = WanModelConfig::from_config_json(&wan22_t2v_14b_config(None));
         assert_eq!(cfg, WanModelConfig::wan22_t2v_14b());
+    }
+
+    /// `assemble_wan_vace_snapshot` (sc-3467) lays out a load-ready `wan_vace` dir: a `transformer/`
+    /// plus the three shared base-Wan files, linked (idempotent) and resolvable. No weights needed —
+    /// it is pure file packaging.
+    #[test]
+    fn assemble_wan_vace_snapshot_links_components() {
+        let tmp = std::env::temp_dir().join(format!("wanvace_assemble_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let tf = tmp.join("vace_repo/transformer");
+        let base = tmp.join("base_wan");
+        let out = tmp.join("wan_vace");
+        std::fs::create_dir_all(&tf).unwrap();
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            tf.join("config.json"),
+            b"{\"_class_name\":\"WanVACETransformer3DModel\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            tf.join("diffusion_pytorch_model-00001-of-00001.safetensors"),
+            b"shard",
+        )
+        .unwrap();
+        for name in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            std::fs::write(base.join(name), name.as_bytes()).unwrap();
+        }
+
+        // Assemble twice to prove idempotency (the second call must replace cleanly).
+        assemble_wan_vace_snapshot(&out, &tf, &base, true).unwrap();
+        let out = assemble_wan_vace_snapshot(&out, &tf, &base, true).unwrap();
+
+        assert!(out.join("transformer").is_symlink());
+        // The dir layout `WanVaceConfig::from_model_dir` + `model_vace::load` resolve.
+        assert!(out.join("transformer/config.json").is_file());
+        assert!(out
+            .join("transformer/diffusion_pytorch_model-00001-of-00001.safetensors")
+            .is_file());
+        for name in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            let p = out.join(name);
+            assert!(p.is_symlink(), "{name} should be a symlink");
+            assert_eq!(
+                std::fs::read(&p).unwrap(),
+                name.as_bytes(),
+                "{name} resolves"
+            );
+        }
+
+        // A missing shared component is a clear, actionable error (not a silent partial snapshot).
+        std::fs::remove_file(base.join("vae.safetensors")).unwrap();
+        let err = assemble_wan_vace_snapshot(out.join("again"), &tf, &base, true).unwrap_err();
+        assert!(err.to_string().contains("vae.safetensors"), "got: {err}");
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
