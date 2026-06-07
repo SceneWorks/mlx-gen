@@ -172,6 +172,16 @@ impl Attn {
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, n * d])?;
         self.o.forward(&out)
     }
+
+    /// Quantize the four projections (`to_q/to_k/to_v/to_out.0`) to Q4/Q8 in place — the
+    /// `_quantize_predicate` attn surface (sc-3440). qk-RMSNorm weights stay dense.
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.q.quantize(bits, group)?;
+        self.k.quantize(bits, group)?;
+        self.v.quantize(bits, group)?;
+        self.o.quantize(bits, group)?;
+        Ok(())
+    }
 }
 
 /// The shared Wan block body (self-attn + cross-attn + gated-GELU FFN) used by **both** the main
@@ -207,6 +217,16 @@ impl CoreBlock {
             ffn_fc2: load_linear(w, &format!("{prefix}.ffn.net.2"), false)?,
             eps: cfg.base.eps as f32,
         })
+    }
+
+    /// Quantize this block's `_quantize_predicate` surface — self/cross attn `to_q/k/v/to_out.0` +
+    /// `ffn.net.0.proj`/`net.2` — to Q4/Q8 in place (sc-3440). The modulation table + norms stay dense.
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.self_attn.quantize(bits, group)?;
+        self.cross_attn.quantize(bits, group)?;
+        self.ffn_fc1.quantize(bits, group)?;
+        self.ffn_fc2.quantize(bits, group)?;
+        Ok(())
     }
 
     /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 1, 6, dim]` (f32, the time modulation). `context`:
@@ -272,6 +292,12 @@ impl VaceBlock {
             core: CoreBlock::load(w, prefix, cfg)?,
             proj_out: load_linear(w, &format!("{prefix}.proj_out"), false)?,
         })
+    }
+
+    /// Quantize the inner [`CoreBlock`]'s attn/ffn surface (sc-3440). `proj_in`/`proj_out` stay dense
+    /// (they sit outside the `_quantize_predicate`, like the main transformer's `proj_out` head).
+    fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        self.core.quantize(bits, group)
     }
 
     /// `control`: `[1, L, dim]` (f32, the running control stream). `hidden`: `[1, L, dim]` (f32, the
@@ -357,6 +383,22 @@ impl WanVaceTransformer {
             cfg: cfg.clone(),
             compute_dtype,
         })
+    }
+
+    /// Quantize the DiT's `_quantize_predicate` surface to Q4/Q8 in place (sc-3440): every base block
+    /// and every vace block's attn (`to_q/k/v/to_out.0`) + FFN (`net.0.proj`/`net.2`). The patch +
+    /// vace-patch embedders, the condition/time/text embedders, the qk/layer norms, the vace
+    /// `proj_in`/`proj_out`, and the `proj_out` head stay **dense** — mirrors the base Wan quant
+    /// surface (sc-2682). Runs on the already-built dense bf16 transformer (post `from_weights`, or
+    /// post LoRA/LoKr merge — the fork order: merge a dense adapter, then quantize).
+    pub fn quantize(&mut self, bits: i32, group: Option<i32>) -> Result<()> {
+        for block in &mut self.blocks {
+            block.quantize(bits, group)?;
+        }
+        for vb in &mut self.vace_blocks {
+            vb.quantize(bits, group)?;
+        }
+        Ok(())
     }
 
     /// Patchify grid `(f, h, w)` for a latent `[C, F, H, W]`.

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     default_seed, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Result,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
     WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
@@ -66,9 +66,9 @@ pub fn descriptor_vace() -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
-            // VACE LoRA/LoKr + Q4/Q8 are separate capability layers (mirroring the base Wan slices
-            // sc-2682/sc-2683) and need diffusers-name adapter routing / a VACE quantize pass —
-            // tracked as follow-ons, not wired here.
+            // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
+            // base Wan slice sc-2682). VACE LoRA/LoKr (sc-3439) needs diffusers-name adapter routing —
+            // still a follow-on, so the adapter flags stay false until then.
             supports_lora: false,
             supports_lokr: false,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
@@ -89,6 +89,9 @@ pub struct WanVace {
     descriptor: ModelDescriptor,
     config: WanVaceConfig,
     root: PathBuf,
+    /// Optional load-time Q4/Q8 quantization of the VACE DiT `_quantize_predicate` surface (sc-3440),
+    /// applied in [`WanVace::generate`] after the dense transformer is built.
+    quantize: Option<Quant>,
 }
 
 impl WanVace {
@@ -128,6 +131,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         descriptor: descriptor_vace(),
         config,
         root,
+        quantize: spec.quantize,
     }))
 }
 
@@ -266,7 +270,9 @@ impl Generator for WanVace {
         // Control latent dims: [96, T_lat(+num_ref), h, w] → the noisy latent matches its frame/space.
         let csh = control.shape();
         let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
-        let scales = vec![1.0f32; self.config.vace_layers.len()];
+        // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
+        // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
+        let scales = vec![req.control_scale.unwrap_or(1.0); self.config.vace_layers.len()];
 
         // Seeded init noise [z16, T_lat(+num_ref), h, w].
         let key = random::key(seed)?;
@@ -280,7 +286,12 @@ impl Generator for WanVace {
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
             let w = load_vace_transformer_weights(&self.root)?;
-            let dit = WanVaceTransformer::from_weights(&w, &self.config, Dtype::Bfloat16)?;
+            let mut dit = WanVaceTransformer::from_weights(&w, &self.config, Dtype::Bfloat16)?;
+            // Q4/Q8 (sc-3440): quantize the DiT `_quantize_predicate` surface in place after the dense
+            // build (the diffusers VACE snapshot ships dense bf16 — no pre-quantized VACE snapshot).
+            if let Some(q) = self.quantize {
+                dit.quantize(q.bits(), None)?;
+            }
             let total = steps as u32;
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {

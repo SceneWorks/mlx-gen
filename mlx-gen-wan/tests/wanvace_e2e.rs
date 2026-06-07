@@ -28,8 +28,8 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
-    ReplacementMode, WeightsSource,
+    registry, Conditioning, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    Progress, Quant, ReplacementMode, WeightsSource,
 };
 use mlx_gen_wan::convert::assemble_wan_vace_snapshot;
 use mlx_gen_wan::MODEL_ID_VACE;
@@ -83,18 +83,9 @@ fn mask_frame(w: u32, h: u32) -> Image {
     }
 }
 
-#[test]
-#[ignore = "needs a wan_vace snapshot — set WANVACE_DIR or have the VACE transformer + a base-Wan snapshot in the cache"]
-fn wan_vace_generate_smoke() {
-    let Some(dir) = resolve_or_assemble_snapshot() else {
-        eprintln!(
-            "skipping: no wan_vace snapshot (set WANVACE_DIR or populate the HF/mlx-gen cache)"
-        );
-        return;
-    };
-    let g = registry::load(MODEL_ID_VACE, &LoadSpec::new(WeightsSource::Dir(dir)))
-        .expect("load wan_vace");
-
+/// Build a small control-clip request (mid-gray clip + fully-active mask → regenerate the whole
+/// frame), generate, and assert the non-causal frame count + coherence. `label` tags the log line.
+fn run_vace_smoke(g: &dyn Generator, label: &str) {
     let (w, h, n) = (256u32, 256u32, 13usize); // n=13 = 1 + 4·3 → t_lat = 4
     let req = GenerationRequest {
         prompt: "a person walking".into(),
@@ -124,15 +115,15 @@ fn wan_vace_generate_smoke() {
     assert_eq!(
         frames.len(),
         expected,
-        "expected {expected} output frames (4·t_lat, non-causal), got {}",
+        "[{label}] expected {expected} output frames (4·t_lat, non-causal), got {}",
         frames.len()
     );
     for (i, f) in frames.iter().enumerate() {
-        assert_eq!((f.width, f.height), (w, h), "frame {i} size");
+        assert_eq!((f.width, f.height), (w, h), "[{label}] frame {i} size");
         assert_eq!(
             f.pixels.len(),
             (w * h * 3) as usize,
-            "frame {i} pixel buffer"
+            "[{label}] frame {i} pixel buffer"
         );
     }
 
@@ -144,16 +135,49 @@ fn wan_vace_generate_smoke() {
     let mean = all.iter().map(|&b| b as f64).sum::<f64>() / all.len() as f64;
     assert!(
         (2.0..=253.0).contains(&mean),
-        "decoded pixel mean {mean:.1} is pinned at an extreme — VAE decode looks degenerate"
+        "[{label}] decoded pixel mean {mean:.1} is pinned at an extreme — VAE decode looks degenerate"
     );
     let identical = frames.windows(2).all(|p| p[0].pixels == p[1].pixels);
     assert!(
         !identical,
-        "all {} frames are byte-identical — temporal decode is degenerate",
+        "[{label}] all {} frames are byte-identical — temporal decode is degenerate",
         frames.len()
     );
     eprintln!(
-        "wan_vace e2e ok: {} frames @ {w}x{h}, pixel mean {mean:.1}",
+        "wan_vace e2e [{label}] ok: {} frames @ {w}x{h}, pixel mean {mean:.1}",
         frames.len()
     );
+}
+
+#[test]
+#[ignore = "needs a wan_vace snapshot — set WANVACE_DIR or have the VACE transformer + a base-Wan snapshot in the cache"]
+fn wan_vace_generate_smoke() {
+    let Some(dir) = resolve_or_assemble_snapshot() else {
+        eprintln!(
+            "skipping: no wan_vace snapshot (set WANVACE_DIR or populate the HF/mlx-gen cache)"
+        );
+        return;
+    };
+    let g = registry::load(MODEL_ID_VACE, &LoadSpec::new(WeightsSource::Dir(dir)))
+        .expect("load wan_vace");
+    run_vace_smoke(g.as_ref(), "dense-bf16");
+}
+
+/// sc-3440: the Q4/Q8 `WanVaceTransformer::quantize` path loads + generates a coherent video on real
+/// weights (catches a broken quantize cascade / packed-Linear shape bug end-to-end).
+#[test]
+#[ignore = "needs a wan_vace snapshot — set WANVACE_DIR or have the VACE transformer + a base-Wan snapshot in the cache"]
+fn wan_vace_quantized_generate_smoke() {
+    let Some(dir) = resolve_or_assemble_snapshot() else {
+        eprintln!(
+            "skipping: no wan_vace snapshot (set WANVACE_DIR or populate the HF/mlx-gen cache)"
+        );
+        return;
+    };
+    let g = registry::load(
+        MODEL_ID_VACE,
+        &LoadSpec::new(WeightsSource::Dir(dir)).with_quant(Quant::Q8),
+    )
+    .expect("load wan_vace Q8");
+    run_vace_smoke(g.as_ref(), "q8");
 }
