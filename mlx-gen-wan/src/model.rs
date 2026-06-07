@@ -188,15 +188,12 @@ impl Generator for Wan {
     }
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        // H/W align to patch×vae_stride (32 for the 5B); the pipeline rounds down, but reject
-        // sub-tile sizes outright.
-        let align = (self.config.patch_size.1 * self.config.vae_stride.1) as u32;
-        if req.width < align || req.height < align {
-            return Err(Error::Msg(format!(
-                "wan2_2_ti2v_5b: width/height must be ≥ {align} (got {}x{})",
-                req.width, req.height
-            )));
-        }
+        // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 32 is
+        // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
+        // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (`Reference`/`Keyframe`).
+        self.descriptor
+            .capabilities
+            .validate_request(MODEL_ID, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -220,6 +217,9 @@ impl Generator for Wan {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Reject anything outside the advertised surface before doing expensive work — in particular
+        // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
+        self.validate(req)?;
         let cfg = &self.config;
 
         // --- Resolve request knobs against config defaults ---
@@ -556,7 +556,9 @@ fn resolve_load_time_quant(
     }
 }
 
-/// Map a request `sampler` string to a [`SolverKind`] (default UniPC, the reference's default).
+/// Map a request `sampler` string to a [`SolverKind`]. Only ever reached after `validate` (called at
+/// the top of `generate`) has rejected any name outside the advertised set, so the `_` arm handles an
+/// **unset** sampler — UniPC, the reference's default — rather than silently downgrading a typo.
 fn solver_kind(sampler: Option<&str>) -> SolverKind {
     match sampler {
         Some("euler") => SolverKind::Euler,
@@ -612,15 +614,11 @@ impl Generator for Wan14b {
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
         let id = self.descriptor.id;
-        // H/W align to patch×vae_stride (16 for the z16 VAE); the pipeline rounds down, but reject
-        // sub-tile sizes outright.
-        let align = (self.config.patch_size.1 * self.config.vae_stride.1) as u32;
-        if req.width < align || req.height < align {
-            return Err(Error::Msg(format!(
-                "{id}: width/height must be ≥ {align} (got {}x{})",
-                req.width, req.height
-            )));
-        }
+        // Shared capability floor: size range (the advertised `min_size` = patch×vae_stride = 16 is
+        // the sub-tile lower bound; `max_size` caps the long edge), count, guidance/negative/true_cfg,
+        // sampler (`unipc`/`euler`/`dpmpp2m`), scheduler, and conditioning (none for T2V, `Reference`
+        // for I2V).
+        self.descriptor.capabilities.validate_request(id, req)?;
         if let Some(frames) = req.frames {
             // num_frames must be 1 + 4·k (one VAE temporal chunk + 4× per chunk).
             if frames % 4 != 1 {
@@ -661,6 +659,9 @@ impl Generator for Wan14b {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Reject anything outside the advertised surface before doing expensive work — in particular
+        // an unknown `sampler`, which `solver_kind` would otherwise silently map to UniPC.
+        self.validate(req)?;
         let cfg = &self.config;
 
         // --- Resolve request knobs against config defaults ---

@@ -812,13 +812,16 @@ impl Ltx {
     }
 }
 
-/// Capability-driven request validation (weight-free, so it's unit-testable without a load):
-/// non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32), `num_frames = 1 + 8·k`, and
-/// only advertised conditioning kinds (I2V `Reference`; everything else is rejected).
+/// Capability-driven request validation (weight-free, so it's unit-testable without a load): the
+/// shared capability floor ([`Capabilities::validate_request`] — size range, count, unsupported
+/// guidance/negative/true_cfg/sampler/scheduler, only advertised conditioning kinds) plus the LTX
+/// model-specific constraints: non-empty prompt, 64-aligned width/height (stage-1 runs at //2//32),
+/// and `num_frames = 1 + 8·k`.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     if req.prompt.is_empty() {
         return Err(Error::Msg("ltx_2_3: prompt must not be empty".into()));
     }
+    caps.validate_request(MODEL_ID, req)?;
     if !req.width.is_multiple_of(64) || !req.height.is_multiple_of(64) {
         return Err(Error::Msg(format!(
             "ltx_2_3: width/height must be divisible by 64 (got {}x{})",
@@ -829,14 +832,6 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         if frames % 8 != 1 {
             return Err(Error::Msg(format!(
                 "ltx_2_3: num_frames must be 1 + 8·k (got {frames})"
-            )));
-        }
-    }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "ltx_2_3 does not accept {kind:?} conditioning (single-image I2V via Reference only)"
             )));
         }
     }

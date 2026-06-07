@@ -496,6 +496,56 @@ fn f16_bits_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Validate the externally-supplied tensor metadata from a `.pth` and compute the contiguous
+/// `[start..end)` byte range (and element count `numel`) into its storage blob. A malformed
+/// checkpoint must yield an `Err`, never a panic or a wrapped/huge index:
+///
+/// - every dimension is non-negative and fits an MLX `i32` axis (so the later `d as i32` shape cast
+///   cannot truncate or sign-flip),
+/// - the storage `offset` is non-negative,
+/// - `numel`, `offset · elsize`, `numel · elsize`, and `start + len` are all computed with checked
+///   arithmetic (no `usize`/`i64` overflow).
+fn tensor_byte_range(
+    name: &str,
+    offset: i64,
+    size: &[i64],
+    elsize: usize,
+) -> Result<(usize, usize, usize)> {
+    if offset < 0 {
+        return Err(Error::Msg(format!(
+            "{name}: negative storage offset {offset}"
+        )));
+    }
+    let mut numel: usize = 1;
+    for &d in size {
+        if d < 0 || d > i32::MAX as i64 {
+            return Err(Error::Msg(format!(
+                "{name}: invalid tensor dimension {d} in shape {size:?} (must be 0..={})",
+                i32::MAX
+            )));
+        }
+        numel = numel.checked_mul(d as usize).ok_or_else(|| {
+            Error::Msg(format!(
+                "{name}: element count overflows usize for shape {size:?}"
+            ))
+        })?;
+    }
+    let start = (offset as usize).checked_mul(elsize).ok_or_else(|| {
+        Error::Msg(format!(
+            "{name}: storage byte offset overflows usize (offset {offset}, elsize {elsize})"
+        ))
+    })?;
+    let byte_len = numel.checked_mul(elsize).ok_or_else(|| {
+        Error::Msg(format!(
+            "{name}: storage byte length overflows usize (numel {numel}, elsize {elsize})"
+        ))
+    })?;
+    let end = start
+        .checked_add(byte_len)
+        .ok_or_else(|| Error::Msg(format!("{name}: storage slice end overflows usize")))?;
+    Ok((start, end, numel))
+}
+
 /// Load a torch `.pth` checkpoint, returning every tensor as an f32 MLX [`Array`] in PyTorch layout
 /// (`torch.load(...).float()` semantics). Conv-weight transposes + key renames are the caller's job.
 pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
@@ -534,7 +584,11 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
             // Non-tensor entries (rare) are skipped — the reference keeps only `torch.Tensor`s.
             continue;
         };
-        let numel: usize = size.iter().product::<i64>().max(0) as usize;
+        // Validate the externally-supplied metadata and compute the contiguous byte range BEFORE the
+        // contiguity check — a passing range guarantees `numel ≤ i64::MAX`, so `is_c_contiguous`'s
+        // running i64 product (a subset of the dims) cannot overflow either.
+        let elsize = dtype.elem_size();
+        let (start, end, numel) = tensor_byte_range(&name, offset, &size, elsize)?;
         // A tensor is a view into its (possibly shared) storage at `offset`. For a C-contiguous view
         // that view is the byte slice `[offset .. offset+numel]`; non-contiguous strides are rejected.
         if !is_c_contiguous(&size, &stride) {
@@ -547,9 +601,6 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
         zip.by_name(&blob_name)
             .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?
             .read_to_end(&mut blob)?;
-        let elsize = dtype.elem_size();
-        let start = offset as usize * elsize;
-        let end = start + numel * elsize;
         if end > blob.len() {
             return Err(Error::Msg(format!(
                 "{name}: storage slice [{start}..{end}] exceeds blob len {} (offset {offset}, numel {numel})",
@@ -557,6 +608,8 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
             )));
         }
         let floats = decode_to_f32(&blob[start..end], dtype, numel)?;
+        // Dims are validated non-negative and ≤ i32::MAX by `tensor_byte_range`, so this cast cannot
+        // truncate or sign-flip.
         let shape: Vec<i32> = size.iter().map(|&d| d as i32).collect();
         out.insert(name, Array::from_slice(&floats, &shape));
     }
@@ -587,6 +640,51 @@ mod tests {
     fn f32_decode_little_endian() {
         let v = decode_to_f32(&1.5f32.to_le_bytes(), StorageDtype::Float32, 1).unwrap();
         assert_eq!(v, vec![1.5]);
+    }
+
+    #[test]
+    fn tensor_byte_range_valid() {
+        // offset 2 elements, shape [3,4] (numel 12), f32 (elsize 4): start 8, len 48, end 56.
+        assert_eq!(tensor_byte_range("t", 2, &[3, 4], 4).unwrap(), (8, 56, 12));
+        // Scalar (empty shape) is numel 1.
+        assert_eq!(tensor_byte_range("t", 0, &[], 4).unwrap(), (0, 4, 1));
+        // A zero dimension collapses numel to 0 (an empty tensor), not an error.
+        assert_eq!(tensor_byte_range("t", 0, &[0, 5], 4).unwrap(), (0, 0, 0));
+    }
+
+    #[test]
+    fn tensor_byte_range_rejects_negative_offset() {
+        let err = tensor_byte_range("t", -1, &[2], 4).unwrap_err().to_string();
+        assert!(err.contains("negative storage offset"), "{err}");
+    }
+
+    #[test]
+    fn tensor_byte_range_rejects_negative_or_oversized_dims() {
+        // A negative dimension (would otherwise sign-flip the i32 shape cast).
+        let neg = tensor_byte_range("t", 0, &[-1, 2], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(neg.contains("invalid tensor dimension"), "{neg}");
+        // A dimension that does not fit an MLX i32 axis (would otherwise truncate).
+        let big = tensor_byte_range("t", 0, &[i32::MAX as i64 + 1], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(big.contains("invalid tensor dimension"), "{big}");
+    }
+
+    #[test]
+    fn tensor_byte_range_rejects_overflowing_products() {
+        // numel = i32::MAX³ overflows usize (the unchecked `.product()` would have wrapped).
+        let m = i32::MAX as i64;
+        let numel = tensor_byte_range("t", 0, &[m, m, m], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(numel.contains("element count overflows usize"), "{numel}");
+        // offset · elsize overflows usize (a huge — but in-range non-negative — offset).
+        let off = tensor_byte_range("t", i64::MAX, &[1], 4)
+            .unwrap_err()
+            .to_string();
+        assert!(off.contains("storage byte offset overflows usize"), "{off}");
     }
 
     /// A hand-built minimal protocol-2 pickle of `OrderedDict({"a": rebuild_tensor(FloatStorage 0,

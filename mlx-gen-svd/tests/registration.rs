@@ -80,9 +80,11 @@ fn svd_provider_generates_video() {
         pixels,
     };
 
+    // Smallest size the descriptor advertises (`min_size`); `validate` now enforces the 256..=1024
+    // range, so a sub-256 smoke size would be (correctly) rejected.
     let req = GenerationRequest {
-        width: 64,
-        height: 64,
+        width: 256,
+        height: 256,
         frames: Some(3),
         steps: Some(2),
         fps: Some(7),
@@ -98,7 +100,7 @@ fn svd_provider_generates_video() {
     match out {
         GenerationOutput::Video { frames, fps, audio } => {
             assert_eq!(frames.len(), 3, "expected 3 frames");
-            assert_eq!((frames[0].width, frames[0].height), (64, 64));
+            assert_eq!((frames[0].width, frames[0].height), (256, 256));
             assert_eq!(fps, 7);
             assert!(audio.is_none(), "svd_xt produces no audio");
         }

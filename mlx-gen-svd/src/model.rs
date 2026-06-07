@@ -187,14 +187,13 @@ impl Generator for Svd {
     }
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        for c in &req.conditioning {
-            if !self.descriptor.capabilities.accepts(c.kind()) {
-                return Err(Error::Msg(format!(
-                    "svd_xt accepts only Reference conditioning, got {:?}",
-                    c.kind()
-                )));
-            }
-        }
+        // Shared capability floor: size range (256..=1024), count, unsupported negative-prompt /
+        // true_cfg / sampler / scheduler, and conditioning (`Reference` only). `guidance` IS supported
+        // — it overrides the frame-wise CFG ceiling.
+        self.descriptor
+            .capabilities
+            .validate_request(MODEL_ID, req)?;
+        // image→video needs the single Reference input.
         self.reference(req)?;
         Ok(())
     }

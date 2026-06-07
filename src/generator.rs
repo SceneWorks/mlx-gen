@@ -7,7 +7,7 @@
 
 use crate::media::{AudioTrack, Image};
 use crate::runtime::{CancelFlag, Progress};
-use crate::Result;
+use crate::{Error, Result};
 
 /// A prompt-conditioned media generator. `generate` is **synchronous** (long/blocking; the
 /// worker runs each job on its own thread); the request carries a cancel flag and
@@ -400,6 +400,75 @@ impl Capabilities {
     pub fn accepts(&self, kind: ConditioningKind) -> bool {
         self.conditioning.contains(&kind)
     }
+
+    /// Reject a request that violates the **advertised** capability surface — the model-agnostic
+    /// checks every `Generator::validate` shares, so a descriptor cannot promise something
+    /// `validate` then silently ignores at runtime:
+    ///
+    /// - `count` within `1..=max_count`,
+    /// - `width`/`height` within `min_size..=max_size`,
+    /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
+    /// - `sampler` / `scheduler` (when supplied) must name an advertised entry,
+    /// - every `conditioning` entry must be an [`accepts`](Self::accepts)ed kind.
+    ///
+    /// `id` is the model's descriptor id, used in error messages. Model-specific constraints — an
+    /// empty-prompt rejection, size-alignment (multiple-of-N), frame-count divisibility,
+    /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
+    /// floor, not a replacement for them.
+    pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        if req.count == 0 || req.count > self.max_count {
+            return Err(Error::Msg(format!(
+                "{id}: count {} out of range 1..={}",
+                req.count, self.max_count
+            )));
+        }
+        if req.width < self.min_size
+            || req.height < self.min_size
+            || req.width > self.max_size
+            || req.height > self.max_size
+        {
+            return Err(Error::Msg(format!(
+                "{id}: size {}x{} outside supported range {}..={}",
+                req.width, req.height, self.min_size, self.max_size
+            )));
+        }
+        if req.negative_prompt.is_some() && !self.supports_negative_prompt {
+            return Err(Error::Msg(format!(
+                "{id}: negative prompts are not supported"
+            )));
+        }
+        if req.guidance.is_some() && !self.supports_guidance {
+            return Err(Error::Msg(format!("{id}: guidance is not supported")));
+        }
+        if req.true_cfg.is_some() && !self.supports_true_cfg {
+            return Err(Error::Msg(format!("{id}: true_cfg is not supported")));
+        }
+        if let Some(s) = &req.sampler {
+            if !self.samplers.contains(&s.as_str()) {
+                return Err(Error::Msg(format!(
+                    "{id}: unsupported sampler {s:?} (supported: {:?})",
+                    self.samplers
+                )));
+            }
+        }
+        if let Some(s) = &req.scheduler {
+            if !self.schedulers.contains(&s.as_str()) {
+                return Err(Error::Msg(format!(
+                    "{id}: unsupported scheduler {s:?} (supported: {:?})",
+                    self.schedulers
+                )));
+            }
+        }
+        for c in &req.conditioning {
+            let kind = c.kind();
+            if !self.accepts(kind) {
+                return Err(Error::Msg(format!(
+                    "{id}: {kind:?} conditioning is not supported"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -495,5 +564,105 @@ mod tests {
         assert!(req.keyframes().is_empty());
         assert!(req.video_clips().is_empty());
         assert!(req.control_clip().is_none());
+    }
+
+    /// A capability surface that turns nothing extra on: a single 256..=1024 image, no
+    /// negative/guidance/true_cfg, no samplers/schedulers, only `Reference` conditioning.
+    fn caps() -> Capabilities {
+        Capabilities {
+            conditioning: vec![ConditioningKind::Reference],
+            samplers: vec!["euler"],
+            min_size: 256,
+            max_size: 1024,
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
+    fn base_req() -> GenerationRequest {
+        GenerationRequest {
+            prompt: "x".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_request_accepts_in_surface() {
+        let c = caps();
+        assert!(c.validate_request("m", &base_req()).is_ok());
+        // An advertised sampler + an accepted conditioning kind are fine.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    sampler: Some("euler".into()),
+                    conditioning: vec![Conditioning::Reference {
+                        image: img(8, 8),
+                        strength: None,
+                    }],
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn validate_request_enforces_advertised_surface() {
+        let c = caps();
+        let cases: Vec<GenerationRequest> = vec![
+            // count out of range
+            GenerationRequest {
+                count: 0,
+                ..base_req()
+            },
+            GenerationRequest {
+                count: 2,
+                ..base_req()
+            },
+            // size out of range (below min, above max)
+            GenerationRequest {
+                width: 128,
+                ..base_req()
+            },
+            GenerationRequest {
+                height: 2048,
+                ..base_req()
+            },
+            // capability flags not advertised
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..base_req()
+            },
+            GenerationRequest {
+                true_cfg: Some(4.0),
+                ..base_req()
+            },
+            // sampler / scheduler not advertised
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                scheduler: Some("linear".into()),
+                ..base_req()
+            },
+            // conditioning kind not accepted
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..base_req()
+            },
+        ];
+        for (i, req) in cases.iter().enumerate() {
+            assert!(
+                c.validate_request("m", req).is_err(),
+                "case {i} should have been rejected"
+            );
+        }
     }
 }

@@ -284,6 +284,19 @@ fn load_t2v_14b_reads_dual_config_and_wires_generate() {
         ..Default::default()
     };
     assert!(g.validate(&bad_frames).is_err());
+    // An advertised sampler is accepted; an unknown one is rejected, not silently downgraded to UniPC.
+    assert!(g
+        .validate(&GenerationRequest {
+            sampler: Some("euler".into()),
+            ..ok.clone()
+        })
+        .is_ok());
+    assert!(g
+        .validate(&GenerationRequest {
+            sampler: Some("unipic".into()), // typo
+            ..ok.clone()
+        })
+        .is_err());
 
     // generate IS wired (unlike the 5B stub) — it errors only by trying to open the absent weight
     // files, NOT with a "not yet wired" WIP message. (The real run needs the 54 GB checkpoint; see
