@@ -27,9 +27,11 @@ pub struct QwenTransformerBlock {
 
 impl AdaptableHost for QwenTransformerBlock {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
-        // The fork's `QwenLoRAMapping` targets the joint attention + the two stream MLPs (no
-        // `*_mod` targets). Routes the trained-file naming (`attn.*`, `{img,txt}_mlp.*`).
+        // Routes trained-file naming: the Diffusers modulation linears live under
+        // `{img,txt}_mod.1` (Sequential[SiLU, Linear]), while the Rust field stores just the Linear.
         match path {
+            ["img_mod", "1"] => Some(&mut self.img_mod),
+            ["txt_mod", "1"] => Some(&mut self.txt_mod),
             ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
             ["img_mlp", rest @ ..] => self.img_ff.adaptable_mut(rest),
             ["txt_mlp", rest @ ..] => self.txt_ff.adaptable_mut(rest),
@@ -38,7 +40,8 @@ impl AdaptableHost for QwenTransformerBlock {
     }
 
     fn adaptable_paths(&self) -> Vec<String> {
-        let mut out = prefixed_paths("attn", &self.attn);
+        let mut out = vec!["img_mod.1".to_string(), "txt_mod.1".to_string()];
+        out.extend(prefixed_paths("attn", &self.attn));
         out.extend(prefixed_paths("img_mlp", &self.img_ff));
         out.extend(prefixed_paths("txt_mlp", &self.txt_ff));
         out

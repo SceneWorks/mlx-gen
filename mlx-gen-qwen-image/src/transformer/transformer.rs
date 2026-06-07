@@ -76,9 +76,9 @@ pub struct QwenTransformer {
 }
 
 /// The Qwen adapter key→module map — the Rust analog of the fork's `QwenLoRAMapping`. Every fork
-/// target is per-block (`transformer_blocks.{i}.{attn.*, img_mlp.*, txt_mlp.*}`); there are no
-/// global targets (`img_in`/`txt_in`/`proj_out` are not trained). Adapter files address modules by
-/// their trained (diffusers) path, routed here to the block hosts.
+/// target is per-block (`transformer_blocks.{i}.{img_mod.1,txt_mod.1,attn.*,img_mlp.*,txt_mlp.*}`);
+/// there are no global targets (`img_in`/`txt_in`/`proj_out` are not trained). Adapter files address
+/// modules by their trained (diffusers) path, routed here to the block hosts.
 impl AdaptableHost for QwenTransformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {

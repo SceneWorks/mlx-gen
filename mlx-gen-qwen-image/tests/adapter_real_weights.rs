@@ -5,8 +5,8 @@
 //! (gitignored, local). Run:
 //!   cargo test -p mlx-gen-qwen-image --release --test adapter_real_weights -- --ignored --nocapture
 //!
-//! Gates: (1) the key→module map resolves the FULL fork `QwenLoRAMapping` surface (60 blocks ×
-//! attention + img/txt MLP) against the real module tree; (2) the public
+//! Gates: (1) the key→module map resolves the FULL fork `QwenLoRAMapping` surface (60 blocks x
+//! modulation + attention + img/txt MLP) against the real module tree; (2) the public
 //! `load(spec.with_adapters(…)).generate()` render matches the fork's LoRA *and* LoKr golden
 //! (px>8); (3) a scale-0 adapter is a bit-exact no-op.
 
@@ -72,8 +72,9 @@ fn lightning_loras() -> Vec<(&'static str, PathBuf)> {
 
 /// sc-2909: the acceleration-LoRA **viability** gate the story is gated on. The real lightx2v
 /// Lightning LoRAs (T2I `Qwen-Image-Lightning` + `Qwen-Image-Edit-2511-Lightning`) load through
-/// `apply_qwen_adapters` with **zero silent drops** — every one of the 720 per-block targets
-/// (60 blocks × 12 modules: joint-attention q/k/v/out + add_q/k/v/to_add_out + img/txt MLP in/out)
+/// `apply_qwen_adapters` with **zero silent drops** — every one of the 840 per-block targets
+/// (60 blocks x 14 modules: img/txt modulation + joint-attention q/k/v/out +
+/// add_q/k/v/to_add_out + img/txt MLP in/out)
 /// resolves on the real 60-block tree. The merge math itself is the sc-2528 seam (already proven
 /// bit-exact); this just confirms the Lightning files address modules the host map reaches.
 #[test]
@@ -102,15 +103,15 @@ fn lightning_loras_apply_cleanly() {
             report.unmatched_paths.len()
         );
         assert_eq!(
-            report.applied, 720,
-            "{label}: expected 720 per-block modules (60 blocks × 12)"
+            report.applied, 840,
+            "{label}: expected 840 per-block modules (60 blocks x 14)"
         );
     }
 }
 
 /// (1) The top-level `AdaptableHost` resolves every fork `QwenLoRAMapping` target (all per-block:
-/// the joint attention + the two stream MLPs; no globals) across the real 60-block tree, and
-/// rejects off-surface paths.
+/// the modulation linears, joint attention, and the two stream MLPs; no globals) across the real
+/// 60-block tree, and rejects off-surface paths.
 #[test]
 #[ignore = "needs real Qwen-Image weights"]
 fn routing_map_covers_full_fork_surface() {
@@ -121,6 +122,8 @@ fn routing_map_covers_full_fork_surface() {
     };
 
     let targets = [
+        "img_mod.1",
+        "txt_mod.1",
         "attn.to_q",
         "attn.to_k",
         "attn.to_v",
@@ -149,7 +152,7 @@ fn routing_map_covers_full_fork_surface() {
     ] {
         assert!(!resolves(&mut t, p), "expected {p} NOT to resolve");
     }
-    println!("✓ routing map covers the full fork QwenLoRAMapping surface (60 blocks × 12 targets)");
+    println!("routing map covers the full fork QwenLoRAMapping surface (60 blocks x 14 targets)");
 }
 
 fn render(adapter: Option<(&str, AdapterKind, f32)>, golden_kind: &str) -> Vec<u8> {
