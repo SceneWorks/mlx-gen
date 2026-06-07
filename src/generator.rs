@@ -58,6 +58,12 @@ pub struct GenerationRequest {
     pub steps: Option<u32>,
     pub guidance: Option<f32>,
     pub true_cfg: Option<f32>,
+    /// CFG-scheduling start step — the companion to [`true_cfg`](Self::true_cfg): real classifier-free
+    /// guidance (and any per-branch conditioning gated with it) engages only once the denoise reaches
+    /// this step, leaving earlier steps single-forward. `None` ⇒ each model's own default. Today only
+    /// PuLID-FLUX honors it (default 1; its photoreal preset uses 4 to delay CFG a few steps); models
+    /// without CFG scheduling ignore it.
+    pub timestep_to_start_cfg: Option<u32>,
     pub sampler: Option<String>,
     pub scheduler: Option<String>,
     pub scheduler_shift: Option<f32>,
@@ -108,6 +114,7 @@ impl Default for GenerationRequest {
             steps: None,
             guidance: None,
             true_cfg: None,
+            timestep_to_start_cfg: None,
             sampler: None,
             scheduler: None,
             scheduler_shift: None,

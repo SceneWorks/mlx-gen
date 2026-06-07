@@ -129,6 +129,23 @@ impl FluxTransformerConfig {
     }
 }
 
+/// A per-block additive residual injector for the FLUX DiT **image** stream — the generic seam the
+/// PuLID-FLUX id cross-attn (sc-3072, `mlx-gen-pulid`) plugs into. Kept model-agnostic so this crate
+/// carries no PuLID-specific code: the DiT just asks "is there a residual to add to the image tokens
+/// after block N?" and the injector (which owns the id_embedding + cross-attn modules) answers.
+///
+/// `after_double` sees the image hidden stream directly; `after_single` sees the image-token tail of
+/// the joint stream (the DiT slices it out and writes the residual back). Returning `None` (e.g. at a
+/// non-injection block index, or when the id weight is 0) leaves the stream untouched.
+pub trait DitImageInjector {
+    /// Residual to add to the image stream after double block `block_idx`, or `None`.
+    fn after_double(&self, block_idx: usize, img_hidden: &Array) -> Result<Option<Array>>;
+    /// Cheap gate so the DiT skips the image-token slice on single blocks with no injection.
+    fn injects_after_single(&self, block_idx: usize) -> bool;
+    /// Residual to add to the image-token tail after single block `block_idx`, or `None`.
+    fn after_single(&self, block_idx: usize, img_tokens: &Array) -> Result<Option<Array>>;
+}
+
 pub struct FluxTransformer {
     x_embedder: AdaptableLinear,
     context_embedder: AdaptableLinear,
@@ -201,6 +218,37 @@ impl FluxTransformer {
         width: u32,
         height: u32,
     ) -> Result<Array> {
+        self.forward_injected(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            None,
+        )
+    }
+
+    /// As [`forward`], but with an optional per-block image-stream residual injector — the seam the
+    /// PuLID-FLUX id cross-attn (sc-3072) hooks into. `injector = None` is byte-identical to
+    /// [`forward`] (it IS the same path), so the plain FLUX render carries zero overhead.
+    ///
+    /// The injector is consulted after every double block (the image stream `hidden`) and after the
+    /// single blocks it opts into (the image-token tail of `joint = cat(encoder, hidden)`), matching
+    /// the reference `flux/model.py` PuLID injection points (every 2nd double, every 4th single).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_injected(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+    ) -> Result<Array> {
         let mut hidden = self.x_embedder.forward(hidden_states)?;
         let mut encoder = self.context_embedder.forward(prompt_embeds)?;
         let text_embeddings = self.time_text_embed.forward(
@@ -214,23 +262,39 @@ impl FluxTransformer {
             (width / 16) as usize,
         )?;
 
-        for block in &self.blocks {
+        for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(&hidden, &encoder, &text_embeddings, &rope)?;
             encoder = e;
             hidden = h;
+            if let Some(inj) = injector {
+                if let Some(r) = inj.after_double(i, &hidden)? {
+                    hidden = add(&hidden, &r)?;
+                }
+            }
         }
 
         let txt_seq = encoder.shape()[1];
-        let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
-        for block in &self.single_blocks {
-            joint = block.forward(&joint, &text_embeddings, &rope)?;
-        }
         let img_seq = hidden.shape()[1];
-        let idx = Array::from_slice(
+        let img_idx = Array::from_slice(
             &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
             &[img_seq],
         );
-        let hidden = joint.take_axis(&idx, 1)?;
+        let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
+        for (i, block) in self.single_blocks.iter().enumerate() {
+            joint = block.forward(&joint, &text_embeddings, &rope)?;
+            if let Some(inj) = injector {
+                if inj.injects_after_single(i) {
+                    let img = joint.take_axis(&img_idx, 1)?;
+                    if let Some(r) = inj.after_single(i, &img)? {
+                        let txt_idx =
+                            Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
+                        let txt = joint.take_axis(&txt_idx, 1)?;
+                        joint = concatenate_axis(&[&txt, &add(&img, &r)?], 1)?;
+                    }
+                }
+            }
+        }
+        let hidden = joint.take_axis(&img_idx, 1)?;
         let hidden = self.norm_out.forward(&hidden, &text_embeddings)?;
         self.proj_out.forward(&hidden)
     }

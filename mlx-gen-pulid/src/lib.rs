@@ -10,5 +10,7 @@
 //! Face analysis (ArcFace embedding + `face_features_image`) is the native `mlx-gen-face` stack
 //! (epic 3079) — no Python/onnx sidecar.
 
+pub mod ca;
 pub mod eva_clip;
 pub mod idformer;
+pub mod pulid_flux;
