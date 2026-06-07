@@ -7,9 +7,12 @@
 //! latent that is channel-concatenated into the UNet input. `motion_bucket_id` / `noise_aug_strength`
 //! use the reference defaults; `fps`, `frames`, `steps`, and the CFG ceiling come from the request.
 //!
-//! Preprocessing note: the CLIP image is resized with the core PIL bicubic resampler, not diffusers'
-//! `_resize_with_antialiasing` (gaussian-blur + align-corners bicubic). The CLIP conditioning is
-//! robust to that resize difference; byte-exact antialiased resize is a tracked follow-up (sc-3412).
+//! Preprocessing (sc-3412): the CLIP image is resized with the faithful diffusers
+//! `_resize_with_antialiasing` (gaussian-blur + align-corners bicubic, in `[-1,1]` space — see
+//! [`crate::preprocess`]); the VAE conditioning image is resized with PIL lanczos
+//! (`mlx_gen::image::resize_lanczos_u8`), matching diffusers' `VideoProcessor.preprocess`
+//! (`config.resample = "lanczos"`). Both are identity when the input already matches the target
+//! size (the production case) and byte-faithful to the reference when they differ.
 
 use mlx_rs::ops::{add, broadcast_to, divide, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
@@ -17,8 +20,8 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Result,
-    WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Result, WeightsSource,
 };
 
 use crate::config::{ImageEncoderConfig, SchedulerConfig, UnetConfig, VaeConfig};
@@ -75,7 +78,14 @@ pub struct Svd {
     descriptor: ModelDescriptor,
 }
 
-/// Load every component (f32) from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
+/// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`).
+///
+/// **Precision.** The dense path (`Precision::Bf16`, the registry's dense sentinel) runs the UNet +
+/// image encoder in **fp16** — the production dtype (SVD ships an fp16 variant and runs
+/// `torch_dtype=float16`); this is the fast path (≈½ the resident weights + half-precision matmuls,
+/// with the fp16-sensitive reductions — GroupNorm via fused `layer_norm`, attention via fused SDPA —
+/// upcast internally by MLX). `Precision::Fp32` selects the full-precision quality path (the
+/// S1/S3/S4 parity-validated precision). The **VAE always stays f32** (`force_upcast=True`).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
@@ -86,24 +96,40 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     };
 
-    // The VAE has `force_upcast=True` (decode in f32); the UNet/encoder also run f32 here — the
-    // S1/S3/S4 parity-validated precision. (A bf16 fast path is a perf follow-up.)
-    let load_f32 = |sub: &str, file: &str| -> Result<Weights> {
-        let mut w = Weights::from_file(root.join(sub).join(file))?;
-        w.cast_all(Dtype::Float32)?;
+    let dense = match spec.precision {
+        Precision::Bf16 => Dtype::Float16,
+        Precision::Fp32 => Dtype::Float32,
+    };
+
+    // Prefer the on-disk fp16 variant when running fp16 (half the load IO, already half precision);
+    // otherwise the full-precision file, cast to the target dtype.
+    let load = |sub: &str, stem: &str, dtype: Dtype| -> Result<Weights> {
+        let dir = root.join(sub);
+        let path = if dtype == Dtype::Float16 {
+            let fp16 = dir.join(format!("{stem}.fp16.safetensors"));
+            if fp16.exists() {
+                fp16
+            } else {
+                dir.join(format!("{stem}.safetensors"))
+            }
+        } else {
+            dir.join(format!("{stem}.safetensors"))
+        };
+        let mut w = Weights::from_file(path)?;
+        w.cast_all(dtype)?;
         Ok(w)
     };
 
     let vae = SvdVae::from_weights(
-        &load_f32("vae", "diffusion_pytorch_model.safetensors")?,
+        &load("vae", "diffusion_pytorch_model", Dtype::Float32)?,
         &VaeConfig::default(),
     )?;
     let unet = SvdUnet::from_weights(
-        &load_f32("unet", "diffusion_pytorch_model.safetensors")?,
+        &load("unet", "diffusion_pytorch_model", dense)?,
         &UnetConfig::default(),
     )?;
     let image_encoder = SvdImageEncoder::from_weights(
-        &load_f32("image_encoder", "model.safetensors")?,
+        &load("image_encoder", "model", dense)?,
         &ImageEncoderConfig::default(),
     )?;
 
@@ -113,12 +139,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-/// An RGB8 [`Image`] → NHWC f32 `[1, out_h, out_w, 3]` in `[0, 1]` (bicubic-resized, rescaled).
+/// An RGB8 [`Image`] → NHWC f32 `[1, out_h, out_w, 3]` in `[0, 1]` for the VAE conditioning image:
+/// PIL **lanczos** resize (matching diffusers' `VideoProcessor.preprocess`, `resample = "lanczos"`),
+/// then rescale to `[0, 1]`. (Identity when the input already matches the target size.)
 fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> {
     if img.pixels.len() != (img.width * img.height * 3) as usize {
         return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
     }
-    let resized = mlx_gen::image::resize_bicubic_u8(
+    let resized = mlx_gen::image::resize_lanczos_u8(
         &img.pixels,
         img.height as usize,
         img.width as usize,
@@ -141,9 +169,20 @@ impl Svd {
             .ok_or_else(|| Error::Msg("svd_xt: image→video requires a Reference image".into()))
     }
 
-    /// CLIP `image_embeds` `[1, 1, 1024]` from the reference (bicubic-resize to 224 → CLIP normalize).
+    /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing`
+    /// to 224 (gaussian-blur + align-corners bicubic, in `[-1,1]`) → CLIP mean/std normalize.
     fn clip_embeds(&self, img: &Image) -> Result<Array> {
-        let unit = image_to_unit_nhwc(img, CLIP_SIZE, CLIP_SIZE)?; // [1,224,224,3] in [0,1]
+        if img.pixels.len() != (img.width * img.height * 3) as usize {
+            return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
+        }
+        let unit = crate::preprocess::resize_with_antialiasing_unit(
+            &img.pixels,
+            img.height as usize,
+            img.width as usize,
+            CLIP_SIZE,
+            CLIP_SIZE,
+        ); // HWC [224,224,3] in [0,1]
+        let unit = Array::from_slice(&unit, &[1, CLIP_SIZE as i32, CLIP_SIZE as i32, 3]);
         let mean = Array::from_slice(&CLIP_MEAN, &[1, 1, 1, 3]);
         let std = Array::from_slice(&CLIP_STD, &[1, 1, 1, 3]);
         let normed = divide(&subtract(&unit, &mean)?, &std)?;

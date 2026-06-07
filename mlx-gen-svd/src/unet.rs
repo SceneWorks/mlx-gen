@@ -15,7 +15,7 @@
 //! (1−σ)·temporal` (`merge_strategy="learned_with_images"`, no switch).
 
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, sigmoid, subtract};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{conv2d, conv3d, group_norm, linear, silu, upsample_nearest};
@@ -406,6 +406,9 @@ pub struct SvdUnet {
     conv_out: (Array, Array),
     time_proj_dim: i32,
     add_time_proj_dim: i32,
+    /// Compute dtype (the loaded weight dtype): fp16 on the dense fast path, f32 on `Precision::Fp32`.
+    /// `forward` casts its inputs to this and returns f32, so the pipeline stays f32-facing.
+    dtype: Dtype,
 }
 
 impl SvdUnet {
@@ -463,6 +466,7 @@ impl SvdUnet {
             conv_out: load_conv2d(w, "conv_out")?,
             time_proj_dim: boc[0] as i32,
             add_time_proj_dim: cfg.addition_time_embed_dim as i32,
+            dtype: w.require("conv_in.weight")?.dtype(),
         })
     }
 
@@ -485,23 +489,31 @@ impl SvdUnet {
         let (b, f, h, w_) = (sh[0], sh[1], sh[2], sh[3]);
         let in_ch = sh[4];
 
+        // Run in the loaded compute dtype (fp16 on the fast path): cast the array inputs in, the
+        // result back to f32 on the way out (the sinusoidal embeddings below are built in f32 and
+        // cast before their weight matmuls). The fp16-sensitive reductions (GroupNorm/SDPA) upcast
+        // internally in the fused MLX kernels.
+        let sample = sample.as_dtype(self.dtype)?;
+        let image_embeds = image_embeds.as_dtype(self.dtype)?;
+
         // Timestep embedding.
         let t = Array::from_slice(&vec![timestep; b as usize], &[b]);
-        let temb = sinusoidal_timestep(&t, self.time_proj_dim)?; // [B, 320]
+        let temb = sinusoidal_timestep(&t, self.time_proj_dim)?.as_dtype(self.dtype)?; // [B, 320]
         let mut emb = self.time_embedding.forward(&temb)?; // [B, 1280]
 
         // `added_time_ids` micro-conditioning.
         let flat = added_time_ids.reshape(&[b * added_time_ids.shape()[1]])?;
         let time_embeds = sinusoidal_timestep(&flat, self.add_time_proj_dim)?; // [B·3, 256]
-        let time_embeds =
-            time_embeds.reshape(&[b, time_embeds.shape()[1] * added_time_ids.shape()[1]])?;
+        let time_embeds = time_embeds
+            .reshape(&[b, time_embeds.shape()[1] * added_time_ids.shape()[1]])?
+            .as_dtype(self.dtype)?;
         let aug = self.add_embedding.forward(&time_embeds)?; // [B, 1280]
         emb = add(&emb, &aug)?;
 
         // Flatten frames; repeat conditioning over frames.
         let sample = sample.reshape(&[b * f, h, w_, in_ch])?;
         let emb = repeat_interleave_2d(&emb, f)?; // [B·F, 1280]
-        let context = repeat_interleave_3d(image_embeds, f)?; // [B·F, ctx, 1024]
+        let context = repeat_interleave_3d(&image_embeds, f)?; // [B·F, ctx, 1024]
 
         // Conv stem; collect skip residuals (starting with the stem output).
         let mut x = conv2d(&sample, &self.conv_in.0, Some(&self.conv_in.1), 1, 1)?;
@@ -527,6 +539,7 @@ impl SvdUnet {
         )?;
         let x = conv2d(&silu(&x)?, &self.conv_out.0, Some(&self.conv_out.1), 1, 1)?;
         let os = x.shape();
-        Ok(x.reshape(&[b, f, os[1], os[2], os[3]])?)
+        // Back to f32 so the CFG combine + EDM step math in the pipeline run in full precision.
+        Ok(x.reshape(&[b, f, os[1], os[2], os[3]])?.as_dtype(Dtype::Float32)?)
     }
 }
