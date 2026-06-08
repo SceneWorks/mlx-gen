@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     AdapterKind, AdapterSpec, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec,
-    WeightsSource,
+    Quant, WeightsSource,
 };
 // Referencing the provider crate links its `inventory` registration so `mlx_gen::load(MODEL_ID, …)`
 // resolves (the test otherwise touches only the `mlx_gen` core and the crate would be dropped).
@@ -194,6 +194,59 @@ fn edit_lightning_lora() -> PathBuf {
         .expect("Qwen-Image-Edit-2511-Lightning-8steps-V1.0-bf16.safetensors not cached")
 }
 
+fn edit_lightning_lora_4step() -> PathBuf {
+    let home = std::env::var("HOME").unwrap();
+    let snaps = PathBuf::from(home)
+        .join(".cache/huggingface/hub/models--lightx2v--Qwen-Image-Edit-2511-Lightning/snapshots");
+    std::fs::read_dir(&snaps)
+        .expect("download lightx2v/Qwen-Image-Edit-2511-Lightning")
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            e.path()
+                .join("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors")
+        })
+        .find(|p| p.exists())
+        .expect("Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors not cached")
+}
+
+fn load_ppm(path: PathBuf) -> Image {
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let mut cursor = 0usize;
+    let mut next_token = || {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor < bytes.len() && bytes[cursor] == b'#' {
+            while cursor < bytes.len() && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+        }
+        let start = cursor;
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        std::str::from_utf8(&bytes[start..cursor]).expect("ppm token utf8")
+    };
+    assert_eq!(next_token(), "P6", "expected binary PPM");
+    let width: u32 = next_token().parse().expect("ppm width");
+    let height: u32 = next_token().parse().expect("ppm height");
+    let max: u32 = next_token().parse().expect("ppm max value");
+    assert_eq!(max, 255, "only 8-bit PPM is supported");
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    let pixels = bytes[cursor..].to_vec();
+    assert_eq!(pixels.len(), (width * height * 3) as usize);
+    Image {
+        width,
+        height,
+        pixels,
+    }
+}
+
 /// A deterministic synthetic reference image (a smooth RGB gradient — coherent, not noise) to edit.
 fn synthetic_reference() -> Image {
     let (w, h) = (512u32, 512u32);
@@ -270,4 +323,57 @@ fn edit_lightning_render_is_coherent() {
         adj < 40.0,
         "edit render looks like noise (adjacent |Δ| {adj:.1} ~ uniform)"
     );
+}
+
+/// Repro gate for SceneWorks' Qwen Edit Lightning stack: Q8 base, 4-step lightx2v distill LoRA,
+/// and a user LoRA over a real 1024px edit reference. This exercises the path that can otherwise
+/// accumulate a large lazy MLX graph and trip Metal's command-buffer watchdog at final readback.
+///
+/// Example:
+/// `QWEN_EDIT_REPRO_REF_PPM=/tmp/source_1024_crop.ppm \
+///  QWEN_EDIT_REPRO_LORA=/path/to/user_lora.safetensors \
+///  cargo test -p mlx-gen-qwen-image --release --test lightning_render_real_weights \
+///    edit_lightning_user_lora_reference_repro -- --ignored --nocapture`
+#[test]
+#[ignore = "needs real Qwen-Image-Edit-2511 weights, 4-step Lightning LoRA, reference PPM, and user LoRA"]
+fn edit_lightning_user_lora_reference_repro() {
+    let reference = load_ppm(PathBuf::from(
+        std::env::var("QWEN_EDIT_REPRO_REF_PPM").expect("set QWEN_EDIT_REPRO_REF_PPM"),
+    ));
+    let user_lora =
+        PathBuf::from(std::env::var("QWEN_EDIT_REPRO_LORA").expect("set QWEN_EDIT_REPRO_LORA"));
+    let spec = LoadSpec::new(WeightsSource::Dir(edit_snapshot()))
+        .with_quant(Quant::Q8)
+        .with_adapters(vec![
+            AdapterSpec::new(edit_lightning_lora_4step(), 1.0, AdapterKind::Lora),
+            AdapterSpec::new(user_lora, 0.9, AdapterKind::Lora),
+        ]);
+    let generator = model_edit::load(&spec).unwrap();
+    let req = GenerationRequest {
+        prompt: "apply the requested edit while preserving the subject".into(),
+        width: reference.width,
+        height: reference.height,
+        count: 1,
+        seed: Some(3018439978),
+        steps: Some(4),
+        sampler: Some("lightning".into()),
+        guidance: Some(1.0),
+        conditioning: vec![Conditioning::Reference {
+            image: reference,
+            strength: None,
+        }],
+        ..Default::default()
+    };
+    let img = match generator
+        .generate(&req, &mut |p| println!("{p:?}"))
+        .unwrap()
+    {
+        GenerationOutput::Images(mut v) => v.swap_remove(0),
+        other => panic!("expected Images, got {other:?}"),
+    };
+    assert_eq!(img.pixels.len(), (req.width * req.height * 3) as usize);
+    let (mean, std, distinct, adj) = image_stats(&img.pixels, req.width);
+    println!("Rust edit-lightning user-LoRA repro: mean {mean:.1} std {std:.1} distinct {distinct} adj|Δ| {adj:.1}");
+    assert!(std > 10.0, "render looks flat/degenerate (std {std:.1})");
+    assert!(distinct > 32, "too few distinct levels ({distinct})");
 }
