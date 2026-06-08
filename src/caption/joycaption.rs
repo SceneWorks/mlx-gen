@@ -12,6 +12,8 @@ use crate::runtime::{LoadSpec, WeightsSource};
 use crate::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use crate::{Error, Result};
 
+pub mod vision;
+
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
 pub const JOY_CAPTION_FAMILY: &str = "joycaption";
 
