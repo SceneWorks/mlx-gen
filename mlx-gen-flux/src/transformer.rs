@@ -580,7 +580,7 @@ impl JointBlock {
             self.norm1.forward_six(hidden, emb)?;
         let (norm_encoder, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp) =
             self.norm1_context.forward_six(encoder, emb)?;
-        let (attn_hidden, attn_context) =
+        let (attn_hidden, attn_context, ip_residual) =
             self.attn
                 .forward_with_ip(&norm_hidden, &norm_encoder, rope, ip)?;
         let hidden = apply_norm_ff(
@@ -592,6 +592,13 @@ impl JointBlock {
             &gate_mlp,
             &self.ff,
         )?;
+        // XLabs IP-Adapter: add the decoupled-cross-attention residual RAW (ungated) to the final
+        // block output, after the FF residual — diffusers `hidden_states = hidden_states +
+        // ip_attn_output` (transformer_flux.py:477). It bypasses `gate_msa` and the FF input.
+        let hidden = match ip_residual {
+            Some(r) => add(&hidden, &r.as_dtype(hidden.dtype())?)?,
+            None => hidden,
+        };
         let encoder = apply_norm_ff(
             encoder,
             &attn_context,
@@ -683,20 +690,23 @@ impl JointAttention {
         })
     }
 
-    /// When `ip = Some((injector, block_idx))` adds the XLabs IP-Adapter
-    /// decoupled-cross-attention residual to the image attention output. The IP query is the image
-    /// stream's **RMS-normed, pre-RoPE** query (`norm_q(to_q(img))`, before the text concat + RoPE)
-    /// — matching diffusers' `FluxIPAdapterAttnProcessor` (`ip_query = query` captured *before*
-    /// `apply_rotary_emb`; the position-less IP keys are attended by the un-rotated query). The
-    /// residual is added before `to_out`'s caller gates it. `ip = None` is byte-identical to the
-    /// plain joint attention.
+    /// When `ip = Some((injector, block_idx))` computes the XLabs IP-Adapter
+    /// decoupled-cross-attention residual for the image stream and returns it as the third tuple
+    /// element (it is **not** folded into the image attention output here). The IP query is the
+    /// image stream's **RMS-normed, pre-RoPE** query (`norm_q(to_q(img))`, before the text concat +
+    /// RoPE) — matching diffusers' `FluxIPAdapterAttnProcessor` (`ip_query = query` captured
+    /// *before* `apply_rotary_emb`; the position-less IP keys are attended by the un-rotated query).
+    /// The caller adds the residual **raw (ungated), after the FF residual**, to the block output —
+    /// diffusers' `hidden_states = hidden_states + ip_attn_output` (the IP term bypasses `gate_msa`
+    /// and the FF input entirely). `ip = None` returns `None` and is byte-identical to the plain
+    /// joint attention.
     fn forward_with_ip(
         &self,
         hidden: &Array,
         encoder: &Array,
         rope: &RopeTable,
         ip: Option<(&dyn DitImageInjector, usize)>,
-    ) -> Result<(Array, Array)> {
+    ) -> Result<(Array, Array, Option<Array>)> {
         let (q, k, v) = process_qkv(
             hidden,
             &self.to_q,
@@ -729,20 +739,23 @@ impl JointAttention {
             &[img_seq],
         );
         let attn_img = self.to_out.forward(&out.take_axis(&img_idx, 1)?)?;
-        let attn_img = match ip {
-            Some((inj, block_idx)) => crate::ip_adapter::add_block_ip(
-                inj,
+        // The IP residual is computed here but returned separately — the block adds it raw to the
+        // final output (after gate_msa + FF), per diffusers. Folding it into `attn_img` (which is
+        // then gated by `gate_msa` and fed into the FF input) would both suppress it where the gate
+        // is small and distort the velocity, breaking resemblance + saturating true_cfg.
+        let ip_residual = match ip {
+            Some((inj, block_idx)) => inj.double_block_ip(
                 block_idx,
                 ip_img_q
                     .as_ref()
                     .expect("ip_img_q captured when ip present"),
-                &attn_img,
             )?,
-            None => attn_img,
+            None => None,
         };
         Ok((
             attn_img,
             self.to_add_out.forward(&out.take_axis(&txt_idx, 1)?)?,
+            ip_residual,
         ))
     }
 

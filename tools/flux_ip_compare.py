@@ -13,6 +13,7 @@ from PIL import Image
 from transformers import CLIPVisionModelWithProjection
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/flux_ab"
+MLX_NAME = sys.argv[2] if len(sys.argv) > 2 else "mlx_ip.png"
 model = CLIPVisionModelWithProjection.from_pretrained(
     "openai/clip-vit-large-patch14", torch_dtype=torch.float32
 ).eval()
@@ -40,7 +41,7 @@ def embed(name):
 
 ref = embed("reference.png")
 torch_ip = embed("torch_ip.png")
-mlx_ip = embed("mlx_ip.png")
+mlx_ip = embed(MLX_NAME)
 
 
 def cos(a, b):
