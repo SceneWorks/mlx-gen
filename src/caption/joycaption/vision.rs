@@ -371,7 +371,7 @@ mod tests {
         let image = Image {
             width: 384,
             height: 384,
-            pixels: vec![0u8, 128, 255].repeat(384 * 384),
+            pixels: [0u8, 128, 255].repeat(384 * 384),
         };
         let out = SiglipImageProcessor::default()
             .preprocess(&image)

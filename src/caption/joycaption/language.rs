@@ -485,7 +485,7 @@ pub fn expand_image_tokens(ids: &[i32], image_token_id: i32, image_seq_length: u
     let mut out = Vec::with_capacity(ids.len() + image_seq_length.saturating_sub(1));
     for &id in ids {
         if id == image_token_id {
-            out.extend(std::iter::repeat(image_token_id).take(image_seq_length));
+            out.extend(std::iter::repeat_n(image_token_id, image_seq_length));
         } else {
             out.push(id);
         }

@@ -31,7 +31,7 @@ pub trait Captioner {
 }
 
 /// A single image-caption request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CaptionRequest {
     /// The RGB image to caption.
     pub image: Image,
@@ -48,19 +48,6 @@ pub struct CaptionRequest {
     /// model text; post-processing stays at the dataset boundary.
     pub trigger_words: Vec<String>,
     pub cancel: CancelFlag,
-}
-
-impl Default for CaptionRequest {
-    fn default() -> Self {
-        Self {
-            image: Image::default(),
-            prompt: String::new(),
-            options: CaptionOptions::default(),
-            sampling: CaptionSampling::default(),
-            trigger_words: Vec::new(),
-            cancel: CancelFlag::default(),
-        }
-    }
 }
 
 /// Caption prompt options preserved from the caller-facing job contract.
