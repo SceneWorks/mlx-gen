@@ -21,7 +21,7 @@ use mlx_rs::ops::{add, broadcast_to, concatenate_axis};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
-use mlx_gen::nn::{conv2d, gelu_exact};
+use mlx_gen::nn::{conv2d, gelu_exact, gelu_quick};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -37,6 +37,10 @@ pub struct VisionConfig {
     pub patch: i32,
     pub image_size: i32,
     pub num_channels: i32,
+    /// MLP activation: `quick_gelu` (`x·sigmoid(1.702x)`, OpenAI CLIP-L) vs exact `gelu` (the laion
+    /// OpenCLIP ViT-H tower). `config.json` `hidden_act` — they differ, and over the tower's depth
+    /// the wrong one drifts the embeds (~0.93 cosine vs torch on ViT-L; sc-3622).
+    pub quick_gelu: bool,
 }
 
 impl VisionConfig {
@@ -49,6 +53,23 @@ impl VisionConfig {
             patch: 14,
             image_size: 224,
             num_channels: 3,
+            quick_gelu: false,
+        }
+    }
+
+    /// OpenAI CLIP ViT-L/14 (`openai/clip-vit-large-patch14`, `vision_model.*`): 1024-wide, 24
+    /// layers, 16 heads (head_dim 64), patch 14, 224px → 257 tokens. The image tower the XLabs
+    /// FLUX IP-Adapter conditions on (a `CLIPVisionModelWithProjection`; the 1024→768 projection
+    /// head lives in the consumer, not here).
+    pub fn vit_l_14() -> Self {
+        Self {
+            hidden: 1024,
+            num_layers: 24,
+            num_heads: 16,
+            patch: 14,
+            image_size: 224,
+            num_channels: 3,
+            quick_gelu: true,
         }
     }
 
@@ -75,6 +96,7 @@ struct VisionEncoderLayer {
     num_heads: i32,
     head_dim: i32,
     scale: f32,
+    quick_gelu: bool,
 }
 
 impl VisionEncoderLayer {
@@ -101,6 +123,7 @@ impl VisionEncoderLayer {
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
+            quick_gelu: cfg.quick_gelu,
         })
     }
 
@@ -112,7 +135,11 @@ impl VisionEncoderLayer {
 
         let y = layer_norm(&x, Some(&self.ln2_w), Some(&self.ln2_b), LN_EPS)?;
         let y = self.fc1.forward(&y)?;
-        let y = gelu_exact(&y)?;
+        let y = if self.quick_gelu {
+            gelu_quick(&y)?
+        } else {
+            gelu_exact(&y)?
+        };
         let y = self.fc2.forward(&y)?;
         Ok(add(&x, &y)?)
     }

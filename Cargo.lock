@@ -570,6 +570,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
 ]
