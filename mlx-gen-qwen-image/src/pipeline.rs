@@ -8,6 +8,7 @@
 //! negative) combined by classifier-free guidance.
 
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract, sum_axes};
+use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
@@ -383,6 +384,11 @@ pub fn denoise_edit_with_progress(
             None => pos,
         };
         latents = sampler.step(&velocity, &latents, t)?;
+        // Force each edit denoise step to finish before the next step extends the lazy MLX
+        // graph. Without this boundary, 1024px Qwen Edit Lightning + LoRA + some references can
+        // accumulate enough queued Metal work to trip the command-buffer watchdog at final
+        // pixel readback.
+        eval([&latents])?;
         on_progress(Progress::Step {
             current: t as u32 + 1,
             total,
