@@ -146,8 +146,8 @@ pub trait DitImageInjector {
     fn after_single(&self, block_idx: usize, img_tokens: &Array) -> Result<Option<Array>>;
 
     /// Decoupled IP-Adapter cross-attention residual added to the image **attention output** of
-    /// double block `block_idx` (before the block's `gate_msa`/FF), given the block's post-RMS-norm,
-    /// post-RoPE per-head image query `img_q` `[B, HEADS, img_seq, HEAD_DIM]`. Returns the residual
+    /// double block `block_idx` (before the block's `gate_msa`/FF), given the block's RMS-normed,
+    /// **pre-RoPE** per-head image query `img_q` `[B, HEADS, img_seq, HEAD_DIM]`. Returns the residual
     /// `[B, img_seq, DIM]`, or `None`. Default `None`: this seam is the XLabs FLUX IP-Adapter
     /// (sc-3623); injectors like PuLID-FLUX that use only the post-block residuals above don't
     /// implement it, so the DiT skips the mid-attention image-query slice for them.
@@ -684,10 +684,12 @@ impl JointAttention {
     }
 
     /// When `ip = Some((injector, block_idx))` adds the XLabs IP-Adapter
-    /// decoupled-cross-attention residual to the image attention output. The IP query is the
-    /// image slice of the post-RoPE joint query `q` (so it matches the diffusers `FluxIPAdapter`
-    /// semantics: RMS-normed + RoPE-applied), and the residual is added before `to_out`'s caller
-    /// gates it. `ip = None` is byte-identical to the plain joint attention.
+    /// decoupled-cross-attention residual to the image attention output. The IP query is the image
+    /// stream's **RMS-normed, pre-RoPE** query (`norm_q(to_q(img))`, before the text concat + RoPE)
+    /// — matching diffusers' `FluxIPAdapterAttnProcessor` (`ip_query = query` captured *before*
+    /// `apply_rotary_emb`; the position-less IP keys are attended by the un-rotated query). The
+    /// residual is added before `to_out`'s caller gates it. `ip = None` is byte-identical to the
+    /// plain joint attention.
     fn forward_with_ip(
         &self,
         hidden: &Array,
@@ -703,6 +705,9 @@ impl JointAttention {
             &self.norm_q,
             &self.norm_k,
         )?;
+        // Pre-RoPE, pre-concat image query — diffusers' `ip_query` (captured before RoPE). Cloned
+        // only when an IP injector is present (otherwise zero overhead).
+        let ip_img_q = ip.map(|_| q.clone());
         let (eq, ek, ev) = process_qkv(
             encoder,
             &self.add_q,
@@ -725,12 +730,14 @@ impl JointAttention {
         );
         let attn_img = self.to_out.forward(&out.take_axis(&img_idx, 1)?)?;
         let attn_img = match ip {
-            // `img_idx` indexes the sequence axis: axis 1 of `out` (`[B, seq, DIM]`) and axis 2 of
-            // the post-RoPE `q` (`[B, HEADS, seq, HEAD_DIM]`) — the same image-token range.
-            Some((inj, block_idx)) => {
-                let img_q = q.take_axis(&img_idx, 2)?;
-                crate::ip_adapter::add_block_ip(inj, block_idx, &img_q, &attn_img)?
-            }
+            Some((inj, block_idx)) => crate::ip_adapter::add_block_ip(
+                inj,
+                block_idx,
+                ip_img_q
+                    .as_ref()
+                    .expect("ip_img_q captured when ip present"),
+                &attn_img,
+            )?,
             None => attn_img,
         };
         Ok((
