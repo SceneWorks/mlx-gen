@@ -78,6 +78,12 @@ impl ChromaVariant {
         }
     }
 
+    /// Base ships `use_beta_sigmas=true` — a beta-distribution sigma spacing (see [`crate::beta`])
+    /// instead of the shifted linspace HD/Flash use.
+    pub fn use_beta_sigmas(self) -> bool {
+        matches!(self, Self::Base)
+    }
+
     pub fn descriptor(self) -> ModelDescriptor {
         ModelDescriptor {
             id: self.id(),

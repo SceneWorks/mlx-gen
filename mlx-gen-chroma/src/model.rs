@@ -160,14 +160,19 @@ impl Chroma {
         let mask_pos = Self::full_mask(&pos_mask, si)?;
         let mask_neg = Self::full_mask(&neg_mask, si)?;
 
-        // Chroma's scheduler is `use_dynamic_shifting=false` with a **static** `shift` — NOT FLUX's
-        // resolution-dependent exp-shift. Take the raw mlx `linspace(1, 1/N, N)` (shift=false) and
-        // apply `σ' = shift·σ/(1+(shift-1)·σ)` on top. (shift=1.0 ⇒ identity.)
-        let shift = self.variant.sigma_shift();
-        let mut sigmas = build_linear_sigmas(steps as usize, width, height, false)?;
-        for s in sigmas.iter_mut().take(steps as usize) {
-            *s = shift * *s / (1.0 + (shift - 1.0) * *s);
-        }
+        // Chroma's scheduler is `use_dynamic_shifting=false`. HD/Flash: static `shift` over the raw
+        // mlx `linspace(1,1/N,N)` — `σ'=shift·σ/(1+(shift-1)·σ)` (shift=1.0 ⇒ identity). Base:
+        // `use_beta_sigmas=true` — a beta-spaced schedule (sc-3840). NOT FLUX's resolution exp-shift.
+        let sigmas = if self.variant.use_beta_sigmas() {
+            crate::beta::base_sigmas(steps as usize)
+        } else {
+            let shift = self.variant.sigma_shift();
+            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
+            for v in s.iter_mut().take(steps as usize) {
+                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
+            }
+            s
+        };
         let sampler = FlowMatchSampler::new(sigmas);
         let n = sampler.num_steps();
 

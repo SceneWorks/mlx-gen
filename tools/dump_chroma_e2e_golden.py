@@ -13,6 +13,8 @@ Small (256x256, 4 steps) to keep the f32 run tractable. Run from the SceneWorks 
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import torch
 from safetensors.torch import save_file
@@ -21,11 +23,14 @@ from diffusers import ChromaPipeline
 
 from _paths import fixture, hf_hub_cache
 
+# argv: [variant=hd|base|flash] [guidance] [steps]
+VARIANT = sys.argv[1] if len(sys.argv) > 1 else "hd"
+REPO = {"hd": "Chroma1-HD", "base": "Chroma1-Base", "flash": "Chroma1-Flash"}[VARIANT]
 PROMPT = "a photograph of an astronaut riding a horse"
 NEG = ""
 H = W = 256
-STEPS = 4
-GUIDANCE = 4.0
+STEPS = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+GUIDANCE = float(sys.argv[2]) if len(sys.argv) > 2 else 4.0
 MAX_SEQ = 512
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
@@ -33,7 +38,7 @@ dtype = torch.float32
 
 
 def snapshot() -> str:
-    base = hf_hub_cache() / "models--lodestones--Chroma1-HD" / "snapshots"
+    base = hf_hub_cache() / f"models--lodestones--{REPO}" / "snapshots"
     return str(next(p for p in base.iterdir() if p.is_dir()))
 
 
@@ -83,21 +88,26 @@ def main() -> None:
     unpacked = (unpacked / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
     image = pipe.vae.decode(unpacked, return_dict=False)[0]  # [1,3,H,W] in [-1,1]
 
+    # The model path is identical across variants (validated comprehensively on HD); base/flash only
+    # differ in the sigma schedule, so their fixtures are minimal (init + final + image) to stay small.
     out = {
-        # embeds stored bf16 to keep the committed fixture small; the parity gates (5%) absorb it.
-        "prompt_embeds": prompt_embeds.cpu().bfloat16(),
-        "prompt_mask": prompt_mask.cpu().float(),          # transformer text mask [1, L]
-        "neg_embeds": neg_embeds.cpu().bfloat16(),
-        "neg_mask": neg_mask.cpu().float(),
         "init_latents": init.cpu().float(),                # [1, Si, 64]
-        "img_ids": img_ids.cpu().float(),
-        "timestep": (t0.expand(1) / 1000).cpu().float(),   # the sigma fed to the transformer
-        "noise_pred": noise_pred.cpu().float(),            # single-forward DiT output
         "final_latents": latents.cpu().float(),            # packed, post-denoise
         "image": image.cpu().float(),                      # [1,3,H,W], [-1,1]
     }
-    save_file(out, fixture("mlx-gen-chroma/tests/fixtures/chroma_e2e.safetensors"))
-    print(f"device={device} dtype={dtype} si={si} t0={float(t0):.3f}")
+    if VARIANT == "hd":
+        out.update({
+            # embeds stored bf16 to keep the committed fixture small; the parity gates (5%) absorb it.
+            "prompt_embeds": prompt_embeds.cpu().bfloat16(),
+            "prompt_mask": prompt_mask.cpu().float(),      # transformer text mask [1, L]
+            "neg_embeds": neg_embeds.cpu().bfloat16(),
+            "neg_mask": neg_mask.cpu().float(),
+            "img_ids": img_ids.cpu().float(),
+            "timestep": (t0.expand(1) / 1000).cpu().float(),  # the sigma fed to the transformer
+            "noise_pred": noise_pred.cpu().float(),        # single-forward DiT output
+        })
+    save_file(out, fixture(f"mlx-gen-chroma/tests/fixtures/chroma_e2e_{VARIANT}.safetensors"))
+    print(f"variant={VARIANT} device={device} dtype={dtype} si={si} t0={float(t0):.3f} g={GUIDANCE} steps={STEPS}")
     print("shapes:", {k: tuple(v.shape) for k, v in out.items()})
     print("wrote chroma_e2e.safetensors")
 

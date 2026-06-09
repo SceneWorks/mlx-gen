@@ -1,11 +1,11 @@
-//! sc-3839: real-weight e2e parity vs torch `diffusers` ChromaPipeline (HD), f32 both sides.
-//! Golden = `tools/dump_chroma_e2e_golden.py`. `#[ignore]` — needs the ~18GB Chroma1-HD snapshot;
-//! run with `cargo test -p mlx-gen-chroma --test e2e_real_weights -- --ignored --nocapture`.
+//! sc-3839/sc-3840: real-weight e2e parity vs torch `diffusers` ChromaPipeline, f32 both sides.
+//! Goldens = `tools/dump_chroma_e2e_golden.py {hd,base,flash}`. `#[ignore]` — each needs the
+//! corresponding ~18GB snapshot; run with
+//! `cargo test -p mlx-gen-chroma --test e2e_real_weights -- --ignored --nocapture`.
 //!
-//! Three gates, increasingly integrated:
-//!   1. masked T5 encode (sc-3838 numeric) — `encode_prompt` `prompt_embeds` vs diffusers;
-//!   2. single real-weight DiT forward (sc-3837 at full scale) — `noise_pred` on fixed inputs;
-//!   3. full true-CFG denoise + VAE decode — final latents + image coherence.
+//! HD is the comprehensive gate (masked T5 encode + single real-weight DiT forward + full image).
+//! base/flash reuse the identical model path (validated on HD) and differ only in the sigma schedule
+//! (beta / static-shift-1.0), so their gates are the full-generate image + final latents.
 
 use std::path::PathBuf;
 
@@ -20,18 +20,17 @@ const NEG: &str = "";
 const W: u32 = 256;
 const H: u32 = 256;
 const STEPS: u32 = 4;
-const GUIDANCE: f32 = 4.0;
 
-fn hf_snapshot() -> PathBuf {
+fn hf_snapshot(repo: &str) -> PathBuf {
     let cache = std::env::var("HF_HUB_CACHE")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HF_HOME").map(|h| PathBuf::from(h).join("hub")))
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface/hub")
         });
-    let snaps = cache.join("models--lodestones--Chroma1-HD/snapshots");
+    let snaps = cache.join(format!("models--lodestones--{repo}/snapshots"));
     std::fs::read_dir(&snaps)
-        .unwrap_or_else(|_| panic!("Chroma1-HD snapshot not found under {}", snaps.display()))
+        .unwrap_or_else(|_| panic!("snapshot not found under {}", snaps.display()))
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .find(|p| p.is_dir())
@@ -57,24 +56,75 @@ fn rel_l2(got: &Array, golden: &Array) -> f32 {
     l2(&subtract(got, golden).unwrap()) / l2(golden)
 }
 
+/// Fraction of decoded pixels differing from the golden image (`[1,3,H,W]` in `[-1,1]`) by > `thr`/255.
+fn image_px_fraction(img: &mlx_gen::Image, golden: &Array, thr: f32) -> f32 {
+    let gi: Vec<f32> = golden
+        .as_dtype(Dtype::Float32)
+        .unwrap()
+        .as_slice::<f32>()
+        .to_vec();
+    let n = (H * W) as usize;
+    let mut bad = 0usize;
+    for c in 0..3 {
+        for p in 0..n {
+            let gv = ((gi[c * n + p] + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
+            let mv = img.pixels[p * 3 + c] as f32; // Image is HWC RGB u8
+            if (gv - mv).abs() > thr {
+                bad += 1;
+            }
+        }
+    }
+    bad as f32 / (3 * n) as f32
+}
+
+/// Full-generate image parity for a variant: denoise from the golden's init latent, compare final
+/// latents (rel-L2) + decoded image (px>8). Shared by base/flash; HD adds the tighter gates below.
+fn run_image_parity(variant: ChromaVariant, repo: &str, fixture: &str, guidance: f32) {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let g = Weights::from_file(format!("{dir}/{fixture}.safetensors")).unwrap();
+    let model = load_chroma(
+        variant,
+        &LoadSpec::new(WeightsSource::Dir(hf_snapshot(repo))),
+    )
+    .unwrap_or_else(|e| panic!("load {repo}: {e}"));
+
+    let init = g.require("init_latents").unwrap();
+    let mut nop = |_p: Progress| {};
+    let final_latents = model
+        .denoise(PROMPT, NEG, W, H, STEPS, guidance, init.clone(), &mut nop)
+        .unwrap();
+    let fl_l2 = rel_l2(&final_latents, g.require("final_latents").unwrap());
+    let img = model.decode(&final_latents, W, H).unwrap();
+    let f8 = image_px_fraction(&img, g.require("image").unwrap(), 8.0);
+    eprintln!("[{repo}] final rel-L2 = {fl_l2:.4}  image px>8 = {f8:.4}");
+    assert!(
+        fl_l2 < 0.08,
+        "{repo}: final latents diverged (rel-L2 {fl_l2})"
+    );
+    assert!(f8 < 0.08, "{repo}: decoded image diverged ({f8} px>8)");
+}
+
 #[test]
-#[ignore = "needs the ~18GB Chroma1-HD snapshot + several minutes"]
+#[ignore = "needs the ~18GB Chroma1-HD snapshot"]
 fn chroma_hd_e2e_matches_diffusers() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
-    let g = Weights::from_file(format!("{dir}/chroma_e2e.safetensors")).unwrap();
+    let g = Weights::from_file(format!("{dir}/chroma_e2e_hd.safetensors")).unwrap();
+    let model = load_chroma(
+        ChromaVariant::Hd,
+        &LoadSpec::new(WeightsSource::Dir(hf_snapshot("Chroma1-HD"))),
+    )
+    .expect("load Chroma1-HD");
 
-    let spec = LoadSpec::new(WeightsSource::Dir(hf_snapshot()));
-    let model = load_chroma(ChromaVariant::Hd, &spec).expect("load Chroma1-HD");
-
-    // --- 1. masked T5 encode parity (sc-3838 numeric) ---
+    // 1. masked T5 encode parity (sc-3838 numeric).
     let (pe, pm) = encode_prompt(model.tokenizer_ref(), model.t5_ref(), PROMPT).unwrap();
     let pe_rel = peak_rel(&pe, g.require("prompt_embeds").unwrap());
     eprintln!("prompt_embeds peak-rel = {pe_rel:.4}");
     assert!(pe_rel < 5e-2, "masked T5 prompt_embeds diverged: {pe_rel}");
-    let (nege, _negm) = encode_prompt(model.tokenizer_ref(), model.t5_ref(), NEG).unwrap();
-    let neg_rel = peak_rel(&nege, g.require("neg_embeds").unwrap());
-    eprintln!("neg_embeds peak-rel = {neg_rel:.4}");
-    // the transformer text mask (keep-one-extra-pad) must match exactly.
+    let (nege, _) = encode_prompt(model.tokenizer_ref(), model.t5_ref(), NEG).unwrap();
+    eprintln!(
+        "neg_embeds peak-rel = {:.4}",
+        peak_rel(&nege, g.require("neg_embeds").unwrap())
+    );
     let pm_diff = max(
         abs(subtract(&pm, g.require("prompt_mask").unwrap()).unwrap()).unwrap(),
         None,
@@ -83,11 +133,7 @@ fn chroma_hd_e2e_matches_diffusers() {
     .item::<f32>();
     assert_eq!(pm_diff, 0.0, "transformer text mask diverged");
 
-    // --- 2. single real-weight DiT forward (tight) ---
-    let init = g.require("init_latents").unwrap();
-    let ts = g.require("timestep").unwrap();
-    let img_ids = g.require("img_ids").unwrap();
-    // Feed the *golden* prompt_embeds so this gate isolates the DiT (decoupled from any T5 delta).
+    // 2. single real-weight DiT forward (tight) — feed the *golden* embeds to isolate the DiT.
     let golden_embeds = g.require("prompt_embeds").unwrap();
     let l = golden_embeds.shape()[1];
     let txt_ids = Array::from_slice(&vec![0f32; (l * 3) as usize], &[l, 3]);
@@ -96,55 +142,38 @@ fn chroma_hd_e2e_matches_diffusers() {
     let full_mask = concatenate_axis(&[g.require("prompt_mask").unwrap(), &ones], 1).unwrap();
     let noise_pred = model
         .transformer_ref()
-        .forward(init, golden_embeds, ts, img_ids, &txt_ids, Some(&full_mask))
+        .forward(
+            g.require("init_latents").unwrap(),
+            golden_embeds,
+            g.require("timestep").unwrap(),
+            g.require("img_ids").unwrap(),
+            &txt_ids,
+            Some(&full_mask),
+        )
         .unwrap();
     let np_rel = peak_rel(&noise_pred, g.require("noise_pred").unwrap());
     eprintln!("noise_pred peak-rel = {np_rel:.4}");
     assert!(np_rel < 5e-2, "single DiT forward diverged: {np_rel}");
 
-    // --- 3. full true-CFG denoise + decode (coherence) ---
-    let mut nop = |_p: Progress| {};
-    let final_latents = model
-        .denoise(PROMPT, NEG, W, H, STEPS, GUIDANCE, init.clone(), &mut nop)
-        .unwrap();
-    let gfl = g.require("final_latents").unwrap();
-    let mymax = max(abs(&final_latents).unwrap(), None)
-        .unwrap()
-        .item::<f32>();
-    let gmax = max(abs(gfl).unwrap(), None).unwrap().item::<f32>();
-    eprintln!("final max|mine|={mymax:.4} max|golden|={gmax:.4}");
-    let fl_rel = peak_rel(&final_latents, gfl);
-    let fl_l2 = rel_l2(&final_latents, gfl);
-    eprintln!("final_latents peak-rel = {fl_rel:.4}  rel-L2 = {fl_l2:.4}");
-    // rel-L2 over a 4-step g=4 CFG run across torch-MPS-f32 vs mlx-Metal-f32 (different GPU kernels);
-    // the decoded image (px>8 below) is the authoritative success criterion.
-    assert!(fl_l2 < 0.08, "final latents diverged (rel-L2 {fl_l2})");
+    // 3. full true-CFG denoise + decode.
+    run_image_parity(ChromaVariant::Hd, "Chroma1-HD", "chroma_e2e_hd", 4.0);
+}
 
-    // decoded image coherence: fraction of pixels with |Δ| > 16/255.
-    let img = model.decode(&final_latents, W, H).unwrap();
-    let golden_img = g.require("image").unwrap(); // [1,3,H,W] in [-1,1]
-    let gi: Vec<f32> = golden_img
-        .as_dtype(Dtype::Float32)
-        .unwrap()
-        .as_slice::<f32>()
-        .to_vec();
-    let n = (H * W) as usize;
-    let (mut p8, mut p16) = (0usize, 0usize);
-    for c in 0..3 {
-        for p in 0..n {
-            let gv = ((gi[c * n + p] + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
-            let mv = img.pixels[p * 3 + c] as f32; // Image is HWC RGB u8
-            let d = (gv - mv).abs();
-            if d > 8.0 {
-                p8 += 1;
-            }
-            if d > 16.0 {
-                p16 += 1;
-            }
-        }
-    }
-    let tot = (3 * n) as f32;
-    let (f8, f16) = (p8 as f32 / tot, p16 as f32 / tot);
-    eprintln!("image px>8 = {f8:.4}  px>16 = {f16:.4}");
-    assert!(f8 < 0.08, "decoded image diverged: {f8} px>8");
+#[test]
+#[ignore = "needs the ~18GB Chroma1-Base snapshot"]
+fn chroma_base_e2e_matches_diffusers() {
+    // Base uses the beta sigma schedule (use_beta_sigmas).
+    run_image_parity(ChromaVariant::Base, "Chroma1-Base", "chroma_e2e_base", 4.0);
+}
+
+#[test]
+#[ignore = "needs the ~18GB Chroma1-Flash snapshot"]
+fn chroma_flash_e2e_matches_diffusers() {
+    // Flash is the few-step distilled model (static shift 1.0, CFG≈1).
+    run_image_parity(
+        ChromaVariant::Flash,
+        "Chroma1-Flash",
+        "chroma_e2e_flash",
+        1.0,
+    );
 }
