@@ -32,3 +32,11 @@ target
 
 # Converted production model weights (e.g. tools/convert_eva_clip.py output) — large, regenerable.
 /tools/*.safetensors
+
+# Real-weight (35GB-derived) e2e golden for the SenseNova T2I #[ignore] test — large, regenerable
+# via tools/dump_sensenova_t2i_realweight.py, and needs the local checkpoint anyway (epic 3180).
+/mlx-gen-sensenova/tests/fixtures/t2i_realweight_golden.safetensors
+
+# Vendored third-party reference source (read-only, dev-only) — e.g. the SenseNova-U1 reference
+# checkout used to port the model. Cloned on demand, never committed. See epic 3180.
+/_vendor/

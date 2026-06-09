@@ -1,0 +1,18 @@
+[package]
+name = "mlx-gen-sensenova"
+version = "0.0.0"
+edition = "2021"
+description = "SenseNova-U1 (NEO-Unify) provider crate for mlx-gen — a unified AR LLM + flow-matching image generator."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "sensenova", "multimodal", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+# config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
+serde_json = "1"
+
+# NOTE: `inventory` (link-time self-registration) is added when the `Generator` impl lands (sc-3194).
