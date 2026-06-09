@@ -33,6 +33,7 @@ use crate::fm::{
     FmHead, TimestepEmbedder,
 };
 use crate::qwen3::{KvCache, Path, Qwen3Backbone};
+use crate::runtime::Sampler;
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
 
@@ -621,6 +622,42 @@ impl T2iModel {
         Ok((cache, img_temporal))
     }
 
+    /// Build + prefill an it2i/VQA prefix (image-conditioned) and return the cache, the
+    /// last-position logits, and the next-token temporal index (`max(t)` — decode starts at `+1`).
+    /// The tokenizer-free entry the VQA path and its parity test share.
+    pub fn prefill_it2i_logits(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Array>,
+        grids: &[(i32, i32)],
+    ) -> Result<(KvCache, Vec<f32>, usize)> {
+        let (embeds, t, h, w) = self.build_it2i_prefix(ids, pixel_values, grids)?;
+        let (cache, last, img_temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+        Ok((cache, last.as_slice::<f32>().to_vec(), img_temporal - 1))
+    }
+
+    /// Greedy/sampled understanding-path text decode from a prefilled cache (wraps
+    /// [`Qwen3Backbone::generate`]). `first_logits` are the prefix's last-position logits; `t_idx`
+    /// the prefix's max temporal index. Returns the generated token ids (stop ids excluded).
+    pub fn decode_text(
+        &self,
+        first_logits: &[f32],
+        cache: &mut KvCache,
+        t_idx: usize,
+        eos: &[i32],
+        max_new_tokens: usize,
+        sampler: Sampler,
+    ) -> Result<Vec<i32>> {
+        self.backbone.generate(
+            first_logits,
+            cache,
+            t_idx as i32,
+            eos,
+            max_new_tokens,
+            sampler,
+        )
+    }
+
     /// Build the it2i condition prefix from a prompt + source images (replacing `<image>` markers
     /// with `<img><IMG_CONTEXT>×n</img>` per image, auto-prepending markers like `it2i_generate`).
     /// Returns the cache, last logits, image-block temporal index, and the per-image patch grids.
@@ -773,6 +810,65 @@ impl T2iModel {
         )?;
         let image = traj.into_iter().last().expect("at least one step");
         Ok(T2iOutput { image, think_text })
+    }
+
+    /// VQA / understanding (`chat` / `answer_question`): image(s) + question → understanding-path
+    /// AR text generation → answer. The question prefix (empty system message, `<image>` markers
+    /// auto-prepended) is built and prefilled exactly like the it2i condition prefix (vision features
+    /// spliced into `<IMG_CONTEXT>`), then [`Qwen3Backbone::generate`] decodes to the `<|im_end|>`
+    /// stop. `images` are decoded RGB `[3,H,W]` in `[0,1]` (sized to multiples of `patch·merge`);
+    /// pass an empty slice for a text-only question. Returns the decoded answer (special tokens
+    /// stripped, trimmed).
+    pub fn vqa(
+        &self,
+        tokenizer: &TextTokenizer,
+        question: &str,
+        images: &[Array],
+        max_new_tokens: usize,
+        sampler: Sampler,
+    ) -> Result<String> {
+        // Preprocess any source images.
+        let mut pv_parts = Vec::with_capacity(images.len());
+        let mut grids = Vec::with_capacity(images.len());
+        for img in images {
+            let (p, g) = self.preprocess_image(img)?;
+            pv_parts.push(p);
+            grids.push(g);
+        }
+        let pixel_values = if pv_parts.is_empty() {
+            None
+        } else {
+            let refs: Vec<&Array> = pv_parts.iter().collect();
+            Some(mlx_rs::ops::concatenate_axis(&refs, 0)?)
+        };
+
+        // Auto-prepend `<image>` markers (the reference `chat` prepends one per missing image).
+        let count = question.matches("<image>").count();
+        let mut q = question.to_string();
+        if images.len() > count {
+            let pre = "<image>\n".repeat(images.len() - count);
+            q = format!("{pre}{q}");
+        }
+        // VQA uses the neo1_0 default (empty) system message, not SYSTEM_MESSAGE_FOR_GEN.
+        let base = build_neo1_query(&q, "");
+        let ids = if images.is_empty() {
+            tokenizer.encode_ids(&base, true)?
+        } else {
+            self.build_it2i_query_ids(tokenizer, &base, &grids)?
+        };
+
+        let (mut cache, last_logits, t_idx) =
+            self.prefill_it2i_logits(&ids, pixel_values.as_ref(), &grids)?;
+        let tokens = self.decode_text(
+            &last_logits,
+            &mut cache,
+            t_idx,
+            &[tokens::IM_END],
+            max_new_tokens,
+            sampler,
+        )?;
+        let u32s: Vec<u32> = tokens.iter().map(|&i| i as u32).collect();
+        Ok(tokenizer.decode(&u32s, true)?.trim().to_string())
     }
 
     /// The dual-guidance denoise loop (`it2i_generate`'s body). `cond`/`img`/`uncond` are
