@@ -14,8 +14,9 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, DiffusionSampler, Image, Result};
 
 use mlx_gen_sdxl::{
-    decode_image, denoise, encode_init_latents, load_unet_kolors_dtype, load_vae, Autoencoder,
-    Denoiser, UNet2DConditionModel,
+    decode_image, denoise, denoise_control, encode_init_latents, load_unet_kolors_dtype, load_vae,
+    preprocess_control_image, Autoencoder, ControlContext, ControlNet, Denoiser,
+    UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -235,6 +236,102 @@ impl Kolors {
             num_steps,
             strength,
             cfg,
+            height,
+            width,
+        )?;
+        self.decode(&latents)
+    }
+
+    /// Run the CFG denoise loop with a Kolors **ControlNet** branch injecting residuals each step
+    /// (sc-3097) — split out (like [`denoise_latents`](Self::denoise_latents)) so the parity gate can
+    /// feed diffusers' exact noise. The `controlnet` is loaded via `mlx_gen_sdxl::load_controlnet`
+    /// (the Kolors ControlNet is a standard SDXL `ControlNetModel` whose only deltas — its own
+    /// `encoder_hid_proj` 4096→2048 + the 5632 add-embedding — are auto-detected/shape-driven). It is
+    /// conditioned with the **same ChatGLM3 context** as the U-Net (the branch projects it with its
+    /// own `encoder_hid_proj`). `control_scale = 0` ⇒ the residuals vanish ⇒ identical to plain T2I.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_latents(
+        &self,
+        controlnet: &ControlNet,
+        init_noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: &(Array, Array),
+        num_steps: usize,
+        cfg: f32,
+        control_scale: f32,
+        height: i32,
+        width: i32,
+    ) -> Result<Array> {
+        use mlx_rs::ops::concatenate_axis;
+        let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        let time_ids = kolors_time_ids(2, height, width);
+        let latents = sampler.scale_initial_noise(init_noise)?;
+
+        // The ControlNet sees the same CFG-batched input as the U-Net (cfg>1 ⇒ [cond, uncond]).
+        let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
+        let cimg = if cfg > 1.0 {
+            concatenate_axis(&[&cimg, &cimg], 0)?
+        } else {
+            cimg
+        };
+        let cc = ControlContext {
+            controlnet,
+            control_image: cimg,
+            scale: control_scale,
+        };
+
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &sampler,
+        };
+        let cancel = CancelFlag::new();
+        denoise_control(
+            &d,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            &cancel,
+            &mut |_p| {},
+            &cc,
+        )
+    }
+
+    /// Full ControlNet T2I: seed the noise, encode the prompts, denoise with the `controlnet` branch
+    /// injecting `control_image`-conditioned residuals (`control_scale`), and VAE-decode. The
+    /// `control_image` is preprocessed (LANCZOS resize → `[0,1]` NHWC) by the SDXL primitive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_controlnet(
+        &self,
+        controlnet: &ControlNet,
+        control_image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        cfg: f32,
+        control_scale: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = self.encode(negative)?;
+        let latents = self.denoise_controlnet_latents(
+            controlnet,
+            &init_noise,
+            control_image,
+            &pos,
+            &neg,
+            num_steps,
+            cfg,
+            control_scale,
             height,
             width,
         )?;
