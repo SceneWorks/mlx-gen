@@ -42,8 +42,12 @@ pub mod text;
 pub mod vision;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
-pub use fm::{apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder};
+pub use fm::{
+    apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
+};
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
 pub use qwen3::{Path, Qwen3Backbone};
-pub use text::{build_neo1_query, image_indexes, load_tokenizer, text_indexes, SYSTEM_MESSAGE_FOR_GEN};
+pub use text::{
+    build_neo1_query, image_indexes, load_tokenizer, text_indexes, SYSTEM_MESSAGE_FOR_GEN,
+};
 pub use vision::NeoVisionEmbedder;

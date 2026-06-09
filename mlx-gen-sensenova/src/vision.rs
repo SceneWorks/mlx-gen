@@ -54,8 +54,8 @@ impl NeoVisionEmbedder {
         let patch_w = require(w, &format!("{prefix}.patch_embedding.weight"))?
             .reshape(&[embed_dim, ch * patch * patch])?;
         // dense_embedding: torch [llm, embed, factor, factor] -> MLX [llm, factor, factor, embed].
-        let dense_w =
-            require(w, &format!("{prefix}.dense_embedding.weight"))?.transpose_axes(&[0, 2, 3, 1])?;
+        let dense_w = require(w, &format!("{prefix}.dense_embedding.weight"))?
+            .transpose_axes(&[0, 2, 3, 1])?;
 
         Ok(Self {
             patch_w,
@@ -93,13 +93,11 @@ impl NeoVisionEmbedder {
         let mut cur = 0usize;
         for &(h, w) in grid {
             let n = (h * w) as i32;
-            let idx = Array::from_slice(
-                &(cur as i32..cur as i32 + n).collect::<Vec<_>>(),
-                &[n],
-            );
-            let block = roped
-                .take_axis(&idx, 0)?
-                .reshape(&[1, h as i32, w as i32, self.embed_dim])?; // NHWC
+            let idx = Array::from_slice(&(cur as i32..cur as i32 + n).collect::<Vec<_>>(), &[n]);
+            let block =
+                roped
+                    .take_axis(&idx, 0)?
+                    .reshape(&[1, h as i32, w as i32, self.embed_dim])?; // NHWC
             let merged = conv2d(&block, &self.dense_w, Some(&self.dense_b), f, 0)?; // [1, h/f, w/f, llm]
             let llm = merged.shape()[3];
             outs.push(merged.reshape(&[(h as i32 / f) * (w as i32 / f), llm])?);

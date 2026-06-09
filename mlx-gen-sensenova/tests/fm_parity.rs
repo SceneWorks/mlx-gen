@@ -12,7 +12,10 @@ use mlx_gen_sensenova::{
 };
 use mlx_rs::Array;
 
-const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fm_golden.safetensors");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/fm_golden.safetensors"
+);
 
 fn rel(a: &Array, b: &Array) -> f32 {
     let n = b.shape().iter().product::<i32>();
@@ -20,7 +23,10 @@ fn rel(a: &Array, b: &Array) -> f32 {
     let b = b.reshape(&[n]).unwrap();
     let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
     let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    a.iter().zip(b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs())) / peak
+    a.iter()
+        .zip(b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()))
+        / peak
 }
 
 fn check(name: &str, got: &Array, want: &Array) {
@@ -50,9 +56,21 @@ fn timestep_embedder_matches_reference() {
 fn time_schedule_matches_reference() {
     let w = Weights::from_file(FIXTURE).unwrap();
     let t = w.require("sched.t").unwrap();
-    check("sched.shift1", &apply_time_schedule(t, 1.0).unwrap(), w.require("sched.standard_shift1").unwrap());
-    check("sched.shift3", &apply_time_schedule(t, 3.0).unwrap(), w.require("sched.standard_shift3").unwrap());
-    check("sched.shift05", &apply_time_schedule(t, 0.5).unwrap(), w.require("sched.standard_shift05").unwrap());
+    check(
+        "sched.shift1",
+        &apply_time_schedule(t, 1.0).unwrap(),
+        w.require("sched.standard_shift1").unwrap(),
+    );
+    check(
+        "sched.shift3",
+        &apply_time_schedule(t, 3.0).unwrap(),
+        w.require("sched.standard_shift3").unwrap(),
+    );
+    check(
+        "sched.shift05",
+        &apply_time_schedule(t, 0.5).unwrap(),
+        w.require("sched.standard_shift05").unwrap(),
+    );
 }
 
 #[test]

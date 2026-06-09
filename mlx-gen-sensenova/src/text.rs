@@ -103,7 +103,11 @@ pub fn text_indexes(len: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
 /// tokens: temporal = `text_len` (all image tokens share one block index → bidirectional attention),
 /// height = `idx / token_w`, width = `idx % token_w` (row-major; the reference
 /// `_build_t2i_image_indexes`).
-pub fn image_indexes(token_h: usize, token_w: usize, text_len: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+pub fn image_indexes(
+    token_h: usize,
+    token_w: usize,
+    text_len: usize,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
     let n = token_h * token_w;
     let mut t = Vec::with_capacity(n);
     let mut h = Vec::with_capacity(n);
@@ -123,7 +127,10 @@ mod tests {
     #[test]
     fn neo1_query_empty_system_has_no_system_block() {
         let q = build_neo1_query("a fox", "");
-        assert_eq!(q, "<|im_start|>user\na fox<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            q,
+            "<|im_start|>user\na fox<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 
     #[test]

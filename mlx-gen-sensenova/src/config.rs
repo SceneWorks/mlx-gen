@@ -55,8 +55,7 @@ impl NeoLlmConfig {
     /// Whether this backbone is the sparse-MoE A3B variant (vs the dense 8B-MoT). Mirrors the
     /// reference `_is_moe_llm_config`: a `qwen3_moe`/`*MoE*` type, or `num_experts > 1`.
     pub fn is_moe(&self) -> bool {
-        self.model_type.to_lowercase().contains("moe")
-            || self.num_experts.is_some_and(|n| n > 1)
+        self.model_type.to_lowercase().contains("moe") || self.num_experts.is_some_and(|n| n > 1)
     }
 
     fn from_value(v: &Value) -> Self {
@@ -75,7 +74,10 @@ impl NeoLlmConfig {
             rope_theta_hw: get_f32(v, "rope_theta_hw", 10_000.0),
             max_position_embeddings: get_usize(v, "max_position_embeddings", 262_144),
             max_position_embeddings_hw: get_usize(v, "max_position_embeddings_hw", 10_000),
-            num_experts: v.get("num_experts").and_then(Value::as_u64).map(|n| n as usize),
+            num_experts: v
+                .get("num_experts")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
             gen_num_experts: v
                 .get("gen_num_experts")
                 .and_then(Value::as_u64)
@@ -162,7 +164,10 @@ impl NeoChatConfig {
         let vision = NeoVisionConfig::from_value(v.get("vision_config").unwrap_or(&Value::Null));
         Self {
             model_type: get_str(v, "model_type", "neo_chat"),
-            template: v.get("template").and_then(Value::as_str).map(str::to_string),
+            template: v
+                .get("template")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             eos_token_id: get_usize(v, "eos_token_id", 151_645) as u32,
             pad_token_id: get_usize(v, "pad_token_id", 151_643) as u32,
             tie_word_embeddings: get_bool(v, "tie_word_embeddings", false),
@@ -202,15 +207,24 @@ impl NeoChatConfig {
 }
 
 fn get_str(v: &Value, key: &str, default: &str) -> String {
-    v.get(key).and_then(Value::as_str).unwrap_or(default).to_string()
+    v.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
 }
 
 fn get_usize(v: &Value, key: &str, default: usize) -> usize {
-    v.get(key).and_then(Value::as_u64).map(|n| n as usize).unwrap_or(default)
+    v.get(key)
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(default)
 }
 
 fn get_f32(v: &Value, key: &str, default: f32) -> f32 {
-    v.get(key).and_then(Value::as_f64).map(|n| n as f32).unwrap_or(default)
+    v.get(key)
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .unwrap_or(default)
 }
 
 fn get_bool(v: &Value, key: &str, default: bool) -> bool {
@@ -284,7 +298,10 @@ mod tests {
         assert_eq!(c.model_type, "neo_chat");
         assert_eq!(c.template.as_deref(), Some("neo1_0"));
         assert!(!c.tie_word_embeddings, "8B-MoT has a distinct lm_head");
-        assert!(!c.use_pixel_head, "8B-MoT pixel path is fm_head, not a conv decoder");
+        assert!(
+            !c.use_pixel_head,
+            "8B-MoT pixel path is fm_head, not a conv decoder"
+        );
         assert!(c.add_noise_scale_embedding);
         assert_eq!(c.fm_head_layers, 2);
 
@@ -294,7 +311,10 @@ mod tests {
         assert_eq!(llm.num_attention_heads, 32);
         assert_eq!(llm.num_key_value_heads, 8);
         // The defining correction: 8B-MoT is DENSE (no experts / no router), not sparse-MoE.
-        assert!(!llm.is_moe(), "8B-MoT backbone is dense Qwen3, not sparse-MoE");
+        assert!(
+            !llm.is_moe(),
+            "8B-MoT backbone is dense Qwen3, not sparse-MoE"
+        );
         assert_eq!(llm.num_experts, None);
 
         assert_eq!(c.vision.hidden_size, 1024);

@@ -31,8 +31,8 @@ fn snapshot() -> PathBuf {
 /// The tensor keys named in `model.safetensors.index.json` (`weight_map`).
 fn checkpoint_keys(root: &std::path::Path) -> Vec<String> {
     let idx = root.join("model.safetensors.index.json");
-    let text = std::fs::read_to_string(&idx)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", idx.display()));
+    let text =
+        std::fs::read_to_string(&idx).unwrap_or_else(|e| panic!("reading {}: {e}", idx.display()));
     let v: serde_json::Value = serde_json::from_str(&text).expect("parse index json");
     v["weight_map"]
         .as_object()

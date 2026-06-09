@@ -20,7 +20,10 @@ const FIXTURE: &str = concat!(
 
 /// Rebuild the synthetic `NeoChatConfig` from the fixture's metadata.
 fn config_from_meta(w: &Weights) -> NeoChatConfig {
-    let m = |k: &str| w.metadata(k).unwrap_or_else(|| panic!("missing metadata {k}"));
+    let m = |k: &str| {
+        w.metadata(k)
+            .unwrap_or_else(|| panic!("missing metadata {k}"))
+    };
     let llm = serde_json::json!({
         "model_type": "qwen3",
         "hidden_size": m("hidden_size").parse::<u64>().unwrap(),
@@ -54,7 +57,10 @@ fn errors(a: &Array, b: &Array) -> (f32, f32) {
     let b = b.reshape(&[n]).unwrap();
     let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
     let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    let max_diff = a.iter().zip(b).fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
+    let max_diff = a
+        .iter()
+        .zip(b)
+        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
     (max_diff, max_diff / peak)
 }
 
@@ -75,13 +81,25 @@ fn backbone_matches_reference_both_paths() {
 
     // Understanding path.
     let (t, h, wid) = index_rows(w.require("und.indexes").unwrap());
-    let und_hidden = model.forward_path(&embeds, &t, &h, &wid, Path::Und).unwrap();
+    let und_hidden = model
+        .forward_path(&embeds, &t, &h, &wid, Path::Und)
+        .unwrap();
     check("und.hidden", &und_hidden, w.require("und.hidden").unwrap());
-    check("und.logits", &model.lm_head(&und_hidden).unwrap(), w.require("und.logits").unwrap());
+    check(
+        "und.logits",
+        &model.lm_head(&und_hidden).unwrap(),
+        w.require("und.logits").unwrap(),
+    );
 
     // Generation path (image-grid positions, bidirectional block).
     let (t, h, wid) = index_rows(w.require("gen.indexes").unwrap());
-    let gen_hidden = model.forward_path(&embeds, &t, &h, &wid, Path::Gen).unwrap();
+    let gen_hidden = model
+        .forward_path(&embeds, &t, &h, &wid, Path::Gen)
+        .unwrap();
     check("gen.hidden", &gen_hidden, w.require("gen.hidden").unwrap());
-    check("gen.logits", &model.lm_head(&gen_hidden).unwrap(), w.require("gen.logits").unwrap());
+    check(
+        "gen.logits",
+        &model.lm_head(&gen_hidden).unwrap(),
+        w.require("gen.logits").unwrap(),
+    );
 }

@@ -149,7 +149,11 @@ mod tests {
         // + 8 vision (2 towers × 2 convs × {weight,bias})
         // + 4 fm_head (2 linears × {weight,bias})
         // + 8 embedders (timestep + noise_scale, 2 idx × {weight,bias} each)
-        assert_eq!(keys.len(), 4 + 42 * 26 + 8 + 4 + 8, "1116 canonical tensors");
+        assert_eq!(
+            keys.len(),
+            4 + 42 * 26 + 8 + 4 + 8,
+            "1116 canonical tensors"
+        );
 
         // Spot-check the suffix placement on the generation path.
         for k in [
@@ -184,7 +188,10 @@ mod tests {
         let cov = check_coverage(trimmed.iter().map(String::as_str), &cfg);
         assert!(!cov.is_complete());
         assert_eq!(cov.missing, vec![dropped]);
-        assert_eq!(cov.unexpected, vec!["language_model.model.layers.0.bogus.weight".to_string()]);
+        assert_eq!(
+            cov.unexpected,
+            vec!["language_model.model.layers.0.bogus.weight".to_string()]
+        );
     }
 
     #[test]

@@ -115,7 +115,10 @@ impl Layer {
             input_ln: require(w, &format!("{prefix}.input_layernorm.weight"))?,
             input_ln_gen: require(w, &format!("{prefix}.input_layernorm_mot_gen.weight"))?,
             post_ln: require(w, &format!("{prefix}.post_attention_layernorm.weight"))?,
-            post_ln_gen: require(w, &format!("{prefix}.post_attention_layernorm_mot_gen.weight"))?,
+            post_ln_gen: require(
+                w,
+                &format!("{prefix}.post_attention_layernorm_mot_gen.weight"),
+            )?,
             attn_und: AttnPath::from_weights(w, &attn, "")?,
             attn_gen: AttnPath::from_weights(w, &attn, "_mot_gen")?,
             mlp_und: Mlp::from_weights(w, &format!("{prefix}.mlp"))?,
@@ -238,7 +241,12 @@ impl Qwen3Backbone {
         let mut hidden = embeds.clone();
         for layer in &self.layers {
             let (input_ln, post_ln, attn, mlp) = match path {
-                Path::Und => (&layer.input_ln, &layer.post_ln, &layer.attn_und, &layer.mlp_und),
+                Path::Und => (
+                    &layer.input_ln,
+                    &layer.post_ln,
+                    &layer.attn_und,
+                    &layer.mlp_und,
+                ),
                 Path::Gen => (
                     &layer.input_ln_gen,
                     &layer.post_ln_gen,

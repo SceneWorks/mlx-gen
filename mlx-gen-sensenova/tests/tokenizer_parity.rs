@@ -13,8 +13,10 @@ use std::path::PathBuf;
 use mlx_gen::weights::Weights;
 use mlx_gen_sensenova::{build_neo1_query, load_tokenizer, SYSTEM_MESSAGE_FOR_GEN};
 
-const FIXTURE: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tokenizer_golden.safetensors");
+const FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/tokenizer_golden.safetensors"
+);
 
 /// The prompt the golden was built with (`tools/build_sensenova_tokenizer.py`).
 const PROMPT: &str = "a red fox sitting in a snowy forest, photorealistic";
@@ -64,7 +66,12 @@ fn tokenizer_encodes_like_reference() {
             .as_slice::<i32>()
             .to_vec();
         let got = tok.encode_ids(s, false).unwrap();
-        assert_eq!(got, golden, "encoding mismatch for {name} ({} tokens)", golden.len());
+        assert_eq!(
+            got,
+            golden,
+            "encoding mismatch for {name} ({} tokens)",
+            golden.len()
+        );
         println!("{name:>12}: {} tokens OK", golden.len());
     }
 }

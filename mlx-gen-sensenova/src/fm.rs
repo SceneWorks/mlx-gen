@@ -126,7 +126,8 @@ pub fn patchify(images: &Array, patch_size: i32) -> Result<Array> {
     let (n, h, w) = (sh[0], sh[2] / patch_size, sh[3] / patch_size);
     let x = images.reshape(&[n, 3, h, patch_size, w, patch_size])?;
     let x = x.transpose_axes(&[0, 2, 4, 3, 5, 1])?; // nchpwq -> nhwpqc
-    x.reshape(&[n, h * w, patch_size * patch_size * 3]).map_err(Error::from)
+    x.reshape(&[n, h * w, patch_size * patch_size * 3])
+        .map_err(Error::from)
 }
 
 /// Inverse of [`patchify`]: patches `[N,L,ps²·3]` → `[N,3,H,W]` (`nhwpqc → nchpwq`). `h`/`w` are
@@ -142,5 +143,6 @@ pub fn unpatchify(x: &Array, patch_size: i32, h: Option<i32>, w: Option<i32>) ->
     };
     let x = x.reshape(&[n, h, w, patch_size, patch_size, 3])?;
     let x = x.transpose_axes(&[0, 5, 1, 3, 2, 4])?; // nhwpqc -> nchpwq
-    x.reshape(&[n, 3, h * patch_size, w * patch_size]).map_err(Error::from)
+    x.reshape(&[n, 3, h * patch_size, w * patch_size])
+        .map_err(Error::from)
 }
