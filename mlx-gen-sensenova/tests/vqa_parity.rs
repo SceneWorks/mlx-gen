@@ -61,7 +61,7 @@ fn vqa_greedy_matches_reference() {
     let img_start_id: i32 = w.metadata("img_start_id").unwrap().parse().unwrap();
     let model = T2iModel::from_weights(&w, &cfg)
         .expect("build")
-        .with_image_token_ids(img_context_id, img_start_id);
+        .with_image_token_ids(img_context_id, img_start_id, 12);
 
     let src_gh: i32 = w.metadata("src_grid_h").unwrap().parse().unwrap();
     let src_gw: i32 = w.metadata("src_grid_w").unwrap().parse().unwrap();

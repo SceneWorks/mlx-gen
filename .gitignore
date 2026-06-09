@@ -38,6 +38,7 @@ target
 /mlx-gen-sensenova/tests/fixtures/t2i_realweight_golden.safetensors
 /mlx-gen-sensenova/tests/fixtures/it2i_realweight_golden.safetensors
 /mlx-gen-sensenova/tests/fixtures/vqa_realweight_golden.safetensors
+/mlx-gen-sensenova/tests/fixtures/interleave_realweight_golden.safetensors
 
 # Vendored third-party reference source (read-only, dev-only) — e.g. the SenseNova-U1 reference
 # checkout used to port the model. Cloned on demand, never committed. See epic 3180.
