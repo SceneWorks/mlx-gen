@@ -147,6 +147,35 @@ pub fn denoise_control(
     on_progress: &mut dyn FnMut(Progress),
     control: &ControlContext,
 ) -> Result<Array> {
+    denoise_multi_control(
+        d,
+        latents,
+        conditioning,
+        pooled,
+        time_ids,
+        cfg,
+        cancel,
+        on_progress,
+        std::slice::from_ref(control),
+    )
+}
+
+/// Like [`denoise_control`] but runs **multiple** ControlNet branches and sums their residuals — the
+/// diffusers `MultiControlNetModel` rule (sc-3378). `controls[i]` pairs with the `i`-th branch; all
+/// share the text `conditioning` as their cross-attention input. A single-element `controls` is
+/// bit-identical to [`denoise_control`]; an empty `controls` reduces to [`denoise`].
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_multi_control(
+    d: &Denoiser,
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+) -> Result<Array> {
     denoise_core(
         d,
         latents,
@@ -157,7 +186,7 @@ pub fn denoise_control(
         cancel,
         on_progress,
         None,
-        std::slice::from_ref(control),
+        controls,
         None,
         None,
     )

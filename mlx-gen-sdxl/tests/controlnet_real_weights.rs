@@ -214,3 +214,76 @@ fn controlnet_scale_zero_equals_img2img() {
     );
     assert_eq!(diff, 0, "ControlNet at scale=0 must equal plain img2img");
 }
+
+/// sc-3378 (provider-level MultiControlNet): two **identical** control branches (same tile-CN, same
+/// control image) at `scale = 0.5` each must equal a **single** branch at `scale = 1.0`, byte-for-byte.
+/// The residual is linear in `conditioning_scale` and `a·0.5 + a·0.5 == a·1.0` is exact in fp16, so
+/// summing two equal branches doubles the residual back to the single-branch value. This exercises the
+/// full provider path: `LoadSpec::extra_controls` load → N-`Control` collection → per-branch
+/// `ControlContext` → `denoise_multi_control` residual sum. (A second *different* checkpoint would need
+/// a diffusers golden; this invariant validates the sum exactly with the one cached checkpoint.)
+#[test]
+#[ignore = "needs the SDXL base snapshot + xinsir tile-CN"]
+fn multicontrolnet_two_branches_sum_equals_single() {
+    let init = gradient(512, 512);
+    let req = |conds: Vec<Conditioning>| {
+        let mut conditioning = vec![Conditioning::Reference {
+            image: init.clone(),
+            strength: Some(0.85),
+        }];
+        conditioning.extend(conds);
+        GenerationRequest {
+            prompt: "a detailed fox".to_string(),
+            width: 512,
+            height: 512,
+            seed: Some(11),
+            steps: Some(6),
+            conditioning,
+            ..Default::default()
+        }
+    };
+    let ctrl = |scale: f32| Conditioning::Control {
+        image: init.clone(),
+        kind: ControlKind::Other("tile".to_string()),
+        scale,
+    };
+    let run = |model: &dyn mlx_gen::Generator, req: &GenerationRequest| match model
+        .generate(req, &mut |_| {})
+        .unwrap()
+    {
+        GenerationOutput::Images(mut v) => v.remove(0),
+        _ => unreachable!(),
+    };
+
+    // Single branch at scale 1.0.
+    let single = mlx_gen_sdxl::load(
+        &LoadSpec::new(WeightsSource::Dir(base_snapshot()))
+            .with_control(WeightsSource::Dir(tile_cn_snapshot())),
+    )
+    .unwrap();
+    let out_single = run(single.as_ref(), &req(vec![ctrl(1.0)]));
+
+    // Two identical branches at scale 0.5 each (sum → 1.0).
+    let multi = mlx_gen_sdxl::load(
+        &LoadSpec::new(WeightsSource::Dir(base_snapshot()))
+            .with_control(WeightsSource::Dir(tile_cn_snapshot()))
+            .with_extra_control(WeightsSource::Dir(tile_cn_snapshot())),
+    )
+    .unwrap();
+    let out_multi = run(multi.as_ref(), &req(vec![ctrl(0.5), ctrl(0.5)]));
+
+    let diff = out_single
+        .pixels
+        .iter()
+        .zip(&out_multi.pixels)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "[multicontrolnet] 1×(s=1.0) vs 2×(s=0.5): {diff} / {} px bytes differ",
+        out_single.pixels.len()
+    );
+    assert_eq!(
+        diff, 0,
+        "MultiControlNet: two branches summing to the same total scale must equal a single branch"
+    );
+}

@@ -25,7 +25,7 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_control, denoise_inpaint, denoise_ip, encode_conditioning,
+    decode_image, denoise, denoise_inpaint, denoise_ip, denoise_multi_control, encode_conditioning,
     encode_init_latents, preprocess_control_image, text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -131,10 +131,11 @@ pub struct Sdxl {
     te1: ClipTextEncoder,
     te2: ClipTextEncoder,
     unet: UNet2DConditionModel,
-    /// Optional ControlNet branch (sc-3058), loaded from `LoadSpec::control` — present only when a
-    /// detail / control checkpoint was supplied. `generate` requires it iff a `Control` conditioning
-    /// is passed.
-    control: Option<ControlNet>,
+    /// ControlNet branches (sc-3058; MultiControlNet sc-3378), loaded from `LoadSpec::control` +
+    /// `LoadSpec::extra_controls`. Empty when no control checkpoint was supplied. `generate` requires
+    /// exactly one `Control` conditioning per loaded branch (paired by order); their residuals are
+    /// summed (the diffusers `MultiControlNetModel` rule).
+    controls: Vec<ControlNet>,
     /// Optional IP-Adapter image-token source (sc-3059), loaded from `LoadSpec::ip_adapter`. When
     /// present, the model is in "IP mode": a `Reference` conditioning is the image prompt (txt2img +
     /// IP), not an img2img init. The decoupled-attn K/V projections are installed into `unet`.
@@ -205,13 +206,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut te2 = loader::load_text_encoder_2_dtype(root, dtype)?;
     let vae = loader::load_vae(root)?; // VAE always f32 (vendored loads the autoencoder float16=False)
 
-    // Optional ControlNet branch (sc-3058) — loaded at the U-Net dtype (fp16). Quantized with the
-    // U-Net below when `spec.quantize` is set (the encoder-copy Linears; conv stem / cond-embedding /
-    // zero-convs stay dense, matching the U-Net scope).
-    let mut control = match &spec.control {
-        Some(src) => Some(loader::load_controlnet(src, dtype)?),
-        None => None,
-    };
+    // ControlNet branches (sc-3058; MultiControlNet sc-3378) — `spec.control` first, then each
+    // `spec.extra_controls`, all at the U-Net dtype (fp16). Quantized with the U-Net below when
+    // `spec.quantize` is set (the encoder-copy Linears; conv stem / cond-embedding / zero-convs stay
+    // dense, matching the U-Net scope).
+    let mut controls: Vec<ControlNet> = Vec::new();
+    if let Some(src) = &spec.control {
+        controls.push(loader::load_controlnet(src, dtype)?);
+    }
+    for src in &spec.extra_controls {
+        controls.push(loader::load_controlnet(src, dtype)?);
+    }
 
     // Optional IP-Adapter (sc-3059) — install the decoupled-attn K/V pairs into the still-mutable,
     // pre-quant U-Net (so they quantize with it) and keep the image-token encoder.
@@ -244,7 +249,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         unet.quantize(bits)?;
         te1.quantize(bits)?;
         te2.quantize(bits)?;
-        if let Some(cn) = &mut control {
+        for cn in &mut controls {
             cn.quantize(bits)?;
         }
     }
@@ -258,7 +263,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         te1,
         te2,
         unet,
-        control,
+        controls,
         ip_adapter,
         vae,
         sampler: EulerSampler::new_with_dtype(&cfg, true, dtype),
@@ -320,21 +325,23 @@ impl Generator for Sdxl {
                 ));
             }
         }
-        // ControlNet (sc-3058): needs a loaded control checkpoint + the ancestral path; not combined
-        // with an inpaint mask in this build.
-        let control_req = self.resolve_control(req)?;
-        if control_req.is_some() {
+        // ControlNet (sc-3058; MultiControlNet sc-3378): each `Control` conditioning pairs, in order,
+        // with a loaded control branch (`spec.control` + `spec.extra_controls`); their residuals are
+        // summed. Needs the ancestral path; not combined with an inpaint mask in this build.
+        let control_reqs = self.resolve_control(req)?;
+        if !control_reqs.is_empty() {
             if is_accel {
                 return Err(Error::Msg(
                     "sdxl: ControlNet is not supported with the acceleration samplers".into(),
                 ));
             }
-            if self.control.is_none() {
-                return Err(Error::Msg(
-                    "sdxl: a Control conditioning was passed but this model was loaded without a \
-                     control checkpoint (set LoadSpec::control)"
-                        .into(),
-                ));
+            if control_reqs.len() != self.controls.len() {
+                return Err(Error::Msg(format!(
+                    "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
+                     checkpoint(s) (set LoadSpec::control + extra_controls, one per Control, in order)",
+                    control_reqs.len(),
+                    self.controls.len()
+                )));
             }
             if mask_img.is_some() {
                 return Err(Error::Msg(
@@ -344,28 +351,22 @@ impl Generator for Sdxl {
             }
         }
 
-        // Build the ControlNet context once (seed-independent): preprocess the control image to
-        // [0,1] NHWC and CFG-batch it to match the U-Net input.
-        let control_ctx = match control_req {
-            Some((image, scale)) => {
-                let cn = self
-                    .control
-                    .as_ref()
-                    .expect("control checkpoint validated above");
-                let img = preprocess_control_image(image, req.width, req.height)?;
-                let img = if cfg_on {
-                    concatenate_axis(&[&img, &img], 0)?
-                } else {
-                    img
-                };
-                Some(ControlContext {
-                    controlnet: cn,
-                    control_image: img,
-                    scale,
-                })
-            }
-            None => None,
-        };
+        // Build the ControlNet contexts once (seed-independent): preprocess each control image to
+        // [0,1] NHWC and CFG-batch it to match the U-Net input, paired by order with a loaded branch.
+        let mut control_ctxs: Vec<ControlContext> = Vec::with_capacity(control_reqs.len());
+        for ((image, scale), cn) in control_reqs.iter().zip(&self.controls) {
+            let img = preprocess_control_image(image, req.width, req.height)?;
+            let img = if cfg_on {
+                concatenate_axis(&[&img, &img], 0)?
+            } else {
+                img
+            };
+            control_ctxs.push(ControlContext {
+                controlnet: cn,
+                control_image: img,
+                scale: *scale,
+            });
+        }
 
         // IP-Adapter (sc-3059): when the model carries IP weights and a Reference is present (no
         // mask/control/accel), the Reference is the image prompt (txt2img + IP), NOT an img2img init.
@@ -374,7 +375,7 @@ impl Generator for Sdxl {
         let ip_mode = self.ip_adapter.is_some()
             && reference.is_some()
             && mask_img.is_none()
-            && control_req.is_none()
+            && control_reqs.is_empty()
             && !is_accel;
         let ip_scale = reference.and_then(|(_, s)| s).unwrap_or(IP_DEFAULT_SCALE);
         let ip_tokens = if ip_mode {
@@ -488,8 +489,8 @@ impl Generator for Sdxl {
                     tokens,
                     ip_scale,
                 )?
-            } else if let Some(cc) = &control_ctx {
-                denoise_control(
+            } else if !control_ctxs.is_empty() {
+                denoise_multi_control(
                     &d,
                     latents,
                     &conditioning,
@@ -498,7 +499,7 @@ impl Generator for Sdxl {
                     cfg,
                     &req.cancel,
                     on_progress,
-                    cc,
+                    &control_ctxs,
                 )?
             } else if let Some(b) = &blend {
                 denoise_inpaint(
@@ -606,21 +607,18 @@ impl Sdxl {
         Ok(mask)
     }
 
-    /// Extract the single ControlNet control image + `conditioning_scale` (sc-3058). SDXL supports
-    /// one control branch; more than one `Control` is an error.
-    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<Option<(&'a Image, f32)>> {
-        let mut control = None;
+    /// Collect the ControlNet control images + `conditioning_scale`s (sc-3058; MultiControlNet
+    /// sc-3378), in request order. Each pairs with a loaded control branch (`spec.control` +
+    /// `spec.extra_controls`); the count must match (validated in `generate`). A single `Control` is
+    /// the common case; more than one runs as MultiControlNet (residuals summed).
+    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<Vec<(&'a Image, f32)>> {
+        let mut controls = Vec::new();
         for c in &req.conditioning {
             if let Conditioning::Control { image, scale, .. } = c {
-                if control.is_some() {
-                    return Err(Error::Msg(
-                        "sdxl: multiple control images are not supported".into(),
-                    ));
-                }
-                control = Some((image, *scale));
+                controls.push((image, *scale));
             }
         }
-        Ok(control)
+        Ok(controls)
     }
 }
 

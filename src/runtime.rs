@@ -55,6 +55,13 @@ pub struct LoadSpec {
     /// *component* (it alters the graph), distinct from [`adapters`](Self::adapters) below, which
     /// are forward-time residual overlays on existing linears.
     pub control: Option<WeightsSource>,
+    /// **Additional** ControlNet checkpoints for MultiControlNet (sc-3378) — used by providers that
+    /// sum several control branches (the SDXL provider). These are loaded *after* [`control`](Self::control)
+    /// and paired, in order, with the request's `Conditioning::Control` images (the diffusers
+    /// `MultiControlNetModel` order semantics: branch *i* ← the *i*-th `Control`). Empty for the
+    /// single-branch case (then only `control` is used); providers that do not support multi-control
+    /// (Z-Image / Qwen union checkpoints) ignore this field.
+    pub extra_controls: Vec<WeightsSource>,
     /// Auxiliary **IP-Adapter** weights overlaid at load time (sc-3059) — the image-prompt
     /// conditioning checkpoint (image encoder + Resampler + decoupled cross-attn K/V), e.g. an
     /// `h94/IP-Adapter`-layout snapshot dir. `None` for the plain base model. Like
@@ -76,6 +83,7 @@ impl LoadSpec {
             quantize: None,
             precision: Precision::Bf16,
             control: None,
+            extra_controls: Vec::new(),
             ip_adapter: None,
             adapters: Vec::new(),
         }
@@ -90,6 +98,15 @@ impl LoadSpec {
     /// Builder-style control-branch overlay (the ControlNet checkpoint over the base `weights`).
     pub fn with_control(mut self, control: WeightsSource) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Builder-style **additional** ControlNet checkpoint for MultiControlNet (sc-3378) — appends to
+    /// [`extra_controls`](Self::extra_controls). Call after [`with_control`](Self::with_control); each
+    /// extra branch pairs, in order, with the request's `Conditioning::Control` images. Supported by
+    /// the SDXL provider.
+    pub fn with_extra_control(mut self, control: WeightsSource) -> Self {
+        self.extra_controls.push(control);
         self
     }
 
