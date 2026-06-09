@@ -95,15 +95,32 @@ pub fn load_text_encoder_2(root: &Path) -> Result<ClipTextEncoder> {
 /// Load the SDXL U-Net at `dtype` from `unet/diffusion_pytorch_model{,.fp16}.safetensors`. The chosen
 /// file is cast to `dtype` (f16 byte-matches the production `float16=True` U-Net).
 pub fn load_unet_dtype(root: &Path, dtype: Dtype) -> Result<UNet2DConditionModel> {
+    load_unet_with_config(root, dtype, &UNetConfig::sdxl_base())
+}
+
+/// Load the U-Net at `dtype` with an explicit [`UNetConfig`] — the shared body of
+/// [`load_unet_dtype`] (SDXL) and the Kolors loader. The `encoder_hid_proj` (Kolors) is auto-detected
+/// from the weights, so the same file-resolution + cast path serves both.
+pub fn load_unet_with_config(
+    root: &Path,
+    dtype: Dtype,
+    cfg: &UNetConfig,
+) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
     let mut w = Weights::from_file(&file)?;
     w.cast_all(dtype)?;
-    UNet2DConditionModel::from_weights(&w, &UNetConfig::sdxl_base())
+    UNet2DConditionModel::from_weights(&w, cfg)
 }
 
 /// f32 U-Net — the tight-stage-gate path (validated against the `float16=False` golden).
 pub fn load_unet(root: &Path) -> Result<UNet2DConditionModel> {
     load_unet_dtype(root, Dtype::Float32)
+}
+
+/// Load the **Kolors** U-Net (epic 3090) at `dtype` — [`UNetConfig::kolors`] + the auto-detected
+/// `encoder_hid_proj`. `root` is the `Kwai-Kolors/Kolors-diffusers` snapshot.
+pub fn load_unet_kolors_dtype(root: &Path, dtype: Dtype) -> Result<UNet2DConditionModel> {
+    load_unet_with_config(root, dtype, &UNetConfig::kolors())
 }
 
 /// Load an SDXL **ControlNet** branch (sc-3058) from a diffusers `ControlNetModel` checkpoint — a

@@ -62,6 +62,22 @@ impl UNetConfig {
         }
     }
 
+    /// Kolors U-Net (`Kwai-Kolors/Kolors-diffusers`, `unet/config.json`). Structurally **identical**
+    /// to [`sdxl_base`](Self::sdxl_base) — same blocks, channels, heads, `cross_attention_dim` 2048 —
+    /// with two ChatGLM-driven deltas, both **weight-driven** at load (so this differs from
+    /// `sdxl_base` only in the documented dim):
+    ///  - an `encoder_hid_proj` Linear (4096→2048) projecting the ChatGLM3 context to the
+    ///    cross-attention width — auto-detected from `encoder_hid_proj.weight` by
+    ///    [`UNet2DConditionModel::from_weights`](crate::unet::UNet2DConditionModel::from_weights);
+    ///  - `add_embedding.linear_1` takes **5632** = pooled(4096) + 6·256 time-ids (vs SDXL's 2816 =
+    ///    1280 + 1536), loaded by weight shape.
+    pub fn kolors() -> Self {
+        Self {
+            projection_class_embeddings_input_dim: Some(5632),
+            ..Self::sdxl_base()
+        }
+    }
+
     pub fn num_blocks(&self) -> usize {
         self.block_out_channels.len()
     }

@@ -45,7 +45,7 @@ pub use ip_adapter::{
 pub use loader::{
     load_controlnet, load_ip_adapter, load_text_encoder_1, load_text_encoder_1_dtype,
     load_text_encoder_2, load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype,
-    load_vae,
+    load_unet_kolors_dtype, load_unet_with_config, load_vae,
 };
 pub use model::{descriptor, load, Sdxl, MODEL_ID};
 pub use pipeline::{

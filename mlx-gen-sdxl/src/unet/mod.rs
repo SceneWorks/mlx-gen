@@ -54,6 +54,11 @@ pub struct UNet2DConditionModel {
     conv_norm_out_b: Array,
     /// Output conv head (NHWC) — a conv-layer LoRA target (sc-2919).
     conv_out: AdaptableConv2d,
+    /// Optional context projection (diffusers `encoder_hid_proj`). Present only when the checkpoint
+    /// carries `encoder_hid_proj.weight` — the **Kolors** U-Net (epic 3090), which projects the
+    /// ChatGLM3 context (4096) down to `cross_attention_dim` (2048) before cross-attention. SDXL has
+    /// no such key, so this stays `None` and the forward is byte-identical to before.
+    encoder_hid_proj: Option<AdaptableLinear>,
 }
 
 impl UNet2DConditionModel {
@@ -138,6 +143,10 @@ impl UNet2DConditionModel {
                 nchw_to_nhwc(w.require("conv_out.weight")?)?,
                 Some(w.require("conv_out.bias")?.clone()),
             ),
+            // Kolors `encoder_hid_proj` (4096→2048). Auto-detected: absent for SDXL → `None`.
+            encoder_hid_proj: w.get("encoder_hid_proj.weight").map(|wt| {
+                AdaptableLinear::dense(wt.clone(), w.get("encoder_hid_proj.bias").cloned())
+            }),
         })
     }
 
@@ -148,6 +157,9 @@ impl UNet2DConditionModel {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.time_embedding.quantize(bits)?;
         self.add_embedding.quantize(bits)?;
+        if let Some(proj) = &mut self.encoder_hid_proj {
+            proj.quantize(bits, None)?; // Kolors context projection (sc-3096 validates)
+        }
         for b in &mut self.down_blocks {
             b.quantize(bits)?;
         }
@@ -280,6 +292,17 @@ impl UNet2DConditionModel {
     ) -> Result<Array> {
         let batch = x.shape()[0];
         let dtype = x.dtype();
+
+        // Kolors: project the ChatGLM3 context (4096) to `cross_attention_dim` (2048) before any
+        // cross-attention (diffusers applies `encoder_hid_proj` once, up front). No-op for SDXL.
+        let projected;
+        let encoder_x = match &self.encoder_hid_proj {
+            Some(proj) => {
+                projected = proj.forward(encoder_x)?;
+                &projected
+            }
+            None => encoder_x,
+        };
 
         // Timestep embedding (broadcast the scalar time to the batch). The sinusoidal encoding runs
         // in f32 (its `sigmas` table is f32), then the reference casts to the model dtype *before* the

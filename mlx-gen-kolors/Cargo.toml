@@ -10,5 +10,8 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
+# Kolors reuses the SDXL U-Net + VAE + sampler. The U-Net gains an auto-detected `encoder_hid_proj`
+# for the ChatGLM3 4096→2048 context projection (see `UNetConfig::kolors`).
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
