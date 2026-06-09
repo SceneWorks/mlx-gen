@@ -314,9 +314,17 @@ impl T5TextEncoder {
 
     /// `tokens`: `[1, L]` int32. Returns T5 sequence embeddings `[1, L, 4096]`.
     pub fn forward(&self, tokens: &Array) -> Result<Array> {
+        self.forward_masked(tokens, None)
+    }
+
+    /// As [`forward`](Self::forward), but with an optional **additive** key-padding mask (broadcastable
+    /// to the attention scores `[1, heads, L, L]`, e.g. `[1, 1, 1, L]` with a large negative at padded
+    /// keys). Chroma (epic 3531) runs T5 with the tokenizer padding mask — unlike FLUX, which runs T5
+    /// unmasked. `mask = None` is **byte-identical** to [`forward`](Self::forward).
+    pub fn forward_masked(&self, tokens: &Array, mask: Option<&Array>) -> Result<Array> {
         let mut hidden = self.shared.forward(tokens)?;
         for block in &self.blocks {
-            hidden = block.forward(&hidden)?;
+            hidden = block.forward(&hidden, mask)?;
         }
         t5_rms_norm(&hidden, &self.final_ln_w, 1e-6)
     }
@@ -335,8 +343,8 @@ impl T5Block {
         })
     }
 
-    fn forward(&self, hidden: &Array) -> Result<Array> {
-        let hidden = self.attn.forward(hidden)?;
+    fn forward(&self, hidden: &Array, mask: Option<&Array>) -> Result<Array> {
+        let hidden = self.attn.forward(hidden, mask)?;
         self.ff.forward(&hidden)
     }
 
@@ -386,14 +394,19 @@ impl T5Attention {
         })
     }
 
-    fn forward(&self, hidden: &Array) -> Result<Array> {
+    fn forward(&self, hidden: &Array, mask: Option<&Array>) -> Result<Array> {
         let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
         let q = shape_t5(&self.q.forward(&normed)?)?;
         let k = shape_t5(&self.k.forward(&normed)?)?;
         let v = shape_t5(&self.v.forward(&normed)?)?;
         let scores = matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
         let bias = self.position_bias(hidden.shape()[1])?;
-        let weights = softmax_axis(&add(&scores, &bias)?, -1, false)?;
+        // Chroma key-padding mask (epic 3531): additive, broadcast over query/heads. `None` for FLUX.
+        let biased = match mask {
+            Some(m) => add(&add(&scores, &bias)?, m)?,
+            None => add(&scores, &bias)?,
+        };
+        let weights = softmax_axis(&biased, -1, false)?;
         let attn = unshape_t5(&matmul(&weights, &v)?)?;
         Ok(add(hidden, &self.o.forward(&attn)?)?)
     }

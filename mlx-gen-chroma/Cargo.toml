@@ -1,0 +1,24 @@
+[package]
+name = "mlx-gen-chroma"
+version = "0.0.0"
+edition = "2021"
+description = "Chroma (chroma1_hd/base/flash) provider crate for mlx-gen — a FLUX.1-schnell-derived DiT with a distilled-guidance Approximator (modulation), T5-only conditioning, and MMDiT attention masking."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "chroma", "flux", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Reuse the T5-XXL encoder type, the AutoencoderKL VAE loader, and the pack/unpack/sigmas helpers.
+mlx-gen-flux = { path = "../mlx-gen-flux" }
+# The shared VAE type returned by the flux VAE loader.
+mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+# Link-time self-registration into mlx-gen's model registry.
+inventory = "0.3"
+
+[dev-dependencies]
+# PNG dump of the Rust render for visual inspection in the e2e parity test.
+image = { version = "0.25", default-features = false, features = ["png"] }
