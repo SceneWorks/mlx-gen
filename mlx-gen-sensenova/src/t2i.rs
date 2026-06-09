@@ -20,7 +20,7 @@
 //! The pixel path is the `fm_head` → unpatchify (`use_pixel_head = false`); the conv decoders and the
 //! dynamic-μ schedule are dead code for this checkpoint.
 
-use mlx_rs::ops::{add, divide, minimum, multiply, subtract, sum_axes};
+use mlx_rs::ops::{add, divide, matmul, minimum, multiply, subtract, sum_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
@@ -54,6 +54,8 @@ pub enum CfgNorm {
 #[derive(Clone, Copy, Debug)]
 pub struct T2iOptions {
     pub cfg_scale: f32,
+    /// Image-guidance scale for it2i (`img_cfg_scale`): edit ≈ 1.0, character ≈ 1.5. Unused by T2I.
+    pub img_cfg_scale: f32,
     pub cfg_norm: CfgNorm,
     pub cfg_interval: (f32, f32),
     pub num_steps: usize,
@@ -69,6 +71,7 @@ impl Default for T2iOptions {
     fn default() -> Self {
         Self {
             cfg_scale: 1.0,
+            img_cfg_scale: 1.0,
             cfg_norm: CfgNorm::None,
             cfg_interval: (0.0, 1.0),
             num_steps: 30,
@@ -94,6 +97,9 @@ pub struct T2iOutput {
 pub struct T2iModel {
     backbone: Qwen3Backbone,
     gen_vision: NeoVisionEmbedder,
+    /// The **understanding**-path vision embedder (`vision_model.embeddings`) used to embed source /
+    /// reference images for it2i (sc-3189). `None` for fixtures that omit `vision_model.*`.
+    und_vision: Option<NeoVisionEmbedder>,
     fm_head: FmHead,
     timestep_embedder: TimestepEmbedder,
     noise_scale_embedder: Option<TimestepEmbedder>,
@@ -103,6 +109,10 @@ pub struct T2iModel {
     noise_scale_mode: String,
     noise_scale_base_image_seq_len: f32,
     noise_scale_max_value: f32,
+    /// `<IMG_CONTEXT>` / `<img>` ids (the checkpoint constants; overridable for tiny test fixtures
+    /// whose vocab can't hold the real ids).
+    img_context_id: i32,
+    img_start_id: i32,
 }
 
 impl T2iModel {
@@ -116,6 +126,20 @@ impl T2iModel {
         } else {
             None
         };
+        // The understanding-path vision embedder is only needed for it2i; gate on its presence so
+        // T2I-only fixtures (no `vision_model.*`) still load.
+        let und_vision = if w
+            .get("vision_model.embeddings.patch_embedding.weight")
+            .is_some()
+        {
+            Some(NeoVisionEmbedder::from_weights(
+                w,
+                cfg,
+                "vision_model.embeddings",
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             backbone: Qwen3Backbone::from_weights(w, cfg, "language_model")?,
             gen_vision: NeoVisionEmbedder::from_weights(
@@ -123,6 +147,7 @@ impl T2iModel {
                 cfg,
                 "fm_modules.vision_model_mot_gen.embeddings",
             )?,
+            und_vision,
             fm_head: FmHead::from_weights(w, "fm_modules.fm_head")?,
             timestep_embedder: TimestepEmbedder::from_weights(w, "fm_modules.timestep_embedder")?,
             noise_scale_embedder,
@@ -132,7 +157,17 @@ impl T2iModel {
             noise_scale_mode: cfg.noise_scale_mode.clone(),
             noise_scale_base_image_seq_len: cfg.noise_scale_base_image_seq_len as f32,
             noise_scale_max_value: cfg.noise_scale_max_value,
+            img_context_id: tokens::IMG_CONTEXT,
+            img_start_id: tokens::IMG_START,
         })
+    }
+
+    /// Override the `<IMG_CONTEXT>` / `<img>` token ids (for tiny test fixtures whose vocab cannot
+    /// hold the real checkpoint ids). Production callers never need this.
+    pub fn with_image_token_ids(mut self, img_context_id: i32, img_start_id: i32) -> Self {
+        self.img_context_id = img_context_id;
+        self.img_start_id = img_start_id;
+        self
     }
 
     /// The resolution-mode noise scale for a `grid_h × grid_w` patch grid (the `t2i_generate`
@@ -338,21 +373,7 @@ impl T2iModel {
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
 
-            let z = patchify(&image, cell)?;
-            let image_input =
-                patchify_channel_first(&image, self.patch_size)?.reshape(&[grid_h * grid_w, -1])?;
-            let vis = self
-                .gen_vision
-                .forward(&image_input, &[(grid_h as usize, grid_w as usize)])?
-                .reshape(&[1, l, -1])?;
-            let t_tok = self
-                .timestep_embedder
-                .forward(&Array::from_slice(&vec![t; l as usize], &[l]))?
-                .reshape(&[1, l, -1])?;
-            let mut cond = add(&vis, &t_tok)?;
-            if let Some(ne) = &noise_embed {
-                cond = add(&cond, ne)?;
-            }
+            let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
 
             let v_cond = self.predict_v(
                 &cond, token_h, token_w, text_len, cache_cond, &z, t, opts.t_eps,
@@ -366,6 +387,489 @@ impl T2iModel {
             } else {
                 v_cond
             };
+
+            image = unpatchify(
+                &euler_step(&v_pred, &z, t, t_next)?,
+                cell,
+                Some(token_h),
+                Some(token_w),
+            )?;
+            traj.push(image.clone());
+        }
+        Ok(traj)
+    }
+
+    /// Build one denoise step's latent `z` (channel-last patchify at `cell`) and the conditioned
+    /// image block `cond = gen_vision(image) + timestep_embed(t) [+ noise_scale_embed]` `[1, L,
+    /// hidden]`. Shared by the T2I and it2i denoise loops.
+    fn step_cond_embeds(
+        &self,
+        image: &Array,
+        grid_h: i32,
+        grid_w: i32,
+        l: i32,
+        t: f32,
+        noise_embed: &Option<Array>,
+    ) -> Result<(Array, Array)> {
+        let cell = self.patch_size * self.merge_size;
+        let z = patchify(image, cell)?;
+        let image_input =
+            patchify_channel_first(image, self.patch_size)?.reshape(&[grid_h * grid_w, -1])?;
+        let vis = self
+            .gen_vision
+            .forward(&image_input, &[(grid_h as usize, grid_w as usize)])?
+            .reshape(&[1, l, -1])?;
+        let t_tok = self
+            .timestep_embedder
+            .forward(&Array::from_slice(&vec![t; l as usize], &[l]))?
+            .reshape(&[1, l, -1])?;
+        let mut cond = add(&vis, &t_tok)?;
+        if let Some(ne) = noise_embed {
+            cond = add(&cond, ne)?;
+        }
+        Ok((z, cond))
+    }
+
+    // ===================== it2i (instruction edit + Character Studio) =====================
+
+    /// ImageNet-normalise a source RGB image `[3, H, W]` (f32 in `[0, 1]`) and channel-first
+    /// patchify to `[grid_h·grid_w, 3·ps²]` for the understanding vision embedder. Returns the
+    /// patches and the `(grid_h, grid_w)` patch grid. `H`/`W` must be multiples of `patch·merge`
+    /// (use [`smart_resize`] upstream). Mirrors the reference `load_image_native` transform
+    /// (ToTensor + Normalize) + `preprocess_pixel_values`.
+    pub fn preprocess_image(&self, rgb: &Array) -> Result<(Array, (i32, i32))> {
+        let sh = rgb.shape();
+        if sh.len() != 3 || sh[0] != 3 {
+            return Err(Error::Msg(format!(
+                "expected source image [3,H,W], got {sh:?}"
+            )));
+        }
+        let (h, w) = (sh[1], sh[2]);
+        let cell = self.patch_size * self.merge_size;
+        if h % cell != 0 || w % cell != 0 {
+            return Err(Error::Msg(format!(
+                "source image H/W must be multiples of {cell}, got {h}x{w}"
+            )));
+        }
+        let mean = Array::from_slice(&[0.485f32, 0.456, 0.406], &[3, 1, 1]);
+        let std = Array::from_slice(&[0.229f32, 0.224, 0.225], &[3, 1, 1]);
+        let norm = divide(&subtract(&rgb.as_dtype(Dtype::Float32)?, &mean)?, &std)?;
+        let (gh, gw) = (h / self.patch_size, w / self.patch_size);
+        let patches = patchify_channel_first(&norm.reshape(&[1, 3, h, w])?, self.patch_size)?
+            .reshape(&[gh * gw, -1])?;
+        Ok((patches, (gh, gw)))
+    }
+
+    /// Understanding-path vision features for source-image patches (diagnostic / it2i internals).
+    pub fn und_vision_features(&self, pixel_values: &Array, grids: &[(i32, i32)]) -> Result<Array> {
+        let und = self
+            .und_vision
+            .as_ref()
+            .ok_or_else(|| Error::Msg("vision_model not loaded".into()))?;
+        let g: Vec<(usize, usize)> = grids
+            .iter()
+            .map(|&(a, b)| (a as usize, b as usize))
+            .collect();
+        und.forward(pixel_values, &g)
+    }
+
+    /// (t, h, w) position rows for a prefix containing source-image blocks (the reference
+    /// `get_thw_indexes`): text tokens advance temporal by one; an image-context block shares one
+    /// temporal index and carries its **merged-grid** `(row, col)` as `(h, w)`. `grids` are the full
+    /// patch grids `(grid_h, grid_w)` per image, in order.
+    fn get_thw_indexes(&self, ids: &[i32], grids: &[(i32, i32)]) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+        let n = ids.len();
+        let mut t = Vec::with_capacity(n);
+        let mut acc = 0i32;
+        for i in 0..n {
+            let shift = i32::from(i > 0 && ids[i - 1] == self.img_start_id);
+            let not_img = i32::from(ids[i] != self.img_context_id);
+            acc += shift + not_img;
+            t.push(acc - 1);
+        }
+        // Merged-grid (row=y, col=x) coordinates, concatenated across images in order.
+        let merge = self.merge_size;
+        let mut abs = Vec::new();
+        for &(gh, gw) in grids {
+            let (mh, mw) = (gh / merge, gw / merge);
+            for idx in 0..(mh * mw) {
+                abs.push((idx / mw, idx % mw));
+            }
+        }
+        let mut h = vec![0i32; n];
+        let mut w = vec![0i32; n];
+        let mut k = 0usize;
+        for i in 0..n {
+            if ids[i] == self.img_context_id {
+                let (y, x) = abs[k];
+                h[i] = y;
+                w[i] = x;
+                k += 1;
+            }
+        }
+        (t, h, w)
+    }
+
+    /// Embed `ids` and splice the understanding vision features into the `<IMG_CONTEXT>` positions
+    /// (the reference `_build_it2i_inputs`). Returns the prefix embeds `[1, S, hidden]` and its
+    /// `(t, h, w)` rows. `pixel_values` is the concatenated per-image patch list; `grids` the full
+    /// patch grids. Scatter is done with a one-hot selection matmul (no in-place index assignment).
+    #[allow(clippy::type_complexity)]
+    fn build_it2i_prefix(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Array>,
+        grids: &[(i32, i32)],
+    ) -> Result<(Array, Vec<i32>, Vec<i32>, Vec<i32>)> {
+        let s = ids.len();
+        let ids_arr = Array::from_slice(ids, &[1, s as i32]);
+        let mut embeds = self.backbone.embed(&ids_arr)?; // [1, S, H]
+        let (t, h, w) = self.get_thw_indexes(ids, grids);
+
+        if let Some(pv) = pixel_values {
+            let und = self.und_vision.as_ref().ok_or_else(|| {
+                Error::Msg("it2i needs the understanding vision embedder (vision_model.*)".into())
+            })?;
+            let grids_us: Vec<(usize, usize)> = grids
+                .iter()
+                .map(|&(a, b)| (a as usize, b as usize))
+                .collect();
+            let vit = und.forward(pv, &grids_us)?; // [n_ctx, H]
+            let hidden = embeds.shape()[2];
+            let dt = embeds.dtype();
+            let ctx: Vec<usize> = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, &id)| id == self.img_context_id)
+                .map(|(i, _)| i)
+                .collect();
+            let n_ctx = vit.shape()[0];
+            if ctx.len() as i32 != n_ctx {
+                return Err(Error::Msg(format!(
+                    "it2i: {} <IMG_CONTEXT> tokens but {n_ctx} vision tokens",
+                    ctx.len()
+                )));
+            }
+            // P [S, n_ctx] one-hot: row = sequence position, col = vision-token index.
+            let mut p = vec![0f32; s * n_ctx as usize];
+            let mut mask = vec![0f32; s];
+            for (k, &pos) in ctx.iter().enumerate() {
+                p[pos * n_ctx as usize + k] = 1.0;
+                mask[pos] = 1.0;
+            }
+            let p_arr = Array::from_slice(&p, &[s as i32, n_ctx]).as_dtype(dt)?;
+            let vit_full = matmul(&p_arr, &vit.as_dtype(dt)?)?; // [S, H], 0 off-context
+            let keep_mask = Array::from_slice(
+                &mask.iter().map(|m| 1.0 - m).collect::<Vec<_>>(),
+                &[s as i32, 1],
+            )
+            .as_dtype(dt)?;
+            let e2d = embeds.reshape(&[s as i32, hidden])?;
+            embeds =
+                add(&multiply(&e2d, &keep_mask)?, &vit_full)?.reshape(&[1, s as i32, hidden])?;
+        }
+        Ok((embeds, t, h, w))
+    }
+
+    /// Prefill a prepared prefix (embeds + positions) on the understanding path. Returns the cache,
+    /// the last-position logits (for think-mode), and the image-block temporal index (`max(t) + 1`).
+    fn prefill_prefix(
+        &self,
+        embeds: &Array,
+        t: &[i32],
+        h: &[i32],
+        w: &[i32],
+    ) -> Result<(KvCache, Array, usize)> {
+        let mut cache = self.backbone.new_cache();
+        let hidden = self
+            .backbone
+            .forward_cached(embeds, t, h, w, Path::Und, &mut cache, true)?;
+        let logits = self.backbone.lm_head(&hidden)?;
+        let s = t.len() as i32;
+        let vocab = logits.shape()[2];
+        let last = logits
+            .take_axis(Array::from_slice(&[s - 1], &[1]), 1)?
+            .reshape(&[vocab])?;
+        let img_temporal = (*t.iter().max().unwrap_or(&0) + 1) as usize;
+        Ok((cache, last, img_temporal))
+    }
+
+    /// The understanding-path prefill hidden states `[1, S, hidden]` for an it2i prefix (diagnostic).
+    pub fn prefill_it2i_hidden(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Array>,
+        grids: &[(i32, i32)],
+    ) -> Result<Array> {
+        let (embeds, t, h, w) = self.build_it2i_prefix(ids, pixel_values, grids)?;
+        let mut cache = self.backbone.new_cache();
+        self.backbone
+            .forward_cached(&embeds, &t, &h, &w, Path::Und, &mut cache, true)
+    }
+
+    /// Build + prefill an it2i prefix from explicit token ids, source-image patches, and per-image
+    /// patch grids (the tokenizer-free entry the parity test drives). Returns the cache and the
+    /// image-block temporal index. `pixel_values` is the concatenated per-image patch list.
+    pub fn prefill_it2i(
+        &self,
+        ids: &[i32],
+        pixel_values: Option<&Array>,
+        grids: &[(i32, i32)],
+    ) -> Result<(KvCache, usize)> {
+        let (embeds, t, h, w) = self.build_it2i_prefix(ids, pixel_values, grids)?;
+        let (cache, _, img_temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+        Ok((cache, img_temporal))
+    }
+
+    /// Build the it2i condition prefix from a prompt + source images (replacing `<image>` markers
+    /// with `<img><IMG_CONTEXT>×n</img>` per image, auto-prepending markers like `it2i_generate`).
+    /// Returns the cache, last logits, image-block temporal index, and the per-image patch grids.
+    fn build_it2i_query_ids(
+        &self,
+        tokenizer: &TextTokenizer,
+        base_query: &str,
+        grids: &[(i32, i32)],
+    ) -> Result<Vec<i32>> {
+        let mut query = base_query.to_string();
+        for &(gh, gw) in grids {
+            let n = (gh / self.merge_size) * (gw / self.merge_size);
+            let block = format!("<img>{}</img>", "<IMG_CONTEXT>".repeat(n as usize));
+            query = query.replacen("<image>", &block, 1);
+        }
+        tokenizer.encode_ids(&query, true)
+    }
+
+    /// Image-conditioned generation (`it2i_generate`): edit / Character-Studio reference. `images`
+    /// are decoded source RGB tensors `[3, H, W]` in `[0, 1]` (smart-resized to multiples of
+    /// `patch·merge`); `prompt` may contain `<image>` markers (auto-prepended otherwise). Dual
+    /// guidance: `opts.cfg_scale` (text) + `opts.img_cfg_scale` (image; edit ≈ 1.0, character ≈
+    /// 1.5). `init_noise` (optional) is a standard-normal `[1,3,H,W]` for cross-build parity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn it2i_generate(
+        &self,
+        tokenizer: &TextTokenizer,
+        prompt: &str,
+        images: &[Array],
+        width: i32,
+        height: i32,
+        opts: &T2iOptions,
+        init_noise: Option<&Array>,
+    ) -> Result<T2iOutput> {
+        let cell = self.patch_size * self.merge_size;
+        if width % cell != 0 || height % cell != 0 {
+            return Err(Error::Msg(format!(
+                "sensenova it2i: width/height must be multiples of {cell}, got {width}x{height}"
+            )));
+        }
+        if images.is_empty() {
+            return Err(Error::Msg("it2i requires at least one source image".into()));
+        }
+
+        // Preprocess source images → concatenated patches + per-image grids.
+        let mut pv_parts = Vec::with_capacity(images.len());
+        let mut grids = Vec::with_capacity(images.len());
+        for img in images {
+            let (p, g) = self.preprocess_image(img)?;
+            pv_parts.push(p);
+            grids.push(g);
+        }
+        let pv_refs: Vec<&Array> = pv_parts.iter().collect();
+        let pixel_values = mlx_rs::ops::concatenate_axis(&pv_refs, 0)?;
+
+        // Auto-prepend `<image>` markers when the prompt has fewer than the image count.
+        let count = prompt.matches("<image>").count();
+        let mut question = prompt.to_string();
+        if images.len() > count {
+            let extra = images.len() - count;
+            let pre = if count == 0 && images.len() > 1 {
+                (0..images.len())
+                    .map(|i| format!("Image-{}:<image>\n", i + 1))
+                    .collect::<String>()
+            } else {
+                "<image>\n".repeat(extra)
+            };
+            question = format!("{pre}{question}");
+        }
+
+        let think_sentinel = if opts.think_mode {
+            "<think>\n"
+        } else {
+            "<think>\n\n</think>\n\n<img>"
+        };
+
+        // Guidance plan (matches it2i_generate's needs_* flags).
+        let needs_cfg = !(opts.cfg_scale == 1.0 && opts.img_cfg_scale == 1.0);
+        let needs_img =
+            needs_cfg && (opts.img_cfg_scale == 1.0 || opts.cfg_scale != opts.img_cfg_scale);
+        let needs_uncond = needs_cfg && opts.img_cfg_scale != 1.0;
+
+        // Condition: prompt + images.
+        let cond_query = format!(
+            "{}{}",
+            build_neo1_query(&question, SYSTEM_MESSAGE_FOR_GEN),
+            think_sentinel
+        );
+        let cond_ids = self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?;
+        let (cond_embeds, ct, ch, cw) =
+            self.build_it2i_prefix(&cond_ids, Some(&pixel_values), &grids)?;
+        let (mut cache_cond, last_logits, mut cond_temporal) =
+            self.prefill_prefix(&cond_embeds, &ct, &ch, &cw)?;
+
+        // think-mode rollout (extends cache + advances the image-block temporal index).
+        let mut think_text = None;
+        if opts.think_mode {
+            let append_ids = tokenizer.encode_ids("\n\n<img>", false)?;
+            let roll = self.backbone.generate_think(
+                last_logits.as_slice::<f32>(),
+                &mut cache_cond,
+                (cond_temporal - 1) as i32,
+                tokens::THINK_END,
+                tokens::IM_END,
+                &append_ids,
+                opts.max_think_tokens,
+            )?;
+            let u32s: Vec<u32> = roll.think_token_ids.iter().map(|&i| i as u32).collect();
+            think_text = Some(tokenizer.decode(&u32s, false)?);
+            cond_temporal = (roll.t_idx + 1) as usize;
+        }
+
+        // Image-condition: images only, empty prompt.
+        let mut cache_img = None;
+        if needs_img {
+            let q = format!(
+                "{}<img>",
+                build_neo1_query(&"<image>".repeat(images.len()), "")
+            );
+            let ids = self.build_it2i_query_ids(tokenizer, &q, &grids)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, Some(&pixel_values), &grids)?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            cache_img = Some((cache, temporal));
+        }
+
+        // Uncondition: empty prompt, no images.
+        let mut cache_uncond = None;
+        if needs_uncond {
+            let q = format!("{}<img>", build_neo1_query("", ""));
+            let ids = tokenizer.encode_ids(&q, true)?;
+            let (embeds, t, h, w) = self.build_it2i_prefix(&ids, None, &[])?;
+            let (cache, _, temporal) = self.prefill_prefix(&embeds, &t, &h, &w)?;
+            cache_uncond = Some((cache, temporal));
+        }
+
+        let base_noise = match init_noise {
+            Some(n) => n.as_dtype(Dtype::Float32)?,
+            None => gaussian(&[1, 3, height, width], opts.seed)?,
+        };
+        let img_ref = cache_img.as_mut().map(|(c, l)| (c, *l));
+        let un_ref = cache_uncond.as_mut().map(|(c, l)| (c, *l));
+        let traj = self.it2i_denoise(
+            (&mut cache_cond, cond_temporal),
+            img_ref,
+            un_ref,
+            width,
+            height,
+            &base_noise,
+            opts,
+        )?;
+        let image = traj.into_iter().last().expect("at least one step");
+        Ok(T2iOutput { image, think_text })
+    }
+
+    /// The dual-guidance denoise loop (`it2i_generate`'s body). `cond`/`img`/`uncond` are
+    /// `(cache, image-block temporal index)`; the per-step blend follows the reference's
+    /// `cfg_scale`/`img_cfg_scale` cases, then optional `cfg_norm`. Returns the image trajectory.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn it2i_denoise(
+        &self,
+        cond: (&mut KvCache, usize),
+        mut img: Option<(&mut KvCache, usize)>,
+        mut uncond: Option<(&mut KvCache, usize)>,
+        width: i32,
+        height: i32,
+        base_noise: &Array,
+        opts: &T2iOptions,
+    ) -> Result<Vec<Array>> {
+        let cell = self.patch_size * self.merge_size;
+        let token_h = height / cell;
+        let token_w = width / cell;
+        let grid_h = height / self.patch_size;
+        let grid_w = width / self.patch_size;
+        let l = token_h * token_w;
+        let (cache_cond, cond_t) = cond;
+
+        let noise_scale = self.noise_scale_for(grid_h, grid_w);
+        let mut image = multiply(
+            &base_noise.as_dtype(Dtype::Float32)?,
+            Array::from_f32(noise_scale),
+        )?;
+
+        let steps = opts.num_steps;
+        let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
+        let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
+        let ts_arr = if opts.enable_timestep_shift {
+            apply_time_schedule(&lin_arr, opts.timestep_shift)?
+        } else {
+            lin_arr
+        };
+        let timesteps = ts_arr.as_slice::<f32>().to_vec();
+
+        let noise_embed = if let Some(emb) = &self.noise_scale_embedder {
+            let ns = vec![noise_scale / self.noise_scale_max_value; l as usize];
+            Some(
+                emb.forward(&Array::from_slice(&ns, &[l]))?
+                    .reshape(&[1, l, -1])?,
+            )
+        } else {
+            None
+        };
+
+        let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
+        let (i0, i1) = opts.cfg_interval;
+        let mut traj = Vec::with_capacity(steps);
+        for i in 0..steps {
+            let t = timesteps[i];
+            let t_next = timesteps[i + 1];
+            let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
+
+            let (z, cond_emb) =
+                self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
+            let out_cond = self.predict_v(
+                &cond_emb, token_h, token_w, cond_t, cache_cond, &z, t, opts.t_eps,
+            )?;
+
+            let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
+                out_cond.clone()
+            } else if img_cfg == 1.0 {
+                let (c, tl) = img.as_mut().unwrap();
+                let oi = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
+                add(
+                    &oi,
+                    &multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?,
+                )?
+            } else if cfg == img_cfg {
+                let (c, tl) = uncond.as_mut().unwrap();
+                let ou = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
+                add(
+                    &ou,
+                    &multiply(&subtract(&out_cond, &ou)?, Array::from_f32(cfg))?,
+                )?
+            } else {
+                let oi = {
+                    let (c, tl) = img.as_mut().unwrap();
+                    self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
+                };
+                let ou = {
+                    let (c, tl) = uncond.as_mut().unwrap();
+                    self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
+                };
+                let a = multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?;
+                let b = multiply(&subtract(&oi, &ou)?, Array::from_f32(img_cfg))?;
+                add(&add(&ou, &a)?, &b)?
+            };
+
+            if (cfg > 1.0 || img_cfg > 1.0) && use_cfg {
+                v_pred = apply_cfg_norm(v_pred, &out_cond, opts.cfg_norm)?;
+            }
 
             image = unpatchify(
                 &euler_step(&v_pred, &z, t, t_next)?,
@@ -416,6 +920,27 @@ fn cfg_blend(
             multiply(&blended, &s).map_err(Error::from)
         }
         _ => Ok(blended),
+    }
+}
+
+/// Apply the post-blend `cfg_norm` rescale (`it2i_generate`): clamp the guided velocity's norm to
+/// the condition velocity's (global = whole-tensor, channel = per-token). `None` is a no-op.
+fn apply_cfg_norm(v: Array, out_cond: &Array, norm: CfgNorm) -> Result<Array> {
+    match norm {
+        CfgNorm::Global => {
+            let nc = frobenius(out_cond)?;
+            let nv = frobenius(&v)?;
+            let s = (nc / (nv + 1e-8)).clamp(0.0, 1.0);
+            multiply(&v, Array::from_f32(s)).map_err(Error::from)
+        }
+        CfgNorm::Channel => {
+            let nc = l2_last(out_cond)?;
+            let nv = l2_last(&v)?;
+            let ratio = divide(&nc, &add(&nv, Array::from_f32(1e-8))?)?;
+            let s = minimum(&ratio, Array::from_f32(1.0))?;
+            multiply(&v, &s).map_err(Error::from)
+        }
+        _ => Ok(v),
     }
 }
 
