@@ -52,6 +52,21 @@ pub const SYSTEM_MESSAGE_FOR_GEN: &str = concat!(
     "user's input language."
 );
 
+/// The interleaved text-image system message (verbatim from the reference
+/// `examples/interleave/inference.py::DEFAULT_SYSTEM_MESSAGE`) — required for Document Studio's
+/// think-mode interleave protocol or the model won't interleave correctly.
+pub const INTERLEAVE_SYSTEM_MESSAGE: &str = concat!(
+    "You are a multimodal assistant capable of reasoning with both text and images. You support ",
+    "two modes:\n\nThink Mode: When reasoning is needed, you MUST start with a <think></think> ",
+    "block and place all reasoning inside it. You MUST interleave text with generated images using ",
+    "tags like <image1>, <image2>. Images can ONLY be generated between <think> and </think>, and ",
+    "may be referenced in the final answer.\n\nNon-Think Mode: When no reasoning is needed, directly ",
+    "provide the answer without reasoning. Do not use tags like <image1>, <image2>; present any ",
+    "images naturally alongside the text.\n\nAfter the think block, always provide a concise, ",
+    "user-facing final answer. The answer may include text, images, or both. Match the user's ",
+    "language in both reasoning and the final answer."
+);
+
 /// Build the `neo1_0` ChatML prompt: optional system block + the user turn + the empty assistant
 /// turn that primes generation. Mirrors the reference `conversation.py` MPT style — an empty
 /// `system_message` omits the system block entirely.

@@ -86,6 +86,37 @@ impl Default for T2iOptions {
     }
 }
 
+/// The result of a [`T2iModel::interleave_gen`] run: the composed text (with `<image>`
+/// placeholders where images were generated) and the generated images in order.
+pub struct InterleaveOutput {
+    pub text: String,
+    pub images: Vec<Array>,
+}
+
+/// The interleave resolution buckets (`examples/interleave/inference.py::SUPPORTED_RESOLUTIONS`) —
+/// `(width, height)` per aspect ratio. Document Studio picks one of these. Default `"16:9"`.
+pub const INTERLEAVE_RESOLUTIONS: &[(&str, (i32, i32))] = &[
+    ("1:1", (1536, 1536)),
+    ("16:9", (2048, 1152)),
+    ("9:16", (1152, 2048)),
+    ("3:2", (1888, 1248)),
+    ("2:3", (1248, 1888)),
+    ("4:3", (1760, 1312)),
+    ("3:4", (1312, 1760)),
+    ("1:2", (1088, 2144)),
+    ("2:1", (2144, 1088)),
+    ("1:3", (864, 2592)),
+    ("3:1", (2592, 864)),
+];
+
+/// Look up an interleave resolution bucket by aspect-ratio key (e.g. `"16:9"`).
+pub fn interleave_resolution_for(ratio: &str) -> Option<(i32, i32)> {
+    INTERLEAVE_RESOLUTIONS
+        .iter()
+        .find(|(r, _)| *r == ratio)
+        .map(|(_, wh)| *wh)
+}
+
 /// The result of a [`T2iModel::generate`] run.
 pub struct T2iOutput {
     /// The generated image `[1, 3, H, W]` (model space, roughly `[-1, 1]`).
@@ -110,10 +141,11 @@ pub struct T2iModel {
     noise_scale_mode: String,
     noise_scale_base_image_seq_len: f32,
     noise_scale_max_value: f32,
-    /// `<IMG_CONTEXT>` / `<img>` ids (the checkpoint constants; overridable for tiny test fixtures
-    /// whose vocab can't hold the real ids).
+    /// `<IMG_CONTEXT>` / `<img>` / `</img>` ids (the checkpoint constants; overridable for tiny test
+    /// fixtures whose vocab can't hold the real ids).
     img_context_id: i32,
     img_start_id: i32,
+    img_end_id: i32,
 }
 
 impl T2iModel {
@@ -160,14 +192,21 @@ impl T2iModel {
             noise_scale_max_value: cfg.noise_scale_max_value,
             img_context_id: tokens::IMG_CONTEXT,
             img_start_id: tokens::IMG_START,
+            img_end_id: tokens::IMG_END,
         })
     }
 
-    /// Override the `<IMG_CONTEXT>` / `<img>` token ids (for tiny test fixtures whose vocab cannot
-    /// hold the real checkpoint ids). Production callers never need this.
-    pub fn with_image_token_ids(mut self, img_context_id: i32, img_start_id: i32) -> Self {
+    /// Override the `<IMG_CONTEXT>` / `<img>` / `</img>` token ids (for tiny test fixtures whose
+    /// vocab cannot hold the real checkpoint ids). Production callers never need this.
+    pub fn with_image_token_ids(
+        mut self,
+        img_context_id: i32,
+        img_start_id: i32,
+        img_end_id: i32,
+    ) -> Self {
         self.img_context_id = img_context_id;
         self.img_start_id = img_start_id;
+        self.img_end_id = img_end_id;
         self
     }
 
@@ -871,6 +910,217 @@ impl T2iModel {
         Ok(tokenizer.decode(&u32s, true)?.trim().to_string())
     }
 
+    /// Re-encode a generated image through the **understanding** vision embedder and append it (plus
+    /// the `</img>` token) to a text cache, so subsequent text generation attends to it (the
+    /// reference `interleave_gen`'s inner `append_image_to_cache`). The generated `image` `[1,3,H,W]`
+    /// is mapped model-space→`[0,1]` (`·0.5+0.5`) then ImageNet-normalised. Image tokens take temporal
+    /// `t_idx+1` with their merged-grid `(h,w)`; `</img>` takes `t_idx+2`. The block-causal mask makes
+    /// image tokens attend bidirectionally to each other + all past but **not** to the `</img>`
+    /// position, while `</img>` sees them — exactly what [`cached_block_mask`](crate::qwen3) yields
+    /// for that temporal layout. Returns the next-token logits and the advanced `t_idx` (`+2`).
+    /// Public so callers can compose custom interleave loops and so the parity test can drive it.
+    pub fn append_generated_image(
+        &self,
+        image: &Array,
+        token_h: i32,
+        token_w: i32,
+        t_idx: usize,
+        cache: &mut KvCache,
+    ) -> Result<(Vec<f32>, usize)> {
+        let sh = image.shape();
+        let (h, w) = (sh[2], sh[3]);
+        let raw = add(
+            &multiply(image, Array::from_f32(0.5))?,
+            Array::from_f32(0.5),
+        )?
+        .reshape(&[3, h, w])?;
+        let (patches, (gh, gw)) = self.preprocess_image(&raw)?;
+        let vit = self.und_vision_features(&patches, &[(gh, gw)])?; // [n_img, hidden]
+        let n_img = vit.shape()[0];
+        let hidden = vit.shape()[1];
+        let end = self
+            .backbone
+            .embed(&Array::from_slice(&[self.img_end_id], &[1, 1]))?
+            .reshape(&[1, hidden])?;
+        let embeds =
+            mlx_rs::ops::concatenate_axis(&[&vit, &end], 0)?.reshape(&[1, n_img + 1, hidden])?;
+
+        let ti = t_idx as i32;
+        let mut t = vec![ti + 1; n_img as usize];
+        t.push(ti + 2);
+        let mut hh = Vec::with_capacity(n_img as usize + 1);
+        let mut ww = Vec::with_capacity(n_img as usize + 1);
+        for i in 0..n_img {
+            hh.push(i / token_w);
+            ww.push(i % token_w);
+        }
+        hh.push(0);
+        ww.push(0);
+        let hs = self
+            .backbone
+            .forward_cached(&embeds, &t, &hh, &ww, Path::Und, cache, true)?;
+        let logits = self.backbone.lm_head(&hs)?;
+        let vocab = logits.shape()[2];
+        let last = logits
+            .take_axis(Array::from_slice(&[n_img], &[1]), 1)?
+            .reshape(&[vocab])?
+            .as_slice::<f32>()
+            .to_vec();
+        let _ = (token_h, token_w);
+        Ok((last, t_idx + 2))
+    }
+
+    /// Interleaved text-image generation (`interleave_gen`) — the **Document Studio** deliverable. A
+    /// single rollout that alternates understanding-path text generation and gen-path flow-matching
+    /// image generation: text streams until the model emits `<img>`, an image is generated (3-cache
+    /// CFG: condition / text-uncondition / image-uncondition) and re-encoded back into the text
+    /// caches, then text resumes — all as **single-path** forwards over growing caches (the upstream
+    /// mixed-token attention is never issued). `input_images` are optional source images;
+    /// `system_message` is normally [`INTERLEAVE_SYSTEM_MESSAGE`]; `init_noises`, when supplied, are
+    /// per-image standard-normal `[1,3,H,W]` tensors for cross-build parity. Returns the composed text
+    /// (with `<image>` placeholders) and the generated images in order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interleave_gen(
+        &self,
+        tokenizer: &TextTokenizer,
+        prompt: &str,
+        input_images: &[Array],
+        width: i32,
+        height: i32,
+        opts: &T2iOptions,
+        system_message: &str,
+        max_new_tokens: usize,
+        max_images: usize,
+        init_noises: Option<&[Array]>,
+    ) -> Result<InterleaveOutput> {
+        let cell = self.patch_size * self.merge_size;
+        if width % cell != 0 || height % cell != 0 {
+            return Err(Error::Msg(format!(
+                "sensenova interleave: width/height must be multiples of {cell}, got {width}x{height}"
+            )));
+        }
+        let token_h = height / cell;
+        let token_w = width / cell;
+
+        // Source images (optional).
+        let mut pv_parts = Vec::with_capacity(input_images.len());
+        let mut grids = Vec::with_capacity(input_images.len());
+        for img in input_images {
+            let (p, g) = self.preprocess_image(img)?;
+            pv_parts.push(p);
+            grids.push(g);
+        }
+        let pixel_values = if pv_parts.is_empty() {
+            None
+        } else {
+            let refs: Vec<&Array> = pv_parts.iter().collect();
+            Some(mlx_rs::ops::concatenate_axis(&refs, 0)?)
+        };
+
+        // ---- Three prefixes / caches ----
+        let mut cond_query = build_neo1_query(prompt, system_message);
+        if !opts.think_mode {
+            cond_query.push_str("<think>\n\n</think>\n\n");
+        }
+        let cond_ids = if input_images.is_empty() {
+            tokenizer.encode_ids(&cond_query, true)?
+        } else {
+            self.build_it2i_query_ids(tokenizer, &cond_query, &grids)?
+        };
+        let (mut cache_cond, cond_logits, mut t_cond) =
+            self.prefill_it2i_logits(&cond_ids, pixel_values.as_ref(), &grids)?;
+
+        let tu_query = build_neo1_query(&"<image>".repeat(input_images.len()), "");
+        let tu_ids = if input_images.is_empty() {
+            tokenizer.encode_ids(&tu_query, true)?
+        } else {
+            self.build_it2i_query_ids(tokenizer, &tu_query, &grids)?
+        };
+        let (mut cache_tu, _, mut t_tu) =
+            self.prefill_it2i_logits(&tu_ids, pixel_values.as_ref(), &grids)?;
+
+        let iu_query = format!("{}<img>", build_neo1_query("", ""));
+        let iu_ids = tokenizer.encode_ids(&iu_query, true)?;
+        let (mut cache_iu, _, iu_max) = self.prefill_it2i_logits(&iu_ids, None, &[])?;
+
+        let mut text = String::new();
+        let mut images = Vec::new();
+        let mut total_tokens = 0usize;
+        let mut next = argmax_i32(&cond_logits);
+
+        loop {
+            // ---- Text generation on the condition cache ----
+            let mut gen_tokens = Vec::new();
+            let mut hit_max = false;
+            loop {
+                if next == tokens::IM_END || next == self.img_start_id {
+                    break;
+                }
+                gen_tokens.push(next);
+                total_tokens += 1;
+                let logits =
+                    self.backbone
+                        .decode_logits(next, (t_cond + 1) as i32, &mut cache_cond)?;
+                t_cond += 1;
+                next = argmax_i32(&logits);
+                if total_tokens >= max_new_tokens {
+                    hit_max = true;
+                    break;
+                }
+            }
+            if !gen_tokens.is_empty() {
+                let u32s: Vec<u32> = gen_tokens.iter().map(|&i| i as u32).collect();
+                text.push_str(&tokenizer.decode(&u32s, true)?);
+            }
+            if next == tokens::IM_END || hit_max || images.len() >= max_images {
+                break;
+            }
+            if next != self.img_start_id {
+                break;
+            }
+
+            // ---- Image generation ----
+            text.push_str("<image>");
+            // Append `<img>` to the condition + text-uncondition caches.
+            self.backbone
+                .decode_logits(self.img_start_id, (t_cond + 1) as i32, &mut cache_cond)?;
+            t_cond += 1;
+            self.backbone
+                .decode_logits(self.img_start_id, (t_tu + 1) as i32, &mut cache_tu)?;
+            t_tu += 1;
+
+            let base_noise = match init_noises {
+                Some(ns) if images.len() < ns.len() => ns[images.len()].as_dtype(Dtype::Float32)?,
+                _ => gaussian(
+                    &[1, 3, height, width],
+                    opts.seed.wrapping_add(images.len() as u64),
+                )?,
+            };
+            let traj = self.it2i_denoise(
+                (&mut cache_cond, t_cond + 1),
+                Some((&mut cache_tu, t_tu + 1)),
+                Some((&mut cache_iu, iu_max + 1)),
+                width,
+                height,
+                &base_noise,
+                opts,
+            )?;
+            let image = traj.into_iter().last().expect("at least one step");
+
+            // Re-encode the generated image back into the condition + text-uncondition caches.
+            let (cond_next, nt_cond) =
+                self.append_generated_image(&image, token_h, token_w, t_cond, &mut cache_cond)?;
+            t_cond = nt_cond;
+            let (_, nt_tu) =
+                self.append_generated_image(&image, token_h, token_w, t_tu, &mut cache_tu)?;
+            t_tu = nt_tu;
+            images.push(image);
+            next = argmax_i32(&cond_next);
+        }
+
+        Ok(InterleaveOutput { text, images })
+    }
+
     /// The dual-guidance denoise loop (`it2i_generate`'s body). `cond`/`img`/`uncond` are
     /// `(cache, image-block temporal index)`; the per-step blend follows the reference's
     /// `cfg_scale`/`img_cfg_scale` cases, then optional `cfg_norm`. Returns the image trajectory.
@@ -1066,6 +1316,19 @@ fn optimized_scale(v_cond: &Array, v_uncond: &Array) -> Result<f32> {
     Ok(dot / (nrm + 1e-8))
 }
 
+/// Index of the maximum element (ties → lowest index, matching `torch.argmax`).
+fn argmax_i32(v: &[f32]) -> i32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    best as i32
+}
+
 /// `smart_resize` (Qwen2.5-VL, the vendored `utils.smart_resize`): round `height`/`width` to
 /// multiples of `factor` (use `patch·merge = 32`) with total pixels held in `[min_pixels,
 /// max_pixels]`. Returns `(height, width)`.
@@ -1161,6 +1424,17 @@ mod tests {
             on <= cn + 1e-4,
             "global-norm output {on} exceeds cond norm {cn}"
         );
+    }
+
+    #[test]
+    fn interleave_resolution_lookup() {
+        assert_eq!(interleave_resolution_for("16:9"), Some((2048, 1152)));
+        assert_eq!(interleave_resolution_for("1:1"), Some((1536, 1536)));
+        assert_eq!(interleave_resolution_for("nope"), None);
+        for (_, (w, h)) in INTERLEAVE_RESOLUTIONS {
+            assert_eq!(w % 32, 0, "interleave bucket width not 32-aligned");
+            assert_eq!(h % 32, 0, "interleave bucket height not 32-aligned");
+        }
     }
 
     #[test]
