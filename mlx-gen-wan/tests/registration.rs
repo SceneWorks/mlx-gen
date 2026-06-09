@@ -604,6 +604,9 @@ fn wan_vace_is_registered() {
     assert_eq!(d.modality, Modality::Video);
     assert!(d.capabilities.supports_guidance);
     assert!(d.capabilities.supports_negative_prompt);
+    // LoRA/LoKr is wired (sc-3439) — diffusers-name adapter routing onto the VACE host.
+    assert!(d.capabilities.supports_lora);
+    assert!(d.capabilities.supports_lokr);
     // The universal VACE input is a masked control clip; optional reference images.
     assert!(d
         .capabilities
@@ -655,7 +658,7 @@ fn wan_vace_load_reads_config_and_validates() {
 }
 
 #[test]
-fn wan_vace_rejects_bad_source_and_adapters() {
+fn wan_vace_rejects_bad_source_accepts_adapters() {
     let dir = temp_model_dir_with("vace_bad", VACE_CONFIG);
     // A single-file source is rejected (expects a converted snapshot dir).
     assert!(registry::load(
@@ -663,7 +666,8 @@ fn wan_vace_rejects_bad_source_and_adapters() {
         &LoadSpec::new(WeightsSource::File(dir.join("model.safetensors")))
     )
     .is_err());
-    // LoRA/LoKr adapters are not yet wired for VACE (diffusers-name routing — a tracked follow-on).
+    // LoRA/LoKr adapters are now ACCEPTED at load (sc-3439, diffusers-name routing); the merge is
+    // deferred to generate (which reads the file + the real DiT weights), so load itself succeeds.
     let lora = vec![AdapterSpec {
         path: dir.join("x.safetensors"),
         scale: 1.0,
@@ -675,6 +679,18 @@ fn wan_vace_rejects_bad_source_and_adapters() {
         MODEL_ID_VACE,
         &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lora)
     )
-    .is_err());
+    .is_ok());
+    let lokr = vec![AdapterSpec {
+        path: dir.join("x.safetensors"),
+        scale: 1.0,
+        kind: AdapterKind::Lokr,
+        pass_scales: None,
+        moe_expert: None,
+    }];
+    assert!(registry::load(
+        MODEL_ID_VACE,
+        &LoadSpec::new(WeightsSource::Dir(dir.clone())).with_adapters(lokr)
+    )
+    .is_ok());
     std::fs::remove_dir_all(&dir).ok();
 }

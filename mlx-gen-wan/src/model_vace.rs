@@ -27,15 +27,16 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    default_seed, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::tiling::TilingConfig;
 
+use crate::adapters::merge_vace_adapters;
 use crate::config::WanVaceConfig;
 use crate::pipeline::{align_dim, decode_to_frames, frames_to_images, preprocess_i2v_image};
 use crate::scheduler::SolverKind;
@@ -67,10 +68,12 @@ pub fn descriptor_vace() -> ModelDescriptor {
             supports_true_cfg: false,
             conditioning: vec![ConditioningKind::ControlClip, ConditioningKind::Reference],
             // Q4/Q8 is wired (sc-3440, `spec.quantize` → `WanVaceTransformer::quantize`, mirroring the
-            // base Wan slice sc-2682). VACE LoRA/LoKr (sc-3439) needs diffusers-name adapter routing —
-            // still a follow-on, so the adapter flags stay false until then.
-            supports_lora: false,
-            supports_lokr: false,
+            // base Wan slice sc-2682). LoRA/LoKr is wired (sc-3439): `spec.adapters` merge onto the
+            // dense diffusers-layout VACE weight map via `merge_vace_adapters` before `from_weights` +
+            // quantize (the fork order — merge a dense adapter, then quantize), mirroring the base Wan
+            // slices sc-2683 (LoRA) / sc-2393 (LoKr) on the diffusers host.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["unipc", "euler", "dpmpp2m"],
             schedulers: Vec::new(),
             min_size: 16,
@@ -92,12 +95,56 @@ pub struct WanVace {
     /// Optional load-time Q4/Q8 quantization of the VACE DiT `_quantize_predicate` surface (sc-3440),
     /// applied in [`WanVace::generate`] after the dense transformer is built.
     quantize: Option<Quant>,
+    /// LoRA/LoKr adapters merged onto the dense diffusers-layout VACE weight map (sc-3439), folded in
+    /// [`WanVace::generate`] **before** `from_weights` + quantize (the fork order). Empty for a plain
+    /// load — the no-adapter path is byte-identical to pre-sc-3439.
+    adapters: Vec<AdapterSpec>,
 }
 
 impl WanVace {
     /// The resolved VACE config (exposed for tests).
     pub fn config(&self) -> &WanVaceConfig {
         &self.config
+    }
+
+    /// Merge the load-time LoRA/LoKr adapters onto the dense diffusers-layout VACE weight map in
+    /// place (sc-3439), before [`WanVaceTransformer::from_weights`] is built and before `spec.quantize`
+    /// quantizes (the fork order — merge a dense adapter, then quantize). No-op without adapters (the
+    /// no-adapter weight map is byte-identical). VACE is a single dense transformer (no MoE), so it
+    /// takes only **shared** (untagged) specs — a `moe_expert`-tagged spec (the dual-expert A14B
+    /// surface) is a misconfiguration here, surfaced rather than silently honored. Reuses the
+    /// diffusers-named [`merge_vace_adapters`] seam; per-key skips are reported (the reference warns
+    /// on skip), and a non-empty spec list that matched **nothing** is a format/prefix error.
+    fn merge_adapters(&self, w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        if self.adapters.iter().any(|s| s.moe_expert.is_some()) {
+            return Err(Error::Msg(format!(
+                "{}: `moe_expert` (high/low) tagging is only for the dual-expert Wan2.2 A14B — the \
+                 single dense VACE transformer takes shared (untagged) adapters",
+                MODEL_ID_VACE
+            )));
+        }
+        let report = merge_vace_adapters(w, &self.adapters)?;
+        if report.applied == 0 {
+            return Err(Error::Msg(format!(
+                "{}: {} adapter file(s) matched no module — check the format (PEFT `lora_A/B` or \
+                 kohya `lora_down/up`, diffusers `blocks.N.attn1/attn2.to_*` / `ffn.net.*` / \
+                 `vace_blocks.*` module names, or native Wan names which are renamed to diffusers)",
+                MODEL_ID_VACE,
+                self.adapters.len()
+            )));
+        }
+        if !report.skipped.is_empty() {
+            eprintln!(
+                "{}: {} adapter target(s) not present in this checkpoint, skipped: {:?}",
+                MODEL_ID_VACE,
+                report.skipped.len(),
+                report.skipped
+            );
+        }
+        Ok(())
     }
 }
 
@@ -119,19 +166,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "wan_vace: LoRA/LoKr adapters are not yet wired for VACE (the diffusers-layout transformer \
-             needs diffusers-name adapter routing — a tracked follow-on)"
-                .into(),
-        ));
-    }
     let config = WanVaceConfig::from_model_dir(&root)?;
     Ok(Box::new(WanVace {
         descriptor: descriptor_vace(),
         config,
         root,
         quantize: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -285,7 +326,12 @@ impl Generator for WanVace {
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
-            let w = load_vace_transformer_weights(&self.root)?;
+            let mut w = load_vace_transformer_weights(&self.root)?;
+            // LoRA/LoKr (sc-3439): merge the diffusers-named adapters onto the dense bf16 weight map
+            // BEFORE building the transformer and BEFORE quantizing — the fork order (a LoRA folds
+            // into the dense weight, then `spec.quantize` quantizes the merged result). No-op without
+            // adapters (the weight map stays byte-identical).
+            self.merge_adapters(&mut w)?;
             let mut dit = WanVaceTransformer::from_weights(&w, &self.config, Dtype::Bfloat16)?;
             // Q4/Q8 (sc-3440): quantize the DiT `_quantize_predicate` surface in place after the dense
             // build (the diffusers VACE snapshot ships dense bf16 — no pre-quantized VACE snapshot).

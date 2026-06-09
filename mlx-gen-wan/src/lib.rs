@@ -66,7 +66,7 @@ pub mod vace;
 pub mod vae;
 pub mod vae22;
 
-pub use adapters::{merge_wan_adapters, WanLoraReport};
+pub use adapters::{merge_vace_adapters, merge_wan_adapters, WanLoraReport};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
 pub use model::{
     descriptor, descriptor_i2v_14b, descriptor_t2v_14b, load, Wan, Wan14b, MODEL_ID,

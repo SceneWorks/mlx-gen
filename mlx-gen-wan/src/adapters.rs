@@ -162,26 +162,138 @@ pub(crate) fn normalize_wan_key(key: &str) -> String {
     t
 }
 
+/// Normalize a LoRA module path to the **diffusers** Wan-VACE checkpoint's naming (sc-3439). Unlike
+/// [`normalize_wan_key`] (which targets the *native* converted Wan layout), the VACE transformer
+/// ([`crate::vace::WanVaceTransformer`]) reads the diffusers tensor names directly, so the target is
+/// already diffusers. This mirrors diffusers' own LoRA loader
+/// (`_convert_non_diffusers_wan_lora_to_diffusers`): strip a known prefix, rename the **native** Wan
+/// module spellings (which third-party trainers like musubi-tuner / diffusion-pipe emit) to their
+/// diffusers equivalents, and pass an **already-diffusers** key (incl. every `vace_blocks.*` module,
+/// which the diffusers converter does not touch and which only ever ships diffusers-named) through
+/// unchanged. Renames (both the `.X.` infix and the bare `…X` suffix forms, as a LoRA module stem
+/// ends at the module):
+/// - `self_attn.{q,k,v,o}` → `attn1.{to_q,to_k,to_v,to_out.0}`
+/// - `cross_attn.{q,k,v,o}` → `attn2.{to_q,to_k,to_v,to_out.0}`
+/// - `ffn.0`/`ffn.2` → `ffn.net.0.proj`/`ffn.net.2`
+/// - VACE block `before_proj`/`after_proj` → `proj_in`/`proj_out`
+/// - `time_projection.1` → `condition_embedder.time_proj`; `head.head` → `proj_out`
+/// - `text_embedding.0/.2` → `condition_embedder.text_embedder.linear_1/2`
+/// - `time_embedding.0/.2` → `condition_embedder.time_embedder.linear_1/2`
+///
+/// The i2v `k_img`/`v_img` cross-attn factors (diffusers `add_k_proj`/`add_v_proj`) are intentionally
+/// not mapped — the VACE host has no such modules, so they resolve to no weight and are surfaced
+/// (skipped), never silently mis-folded.
+pub(crate) fn normalize_vace_key(key: &str) -> String {
+    let stripped = PREFIXES
+        .iter()
+        .find_map(|p| key.strip_prefix(p))
+        .unwrap_or(key);
+    let mut t = stripped.to_string();
+
+    // VACE block hint projections: native before_proj/after_proj → diffusers proj_in/proj_out.
+    t = t
+        .replace(".before_proj.", ".proj_in.")
+        .replace(".after_proj.", ".proj_out.");
+    if let Some(h) = t.strip_suffix(".before_proj") {
+        t = format!("{h}.proj_in");
+    }
+    if let Some(h) = t.strip_suffix(".after_proj") {
+        t = format!("{h}.proj_out");
+    }
+
+    // Self-/cross-attn projections → attn1/attn2.{to_q,to_k,to_v,to_out.0}.
+    for (src, dst) in [("self_attn", "attn1"), ("cross_attn", "attn2")] {
+        for (n, d) in [
+            ("q", "to_q"),
+            ("k", "to_k"),
+            ("v", "to_v"),
+            ("o", "to_out.0"),
+        ] {
+            t = t.replace(&format!(".{src}.{n}."), &format!(".{dst}.{d}."));
+            if let Some(h) = t.strip_suffix(&format!(".{src}.{n}")) {
+                t = format!("{h}.{dst}.{d}");
+            }
+        }
+    }
+
+    // ffn.0/.2 → ffn.net.0.proj / ffn.net.2.
+    t = t
+        .replace(".ffn.0.", ".ffn.net.0.proj.")
+        .replace(".ffn.2.", ".ffn.net.2.");
+    if let Some(h) = t.strip_suffix(".ffn.0") {
+        t = format!("{h}.ffn.net.0.proj");
+    }
+    if let Some(h) = t.strip_suffix(".ffn.2") {
+        t = format!("{h}.ffn.net.2");
+    }
+
+    // Global modules (the diffusers converter's "Remaining" branch).
+    t = t.replace("time_projection.1.", "condition_embedder.time_proj.");
+    if let Some(h) = t.strip_suffix("time_projection.1") {
+        t = format!("{h}condition_embedder.time_proj");
+    }
+    t = t.replace("head.head.", "proj_out.");
+    if let Some(h) = t.strip_suffix("head.head") {
+        t = format!("{h}proj_out");
+    }
+    t = t
+        .replace(
+            "text_embedding.0.",
+            "condition_embedder.text_embedder.linear_1.",
+        )
+        .replace(
+            "text_embedding.2.",
+            "condition_embedder.text_embedder.linear_2.",
+        );
+    if let Some(h) = t.strip_suffix("text_embedding.0") {
+        t = format!("{h}condition_embedder.text_embedder.linear_1");
+    }
+    if let Some(h) = t.strip_suffix("text_embedding.2") {
+        t = format!("{h}condition_embedder.text_embedder.linear_2");
+    }
+    t = t
+        .replace(
+            "time_embedding.0.",
+            "condition_embedder.time_embedder.linear_1.",
+        )
+        .replace(
+            "time_embedding.2.",
+            "condition_embedder.time_embedder.linear_2.",
+        );
+    if let Some(h) = t.strip_suffix("time_embedding.0") {
+        t = format!("{h}condition_embedder.time_embedder.linear_1");
+    }
+    if let Some(h) = t.strip_suffix("time_embedding.2") {
+        t = format!("{h}condition_embedder.time_embedder.linear_2");
+    }
+    t
+}
+
 /// Merge one LoRA file's deltas into the weight map `w` at `spec.scale`, accumulating into `report`.
 /// Mirrors `apply_lora_to_linear` per module: `ΔW = (B·A)·(alpha/rank·strength)` at the factor dtype,
 /// cast to the weight dtype and added — so the no-LoRA forward and the merged forward share one bf16
 /// GEMM (no per-step residual). Multiple files accumulate because each reads the (already-merged)
 /// weight back from `w`.
-fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut WanLoraReport) -> Result<()> {
+fn merge_one(
+    w: &mut Weights,
+    spec: &AdapterSpec,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
     let lw = Weights::from_file(&spec.path)?;
     if spec.kind == AdapterKind::Lokr || is_lokr(&lw) {
         // LoKr (sc-2393 — net-new; the reference Wan path is LoRA-only) merges through the same
         // in-place weight fold, with the delta reconstructed from Kronecker factors instead of B·A.
-        return merge_one_lokr(w, &lw, spec.scale, report);
+        return merge_one_lokr(w, &lw, spec.scale, normalize, report);
     }
     // Third-party LyCORIS (sc-3671): `lokr_*` / `hada_*` keys WITHOUT a `networkType=lokr` stamp
     // (kohya / ai-toolkit / lycoris-lib). `is_lokr` (peft) is handled above, so reaching here means
     // third-party; reconstruct per-module and merge like the peft path.
     if is_lokr_keys(&lw) {
-        return merge_one_lokr_thirdparty(w, &lw, spec.scale, report);
+        return merge_one_lokr_thirdparty(w, &lw, spec.scale, normalize, report);
     }
     if is_loha_keys(&lw) {
-        return merge_one_loha_thirdparty(w, &lw, spec.scale, report);
+        return merge_one_loha_thirdparty(w, &lw, spec.scale, normalize, report);
     }
 
     // Group factors by normalized module path.
@@ -193,7 +305,7 @@ fn merge_one(w: &mut Weights, spec: &AdapterSpec, report: &mut WanLoraReport) ->
         else {
             continue; // not a LoRA factor key (base weight / bundled extra) — ignore.
         };
-        let parts = groups.entry(normalize_wan_key(stem)).or_default();
+        let parts = groups.entry(normalize(stem)).or_default();
         match role {
             Role::Down => parts.down = Some(lw.require(&key)?.clone()),
             Role::Up => parts.up = Some(lw.require(&key)?.clone()),
@@ -237,11 +349,12 @@ fn merge_one_lokr(
     w: &mut Weights,
     lw: &Weights,
     scale: f32,
+    normalize: fn(&str) -> String,
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let file = parse_lokr(lw)?;
     for (raw_path, factors) in &file.groups {
-        let path = normalize_wan_key(raw_path);
+        let path = normalize(raw_path);
         let wkey = format!("{path}.weight");
         let Some(base) = w.get(&wkey).cloned() else {
             report.skipped.push(path);
@@ -268,12 +381,17 @@ fn wan_module_table(w: &Weights) -> BTreeMap<String, String> {
 }
 
 /// Resolve a third-party LoKr/LoHa raw module key to a Wan checkpoint module path: prefer the
-/// flattened-stem table (kohya `lora_unet_…`), else the dotted-path normalize (the reference rename
-/// map, which a dotted diffusers third-party file shares with the peft path).
-fn resolve_wan_thirdparty(raw: &str, table: &BTreeMap<String, String>) -> String {
+/// flattened-stem table (kohya `lora_unet_…`), else the dotted-path `normalize` (the host's rename
+/// map — [`normalize_wan_key`] for native Wan, [`normalize_vace_key`] for the diffusers VACE host —
+/// which a dotted diffusers third-party file shares with the peft path).
+fn resolve_wan_thirdparty(
+    raw: &str,
+    table: &BTreeMap<String, String>,
+    normalize: fn(&str) -> String,
+) -> String {
     resolve_lokr_path(raw, table)
         .map(str::to_string)
-        .unwrap_or_else(|| normalize_wan_key(raw))
+        .unwrap_or_else(|| normalize(raw))
 }
 
 /// Merge one third-party-reconstructed `[out,in]` delta into `w` at the resolved module path
@@ -307,11 +425,12 @@ fn merge_one_lokr_thirdparty(
     w: &mut Weights,
     lw: &Weights,
     scale: f32,
+    normalize: fn(&str) -> String,
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let table = wan_module_table(w);
     for (raw, g) in &parse_lokr_thirdparty(lw)? {
-        let path = resolve_wan_thirdparty(raw, &table);
+        let path = resolve_wan_thirdparty(raw, &table, normalize);
         merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
     }
     Ok(())
@@ -323,11 +442,12 @@ fn merge_one_loha_thirdparty(
     w: &mut Weights,
     lw: &Weights,
     scale: f32,
+    normalize: fn(&str) -> String,
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let table = wan_module_table(w);
     for (raw, g) in &parse_loha_thirdparty(lw)? {
-        let path = resolve_wan_thirdparty(raw, &table);
+        let path = resolve_wan_thirdparty(raw, &table, normalize);
         merge_wan_thirdparty_delta(w, path, |bs| g.delta(bs, Dtype::Float32), scale, report)?;
     }
     Ok(())
@@ -345,15 +465,38 @@ pub fn merge_wan_adapters(
     specs: &[AdapterSpec],
     expert: MoeExpert,
 ) -> Result<WanLoraReport> {
+    merge_adapters_into(w, specs, expert, normalize_wan_key)
+}
+
+/// Merge every adapter in `specs` onto the **diffusers-layout** Wan-VACE transformer weight map `w`
+/// (sc-3439). The VACE DiT ([`crate::vace::WanVaceTransformer`]) is a single dense model (no MoE), so
+/// it takes only **shared** (untagged) specs — `MoeExpert::High` is passed purely so the untagged
+/// pass fires; a `moe_expert`-tagged spec is a misconfiguration the caller
+/// ([`crate::model_vace`]) rejects before calling here. Identical merge math + format dispatch as
+/// [`merge_wan_adapters`] (PEFT/kohya LoRA, peft LoKr, third-party LyCORIS LoKr/LoHa), differing only
+/// in the key→module map: [`normalize_vace_key`] targets the diffusers `attn1/attn2.{to_*}` +
+/// `ffn.net.0.proj`/`net.2` + `vace_blocks.*` host instead of the native Wan layout.
+pub fn merge_vace_adapters(w: &mut Weights, specs: &[AdapterSpec]) -> Result<WanLoraReport> {
+    merge_adapters_into(w, specs, MoeExpert::High, normalize_vace_key)
+}
+
+/// Shared merge core for both the native Wan ([`merge_wan_adapters`]) and the diffusers VACE
+/// ([`merge_vace_adapters`]) hosts — only the `normalize` key→module map differs. Pass 1: shared
+/// (untagged) files. Pass 2: this `expert`'s specific files (the reference `(loras)+(loras_*)` order).
+fn merge_adapters_into(
+    w: &mut Weights,
+    specs: &[AdapterSpec],
+    expert: MoeExpert,
+    normalize: fn(&str) -> String,
+) -> Result<WanLoraReport> {
     let mut report = WanLoraReport::default();
-    // Pass 1: shared files (merged onto every expert). Pass 2: this expert's specific files.
     for spec in specs.iter().filter(|s| s.moe_expert.is_none()) {
         report.applicable += 1;
-        merge_one(w, spec, &mut report)?;
+        merge_one(w, spec, normalize, &mut report)?;
     }
     for spec in specs.iter().filter(|s| s.moe_expert == Some(expert)) {
         report.applicable += 1;
-        merge_one(w, spec, &mut report)?;
+        merge_one(w, spec, normalize, &mut report)?;
     }
     Ok(report)
 }
@@ -426,6 +569,112 @@ mod tests {
                 &normalize_wan_key(raw),
                 expected,
                 "normalize_wan_key({raw}) must match the reference _normalize_wan_lora_key"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_vace_passes_diffusers_and_renames_native() {
+        // Diffusers names (the host layout) pass through after prefix strip — incl. vace_blocks.
+        for (raw, want) in [
+            ("diffusion_model.blocks.0.attn1.to_q", "blocks.0.attn1.to_q"),
+            (
+                "diffusion_model.blocks.3.attn2.to_out.0",
+                "blocks.3.attn2.to_out.0",
+            ),
+            (
+                "diffusion_model.blocks.0.ffn.net.0.proj",
+                "blocks.0.ffn.net.0.proj",
+            ),
+            ("blocks.2.ffn.net.2", "blocks.2.ffn.net.2"),
+            (
+                "diffusion_model.vace_blocks.0.attn1.to_v",
+                "vace_blocks.0.attn1.to_v",
+            ),
+            (
+                "diffusion_model.vace_blocks.0.proj_in",
+                "vace_blocks.0.proj_in",
+            ),
+            (
+                "diffusion_model.vace_blocks.7.proj_out",
+                "vace_blocks.7.proj_out",
+            ),
+        ] {
+            assert_eq!(normalize_vace_key(raw), want, "passthrough {raw}");
+        }
+        // Native Wan spellings (musubi / diffusion-pipe) → diffusers (the diffusers loader's map).
+        for (raw, want) in [
+            (
+                "diffusion_model.blocks.0.self_attn.q",
+                "blocks.0.attn1.to_q",
+            ),
+            (
+                "diffusion_model.blocks.5.self_attn.o",
+                "blocks.5.attn1.to_out.0",
+            ),
+            (
+                "diffusion_model.blocks.0.cross_attn.k",
+                "blocks.0.attn2.to_k",
+            ),
+            ("diffusion_model.blocks.0.ffn.0", "blocks.0.ffn.net.0.proj"),
+            ("diffusion_model.blocks.2.ffn.2", "blocks.2.ffn.net.2"),
+            // VACE block native hint projections → proj_in/proj_out (diffusers leaves these alone;
+            // we complete the map for native-trained VACE LoRAs).
+            (
+                "diffusion_model.vace_blocks.0.before_proj",
+                "vace_blocks.0.proj_in",
+            ),
+            (
+                "diffusion_model.vace_blocks.3.after_proj",
+                "vace_blocks.3.proj_out",
+            ),
+            (
+                "diffusion_model.vace_blocks.1.self_attn.v",
+                "vace_blocks.1.attn1.to_v",
+            ),
+            // Globals + alternate prefixes.
+            (
+                "diffusion_model.time_projection.1",
+                "condition_embedder.time_proj",
+            ),
+            ("model.diffusion_model.head.head", "proj_out"),
+            (
+                "base_model.model.text_embedding.0",
+                "condition_embedder.text_embedder.linear_1",
+            ),
+            (
+                "diffusion_model.time_embedding.2",
+                "condition_embedder.time_embedder.linear_2",
+            ),
+        ] {
+            assert_eq!(normalize_vace_key(raw), want, "rename {raw}");
+        }
+    }
+
+    #[test]
+    fn normalize_vace_matches_reference_golden() {
+        // sc-3439 parity gate for the diffusers-named VACE key→module map. The fixture
+        // (tools/dump_wanvace_lora_keys.py) takes the base-block + global native→diffusers mappings
+        // **authoritatively from the diffusers loader** (`_convert_non_diffusers_wan_lora_to_diffusers`)
+        // and the vace_blocks + diffusers-passthrough entries from the shared rename rule, every target
+        // verified to be a real module in the cached `Wan2.1-VACE-1.3B-diffusers` checkpoint. The Rust
+        // `normalize_vace_key` must reproduce each mapping — the load-bearing piece of the VACE merge.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/wanvace_lora_keys.json"
+        );
+        let text = std::fs::read_to_string(path).expect("read wanvace_lora_keys.json fixture");
+        let map: BTreeMap<String, String> = serde_json::from_str(&text).expect("parse fixture");
+        assert!(
+            map.len() >= 80,
+            "fixture should cover the VACE LoRA surface (got {})",
+            map.len()
+        );
+        for (raw, expected) in &map {
+            assert_eq!(
+                &normalize_vace_key(raw),
+                expected,
+                "normalize_vace_key({raw}) must match the diffusers VACE key map"
             );
         }
     }
@@ -801,5 +1050,225 @@ mod tests {
                 "{stem}: Wan third-party merge diverged from the lycoris reference"
             );
         }
+    }
+
+    // ====================================================================================
+    // sc-3439 — VACE diffusers-named merge (`merge_vace_adapters`). Same merge math + format
+    // dispatch as the native Wan path, on the diffusers `attn1/attn2.to_*` / `ffn.net.*` /
+    // `vace_blocks.*` host. Bit-exact vs the in-test hand-computed `W + (B·A)` / `W + reconstruct`.
+    // ====================================================================================
+
+    /// A synthetic VACE (diffusers-layout) weight map: a base-block attn projection, a base-block
+    /// FFN proj, and a vace-block hint projection — bf16, the modules the VACE LoRA tests target.
+    fn synthetic_vace_weights() -> Weights {
+        let path = tmp("vace_base.safetensors");
+        let mk = |n: i32, scale: f32, bias: f32| {
+            Array::from_slice(
+                &(0..n).map(|i| i as f32 * scale - bias).collect::<Vec<_>>(),
+                &[n / 8, 8],
+            )
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+        };
+        let q = mk(16 * 8, 0.01, 0.3); // attn1.to_q [16,8]
+        let fc1 = mk(24 * 8, 0.005, 0.2); // ffn.net.0.proj [24,8]
+        let pin = mk(16 * 8, 0.007, 0.25); // vace_blocks.0.proj_in [16,8]
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.attn1.to_q.weight", &q),
+                ("blocks.0.ffn.net.0.proj.weight", &fc1),
+                ("vace_blocks.0.proj_in.weight", &pin),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        Weights::from_file(&path).unwrap()
+    }
+
+    #[test]
+    fn merge_vace_folds_diffusers_named_delta_bit_exact() {
+        // A diffusers-named LoRA (the host layout) folds W += B·A on the matching VACE modules,
+        // including a vace_blocks Linear. Bit-exact to the hand-computed merge.
+        let lora = write_lora(
+            "vace_diff.safetensors",
+            &[
+                ("blocks.0.attn1.to_q", 16, 8),
+                ("blocks.0.ffn.net.0.proj", 24, 8),
+                ("vace_blocks.0.proj_in", 16, 8),
+            ],
+            4,
+            0.2,
+        );
+        let mut w = synthetic_vace_weights();
+        let report = merge_vace_adapters(&mut w, &[spec(lora.clone(), 1.0, None)]).unwrap();
+        assert_eq!(report.applied, 3);
+        assert!(report.skipped.is_empty());
+
+        let lw = Weights::from_file(&lora).unwrap();
+        let base = synthetic_vace_weights();
+        for stem in [
+            "blocks.0.attn1.to_q",
+            "blocks.0.ffn.net.0.proj",
+            "vace_blocks.0.proj_in",
+        ] {
+            let wkey = format!("{stem}.weight");
+            let a = lw
+                .require(&format!("diffusion_model.{stem}.lora_A.weight"))
+                .unwrap();
+            let b = lw
+                .require(&format!("diffusion_model.{stem}.lora_B.weight"))
+                .unwrap();
+            let delta = matmul(b, a).unwrap();
+            let want = add(
+                base.require(&wkey).unwrap(),
+                delta.as_dtype(Dtype::Bfloat16).unwrap(),
+            )
+            .unwrap();
+            let got = w.require(&wkey).unwrap();
+            assert!(
+                array_eq(got, &want, false).unwrap().item::<bool>(),
+                "{stem}: merged weight must be bit-exact to W + (B·A).astype(W.dtype)"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_vace_renames_native_named_lora_to_diffusers_host() {
+        // A native-Wan-named LoRA (self_attn.q / ffn.0 — what musubi / diffusion-pipe emit) resolves
+        // onto the diffusers host modules (attn1.to_q / ffn.net.0.proj) and folds there.
+        let lora = write_lora(
+            "vace_native.safetensors",
+            &[("blocks.0.self_attn.q", 16, 8), ("blocks.0.ffn.0", 24, 8)],
+            4,
+            0.4,
+        );
+        let mut w = synthetic_vace_weights();
+        let report = merge_vace_adapters(&mut w, &[spec(lora.clone(), 1.0, None)]).unwrap();
+        assert_eq!(
+            report.applied, 2,
+            "native names must resolve to the diffusers host"
+        );
+        assert!(report.skipped.is_empty());
+
+        let base = synthetic_vace_weights();
+        // The diffusers host keys moved; the native key names are absent (they were renamed).
+        let q = w.require("blocks.0.attn1.to_q.weight").unwrap();
+        let q_base = base.require("blocks.0.attn1.to_q.weight").unwrap();
+        assert!(!array_eq(q, q_base, false).unwrap().item::<bool>());
+        assert!(w.get("blocks.0.self_attn.q.weight").is_none());
+        assert!(w.get("blocks.0.ffn.net.0.proj.weight").is_some());
+    }
+
+    #[test]
+    fn merge_vace_lokr_matches_reconstruct_and_scale_zero_is_noop() {
+        // sc-2393 LoKr on the diffusers host: `blocks.0.attn1.to_q` is [16,8] = kron(w1[4,2],w2[4,4]).
+        // Merged weight must equal W + (reconstruct·scale).astype(W.dtype); scale 0 is a bit-exact no-op.
+        use mlx_gen::adapters::reconstruct_lokr_delta;
+        use std::collections::HashMap;
+
+        let w1 = Array::from_slice(
+            &(0..8)
+                .map(|i| (i as f32 * 0.03).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 2],
+        );
+        let w2 = Array::from_slice(
+            &(0..16)
+                .map(|i| (i as f32 * 0.05).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 4],
+        );
+        let (alpha, rank) = (4.0f32, 4.0f32);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), alpha.to_string());
+        meta.insert("rank".to_string(), rank.to_string());
+        let lokr_path = tmp("vace_lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.attn1.to_q.lokr_w1", &w1),
+                ("blocks.0.attn1.to_q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &lokr_path,
+        )
+        .unwrap();
+
+        let scale = 0.5f32;
+        let mut w = synthetic_vace_weights();
+        let report = merge_vace_adapters(
+            &mut w,
+            &[AdapterSpec {
+                kind: AdapterKind::Lokr,
+                ..spec(lokr_path.clone(), scale, None)
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.skipped.is_empty());
+
+        let base = synthetic_vace_weights();
+        let q_base = base.require("blocks.0.attn1.to_q.weight").unwrap();
+        let delta = reconstruct_lokr_delta(
+            alpha,
+            rank,
+            q_base.shape(),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap();
+        let delta = multiply(&delta, scalar(scale).as_dtype(delta.dtype()).unwrap()).unwrap();
+        let want = add(q_base, delta.as_dtype(q_base.dtype()).unwrap()).unwrap();
+        let got = w.require("blocks.0.attn1.to_q.weight").unwrap();
+        assert!(
+            array_eq(got, &want, false).unwrap().item::<bool>(),
+            "merged VACE LoKr weight must be bit-exact to W + (reconstruct·scale).astype(W.dtype)"
+        );
+
+        // scale 0 → bit-exact no-op.
+        let mut w0 = synthetic_vace_weights();
+        merge_vace_adapters(
+            &mut w0,
+            &[AdapterSpec {
+                kind: AdapterKind::Lokr,
+                ..spec(lokr_path, 0.0, None)
+            }],
+        )
+        .unwrap();
+        assert!(
+            array_eq(
+                w0.require("blocks.0.attn1.to_q.weight").unwrap(),
+                q_base,
+                false
+            )
+            .unwrap()
+            .item::<bool>(),
+            "scale-0 VACE LoKr merge must be a bit-exact no-op"
+        );
+    }
+
+    #[test]
+    fn merge_vace_reports_skipped_target_never_fatal() {
+        // A LoRA module absent from the checkpoint is surfaced (skipped), never fatal — and a module
+        // that IS present still merges in the same file.
+        let lora = write_lora(
+            "vace_skip.safetensors",
+            &[
+                ("blocks.0.attn1.to_q", 16, 8),
+                ("blocks.99.attn1.to_q", 16, 8),
+            ],
+            4,
+            0.1,
+        );
+        let mut w = synthetic_vace_weights();
+        let report = merge_vace_adapters(&mut w, &[spec(lora, 1.0, None)]).unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.skipped, vec!["blocks.99.attn1.to_q".to_string()]);
     }
 }
