@@ -122,6 +122,12 @@ sides run MLX Metal, so parity is near-bit.
 | `sam2_photo_golden.safetensors` | `dump_sam2_photo_golden.py` | `tests/photo_parity.rs` | sc-3708 real-photo box→mask vs the spike baseline (zidane/bus). |
 | `sam2_memory_golden_large.safetensors` | `dump_sam2_memory_golden.py` | `tests/memory_parity.rs` | sc-3713 Phase-B video layer — `memory_encoder.*`/`memory_attention.*` weights + two fixtures: the memory encoder (`mem_pix_feat`/`mem_masks` → 64-ch feature map + pos enc) and the memory attention (a 3-frame bank + 2 object pointers: `ma_curr`/`ma_mem`/… + `ma_num_obj` → conditioned tokens). Exercises the depthwise-conv ConvNeXt fuser and the interleaved axial RoPE self/cross attention with key-repeat + object-pointer RoPE exclusion. cos 1.0 (encoder mean-rel 0; attention mean-rel ~3e-5). |
 
+### Kolors (`mlx-gen-kolors`, epic 3090)
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `kolors_chatglm_golden.safetensors` | `dump_kolors_chatglm_golden.py` | `tests/chatglm_parity.rs` | sc-3091 ChatGLM3-6B text encoder. Diffusers `KolorsPipeline` `ChatGLMModel` (`text_encoder/` fp16 shards, ~12.5 GB) run with `output_hidden_states=True` on two fixed inputs — `packed` (pure causal) and `padded` (right-pad → causal+padding mask) — for BOTH f32 and fp16 (`f16_` prefix). Bundles per case/dtype: `input_ids`/`attention_mask` + all 29 hidden states (permuted `[S,B,H]→[B,S,H]`) + `context` (`hidden_states[-2]`) + `pooled` (`hidden_states[-1]` last token). f32 worst hidden ~1.1e-3 (flat over depth = Metal-vs-CPU floor), fp16 worst ~1.7e-3. |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |

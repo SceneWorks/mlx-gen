@@ -1,0 +1,14 @@
+[package]
+name = "mlx-gen-kolors"
+version = "0.0.0"
+edition = "2021"
+description = "Kolors (SDXL-family U-Net + ChatGLM3-6B text encoder) provider for mlx-gen — bilingual Chinese/English T2I."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "kolors", "chatglm", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
