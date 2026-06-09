@@ -12,8 +12,8 @@
 //! ([`T2iModel::interleave_gen`], text + images) cannot be expressed by [`GenerationOutput`]
 //! (`Images`/`Video` only), so they are consumed by the SceneWorks worker through those public
 //! [`T2iModel`] methods directly — the registry path here covers exactly the image-generation
-//! surface. The 8-step `sensenova_u1_8b_fast` distill variant (sc-3192) and Q4/Q8 quant (sc-3193)
-//! register/extend this loader in their own slices.
+//! surface. `spec.quantize` (Q4/Q8) quantizes the backbone decoder stack (sc-3193); the 8-step
+//! `sensenova_u1_8b_fast` distill variant (sc-3192) extends this loader in its own slice.
 
 use mlx_rs::ops::divide;
 use mlx_rs::Array;
@@ -94,17 +94,12 @@ impl SenseNova {
 
 /// Construct a [`SenseNova`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a `sensenova/SenseNova-U1-8B-MoT` snapshot. Weights load dense at their on-disk dtype
-/// (bf16). Quantization (sc-3193) and LoRA (the 8-step distill, sc-3192) are not yet wired and are
-/// rejected rather than silently ignored.
+/// (bf16); `spec.quantize` (Q4/Q8) then quantizes the backbone decoder stack (sc-3193). LoRA (the
+/// 8-step distill, sc-3192) is not yet wired and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
             "sensenova_u1_8b: only dense bf16 is wired (drop the precision override)".into(),
-        ));
-    }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(
-            "sensenova_u1_8b: Q4/Q8 quantization is not wired yet (sc-3193)".into(),
         ));
     }
     if !spec.adapters.is_empty() {
@@ -124,7 +119,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     };
     let cfg = NeoChatConfig::from_dir(root)?;
     let weights = load_raw(root)?;
-    let model = T2iModel::from_weights(&weights, &cfg)?;
+    let mut model = T2iModel::from_weights(&weights, &cfg)?;
+    // Q4/Q8 quantize the backbone decoder stack after the dense bf16 load (sc-3193).
+    if let Some(q) = spec.quantize {
+        model.quantize(q.bits())?;
+    }
     let tokenizer = load_tokenizer(root)?;
     Ok(Box::new(SenseNova {
         descriptor: descriptor(),

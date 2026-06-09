@@ -61,6 +61,7 @@ fn base_spec() -> LoadSpec {
         control: None,
         ip_adapter: None,
         adapters: Vec::new(),
+        extra_controls: Vec::new(),
     }
 }
 

@@ -24,6 +24,7 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, softmax_axis, split};
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -96,12 +97,19 @@ fn require(w: &Weights, key: &str) -> Result<Array> {
     Ok(w.require(key)?.clone())
 }
 
-/// The per-path attention weights (one of understanding / generation).
+/// A bias-less Linear from a stored `[out, in]` weight, as a quantizable [`AdaptableLinear`]
+/// (dense bf16 forward == the previous `matmul_t`; `quantize` swaps in a `quantized_matmul` base).
+fn linear(w: &Weights, key: &str) -> Result<AdaptableLinear> {
+    Ok(AdaptableLinear::dense(require(w, key)?, None))
+}
+
+/// The per-path attention weights (one of understanding / generation). The projections are
+/// quantizable; the QK-norms stay dense (small, precision-sensitive).
 struct AttnPath {
-    q_proj: Array,
-    k_proj: Array,
-    v_proj: Array,
-    o_proj: Array,
+    q_proj: AdaptableLinear,
+    k_proj: AdaptableLinear,
+    v_proj: AdaptableLinear,
+    o_proj: AdaptableLinear,
     q_norm: Array,
     k_norm: Array,
     q_norm_hw: Array,
@@ -112,36 +120,51 @@ impl AttnPath {
     /// `attn_prefix` = `…layers.{i}.self_attn`, `s` = the path suffix (`""` or `"_mot_gen"`).
     fn from_weights(w: &Weights, attn_prefix: &str, s: &str) -> Result<Self> {
         Ok(Self {
-            q_proj: require(w, &format!("{attn_prefix}.q_proj{s}.weight"))?,
-            k_proj: require(w, &format!("{attn_prefix}.k_proj{s}.weight"))?,
-            v_proj: require(w, &format!("{attn_prefix}.v_proj{s}.weight"))?,
-            o_proj: require(w, &format!("{attn_prefix}.o_proj{s}.weight"))?,
+            q_proj: linear(w, &format!("{attn_prefix}.q_proj{s}.weight"))?,
+            k_proj: linear(w, &format!("{attn_prefix}.k_proj{s}.weight"))?,
+            v_proj: linear(w, &format!("{attn_prefix}.v_proj{s}.weight"))?,
+            o_proj: linear(w, &format!("{attn_prefix}.o_proj{s}.weight"))?,
             q_norm: require(w, &format!("{attn_prefix}.q_norm{s}.weight"))?,
             k_norm: require(w, &format!("{attn_prefix}.k_norm{s}.weight"))?,
             q_norm_hw: require(w, &format!("{attn_prefix}.q_norm_hw{s}.weight"))?,
             k_norm_hw: require(w, &format!("{attn_prefix}.k_norm_hw{s}.weight"))?,
         })
     }
+
+    /// Quantize the four projections in place (Q4/Q8, group 64).
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.q_proj.quantize(bits, None)?;
+        self.k_proj.quantize(bits, None)?;
+        self.v_proj.quantize(bits, None)?;
+        self.o_proj.quantize(bits, None)
+    }
 }
 
 struct Mlp {
-    gate: Array,
-    up: Array,
-    down: Array,
+    gate: AdaptableLinear,
+    up: AdaptableLinear,
+    down: AdaptableLinear,
 }
 
 impl Mlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            gate: require(w, &format!("{prefix}.gate_proj.weight"))?,
-            up: require(w, &format!("{prefix}.up_proj.weight"))?,
-            down: require(w, &format!("{prefix}.down_proj.weight"))?,
+            gate: linear(w, &format!("{prefix}.gate_proj.weight"))?,
+            up: linear(w, &format!("{prefix}.up_proj.weight"))?,
+            down: linear(w, &format!("{prefix}.down_proj.weight"))?,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
-        let gated = multiply(&silu(&matmul_t(x, &self.gate)?)?, &matmul_t(x, &self.up)?)?;
-        matmul_t(&gated, &self.down)
+        let gated = multiply(&silu(&self.gate.forward(x)?)?, &self.up.forward(x)?)?;
+        self.down.forward(&gated)
+    }
+
+    /// Quantize the SwiGLU's three linears in place.
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.gate.quantize(bits, None)?;
+        self.up.quantize(bits, None)?;
+        self.down.quantize(bits, None)
     }
 }
 
@@ -172,6 +195,14 @@ impl Layer {
             mlp_und: Mlp::from_weights(w, &format!("{prefix}.mlp"))?,
             mlp_gen: Mlp::from_weights(w, &format!("{prefix}.mlp_mot_gen"))?,
         })
+    }
+
+    /// Quantize both paths' attention projections + SwiGLU linears in place.
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn_und.quantize(bits)?;
+        self.attn_gen.quantize(bits)?;
+        self.mlp_und.quantize(bits)?;
+        self.mlp_gen.quantize(bits)
     }
 }
 
@@ -265,6 +296,18 @@ impl Qwen3Backbone {
     /// Project final hidden states `[B,S,hidden]` → logits `[B,S,vocab]`.
     pub fn lm_head(&self, hidden: &Array) -> Result<Array> {
         matmul_t(hidden, &self.lm_head)
+    }
+
+    /// Quantize the decoder stack to Q4/Q8 (group 64) — every layer's attention projections and
+    /// SwiGLU linears on **both** the understanding and generation paths (the bulk of the 8B
+    /// params). The token embedding, `lm_head`, RMSNorms, and QK-norms stay dense (precision-
+    /// sensitive / not Linears). Weights are bf16-native on disk, so the packing byte-matches the
+    /// reference `nn.quantize`.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// Run the full stack on a single path. `embeds` `[B,S,hidden]`; `temporal`/`height`/`width`
@@ -417,7 +460,7 @@ impl Qwen3Backbone {
         // q/k: project + reshape + temporal/spatial norm + tri-axis RoPE, then to [B,H,S,D].
         let q = self
             .qk_rope(
-                &matmul_t(x, &a.q_proj)?,
+                &a.q_proj.forward(x)?,
                 b,
                 s,
                 self.num_heads,
@@ -433,7 +476,7 @@ impl Qwen3Backbone {
             .transpose_axes(&[0, 2, 1, 3])?;
         let k = self
             .qk_rope(
-                &matmul_t(x, &a.k_proj)?,
+                &a.k_proj.forward(x)?,
                 b,
                 s,
                 self.num_kv_heads,
@@ -447,7 +490,9 @@ impl Qwen3Backbone {
                 sin_w,
             )?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let v = matmul_t(x, &a.v_proj)?
+        let v = a
+            .v_proj
+            .forward(x)?
             .reshape(&[b, s, self.num_kv_heads, hd])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
@@ -472,7 +517,7 @@ impl Qwen3Backbone {
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.num_heads * hd])?;
-        matmul_t(&out, &a.o_proj)
+        a.o_proj.forward(&out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -494,7 +539,7 @@ impl Qwen3Backbone {
 
         // q/k: project, reshape to heads, split temporal/spatial, norm each half, rope, concat.
         let q = self.qk_rope(
-            &matmul_t(x, &a.q_proj)?,
+            &a.q_proj.forward(x)?,
             b,
             s,
             self.num_heads,
@@ -508,7 +553,7 @@ impl Qwen3Backbone {
             sin_w,
         )?;
         let k = self.qk_rope(
-            &matmul_t(x, &a.k_proj)?,
+            &a.k_proj.forward(x)?,
             b,
             s,
             self.num_kv_heads,
@@ -522,7 +567,10 @@ impl Qwen3Backbone {
             sin_w,
         )?;
         // v: project + reshape only (no norm, no rope).
-        let v = matmul_t(x, &a.v_proj)?.reshape(&[b, s, self.num_kv_heads, hd])?;
+        let v = a
+            .v_proj
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, hd])?;
 
         // GQA expand, then [B,H,S,D].
         let groups = self.num_heads / self.num_kv_heads;
@@ -543,7 +591,7 @@ impl Qwen3Backbone {
         let out = out
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.num_heads * hd])?;
-        matmul_t(&out, &a.o_proj)
+        a.o_proj.forward(&out)
     }
 
     /// Project→reshape→(temporal/spatial split)→norm halves→rope(t,h,w)→concat. `proj` is the

@@ -196,6 +196,13 @@ impl T2iModel {
         })
     }
 
+    /// Quantize the backbone decoder stack to Q4/Q8 (sc-3193) — the bulk of the 8B params
+    /// (attention projections + SwiGLU on both paths). The vision embedders, FM head, and
+    /// timestep/noise embedders stay dense (small; precision-sensitive flow-matching head).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.backbone.quantize(bits)
+    }
+
     /// Override the `<IMG_CONTEXT>` / `<img>` / `</img>` token ids (for tiny test fixtures whose
     /// vocab cannot hold the real checkpoint ids). Production callers never need this.
     pub fn with_image_token_ids(
