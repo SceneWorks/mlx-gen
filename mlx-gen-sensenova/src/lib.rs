@@ -36,6 +36,8 @@
 
 pub mod config;
 pub mod loader;
+pub mod qwen3;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
+pub use qwen3::{Path, Qwen3Backbone};
