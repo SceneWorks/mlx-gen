@@ -39,6 +39,54 @@ pub enum Path {
     Gen,
 }
 
+/// Per-layer key/value cache for incremental decode (the reference's HF `DynamicCache`). Each entry
+/// holds the **already-RoPE'd** keys and the raw values in `[B, Hkv, S, D]` layout (kv-head count,
+/// pre-GQA-expansion — matching what the reference appends before `repeat_kv`). The flash-attn
+/// `[B,S,H,D]` repack (`prepare_flash_kv_cache`) is a torch-kernel micro-opt with no MLX analogue;
+/// the plain `[B,Hkv,S,D]` concat here is its functional equivalent.
+pub struct KvCache {
+    layers: Vec<Option<(Array, Array)>>,
+    seq_len: i32,
+}
+
+impl KvCache {
+    /// Total cached sequence length (the reference cache's `get_seq_length()`).
+    pub fn len(&self) -> i32 {
+        self.seq_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.seq_len == 0
+    }
+
+    /// Persisting append (`update_cache=True`): concat the new K/V onto layer `i` and store the
+    /// result back. Returns the full `[B,Hkv,S_all,D]` K/V for this forward.
+    fn append(&mut self, i: usize, k: Array, v: Array) -> Result<(Array, Array)> {
+        let merged = match self.layers[i].take() {
+            Some((pk, pv)) => (
+                concatenate_axis(&[&pk, &k], 2)?,
+                concatenate_axis(&[&pv, &v], 2)?,
+            ),
+            None => (k, v),
+        };
+        self.layers[i] = Some((merged.0.clone(), merged.1.clone()));
+        Ok(merged)
+    }
+
+    /// Non-persisting use (`update_cache=False`): concat past + current for this forward only, but
+    /// do **not** store the current K/V. This is the denoise-loop path — each diffusion step runs a
+    /// fresh image block against the frozen text prefix without polluting the cache.
+    fn extend(&self, i: usize, k: &Array, v: &Array) -> Result<(Array, Array)> {
+        match &self.layers[i] {
+            Some((pk, pv)) => Ok((
+                concatenate_axis(&[pk, k], 2)?,
+                concatenate_axis(&[pv, v], 2)?,
+            )),
+            None => Ok((k.clone(), v.clone())),
+        }
+    }
+}
+
 /// `y = x · Wᵀ` for a stored `[out, in]` bias-less Linear.
 fn matmul_t(x: &Array, w: &Array) -> Result<Array> {
     Ok(matmul(x, w.t())?)
@@ -272,6 +320,161 @@ impl Qwen3Backbone {
         Ok(rms_norm(&hidden, final_norm, self.eps)?)
     }
 
+    /// A fresh empty cache (one slot per decoder layer).
+    pub fn new_cache(&self) -> KvCache {
+        KvCache {
+            layers: (0..self.layers.len()).map(|_| None).collect(),
+            seq_len: 0,
+        }
+    }
+
+    /// The cached counterpart of [`Qwen3Backbone::forward_path`] — the incremental-decode forward
+    /// that backs the AR runtime (sc-3187) and the denoise loop (sc-3188).
+    ///
+    /// `embeds` `[B, S_new, hidden]` are the **new** tokens; `temporal`/`height`/`width` are their
+    /// `(t,h,w)` positions (each length `S_new`). Attention runs the `S_new` queries against the
+    /// `cache.len() + S_new` cached-plus-new keys under a mask that lets every new token see all
+    /// cached context (the reference's all-zero past block) and applies block-causal masking within
+    /// the new tokens (same temporal index → bidirectional, else causal). When `append` is true the
+    /// new K/V is persisted (text decode); when false it is used for this forward only (the
+    /// `update_cache=False` denoise path). Returns the final-normed hidden states `[B, S_new,
+    /// hidden]`; the caller applies [`Qwen3Backbone::lm_head`] for logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_cached(
+        &self,
+        embeds: &Array,
+        temporal: &[i32],
+        height: &[i32],
+        width: &[i32],
+        path: Path,
+        cache: &mut KvCache,
+        append: bool,
+    ) -> Result<Array> {
+        let dt = (self.head_dim / 2) as usize;
+        let dhw = (self.head_dim / 4) as usize;
+        let (cos_t, sin_t) = rope_cos_sin(temporal, dt, self.rope_theta)?;
+        let (cos_h, sin_h) = rope_cos_sin(height, dhw, self.rope_theta_hw)?;
+        let (cos_w, sin_w) = rope_cos_sin(width, dhw, self.rope_theta_hw)?;
+        let mask = cached_block_mask(cache.len(), temporal)?;
+
+        let mut hidden = embeds.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let (input_ln, post_ln, attn, mlp) = match path {
+                Path::Und => (
+                    &layer.input_ln,
+                    &layer.post_ln,
+                    &layer.attn_und,
+                    &layer.mlp_und,
+                ),
+                Path::Gen => (
+                    &layer.input_ln_gen,
+                    &layer.post_ln_gen,
+                    &layer.attn_gen,
+                    &layer.mlp_gen,
+                ),
+            };
+            let normed = rms_norm(&hidden, input_ln, self.eps)?;
+            let attn_out = self.attention_cached(
+                &normed, attn, &cos_t, &sin_t, &cos_h, &sin_h, &cos_w, &sin_w, &mask, cache, i,
+                append,
+            )?;
+            hidden = add(&hidden, &attn_out)?;
+            let normed = rms_norm(&hidden, post_ln, self.eps)?;
+            hidden = add(&hidden, &mlp.forward(&normed)?)?;
+        }
+        if append {
+            cache.seq_len += temporal.len() as i32;
+        }
+
+        let final_norm = match path {
+            Path::Und => &self.norm,
+            Path::Gen => &self.norm_gen,
+        };
+        Ok(rms_norm(&hidden, final_norm, self.eps)?)
+    }
+
+    /// Cached attention: project the new tokens, RoPE q/k, merge with the cache, GQA-expand, attend.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_cached(
+        &self,
+        x: &Array,
+        a: &AttnPath,
+        cos_t: &Array,
+        sin_t: &Array,
+        cos_h: &Array,
+        sin_h: &Array,
+        cos_w: &Array,
+        sin_w: &Array,
+        mask: &Array,
+        cache: &mut KvCache,
+        layer_idx: usize,
+        append: bool,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let (b, s) = (sh[0], sh[1]);
+        let hd = self.head_dim;
+
+        // q/k: project + reshape + temporal/spatial norm + tri-axis RoPE, then to [B,H,S,D].
+        let q = self
+            .qk_rope(
+                &matmul_t(x, &a.q_proj)?,
+                b,
+                s,
+                self.num_heads,
+                &a.q_norm,
+                &a.q_norm_hw,
+                cos_t,
+                sin_t,
+                cos_h,
+                sin_h,
+                cos_w,
+                sin_w,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = self
+            .qk_rope(
+                &matmul_t(x, &a.k_proj)?,
+                b,
+                s,
+                self.num_kv_heads,
+                &a.k_norm,
+                &a.k_norm_hw,
+                cos_t,
+                sin_t,
+                cos_h,
+                sin_h,
+                cos_w,
+                sin_w,
+            )?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = matmul_t(x, &a.v_proj)?
+            .reshape(&[b, s, self.num_kv_heads, hd])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Merge with the cache (persist or use-only), then GQA-expand the full K/V.
+        let (k_all, v_all) = if append {
+            cache.append(layer_idx, k, v)?
+        } else {
+            cache.extend(layer_idx, &k, &v)?
+        };
+        let groups = self.num_heads / self.num_kv_heads;
+        let k_all = repeat_kv_bhsd(&k_all, groups)?;
+        let v_all = repeat_kv_bhsd(&v_all, groups)?;
+
+        let scale = (hd as f32).powf(-0.5);
+        let scores = multiply(
+            &matmul(&q, &k_all.transpose_axes(&[0, 1, 3, 2])?)?,
+            Array::from_f32(scale),
+        )?;
+        let scores = add(&scores, mask)?;
+        let weights = softmax_axis(&scores, -1, true)?;
+        let out = matmul(&weights, &v_all)?;
+        let out = out
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[b, s, self.num_heads * hd])?;
+        matmul_t(&out, &a.o_proj)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -371,6 +574,46 @@ impl Qwen3Backbone {
         let w = apply_rope(&hw_parts[1], cos_w, sin_w)?;
         concatenate_axis(&[&t, &h, &w], 3).map_err(Error::from)
     }
+}
+
+/// Expand `[B,Hkv,S,D]` → `[B,Hkv*groups,S,D]` (GQA), repeating each kv head `groups` times. The
+/// cached-attention counterpart of [`repeat_kv`] (which operates on the pre-transpose `[B,S,Hkv,D]`
+/// layout); both insert the repeat axis immediately after the head axis, so the resulting head
+/// ordering is identical.
+fn repeat_kv_bhsd(x: &Array, groups: i32) -> Result<Array> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let sh = x.shape();
+    let (b, hkv, s, d) = (sh[0], sh[1], sh[2], sh[3]);
+    let x = x.expand_dims(2)?;
+    let x = broadcast_to(&x, &[b, hkv, groups, s, d])?;
+    Ok(x.reshape(&[b, hkv * groups, s, d])?)
+}
+
+/// Cached additive mask `[1,1,S_new, past+S_new]` (0 / -inf). New query row `r` attends to: every
+/// cached column (`j < past` — the reference's all-zero past block), and new column `c` iff
+/// `temporal[r] == temporal[c]` (same image block → bidirectional) **or** `c <= r` (causal). With
+/// `past == 0` this is exactly [`block_causal_mask`].
+fn cached_block_mask(past: i32, temporal: &[i32]) -> Result<Array> {
+    let q = temporal.len();
+    let past = past as usize;
+    let k = past + q;
+    let mut data = vec![0f32; q * k];
+    for r in 0..q {
+        for j in 0..k {
+            let allowed = if j < past {
+                true
+            } else {
+                let c = j - past;
+                temporal[r] == temporal[c] || c <= r
+            };
+            if !allowed {
+                data[r * k + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Ok(Array::from_slice(&data, &[1, 1, q as i32, k as i32]))
 }
 
 /// Block-causal additive mask `[1,1,S,S]` (0 / -inf): token `i` attends to `j` iff

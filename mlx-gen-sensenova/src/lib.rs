@@ -29,15 +29,19 @@
 //!
 //! ## Status
 //!
-//! sc-3181 (this slice) ships the crate scaffold plus the [`config`] parser and the [`loader`]
-//! weight-map foundation (the canonical key layout + a coverage check against the real shards). The
-//! backbone, vision embedder, flow-matching head, AR runtime, the generation modes, and the
-//! `Generator` impl + `inventory` registration land in the following stories (sc-3182 … sc-3194).
+//! The foundation tier (sc-3181 … sc-3186) ships the crate scaffold, the [`config`] parser, the
+//! [`loader`] weight-map foundation, the [`qwen3`] backbone, the [`vision`] embedder, the [`fm`]
+//! flow-matching head, and the [`text`] tokenizer/template. sc-3187 (this slice) adds the
+//! [`runtime`] AR text-generation layer — the [`KvCache`](qwen3::KvCache) + cached forward, token
+//! [`Sampler`], greedy/sampled `generate`, and the `_generate_think` rollout — the runtime the
+//! generation modes build on. The generation modes (T2I / edit / interleave / VQA) and the
+//! `Generator` impl + `inventory` registration land in the following stories (sc-3188 … sc-3194).
 
 pub mod config;
 pub mod fm;
 pub mod loader;
 pub mod qwen3;
+pub mod runtime;
 pub mod text;
 pub mod vision;
 
@@ -46,7 +50,8 @@ pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
 };
 pub use loader::{check_coverage, expected_keys, load_raw, Coverage};
-pub use qwen3::{Path, Qwen3Backbone};
+pub use qwen3::{KvCache, Path, Qwen3Backbone};
+pub use runtime::{Sampler, ThinkRollout};
 pub use text::{
     build_neo1_query, image_indexes, load_tokenizer, text_indexes, SYSTEM_MESSAGE_FOR_GEN,
 };
