@@ -257,8 +257,16 @@ impl Sam2VideoModel {
 
         // Spatial memories: cond frames at t_pos 0, then the temporally-strided recent frames.
         let mut append_memory = |out: &FrameOut, t_pos: i32| -> Result<()> {
-            let mf = out.maskmem_features.as_ref().expect("memory encoded");
-            let mp = out.maskmem_pos_enc.as_ref().expect("memory encoded");
+            // A cond frame added via `add_points_internal` stores `run_mem_encoder: false` — its memory
+            // is encoded lazily in `preflight`. Correcting a prompted frame before `propagate`
+            // (`add_new_box(f0)` → `add_correction_points(f0)`) reaches here with memory not yet
+            // encoded. Skip such a frame rather than panicking: `preflight` encodes it before
+            // propagation, and if no frame has memory the empty-mem path below handles it (F-166).
+            let (Some(mf), Some(mp)) =
+                (out.maskmem_features.as_ref(), out.maskmem_pos_enc.as_ref())
+            else {
+                return Ok(());
+            };
             let (mb, mc) = (mf.shape()[0], mf.shape()[1]);
             let mem = mf.reshape(&[mb, mc, -1])?.transpose_axes(&[2, 0, 1])?; // [HW,b,64]
             let mem_pos = mp.reshape(&[mb, mc, -1])?.transpose_axes(&[2, 0, 1])?;

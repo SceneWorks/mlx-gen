@@ -113,3 +113,33 @@ fn video_propagation_matches_mlx_reference_large() {
     assert!(worst_cos > 0.99, "worst-frame cosine {worst_cos:.6}");
     assert!(worst_iou > 0.97, "worst-frame IoU {worst_iou:.6}");
 }
+
+/// F-166 regression: correcting a prompted frame *before* `propagate` — the documented
+/// `add_new_box(f0)` → `add_correction_points(f0, …)` sequence — must not panic. The corrected cond
+/// frame has no encoded memory yet (memory is encoded lazily in the propagation preflight), so the
+/// second call's `condition_with_memories` must skip it instead of `expect`-panicking.
+#[test]
+#[ignore = "needs local golden from tools/dump_sam2_video_golden.py --size large"]
+fn correction_before_propagate_does_not_panic() {
+    let g = golden();
+    let images = g.require("images").unwrap().clone();
+    let hw = flat(g.require("video_hw").unwrap());
+    let (video_h, video_w) = (hw[0] as u32, hw[1] as u32);
+    let bx = flat(g.require("box_xyxy").unwrap());
+    let box_xyxy = [bx[0], bx[1], bx[2], bx[3]];
+
+    let predictor = Sam2VideoPredictor::from_weights_for_size(&g, Sam2ModelSize::Large).unwrap();
+    let mut state = predictor.init_state_from_pixels(images, video_h, video_w);
+    predictor.add_new_box(&mut state, 0, box_xyxy).unwrap();
+
+    // A positive correction click at the box center on the SAME frame, before any propagate.
+    let (cx, cy) = ((bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0);
+    let refined = predictor
+        .add_correction_points(&mut state, 0, &[[cx, cy]], &[1])
+        .expect("correcting a prompted frame before propagate must not panic (F-166)");
+    assert_eq!(
+        refined.shape(),
+        &[1, 1, 256, 256],
+        "refined low-res mask logits"
+    );
+}
