@@ -490,10 +490,10 @@ impl DiffusionSampler for FlowMatchSampler {
 
     fn step(&self, model_output: &Array, x: &Array, i: usize) -> Result<Array> {
         // Forward Euler on the velocity field: `x + v·dt`, dt = σ_{i+1} − σ_i (negative; the schedule
-        // descends to 0). Computed in the latents' dtype (f32) exactly like the fork's
-        // `LinearScheduler.step` and the proven inline FLUX loop — byte-identical, no upcast.
-        let dt = self.sigmas[i + 1] - self.sigmas[i];
-        Ok(add(x, &multiply(model_output, scalar(dt))?)?)
+        // descends to 0). Delegates to the shared [`crate::scheduler::flow_match_euler_step`] so this
+        // one load-bearing line stays identical to `FlowMatchEuler::step` (F-009) — byte-identical, no
+        // upcast, computed in the latents' dtype (f32).
+        crate::scheduler::flow_match_euler_step(&self.sigmas, x, model_output, i)
     }
 }
 
