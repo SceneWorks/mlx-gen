@@ -10,6 +10,7 @@ use mlx_rs::{Array, Dtype};
 
 use crate::array::host_i32;
 use crate::caption::{CaptionFinishReason, CaptionSampling};
+use crate::generator::default_seed;
 use crate::nn::{gelu_exact, linear, silu};
 use crate::runtime::CancelFlag;
 use crate::weights::Weights;
@@ -236,7 +237,9 @@ impl LlamaDecoder {
         let mut history = prompt_ids.to_vec();
         let mut generated = Vec::new();
         let mut cache = self.new_cache();
-        let mut rng = SplitMix64::new(0);
+        // `seed: None` draws a fresh per-call seed so repeated captions vary; an explicit seed
+        // reproduces an exact sample (F-002 — previously hardcoded to 0, silently deterministic).
+        let mut rng = SplitMix64::new(sampling.seed.unwrap_or_else(default_seed));
         let prompt_len = prompt_embeds.shape()[1];
         let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
 
@@ -798,6 +801,7 @@ mod tests {
                 temperature: 0.0,
                 top_p: 1.0,
                 max_new_tokens: 1,
+                seed: None,
             },
             &mut rng,
         )
@@ -816,11 +820,45 @@ mod tests {
                 temperature: 0.7,
                 top_p: 0.0,
                 max_new_tokens: 1,
+                seed: None,
             },
             &mut rng,
         )
         .unwrap();
         assert_eq!(next, 0);
+    }
+
+    #[test]
+    fn caption_sampling_seed_is_reproducible_and_varies() {
+        // F-002: stochastic sampling must be reproducible with a chosen seed and vary across seeds
+        // (previously the RNG was hardcoded to 0, so every "sampled" caption was identical forever).
+        assert_eq!(
+            CaptionSampling::default().seed,
+            None,
+            "default seed is None"
+        );
+
+        // A flat distribution makes the categorical draw rng-dominated, so the seed steers it.
+        let logits = Array::from_slice(&[0.0f32; 64], &[1, 64]);
+        let sampling = CaptionSampling {
+            temperature: 1.0,
+            top_p: 1.0,
+            max_new_tokens: 32,
+            seed: None,
+        };
+        let draw = |seed: u64| -> Vec<i32> {
+            let mut rng = SplitMix64::new(seed);
+            (0..32)
+                .map(|_| sample_token(&logits, &[], sampling, &mut rng).unwrap())
+                .collect()
+        };
+
+        assert_eq!(draw(7), draw(7), "same seed reproduces the same samples");
+        assert_ne!(
+            draw(7),
+            draw(99),
+            "different seeds produce different samples"
+        );
     }
 
     #[test]

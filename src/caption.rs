@@ -84,6 +84,10 @@ pub struct CaptionSampling {
     pub temperature: f32,
     pub top_p: f32,
     pub max_new_tokens: u32,
+    /// RNG seed for stochastic sampling (`temperature > 0`). `None` draws a fresh per-call seed via
+    /// [`default_seed`](crate::generator::default_seed) so repeated calls vary; pass `Some(seed)` to
+    /// reproduce an exact caption. (At `temperature == 0` decoding is greedy and the seed is unused.)
+    pub seed: Option<u64>,
 }
 
 impl Default for CaptionSampling {
@@ -92,6 +96,7 @@ impl Default for CaptionSampling {
             temperature: 0.6,
             top_p: 0.9,
             max_new_tokens: 256,
+            seed: None,
         }
     }
 }
