@@ -360,6 +360,62 @@ impl WanModelConfig {
             });
         }
     }
+
+    /// Serialize to the `config.json` schema `convert_wan.py` writes and
+    /// [`from_config_json`](Self::from_config_json) reads back — the inverse of `overlay_json`. The
+    /// native converter builds its three preset config.jsons from this (F-027), so the presets and the
+    /// 200-char `sample_neg_prompt` live in exactly one place. Round-trips by construction:
+    /// `from_config_json(c.to_json()) == c` (the round-trip tests in `convert.rs` assert it).
+    pub fn to_json(&self) -> Value {
+        let guide = match self.sample_guide_scale {
+            GuideScale::Single(s) => serde_json::json!(s),
+            GuideScale::Dual { low, high } => serde_json::json!([low, high]),
+        };
+        let (p0, p1, p2) = self.patch_size;
+        let (vs0, vs1, vs2) = self.vae_stride;
+        let (w0, w1) = self.window_size;
+        let mut v = serde_json::json!({
+            "model_type": self.model_type,
+            "model_version": self.model_version,
+            "patch_size": [p0, p1, p2],
+            "text_len": self.text_len,
+            "in_dim": self.in_dim,
+            "dim": self.dim,
+            "ffn_dim": self.ffn_dim,
+            "freq_dim": self.freq_dim,
+            "text_dim": self.text_dim,
+            "out_dim": self.out_dim,
+            "num_heads": self.num_heads,
+            "num_layers": self.num_layers,
+            "window_size": [w0, w1],
+            "qk_norm": self.qk_norm,
+            "cross_attn_norm": self.cross_attn_norm,
+            "eps": self.eps,
+            "vae_stride": [vs0, vs1, vs2],
+            "vae_z_dim": self.vae_z_dim,
+            "dual_model": self.dual_model,
+            "boundary": self.boundary,
+            "sample_shift": self.sample_shift,
+            "sample_steps": self.sample_steps,
+            "sample_guide_scale": guide,
+            "num_train_timesteps": self.num_train_timesteps,
+            "sample_fps": self.sample_fps,
+            "frame_num": self.frame_num,
+            "sample_neg_prompt": self.sample_neg_prompt,
+            "max_area": self.max_area,
+            "t5_vocab_size": self.t5_vocab_size,
+            "t5_dim": self.t5_dim,
+            "t5_dim_attn": self.t5_dim_attn,
+            "t5_dim_ffn": self.t5_dim_ffn,
+            "t5_num_heads": self.t5_num_heads,
+            "t5_num_layers": self.t5_num_layers,
+            "t5_num_buckets": self.t5_num_buckets,
+        });
+        if let Some(q) = self.quantization {
+            v["quantization"] = serde_json::json!({ "bits": q.bits, "group_size": q.group_size });
+        }
+        v
+    }
 }
 
 /// Configuration for a **Wan-VACE** model (sc-3388 / epic 3040) — the base Wan DiT plus the two

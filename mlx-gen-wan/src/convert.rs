@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+use crate::config::{WanModelConfig, WanQuant};
 use mlx_rs::ops::quantize;
 use mlx_rs::transforms::eval;
 use mlx_rs::{Array, Dtype};
@@ -236,45 +238,10 @@ pub fn sanitize_wan_t5(raw: &HashMap<String, Array>) -> HashMap<String, Array> {
         .collect()
 }
 
-/// The `WanModelConfig.wan22_ti2v_5b().to_dict()` config.json (matches the golden semantically).
+/// The `wan22_ti2v_5b` preset serialized to its config.json (F-027: built from the single preset +
+/// `SAMPLE_NEG_PROMPT` in `config.rs`, not a hand-inlined copy). Guarded by the round-trip test below.
 fn wan22_ti2v_5b_config() -> serde_json::Value {
-    serde_json::json!({
-        "model_type": "ti2v",
-        "model_version": "2.2",
-        "patch_size": [1, 2, 2],
-        "text_len": 512,
-        "in_dim": 48,
-        "dim": 3072,
-        "ffn_dim": 14336,
-        "freq_dim": 256,
-        "text_dim": 4096,
-        "out_dim": 48,
-        "num_heads": 24,
-        "num_layers": 30,
-        "window_size": [-1, -1],
-        "qk_norm": true,
-        "cross_attn_norm": true,
-        "eps": 1e-6,
-        "vae_stride": [4, 16, 16],
-        "vae_z_dim": 48,
-        "dual_model": false,
-        "boundary": 0.0,
-        "sample_shift": 5.0,
-        "sample_steps": 40,
-        "sample_guide_scale": 5.0,
-        "num_train_timesteps": 1000,
-        "sample_fps": 24,
-        "frame_num": 81,
-        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-        "max_area": 901120,
-        "t5_vocab_size": 256384,
-        "t5_dim": 4096,
-        "t5_dim_attn": 4096,
-        "t5_dim_ffn": 10240,
-        "t5_num_heads": 64,
-        "t5_num_layers": 24,
-        "t5_num_buckets": 32
-    })
+    WanModelConfig::wan22_ti2v_5b().to_json()
 }
 
 /// Convert a native Wan2.2 **TI2V-5B** checkpoint dir into an MLX model dir at `out_dir`: the
@@ -384,93 +351,21 @@ pub fn quantize_wan_transformer(
 /// The `WanModelConfig.wan22_i2v_14b().to_dict()` config.json (round-trips through
 /// `WanModelConfig::from_config_json`; the dual guide scale is a 2-element array).
 fn wan22_i2v_14b_config(quantize: Option<(i32, i32)>) -> serde_json::Value {
-    let mut cfg = serde_json::json!({
-        "model_type": "i2v",
-        "model_version": "2.2",
-        "patch_size": [1, 2, 2],
-        "text_len": 512,
-        "in_dim": 36,
-        "dim": 5120,
-        "ffn_dim": 13824,
-        "freq_dim": 256,
-        "text_dim": 4096,
-        "out_dim": 16,
-        "num_heads": 40,
-        "num_layers": 40,
-        "window_size": [-1, -1],
-        "qk_norm": true,
-        "cross_attn_norm": true,
-        "eps": 1e-6,
-        "vae_stride": [4, 8, 8],
-        "vae_z_dim": 16,
-        "dual_model": true,
-        "boundary": 0.9,
-        "sample_shift": 5.0,
-        "sample_steps": 40,
-        "sample_guide_scale": [3.5, 3.5],
-        "num_train_timesteps": 1000,
-        "sample_fps": 16,
-        "frame_num": 81,
-        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-        "max_area": 901120,
-        "t5_vocab_size": 256384,
-        "t5_dim": 4096,
-        "t5_dim_attn": 4096,
-        "t5_dim_ffn": 10240,
-        "t5_num_heads": 64,
-        "t5_num_layers": 24,
-        "t5_num_buckets": 32
-    });
+    let mut cfg = WanModelConfig::wan22_i2v_14b();
     if let Some((bits, group_size)) = quantize {
-        cfg["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+        cfg.quantization = Some(WanQuant { bits, group_size });
     }
-    cfg
+    cfg.to_json()
 }
 
 /// The `WanModelConfig.wan22_t2v_14b().to_dict()` config.json (the dual-expert **T2V** preset:
 /// in_dim 16, boundary 0.875, sample_shift 12.0, dual guide scale `[3.0, 4.0]`, no resolution cap).
 fn wan22_t2v_14b_config(quantize: Option<(i32, i32)>) -> serde_json::Value {
-    let mut cfg = serde_json::json!({
-        "model_type": "t2v",
-        "model_version": "2.2",
-        "patch_size": [1, 2, 2],
-        "text_len": 512,
-        "in_dim": 16,
-        "dim": 5120,
-        "ffn_dim": 13824,
-        "freq_dim": 256,
-        "text_dim": 4096,
-        "out_dim": 16,
-        "num_heads": 40,
-        "num_layers": 40,
-        "window_size": [-1, -1],
-        "qk_norm": true,
-        "cross_attn_norm": true,
-        "eps": 1e-6,
-        "vae_stride": [4, 8, 8],
-        "vae_z_dim": 16,
-        "dual_model": true,
-        "boundary": 0.875,
-        "sample_shift": 12.0,
-        "sample_steps": 40,
-        "sample_guide_scale": [3.0, 4.0],
-        "num_train_timesteps": 1000,
-        "sample_fps": 16,
-        "frame_num": 81,
-        "sample_neg_prompt": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
-        "max_area": 0,
-        "t5_vocab_size": 256384,
-        "t5_dim": 4096,
-        "t5_dim_attn": 4096,
-        "t5_dim_ffn": 10240,
-        "t5_num_heads": 64,
-        "t5_num_layers": 24,
-        "t5_num_buckets": 32
-    });
+    let mut cfg = WanModelConfig::wan22_t2v_14b();
     if let Some((bits, group_size)) = quantize {
-        cfg["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+        cfg.quantization = Some(WanQuant { bits, group_size });
     }
-    cfg
+    cfg.to_json()
 }
 
 /// Convert one native transformer expert dir (`low_noise_model` / `high_noise_model`) → a sanitized,
@@ -984,6 +879,21 @@ mod tests {
         assert_ne!(q["blocks.0.self_attn.q.weight"].dtype(), Dtype::Bfloat16); // packed (u32)
         assert!(q.contains_key("blocks.0.norm1.weight")); // dense
         assert!(!q.contains_key("blocks.0.norm1.scales"));
+    }
+
+    /// The TI2V-5B config.json round-trips through the loader's parser to the `wan22_ti2v_5b` preset
+    /// — the literal it replaced (F-027) had no guard. Confirms `to_json` emits every key the loader
+    /// reads (incl. the scalar `sample_guide_scale` and `SAMPLE_NEG_PROMPT`).
+    #[test]
+    fn ti2v_5b_config_round_trips() {
+        use crate::config::WanModelConfig;
+        let cfg = WanModelConfig::from_config_json(&wan22_ti2v_5b_config());
+        assert_eq!(cfg, WanModelConfig::wan22_ti2v_5b());
+        assert_eq!(
+            cfg.sample_neg_prompt,
+            crate::config::SAMPLE_NEG_PROMPT,
+            "5B config must carry the shared negative prompt"
+        );
     }
 
     /// The I2V-14B config.json round-trips through the loader's parser to the `wan22_i2v_14b` preset
