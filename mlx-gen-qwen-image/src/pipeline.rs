@@ -7,7 +7,7 @@
 //! w/8]` only at decode. Conditioning runs **two** transformer forwards per step (positive +
 //! negative) combined by classifier-free guidance.
 
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract, sum_axes};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtract, sum_axes};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
@@ -397,15 +397,33 @@ pub fn denoise_edit_with_progress(
     Ok(latents)
 }
 
-/// Slice the transformer velocity `[1, full_seq, 64]` back to the noise prefix `[1, n, 64]`.
+/// Slice the transformer velocity `[1, full_seq, 64]` back to the noise prefix `[1, n, 64]`. A
+/// zero-copy strided split at the static boundary, vs the old per-step arange `take_axis` gather
+/// (F-114).
 fn slice_seq(x: &Array, n: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-    Ok(x.take_axis(&idx, 1)?)
+    Ok(split_sections(x, &[n], 1)?.swap_remove(0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_seq_matches_arange_gather() {
+        // F-114: the zero-copy split-at-boundary must return exactly what the old arange `take_axis`
+        // gather did — the leading n tokens, same values.
+        let x = Array::from_slice(
+            &(0..(5 * 2)).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 5, 2],
+        );
+        let got = slice_seq(&x, 3).unwrap();
+        assert_eq!(got.shape(), &[1, 3, 2]);
+        let idx = Array::from_slice(&[0i32, 1, 2], &[3]);
+        let want = x.take_axis(&idx, 1).unwrap();
+        assert!(mlx_rs::ops::array_eq(&got, &want, None)
+            .unwrap()
+            .item::<bool>());
+    }
 
     #[test]
     fn noise_shape_is_packed() {

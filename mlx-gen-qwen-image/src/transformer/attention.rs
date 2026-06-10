@@ -6,7 +6,7 @@
 
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
@@ -158,11 +158,11 @@ impl QwenJointAttention {
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, joint, h * hd])?;
 
-        // split back along the sequence axis: text first, then image.
-        let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
-        let img_idx = Array::from_slice(&(txt_seq..joint).collect::<Vec<i32>>(), &[img_seq]);
-        let txt_attn = self.to_add_out.forward(&o.take_axis(&txt_idx, 1)?)?;
-        let img_attn = self.to_out.forward(&o.take_axis(&img_idx, 1)?)?;
+        // Split back along the sequence axis at the static text/image boundary: a zero-copy strided
+        // split, vs the old pair of arange `take_axis` gathers run 60 blocks × 2 CFG / step (F-114).
+        let parts = split_sections(&o, &[txt_seq], 1)?;
+        let txt_attn = self.to_add_out.forward(&parts[0])?;
+        let img_attn = self.to_out.forward(&parts[1])?;
         Ok((img_attn, txt_attn))
     }
 }
