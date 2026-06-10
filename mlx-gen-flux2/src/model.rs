@@ -513,58 +513,22 @@ impl Generator for Flux2 {
 }
 
 fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+    // Empty-prompt first so it wins over the shared floor for a bare default request.
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
     }
+    // The shared capability floor (count, size range, negative/guidance/true_cfg, sampler, scheduler,
+    // conditioning) — the same check chroma delegates to (F-100; this dedups flux2's near-verbatim
+    // copy and adds the previously-missing scheduler validation).
+    desc.capabilities.validate_request(desc.id, req)?;
+    // FLUX.2-specific: latent dims must be a multiple of 16 (VAE 8× × patch 2).
     if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
             "{}: width and height must be multiples of 16, got {}x{}",
             desc.id, req.width, req.height
         )));
     }
-    let caps = &desc.capabilities;
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(Error::Msg(format!(
-            "{}: size {}x{} outside supported range {}..={}",
-            desc.id, req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
-    if req.count == 0 || req.count > caps.max_count {
-        return Err(Error::Msg(format!(
-            "{}: count must be 1..={}",
-            desc.id, caps.max_count
-        )));
-    }
-    if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
-        return Err(Error::Msg(format!(
-            "{}: negative prompts are not supported by FLUX.2",
-            desc.id
-        )));
-    }
-    if req.true_cfg.is_some() && !caps.supports_true_cfg {
-        return Err(Error::Msg(format!(
-            "{}: true_cfg is not supported",
-            desc.id
-        )));
-    }
-    for c in &req.conditioning {
-        let kind = conditioning_kind(c);
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "{}: conditioning {kind:?} is not supported by this variant",
-                desc.id
-            )));
-        }
-    }
     Ok(())
-}
-
-fn conditioning_kind(c: &mlx_gen::Conditioning) -> mlx_gen::ConditioningKind {
-    c.kind()
 }
 
 inventory::submit! {
@@ -602,6 +566,29 @@ mod tests {
         let req = GenerationRequest::default();
         let err = model.validate(&req).unwrap_err().to_string();
         assert!(err.contains("prompt is required"));
+    }
+
+    #[test]
+    fn rejects_unsupported_scheduler() {
+        // F-100: flux2 delegated to the shared floor now validates the scheduler (was silently
+        // accepted). The advertised "flow_match_euler" passes.
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        let err = model
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                scheduler: Some("karras".into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported scheduler"), "got: {err}");
+        model
+            .validate(&GenerationRequest {
+                prompt: "x".into(),
+                scheduler: Some("flow_match_euler".into()),
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     #[test]

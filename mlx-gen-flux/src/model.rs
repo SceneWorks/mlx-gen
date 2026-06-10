@@ -465,6 +465,17 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             )));
         }
     }
+    // Likewise reject an unadvertised scheduler (F-100: previously silently accepted). flux1's
+    // negative/true_cfg checks keep their IP-Adapter reference carve-out below, so this validate
+    // stays bespoke rather than fully delegating to `Capabilities::validate_request`.
+    if let Some(s) = &req.scheduler {
+        if !desc.capabilities.schedulers.contains(&s.as_str()) {
+            return Err(Error::Msg(format!(
+                "{}: unsupported scheduler {s:?} (supported: {:?})",
+                desc.id, desc.capabilities.schedulers
+            )));
+        }
+    }
     if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
             "{}: width and height must be multiples of 16, got {}x{}",
@@ -721,6 +732,31 @@ mod tests {
             ..Default::default()
         };
         assert!(model.validate(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unadvertised_scheduler() {
+        // F-100: an unsupported scheduler was silently accepted before. Now rejected; the advertised
+        // "linear" still passes.
+        let model = Flux1::new_for_tests(FluxVariant::Dev);
+        let err = model
+            .validate(&GenerationRequest {
+                prompt: "a red fox".into(),
+                guidance: Some(3.5),
+                scheduler: Some("karras".into()),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported scheduler"), "got: {err}");
+        model
+            .validate(&GenerationRequest {
+                prompt: "a red fox".into(),
+                guidance: Some(3.5),
+                scheduler: Some("linear".into()),
+                ..Default::default()
+            })
+            .unwrap();
     }
 
     #[test]
