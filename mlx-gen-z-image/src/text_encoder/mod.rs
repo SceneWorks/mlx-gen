@@ -3,8 +3,8 @@
 //!
 //! Qwen3-style (not Qwen2): per-head `q_norm`/`k_norm`, **no biases**, HF half-split RoPE,
 //! GQA (32 query / 8 kv heads), pre-norm residual blocks. The encoder returns the **second-to-
-//! last** layer's hidden states (no final norm). Slice A here is the sub-modules + a single
-//! `EncoderLayer` parity test; the full `TextEncoder` assembly + prompt encoding follow.
+//! last** layer's hidden states (no final norm). The sub-modules live here; the full
+//! [`encoder::TextEncoder`] assembly + prompt encoding are in [`encoder`].
 
 pub mod attention;
 pub mod encoder;

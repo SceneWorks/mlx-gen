@@ -1,8 +1,10 @@
-//! Z-Image sampling-pipeline helpers: seeded latent creation, latent unpacking, and the
-//! decoded-tensor → [`Image`] conversion — ports of the fork's `ZImageLatentCreator` +
-//! `ImageUtil`. The denoise loop that composes these with the transformer
-//! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`])
-//! lands once `load()` assembles the model from weights (+ the text encoder).
+//! Z-Image sampling pipeline: seeded latent creation, latent unpacking, the decoded-tensor →
+//! [`Image`] conversion (ports of the fork's `ZImageLatentCreator` + `ImageUtil`), img2img
+//! init-latent encoding, and the denoise loops ([`denoise_with_progress`] /
+//! [`denoise_control_with_progress`]) that compose these with the transformer
+//! ([`crate::transformer`]), scheduler ([`mlx_gen::FlowMatchEuler`]) and VAE ([`crate::vae`]). The
+//! two generators ([`crate::model`] / [`crate::model_control`]) drive them through the shared
+//! `render_batch`.
 
 use mlx_gen::array::host_i32;
 use mlx_gen::image::resize_lanczos_u8;
