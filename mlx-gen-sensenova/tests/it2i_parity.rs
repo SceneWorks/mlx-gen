@@ -112,6 +112,7 @@ fn it2i_denoise_matches_reference() {
             height,
             &raw_noise,
             &opts,
+            None,
         )
         .expect("it2i_denoise");
     assert_eq!(traj.len(), num_steps);

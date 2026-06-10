@@ -96,7 +96,15 @@ fn t2i_realweight_matches_reference() {
         ..Default::default()
     };
     let out = model
-        .generate(&tokenizer, prompt, width, height, &opts, Some(&raw_noise))
+        .generate(
+            &tokenizer,
+            prompt,
+            width,
+            height,
+            &opts,
+            Some(&raw_noise),
+            None,
+        )
         .expect("generate");
 
     let got = flat(&out.image);

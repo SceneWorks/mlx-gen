@@ -36,7 +36,7 @@ use mlx_gen::{
 use crate::config::NeoChatConfig;
 use crate::distill::resolve_distill_lora;
 use crate::loader::load_raw;
-use crate::t2i::{smart_resize, T2iModel, T2iOptions};
+use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
 use mlx_gen::weights::Weights;
 
@@ -259,14 +259,25 @@ impl Generator for SenseNova {
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
-            on_progress(Progress::Step {
-                current: i + 1,
-                total: req.count,
-            });
+            // Check the worker's cancel flag between images too (a 50-step 8B run is multi-minute;
+            // the per-step check lives in the denoise loop via the StepReporter). F-128.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Msg("sensenova: generation cancelled".into()));
+            }
             let opts = self.options(req, base_seed.wrapping_add(i as u64));
+            // Thread cancellation + per-step progress into the denoise loop. Progress now reports the
+            // denoise step (Kolors/SDXL semantics), not the image index as the old single tick did.
+            let reporter = StepReporter::new(&req.cancel, on_progress);
             let out = if references.is_empty() {
-                self.model
-                    .generate(&self.tokenizer, &req.prompt, w, h, &opts, None)?
+                self.model.generate(
+                    &self.tokenizer,
+                    &req.prompt,
+                    w,
+                    h,
+                    &opts,
+                    None,
+                    Some(reporter),
+                )?
             } else {
                 self.model.it2i_generate(
                     &self.tokenizer,
@@ -276,6 +287,7 @@ impl Generator for SenseNova {
                     h,
                     &opts,
                     None,
+                    Some(reporter),
                 )?
             };
             images.push(decoded_to_image(&out.image)?);

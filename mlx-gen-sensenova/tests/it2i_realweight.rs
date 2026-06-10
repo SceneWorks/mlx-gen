@@ -163,6 +163,7 @@ fn it2i_realweight_matches_reference() {
             height,
             &cond_opts,
             Some(&raw_noise),
+            None,
         )
         .expect("it2i_generate cond-only");
     let co_cos = cosine(&out_co.image, &want_cond_only);
@@ -189,6 +190,7 @@ fn it2i_realweight_matches_reference() {
             height,
             &opts,
             Some(&raw_noise),
+            None,
         )
         .expect("it2i_generate");
     assert!(flat(&out.image).iter().all(|v| v.is_finite()));

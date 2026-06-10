@@ -107,7 +107,9 @@ fn t2i_denoise_matches_reference() {
         ..Default::default()
     };
     let traj = model
-        .denoise(&mut cache, text_len, None, width, height, &raw_noise, &opts)
+        .denoise(
+            &mut cache, text_len, None, width, height, &raw_noise, &opts, None,
+        )
         .expect("denoise");
     assert_eq!(traj.len(), num_steps);
 

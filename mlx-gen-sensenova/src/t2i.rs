@@ -25,7 +25,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 
 use crate::config::NeoChatConfig;
 use crate::fm::{
@@ -36,6 +36,41 @@ use crate::qwen3::{KvCache, Path, Qwen3Backbone};
 use crate::runtime::Sampler;
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
+
+/// Per-step cancellation + progress for the denoise loops, matching the SDXL family's `&CancelFlag` +
+/// `on_progress` threading. `None` ⇒ uncancellable with no progress (diagnostic/parity callers); the
+/// production [`SenseNova`](crate::SenseNova) path passes the request's flag and the worker's progress
+/// callback so a multi-minute 8B run is cancellable and reports **denoise steps**, not the image index
+/// (F-128).
+pub struct StepReporter<'a> {
+    cancel: &'a CancelFlag,
+    on_progress: &'a mut dyn FnMut(Progress),
+}
+
+impl<'a> StepReporter<'a> {
+    pub fn new(cancel: &'a CancelFlag, on_progress: &'a mut dyn FnMut(Progress)) -> Self {
+        Self {
+            cancel,
+            on_progress,
+        }
+    }
+
+    /// Abort with a typed error if the request was cancelled (checked before each denoise step).
+    fn check_cancel(&self) -> Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(Error::Msg("sensenova: generation cancelled".into()));
+        }
+        Ok(())
+    }
+
+    /// Report one completed denoise step (`current` is 1-based).
+    fn step(&mut self, current: usize, total: usize) {
+        (self.on_progress)(Progress::Step {
+            current: current as u32,
+            total: total as u32,
+        });
+    }
+}
 
 /// Classifier-free-guidance velocity-blend normalisation (`t2i_generate`'s `cfg_norm`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -294,6 +329,7 @@ impl T2iModel {
     /// Generate an image for `prompt` at `width × height` (both multiples of `patch·merge = 32`).
     /// `init_noise`, when supplied, is a standard-normal tensor `[1, 3, H, W]` used in place of
     /// fresh sampling (for cross-build parity); it is scaled by the resolution-mode `noise_scale`.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         tokenizer: &TextTokenizer,
@@ -302,9 +338,10 @@ impl T2iModel {
         height: i32,
         opts: &T2iOptions,
         init_noise: Option<&Array>,
+        reporter: Option<StepReporter>,
     ) -> Result<T2iOutput> {
         let (traj, think_text) =
-            self.t2i_run(tokenizer, prompt, width, height, opts, init_noise)?;
+            self.t2i_run(tokenizer, prompt, width, height, opts, init_noise, reporter)?;
         let image = traj.into_iter().last().expect("at least one step");
         Ok(T2iOutput { image, think_text })
     }
@@ -324,13 +361,14 @@ impl T2iModel {
         init_noise: Option<&Array>,
     ) -> Result<Vec<Array>> {
         Ok(self
-            .t2i_run(tokenizer, prompt, width, height, opts, init_noise)?
+            .t2i_run(tokenizer, prompt, width, height, opts, init_noise, None)?
             .0)
     }
 
     /// Shared T2I body: condition/uncondition prefixes (+ optional think rollout) and the denoise
     /// loop. Returns the per-step trajectory and any think text. [`generate`] keeps the last frame;
     /// [`t2i_trajectory`](Self::t2i_trajectory) returns them all.
+    #[allow(clippy::too_many_arguments)]
     fn t2i_run(
         &self,
         tokenizer: &TextTokenizer,
@@ -339,6 +377,7 @@ impl T2iModel {
         height: i32,
         opts: &T2iOptions,
         init_noise: Option<&Array>,
+        reporter: Option<StepReporter>,
     ) -> Result<(Vec<Array>, Option<String>)> {
         let cell = self.patch_size * self.merge_size;
         if width % cell != 0 || height % cell != 0 {
@@ -403,6 +442,7 @@ impl T2iModel {
             height,
             &base_noise,
             opts,
+            reporter,
         )?;
         Ok((traj, think_text))
     }
@@ -428,6 +468,7 @@ impl T2iModel {
         height: i32,
         base_noise: &Array,
         opts: &T2iOptions,
+        mut reporter: Option<StepReporter>,
     ) -> Result<Vec<Array>> {
         let cell = self.patch_size * self.merge_size;
         let token_h = height / cell;
@@ -466,6 +507,9 @@ impl T2iModel {
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
         let mut traj = Vec::with_capacity(steps);
         for i in 0..steps {
+            if let Some(r) = reporter.as_ref() {
+                r.check_cancel()?;
+            }
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
 
@@ -491,6 +535,9 @@ impl T2iModel {
                 Some(token_w),
             )?;
             traj.push(image.clone());
+            if let Some(r) = reporter.as_mut() {
+                r.step(i + 1, steps);
+            }
         }
         Ok(traj)
     }
@@ -777,6 +824,7 @@ impl T2iModel {
     /// guidance: `opts.cfg_scale` (text) + `opts.img_cfg_scale` (image; edit ≈ 1.0, character ≈
     /// 1.5). `init_noise` (optional) is a standard-normal `[1,3,H,W]` for cross-build parity.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn it2i_generate(
         &self,
         tokenizer: &TextTokenizer,
@@ -786,6 +834,7 @@ impl T2iModel {
         height: i32,
         opts: &T2iOptions,
         init_noise: Option<&Array>,
+        reporter: Option<StepReporter>,
     ) -> Result<T2iOutput> {
         let cell = self.patch_size * self.merge_size;
         if width % cell != 0 || height % cell != 0 {
@@ -902,6 +951,7 @@ impl T2iModel {
             height,
             &base_noise,
             opts,
+            reporter,
         )?;
         let image = traj.into_iter().last().expect("at least one step");
         Ok(T2iOutput { image, think_text })
@@ -1164,6 +1214,7 @@ impl T2iModel {
                 height,
                 &base_noise,
                 opts,
+                None,
             )?;
             let image = traj.into_iter().last().expect("at least one step");
 
@@ -1194,6 +1245,7 @@ impl T2iModel {
         height: i32,
         base_noise: &Array,
         opts: &T2iOptions,
+        mut reporter: Option<StepReporter>,
     ) -> Result<Vec<Array>> {
         let cell = self.patch_size * self.merge_size;
         let token_h = height / cell;
@@ -1244,6 +1296,9 @@ impl T2iModel {
         let (i0, i1) = opts.cfg_interval;
         let mut traj = Vec::with_capacity(steps);
         for i in 0..steps {
+            if let Some(r) = reporter.as_ref() {
+                r.check_cancel()?;
+            }
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
             let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
@@ -1295,6 +1350,9 @@ impl T2iModel {
                 Some(token_w),
             )?;
             traj.push(image.clone());
+            if let Some(r) = reporter.as_mut() {
+                r.step(i + 1, steps);
+            }
         }
         Ok(traj)
     }
@@ -1487,6 +1545,32 @@ mod tests {
     fn slice(a: &Array) -> Vec<f32> {
         let n = a.shape().iter().product::<i32>();
         a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
+    }
+
+    #[test]
+    fn step_reporter_cancels_and_reports_steps() {
+        use mlx_gen::CancelFlag;
+
+        // A cancelled flag makes the pre-step check error (the denoise loop aborts here).
+        let cancelled = CancelFlag::new();
+        cancelled.cancel();
+        let mut sink = |_p: Progress| {};
+        let r = StepReporter::new(&cancelled, &mut sink);
+        assert!(r.check_cancel().is_err());
+
+        // A live flag passes the check; step() forwards 1-based denoise progress (not the image index).
+        let live = CancelFlag::new();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let mut rec = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                seen.borrow_mut().push((current, total));
+            }
+        };
+        let mut r = StepReporter::new(&live, &mut rec);
+        assert!(r.check_cancel().is_ok());
+        r.step(1, 4);
+        r.step(4, 4);
+        assert_eq!(*seen.borrow(), vec![(1u32, 4u32), (4, 4)]);
     }
 
     #[test]
