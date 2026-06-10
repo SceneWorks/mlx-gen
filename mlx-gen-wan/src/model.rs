@@ -237,7 +237,8 @@ impl Generator for Wan {
         }
         let steps = req.steps.map(|s| s as usize).unwrap_or(cfg.sample_steps);
         let shift = req.scheduler_shift.unwrap_or(cfg.sample_shift);
-        let kind = solver_kind(req.sampler.as_deref());
+        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
+        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
         let seed = req.seed.unwrap_or_else(default_seed);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
         let guidance = match (cfg.sample_guide_scale, req.guidance) {
@@ -556,17 +557,6 @@ fn resolve_load_time_quant(
     }
 }
 
-/// Map a request `sampler` string to a [`SolverKind`]. Only ever reached after `validate` (called at
-/// the top of `generate`) has rejected any name outside the advertised set, so the `_` arm handles an
-/// **unset** sampler — UniPC, the reference's default — rather than silently downgrading a typo.
-fn solver_kind(sampler: Option<&str>) -> SolverKind {
-    match sampler {
-        Some("euler") => SolverKind::Euler,
-        Some("dpmpp2m") | Some("dpm++") => SolverKind::Dpmpp2m,
-        _ => SolverKind::UniPC,
-    }
-}
-
 /// Load the Wan2.2 T2V-A14B from a converted MLX snapshot directory (`convert_wan.py` output:
 /// `low_noise_model.safetensors` + `high_noise_model.safetensors` + `t5_encoder.safetensors` +
 /// `vae.safetensors` + `tokenizer.json` + `config.json`). LoRA adapters merge per-expert at generate
@@ -685,7 +675,8 @@ impl Generator for Wan14b {
         }
         let steps = req.steps.map(|s| s as usize).unwrap_or(cfg.sample_steps);
         let shift = req.scheduler_shift.unwrap_or(cfg.sample_shift);
-        let kind = solver_kind(req.sampler.as_deref());
+        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
+        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
         let seed = req.seed.unwrap_or_else(default_seed);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
         let (low_gs, high_gs) = match (cfg.sample_guide_scale, req.guidance) {

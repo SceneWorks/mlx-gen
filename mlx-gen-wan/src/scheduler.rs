@@ -585,6 +585,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_name_maps_advertised_samplers_and_defaults_to_unipc() {
+        // F-021: the single sampler→solver mapping the production model entries now share. The
+        // advertised set (validate_request) is unipc/euler/dpmpp2m; an unset/unknown name → UniPC.
+        assert_eq!(SolverKind::from_name("euler"), SolverKind::Euler);
+        assert_eq!(SolverKind::from_name("dpmpp2m"), SolverKind::Dpmpp2m);
+        assert_eq!(SolverKind::from_name("dpm++"), SolverKind::Dpmpp2m);
+        assert_eq!(SolverKind::from_name("unipc"), SolverKind::UniPC);
+        assert_eq!(SolverKind::from_name(""), SolverKind::UniPC); // the unset-sampler sentinel
+        assert_eq!(SolverKind::from_name("nope"), SolverKind::UniPC);
+        // Case-insensitive (the model entries lower-case via the same path).
+        assert_eq!(SolverKind::from_name("Euler"), SolverKind::Euler);
+        assert_eq!(SolverKind::from_name("DPM++"), SolverKind::Dpmpp2m);
+    }
+
+    #[test]
     fn sigma_schedule_endpoints_and_shape() {
         let s = compute_sigmas(40, 5.0, 1000);
         assert_eq!(s.len(), 41);
