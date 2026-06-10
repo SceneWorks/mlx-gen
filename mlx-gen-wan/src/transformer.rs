@@ -672,10 +672,18 @@ impl WanTransformer {
     /// path) — the cond/uncond branches diverge only at the first cross-attention (different context
     /// K/V), so the `B=2` forward is bit-identical to two `B=1` forwards but launches each GPU kernel
     /// once instead of twice (the small-seq CFG win, sc-2853).
-    pub fn forward_cached(
+    /// The shared cached DiT forward (F-022): patchify → embed → broadcast over the CFG batch → block
+    /// loop with the per-block modulation `e0` → head with `e` → per-batch unpatchify. The scalar
+    /// [`forward_cached`](Self::forward_cached) and per-token
+    /// [`forward_tokens_cached`](Self::forward_tokens_cached) paths differ **only** in how they build
+    /// `(e, e0)` (scalar `time_embed` vs per-token `time_embed_tokens`), so they precompute it and pass
+    /// it in here — keeping the ~45-line body in one place so the TI2V path can't silently diverge.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_modulation(
         &self,
         latent: &Array,
-        t: f32,
+        e: &Array,
+        e0: &Array,
         cross_kv: &[(Array, Array)],
         cos: &Array,
         sin: &Array,
@@ -693,13 +701,11 @@ impl WanTransformer {
             x1
         };
 
-        let (e, e0) = self.time_embed(t)?;
-
         for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
-            x = block.forward(&x, &e0, kv, cos, sin)?;
+            x = block.forward(&x, e0, kv, cos, sin)?;
         }
 
-        let x = self.apply_head(&x, &e)?; // [batch, L, out_dim·∏patch] f32
+        let x = self.apply_head(&x, e)?; // [batch, L, out_dim·∏patch] f32
         let op = x.shape()[2];
 
         // Unpatchify each batch element back to [out_dim, F, H, W].
@@ -723,6 +729,19 @@ impl WanTransformer {
             )?);
         }
         Ok(out)
+    }
+
+    pub fn forward_cached(
+        &self,
+        latent: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+        batch: usize,
+    ) -> Result<Vec<Array>> {
+        let (e, e0) = self.time_embed(t)?;
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
     }
 
     /// Full DiT forward for a single latent (B=1). `latent`: `[C, F, H, W]` (f32). `t`: integer-valued
@@ -760,44 +779,8 @@ impl WanTransformer {
         sin: &Array,
         batch: usize,
     ) -> Result<Vec<Array>> {
-        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
-        let l = (grid.0 * grid.1 * grid.2) as i32;
-        let dim = self.cfg.dim as i32;
-        let x1 = bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, dim])?;
-        let mut x = if batch > 1 {
-            broadcast_to(&x1, &[batch as i32, l, dim])?
-        } else {
-            x1
-        };
-
         let (e, e0) = self.time_embed_tokens(t_tokens)?;
-
-        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
-            x = block.forward(&x, &e0, kv, cos, sin)?;
-        }
-
-        let x = self.apply_head(&x, &e)?; // [batch, L, out_dim·∏patch] f32
-        let op = x.shape()[2];
-        if batch == 1 {
-            let xb = x.reshape(&[l, op])?;
-            return Ok(vec![unpatchify(
-                &xb,
-                grid,
-                self.cfg.out_dim,
-                self.cfg.patch_size,
-            )?]);
-        }
-        let mut out = Vec::with_capacity(batch);
-        for part in split(&x, batch as i32, 0)? {
-            let xb = part.reshape(&[l, op])?;
-            out.push(unpatchify(
-                &xb,
-                grid,
-                self.cfg.out_dim,
-                self.cfg.patch_size,
-            )?);
-        }
-        Ok(out)
+        self.forward_with_modulation(latent, &e, &e0, cross_kv, cos, sin, batch)
     }
 
     /// B=1 per-token convenience wrapper (builds the caches on the fly + runs [`forward_tokens_cached`]
