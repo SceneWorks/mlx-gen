@@ -46,9 +46,7 @@ const IP_DEFAULT_SCALE: f32 = 0.6;
 /// SDXL-base-1.0 production defaults (the SceneWorks `MlxSdxlAdapter`): 30 inference steps,
 /// CFG 7.0, native 1024². Used when a request omits the corresponding field (consumed by the
 /// `generate` pipeline slice, sc-2400 S5).
-#[allow(dead_code)]
 pub(crate) const DEFAULT_STEPS: u32 = 30;
-#[allow(dead_code)]
 pub(crate) const DEFAULT_GUIDANCE: f32 = 7.0;
 
 /// The few-step acceleration samplers (sc-2769). Selected per request via `req.sampler`; each is
