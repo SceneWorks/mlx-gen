@@ -18,7 +18,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::host_i32;
 use mlx_gen::nn::{gelu_exact, gelu_quick};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::{ClipActivation, ClipTextConfig};
 
@@ -207,6 +207,17 @@ impl ClipTextEncoder {
         let sh = input_ids.shape();
         let (b, n) = (sh[0], sh[1]);
         let dim = self.token_embedding.shape()[1];
+
+        // Defensive bound: the position-embedding gather below indexes `0..n` into the `[max_len, D]`
+        // table. MLX gathers are not bounds-checked, so `n` past the table would silently produce
+        // garbage embeddings. The tokenizer caps at `MAX_LENGTH`, but guard here too so any other
+        // caller surfaces a typed error instead (F-062).
+        let max_pos = self.position_embedding.shape()[0];
+        if n > max_pos {
+            return Err(Error::Msg(format!(
+                "sdxl clip: sequence length {n} exceeds position-embedding capacity {max_pos}"
+            )));
+        }
 
         // Token + position embeddings. `position_embedding.weight[:N]` broadcast over the batch.
         let ids_flat = input_ids.reshape(&[b * n])?;

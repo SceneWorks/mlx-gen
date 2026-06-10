@@ -31,6 +31,11 @@ const MERGES_END: usize = 49152 - 256 - 2 + 1;
 /// NOT EOS, so the encoder's `argmax(-1)` EOS-pooling still finds the real end-of-text token.
 pub const PAD_ID: i32 = 0;
 
+/// CLIP context length (`ClipTextConfig.max_length`). The position-embedding table is `[77, D]`, so a
+/// prompt that tokenizes to more than this many ids would gather out-of-bounds position rows (silent
+/// garbage in MLX). diffusers truncates at 77; `tokenize` does the same (F-062).
+pub const MAX_LENGTH: usize = 77;
+
 /// A loaded CLIP BPE tokenizer.
 pub struct ClipBpeTokenizer {
     /// Adjacent-symbol bigram → merge rank (lower = merged first).
@@ -158,6 +163,14 @@ impl ClipBpeTokenizer {
             }
         }
         ids.push(self.eos_id);
+        // Cap at the CLIP context length (F-062): a longer prompt would gather out-of-bounds rows
+        // from the `[77, D]` position-embedding table → silent garbage conditioning. diffusers
+        // truncates the same way — keep BOS + the first content tokens, force EOS into the last slot.
+        // Parity is unaffected for the <=77-token domain the goldens cover.
+        if ids.len() > MAX_LENGTH {
+            ids.truncate(MAX_LENGTH);
+            ids[MAX_LENGTH - 1] = self.eos_id;
+        }
         Ok(ids)
     }
 
@@ -228,5 +241,42 @@ mod tests {
             .collect();
         // letters run together; each digit is separate; punctuation runs grouped.
         assert_eq!(toks, vec!["a", "red", "fox", ",", "1", "0", "2", "4", "!"]);
+    }
+
+    /// Build a tiny tokenizer with no merges: each single-letter word `x` → one `x</w>` token. Enough
+    /// to exercise the length cap without loading the real vocab/merges.
+    fn tiny_tokenizer() -> ClipBpeTokenizer {
+        let mut vocab = HashMap::new();
+        vocab.insert("<|startoftext|>".to_string(), 49406);
+        vocab.insert("<|endoftext|>".to_string(), 49407);
+        vocab.insert("a</w>".to_string(), 320);
+        ClipBpeTokenizer {
+            bpe_ranks: HashMap::new(),
+            vocab,
+            pat: Regex::new(CLIP_PATTERN).unwrap(),
+            bos_id: 49406,
+            eos_id: 49407,
+        }
+    }
+
+    #[test]
+    fn tokenize_caps_at_max_length_with_eos_last() {
+        // F-062: a prompt longer than the CLIP context window must be truncated to MAX_LENGTH, not
+        // produce ids that gather out of bounds from the [77, D] position table.
+        let tok = tiny_tokenizer();
+        // 100 single-letter words → 100 content tokens + BOS + EOS = 102 ids before the cap.
+        let prompt = "a ".repeat(100);
+        let ids = tok.tokenize(&prompt).unwrap();
+        assert_eq!(ids.len(), MAX_LENGTH, "must cap at the context length");
+        assert_eq!(ids[0], 49406, "BOS preserved");
+        assert_eq!(ids[MAX_LENGTH - 1], 49407, "EOS forced into the last slot");
+    }
+
+    #[test]
+    fn tokenize_short_prompt_is_unchanged() {
+        // The cap must not touch prompts within the window — parity for the golden domain.
+        let tok = tiny_tokenizer();
+        let ids = tok.tokenize("a a a").unwrap();
+        assert_eq!(ids, vec![49406, 320, 320, 320, 49407]);
     }
 }
