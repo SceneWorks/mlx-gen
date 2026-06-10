@@ -176,14 +176,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-fn solver_kind(sampler: Option<&str>) -> SolverKind {
-    match sampler {
-        Some("euler") => SolverKind::Euler,
-        Some("dpmpp2m") | Some("dpm++") => SolverKind::Dpmpp2m,
-        _ => SolverKind::UniPC,
-    }
-}
-
 /// Preprocess a list of frame [`Image`]s → a channels-first `[3, F, H, W]` clip in `[-1, 1]` (the
 /// Wan VAE input convention), via the per-frame cover-fit lanczos resize + center-crop.
 fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
@@ -250,7 +242,8 @@ impl Generator for WanVace {
         let height = align_dim(req.height, base.patch_size.1, VAE_S);
         let steps = req.steps.map(|s| s as usize).unwrap_or(base.sample_steps);
         let shift = req.scheduler_shift.unwrap_or(base.sample_shift);
-        let kind = solver_kind(req.sampler.as_deref());
+        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
+        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
         let seed = req.seed.unwrap_or_else(default_seed);
         let guidance = req
             .guidance
