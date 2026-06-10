@@ -42,6 +42,9 @@ const NUM_SINGLE_BLOCKS: usize = 38;
 /// `timestep_to_start_cfg` unset — the upstream PuLID default (the photoreal preset overrides to 4
 /// via `req.timestep_to_start_cfg`).
 const DEFAULT_TIMESTEP_TO_START_CFG: usize = 1;
+/// ArcFace (antelopev2) face embedding width — the first half of the IdFormer `id_cond`
+/// (`cat(arcface, id_cond_vit)`). The id_cond_vit half is the EVA head's `proj_dim`.
+const ARCFACE_DIM: i32 = 512;
 
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
@@ -126,15 +129,25 @@ impl PulidFlux {
     /// The unconditional id_embedding — IDFormer over **zeroed** id_cond + zeroed hidden states (the
     /// PuLID `get_id_embedding(cal_uncond=True)` path), injected on the negative real-CFG branch.
     pub fn compute_uncond_id_embedding(&self) -> Result<Array> {
-        let id_cond = Array::from_slice(&vec![0f32; 1280], &[1, 1280]);
-        let hidden: Vec<Array> = (0..5)
-            .map(|_| Array::from_slice(&vec![0f32; 577 * 1024], &[1, 577, 1024]))
+        // Derive the EVA token geometry from the loaded tower's config, not the default-tower
+        // constants (F-082): seq = grid²+1 (CLS + patches) = 577, embed = embed_dim = 1024, and one
+        // zeroed hidden state per captured block (5). `id_cond` is the IdFormer input width (ArcFace
+        // 512 + the EVA head's proj_dim 768).
+        let cfg = self.eva.config();
+        let seq = cfg.grid() * cfg.grid() + 1;
+        let embed = cfg.embed_dim;
+        let id_cond_dim = ARCFACE_DIM + cfg.proj_dim;
+        let id_cond = Array::from_slice(&vec![0f32; id_cond_dim as usize], &[1, id_cond_dim]);
+        let hidden: Vec<Array> = cfg
+            .hidden_capture
+            .iter()
+            .map(|_| Array::from_slice(&vec![0f32; (seq * embed) as usize], &[1, seq, embed]))
             .collect();
         self.idformer.forward(&id_cond, &hidden)
     }
 
     fn eva_image_size(&self) -> i32 {
-        EvaConfig::default().image_size
+        self.eva.config().image_size
     }
 
     fn reference_face<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {

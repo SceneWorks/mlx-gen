@@ -128,6 +128,13 @@ impl EvaVisionTransformer {
         &self.rope
     }
 
+    /// The tower's loaded [`EvaConfig`]. Consumers (e.g. PuLID's uncond-embedding builder) derive the
+    /// EVA token geometry (`grid²+1` sequence length, `embed_dim`, hidden-capture count) from this
+    /// rather than re-hardcoding the default-tower constants (F-082).
+    pub fn config(&self) -> &EvaConfig {
+        &self.cfg
+    }
+
     /// `pixel_values`: NHWC `[B, image_size, image_size, 3]`, EVA-normalized.
     pub fn forward(&self, pixel_values: &Array) -> Result<EvaOutput> {
         let mut x = self.patch_embed.forward(pixel_values)?; // [B, grid², embed]
@@ -154,5 +161,32 @@ impl EvaVisionTransformer {
             id_cond_vit,
             hidden,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-082: the EVA token geometry PuLID's uncond builder derives from the config must reproduce the
+    /// previously-hardcoded default-tower constants (577×1024 over 5 captures) AND track a non-default
+    /// `image_size`, so the constructor's "any EvaConfig" contract is honored, not silently assumed.
+    #[test]
+    fn derived_token_geometry_matches_and_tracks_config() {
+        let cfg = EvaConfig::default();
+        assert_eq!(cfg.grid() * cfg.grid() + 1, 577, "grid²+1 = 577 for 336/14");
+        assert_eq!(cfg.embed_dim, 1024);
+        assert_eq!(cfg.hidden_capture.len(), 5);
+
+        // A larger square input (one more patch per side) shifts the derived sequence length.
+        let bigger = EvaConfig {
+            image_size: cfg.image_size + cfg.patch,
+            ..cfg.clone()
+        };
+        assert_eq!(bigger.grid(), cfg.grid() + 1);
+        assert_eq!(
+            bigger.grid() * bigger.grid() + 1,
+            (cfg.grid() + 1) * (cfg.grid() + 1) + 1
+        );
     }
 }
