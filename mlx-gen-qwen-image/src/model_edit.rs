@@ -14,20 +14,20 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
+    Result, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
-use crate::model::{validate_request, LIGHTNING_SAMPLER};
+use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decoded_to_image, denoise_edit_with_progress, qwen_scheduler, unpack_latents,
+    create_noise, decode_and_collect, denoise_edit_with_progress, resolve_run_params,
+    LIGHTNING_SAMPLER,
 };
-use crate::sampler::{lightning, FlowMatchSampler};
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
 use crate::transformer::QwenTransformer;
@@ -35,14 +35,6 @@ use crate::vae::QwenVae;
 use crate::vl_tokenizer::{
     condition_resize_dims, encode_reference_latents, preprocess_edit_image, tokenize_edit_text,
 };
-
-/// Qwen-Image-Edit default inference steps (the fork's `num_inference_steps`).
-const DEFAULT_STEPS: u32 = 4;
-/// Qwen-Image-Edit default CFG guidance (the fork's `guidance=4.0`).
-const DEFAULT_GUIDANCE: f32 = 4.0;
-/// Lightning default steps — must match the loaded LoRA variant (4-step / 8-step); 8 is the
-/// higher-quality default (e.g. `lightx2v/Qwen-Image-Edit-2511-Lightning` 8-step). sc-2909.
-const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
 /// Registry id for Qwen-Image-Edit.
 pub const MODEL_ID: &str = "qwen_image_edit";
@@ -168,19 +160,11 @@ impl Generator for QwenImageEdit {
         let first = references[0];
         let last = *references.last().expect("validated non-empty");
 
-        // `req.sampler == "lightning"` selects the few-step Lightning recipe (sc-2909): static-shift
-        // schedule + CFG-off single forward + its own step default. Unset = production. The matching
-        // Edit Lightning LoRA must be supplied via `spec.adapters`.
-        let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
-        let default_steps = if is_lightning {
-            LIGHTNING_DEFAULT_STEPS
-        } else {
-            DEFAULT_STEPS
-        };
-        let steps = req.steps.unwrap_or(default_steps) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Shared step/sampler/guidance/seed resolution (F-117): `req.sampler == "lightning"` selects
+        // the few-step recipe (its matching Edit Lightning LoRA must be supplied via `spec.adapters`),
+        // else the production resolution-dependent schedule.
         let (out_w, out_h) = (req.width, req.height);
+        let params = resolve_run_params(req, out_w, out_h);
 
         // VL condition / dual-latent reference resolution (~384² area, /32). The fork's
         // `_compute_dimensions` derives all dims from `image_paths[-1]`, so the dual-latent
@@ -205,7 +189,7 @@ impl Generator for QwenImageEdit {
         // branch is built only for true CFG — the Lightning LoRAs are CFG-distilled, so Lightning
         // runs CFG-off (a single forward/step).
         let pos = self.encode_edit(&req.prompt, pre.n_image_tokens, &vision)?;
-        let neg = if is_lightning {
+        let neg = if params.is_lightning {
             None
         } else {
             Some(self.encode_edit(
@@ -233,37 +217,31 @@ impl Generator for QwenImageEdit {
             concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
         };
 
-        // Build the sampler once (seed-independent): the static-shift Lightning schedule, or the
-        // production `qwen_scheduler` (resolution-dependent).
-        let sampler = if is_lightning {
-            lightning(steps)
-        } else {
-            FlowMatchSampler::new(qwen_scheduler(steps, out_w, out_h).sigmas)
-        };
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let noise = create_noise(seed, out_w, out_h)?;
-            let latents = denoise_edit_with_progress(
-                &self.transformer,
-                &sampler,
-                noise,
-                &static_latents,
-                &cond_grids,
-                &pos,
-                neg.as_ref(),
-                guidance,
-                out_w,
-                out_h,
-                &req.cancel,
-                on_progress,
-            )?;
-
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents, out_w, out_h)?;
-            let decoded = self.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        let images = decode_and_collect(
+            &self.vae,
+            req.count,
+            params.base_seed,
+            out_w,
+            out_h,
+            on_progress,
+            |seed, progress| {
+                let noise = create_noise(seed, out_w, out_h)?;
+                denoise_edit_with_progress(
+                    &self.transformer,
+                    &params.sampler,
+                    noise,
+                    &static_latents,
+                    &cond_grids,
+                    &pos,
+                    neg.as_ref(),
+                    params.guidance,
+                    out_w,
+                    out_h,
+                    &req.cancel,
+                    progress,
+                )
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }

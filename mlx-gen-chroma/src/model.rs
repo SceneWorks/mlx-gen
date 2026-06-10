@@ -13,9 +13,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    WeightsSource,
+    default_seed, CancelFlag, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
+    Progress, Result, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
@@ -154,6 +154,7 @@ impl Chroma {
         steps: u32,
         guidance: f32,
         latents: Array,
+        cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let (tok, t5, tr, _) = self.parts()?;
@@ -197,6 +198,11 @@ impl Chroma {
 
         let mut latents = latents;
         for t in 0..n {
+            // Honor the engine cancellation contract every other image provider implements (F-096):
+            // an HD 28-step dual-forward 1024² render runs minutes, so check before each step.
+            if cancel.is_cancelled() {
+                return Err(Error::Msg("generation cancelled".into()));
+            }
             let ts = Array::from_slice(&[sampler.timestep(t)], &[1]);
             let pos = tr.forward(
                 &latents,
@@ -293,6 +299,10 @@ impl Generator for Chroma {
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
+            // Cancel between images too, so a multi-image batch stops promptly (F-096).
+            if req.cancel.is_cancelled() {
+                return Err(Error::Msg("generation cancelled".into()));
+            }
             let seed = base_seed.wrapping_add(i as u64);
             let latents = create_noise(seed, req.width, req.height)?;
             let final_latents = self.denoise(
@@ -303,6 +313,7 @@ impl Generator for Chroma {
                 steps,
                 guidance,
                 latents,
+                &req.cancel,
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
@@ -322,4 +333,38 @@ inventory::submit! {
 
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_flash, load: load_flash }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Chroma with no weights — enough to exercise the request-boundary paths (`validate`,
+    /// cancellation) that run before any tensor is touched.
+    fn weightless(variant: ChromaVariant) -> Chroma {
+        Chroma {
+            descriptor: variant.descriptor(),
+            variant,
+            tokenizer: None,
+            t5: None,
+            transformer: None,
+            vae: None,
+        }
+    }
+
+    #[test]
+    fn generate_honors_pre_cancellation() {
+        // F-096: an already-cancelled request must abort before any forward, returning the same
+        // "generation cancelled" error the FLUX crates use. The per-image cancel check runs before
+        // `denoise`, so this needs no loaded weights.
+        let model = weightless(ChromaVariant::Hd);
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        req.cancel.cancel();
+        let mut nop = |_p: Progress| {};
+        let err = model.generate(&req, &mut nop).unwrap_err().to_string();
+        assert!(err.contains("generation cancelled"), "got: {err}");
+    }
 }

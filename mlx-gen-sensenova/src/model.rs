@@ -238,13 +238,7 @@ impl Generator for SenseNova {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
-        if !req.width.is_multiple_of(CELL) || !req.height.is_multiple_of(CELL) {
-            return Err(Error::Msg(format!(
-                "sensenova_u1_8b: {}x{} must be a multiple of {CELL} per side",
-                req.width, req.height
-            )));
-        }
-        Ok(())
+        validate_dims_and_steps(req)
     }
 
     fn generate(
@@ -294,6 +288,24 @@ impl Generator for SenseNova {
         }
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Request-boundary checks beyond the capability surface: 32-pixel alignment per side and a positive
+/// step count. Factored out so it can be unit-tested without loaded weights.
+fn validate_dims_and_steps(req: &GenerationRequest) -> Result<()> {
+    if !req.width.is_multiple_of(CELL) || !req.height.is_multiple_of(CELL) {
+        return Err(Error::Msg(format!(
+            "sensenova_u1_8b: {}x{} must be a multiple of {CELL} per side",
+            req.width, req.height
+        )));
+    }
+    // `steps == 0` builds an empty denoise trajectory, so `generate`/`it2i_generate`/`interleave_gen`
+    // panic on `.last().expect("at least one step")` (F-125). Reject it at the boundary; `None` falls
+    // back to the variant default.
+    if req.steps == Some(0) {
+        return Err(Error::Msg("sensenova_u1_8b: steps must be >= 1".into()));
+    }
+    Ok(())
 }
 
 /// Decode an [`Image`] (RGB8 HWC) to a `[3,H,W]` f32 tensor in `[0,1]`, smart-resized to a
@@ -410,5 +422,31 @@ mod tests {
         // Capability floor passes (in range) but the 32-alignment check rejects 300.
         assert!(d.capabilities.validate_request(MODEL_ID, &req).is_ok());
         assert!(!300u32.is_multiple_of(CELL));
+        let err = validate_dims_and_steps(&req).unwrap_err().to_string();
+        assert!(err.contains("multiple of"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_steps() {
+        // F-125: `steps == 0` builds an empty denoise trajectory → `.expect("at least one step")`
+        // panic. Reject at the boundary; `None` and any positive count pass.
+        let bad = GenerationRequest {
+            width: 512,
+            height: 512,
+            steps: Some(0),
+            ..Default::default()
+        };
+        let err = validate_dims_and_steps(&bad).unwrap_err().to_string();
+        assert!(err.contains("steps must be >= 1"), "got: {err}");
+
+        for steps in [None, Some(1), Some(50)] {
+            let ok = GenerationRequest {
+                width: 512,
+                height: 512,
+                steps,
+                ..Default::default()
+            };
+            assert!(validate_dims_and_steps(&ok).is_ok(), "steps={steps:?}");
+        }
     }
 }

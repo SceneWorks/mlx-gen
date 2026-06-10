@@ -47,6 +47,7 @@ const MAX_OBJ_PTRS: i32 = 16;
 const MEM_STRIDE: i32 = 1; // memory_temporal_stride_for_eval
 
 /// A frame's encoded image features (`Sam2ImageSegmenter.encode_image`).
+#[derive(Clone)]
 struct Encoded {
     /// Coarsest backbone-FPN map `[1, 256, 64, 64]` — the decoder image embedding + memory seq.
     vision_features: Array,
@@ -490,6 +491,11 @@ pub struct VideoState {
     /// Per-frame point prompts (1024-space coords `[1,n,2]`, labels `[1,n]`).
     points: BTreeMap<i32, (Array, Array)>,
     frames_tracked: BTreeMap<i32, bool>, // frame → reverse
+    /// Per-frame image-encoder output cached for prompted/corrected (cond) frames, so `preflight`'s
+    /// memory encode reuses the Hiera+FPN forward `run_single_frame` already ran instead of redoing
+    /// it (F-168, the torch reference's `cached_features`). Evicted in `preflight` after consumption,
+    /// so it only ever holds the handful of un-memory-encoded cond frames.
+    encoded: BTreeMap<i32, Encoded>,
 }
 
 impl Sam2VideoPredictor {
@@ -516,6 +522,7 @@ impl Sam2VideoPredictor {
             non_cond: BTreeMap::new(),
             points: BTreeMap::new(),
             frames_tracked: BTreeMap::new(),
+            encoded: BTreeMap::new(),
         }
     }
 
@@ -623,7 +630,7 @@ impl Sam2VideoPredictor {
             })
             .transpose()?;
 
-        let out = self.run_single_frame(
+        let (out, enc) = self.run_single_frame(
             state,
             frame_idx,
             is_init_cond,
@@ -635,12 +642,17 @@ impl Sam2VideoPredictor {
         let mask = out.pred_masks.clone();
         state.cond.insert(frame_idx, out);
         state.non_cond.remove(&frame_idx);
+        // Cache this cond frame's encoder output so `preflight` reuses it instead of re-encoding
+        // (F-168). `preflight` removes it once the memory is encoded.
+        state.encoded.insert(frame_idx, enc);
         Ok(mask)
     }
 
     /// `_run_single_frame_inference` (single object). Predict the frame's mask — from the prompt
     /// directly on an init cond frame, else conditioned on the memory bank — and optionally
     /// memory-encode it.
+    /// Returns the frame output and the `Encoded` image features it computed, so the caller can cache
+    /// them for `preflight` (F-168) rather than re-running the Hiera+FPN forward.
     #[allow(clippy::too_many_arguments)]
     fn run_single_frame(
         &self,
@@ -651,7 +663,7 @@ impl Sam2VideoPredictor {
         reverse: bool,
         prev_low: Option<&Array>,
         run_mem_encoder: bool,
-    ) -> Result<FrameOut> {
+    ) -> Result<(FrameOut, Encoded)> {
         let enc = self.encode_frame(state, frame_idx)?;
         let is_mask_from_points = point_inputs.is_some();
         let init_prompt = match (is_init_cond, prev_low.is_none(), point_inputs) {
@@ -702,7 +714,7 @@ impl Sam2VideoPredictor {
             frame.maskmem_features = Some(mf);
             frame.maskmem_pos_enc = Some(mp);
         }
-        Ok(frame)
+        Ok((frame, enc))
     }
 
     /// Ensure every cond frame's memory is encoded (`_propagate_preflight`).
@@ -714,7 +726,12 @@ impl Sam2VideoPredictor {
             .map(|(&f, _)| f)
             .collect();
         for frame_idx in to_encode {
-            let enc = self.encode_frame(state, frame_idx)?;
+            // Reuse the encoder output `add_points_internal` cached for this cond frame; only re-encode
+            // if it isn't there (e.g. a cond frame inserted by another path). Evicting frees it (F-168).
+            let enc = match state.encoded.remove(&frame_idx) {
+                Some(enc) => enc,
+                None => self.encode_frame(state, frame_idx)?,
+            };
             let out = state.cond.get(&frame_idx).unwrap();
             let is_mask_from_points = state.points.contains_key(&frame_idx);
             let (mf, mp) = self.model.encode_memory(
@@ -744,7 +761,9 @@ impl Sam2VideoPredictor {
             if let Some(out) = state.cond.get(&frame_idx) {
                 results.push((frame_idx, out.pred_masks.clone()));
             } else {
-                let out =
+                // Non-cond propagate frames are encoded once and never revisited, so their `Encoded`
+                // is dropped rather than cached (keeps the cache bounded to cond frames — F-168).
+                let (out, _enc) =
                     self.run_single_frame(state, frame_idx, false, None, false, None, true)?;
                 results.push((frame_idx, out.pred_masks.clone()));
                 state.non_cond.insert(frame_idx, out);

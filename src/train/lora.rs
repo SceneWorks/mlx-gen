@@ -146,8 +146,16 @@ pub fn install_training_lora<H: AdaptableHost>(
     alpha: f32,
 ) -> MlxResult<()> {
     for t in targets {
-        let a = params[&t.a_key].t(); // [r,in] -> [in,r]
-        let b_t = params[&t.b_key].t(); // [out,r] -> [r,out]
+        // `.get().ok_or_else()?` rather than a direct index: a bookkeeping bug that drops a key from
+        // the optimizer-stepped params map must surface as a typed error, not a panic (F-008).
+        let a = params
+            .get(&t.a_key)
+            .ok_or_else(|| Exception::custom(format!("LoRA param missing: {}", t.a_key)))?
+            .t(); // [r,in] -> [in,r]
+        let b_t = params
+            .get(&t.b_key)
+            .ok_or_else(|| Exception::custom(format!("LoRA param missing: {}", t.b_key)))?
+            .t(); // [out,r] -> [r,out]
         let rank = a.shape()[1] as f32;
         let b = b_t.multiply(Array::from_slice(&[alpha / rank], &[1]))?;
         let segs: Vec<&str> = t.path.split('.').collect();
@@ -193,14 +201,16 @@ pub fn save_lora_peft(
         .collect();
     let mut entries: Vec<(String, &Array)> = Vec::with_capacity(targets.len() * 3);
     for t in targets {
-        entries.push((
-            format!("{key_prefix}{}.lora_A.weight", t.path),
-            &params[&t.a_key],
-        ));
-        entries.push((
-            format!("{key_prefix}{}.lora_B.weight", t.path),
-            &params[&t.b_key],
-        ));
+        // `.get().ok_or_else()?` over a direct index so a missing param surfaces as a typed error
+        // rather than a panic mid-checkpoint (F-008).
+        let a = params
+            .get(&t.a_key)
+            .ok_or_else(|| crate::Error::Msg(format!("LoRA param missing: {}", t.a_key)))?;
+        let b = params
+            .get(&t.b_key)
+            .ok_or_else(|| crate::Error::Msg(format!("LoRA param missing: {}", t.b_key)))?;
+        entries.push((format!("{key_prefix}{}.lora_A.weight", t.path), a));
+        entries.push((format!("{key_prefix}{}.lora_B.weight", t.path), b));
     }
     for (k, v) in &alphas {
         entries.push((k.clone(), v));
@@ -343,7 +353,12 @@ pub fn save_lokr(
             t.w2b_key.as_ref(),
         ];
         for key in keys.into_iter().flatten() {
-            entries.push((key.to_string(), &params[key.as_ref()]));
+            // `.get().ok_or_else()?` over a direct index so a missing factor surfaces as a typed
+            // error rather than a panic mid-checkpoint (F-008).
+            let v = params
+                .get(key.as_ref())
+                .ok_or_else(|| crate::Error::Msg(format!("LoKr factor missing: {key}")))?;
+            entries.push((key.to_string(), v));
         }
     }
     let mut meta: HashMap<String, String> = HashMap::new();
@@ -454,6 +469,31 @@ impl TrainAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_lora_peft_errors_on_missing_param() {
+        // F-008: a target whose factor key isn't in the (empty) params map must surface a typed
+        // error, not a panic from a direct map index.
+        let target = LoraTarget {
+            path: "blocks.0.attn.to_q".into(),
+            a_key: Rc::from("blocks.0.attn.to_q.lora_a"),
+            b_key: Rc::from("blocks.0.attn.to_q.lora_b"),
+            in_f: 8,
+            out_f: 8,
+        };
+        let params: LoraParams = HashMap::new();
+        let err = save_lora_peft(
+            &params,
+            &[target],
+            1.0,
+            4,
+            "",
+            "/tmp/unused_sc4019.safetensors",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LoRA param missing"), "got: {err}");
+    }
 
     #[test]
     fn factorization_balances_and_respects_factor() {

@@ -282,6 +282,12 @@ pub fn trapezoidal_mask(
 
 /// Raw per-axis interval split (`split_in_spatial`): `(starts, ends, left_ramps, right_ramps)`.
 fn split_spatial(size: i32, overlap: i32, dim: i32) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    // Guard degenerate configs (F-005): a caller-supplied tile ≤ overlap (reachable via
+    // `TilingConfig::spatial_only`/`temporal_only`), or a tile floored to 0 by latent downscaling,
+    // would divide by zero — or wrap `amount` to a huge `usize` (capacity panic) — below. Clamp to a
+    // tile ≥ 1 and an overlap in `0..size`. For every valid config (`overlap < size`) this is a no-op.
+    let size = size.max(1);
+    let overlap = overlap.clamp(0, size - 1);
     if dim <= size {
         return (vec![0], vec![dim], vec![0], vec![0]);
     }
@@ -506,6 +512,44 @@ mod tests {
                     "{vae:?} axis {axis}: zero-weight output position (gap in tiling)"
                 );
             }
+        }
+    }
+
+    /// F-005: degenerate tile/overlap configs (tile == overlap, overlap > tile, and a tile floored to
+    /// 0 by latent downscaling) must not panic — they clamp to a valid split instead of dividing by
+    /// zero or wrapping `amount` to a huge length.
+    #[test]
+    fn split_spatial_survives_degenerate_overlap() {
+        // tile == overlap (would divide by zero), overlap > tile (would wrap), tile == 0 (floored).
+        for (size, overlap) in [(8, 8), (8, 16), (0, 0), (0, 4)] {
+            let (starts, ends, left, right) = split_spatial(size, overlap, 64);
+            assert!(
+                !starts.is_empty(),
+                "size={size} overlap={overlap}: no tiles"
+            );
+            assert_eq!(starts.len(), ends.len());
+            assert_eq!(left.len(), right.len());
+            assert_eq!(*ends.last().unwrap(), 64, "last tile must reach dim");
+        }
+    }
+
+    /// The crash is reachable through the public `plan` via `spatial_only`/`temporal_only` with a tile
+    /// ≤ overlap; it must produce a valid, gap-free plan rather than panicking.
+    #[test]
+    fn plan_survives_tile_equal_overlap() {
+        let cfg = TilingConfig::spatial_only(64, 64); // tile_px == overlap_px
+        let plan = cfg.plan(VaeTiling::WAN, 1, 16, 16);
+        for (tiles, out) in [(&plan.h, plan.out_h), (&plan.w, plan.out_w)] {
+            let mut weight = vec![0f32; out as usize];
+            for tile in tiles {
+                for (i, &m) in tile.mask.iter().enumerate() {
+                    weight[tile.out_start as usize + i] += m;
+                }
+            }
+            assert!(
+                weight.iter().all(|&v| v > 1e-6),
+                "tile==overlap plan left a zero-weight gap"
+            );
         }
     }
 }

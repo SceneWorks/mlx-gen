@@ -318,11 +318,13 @@ impl T2iModel {
         let hidden =
             self.backbone
                 .forward_cached(&embeds, &t, &h, &wid, Path::Und, &mut cache, true)?;
-        let logits = self.backbone.lm_head(&hidden)?; // [1, S, vocab]
+        // Only the last position's logits are kept, so slice the hidden state to `[1, 1, 4096]`
+        // *before* `lm_head` — applying it over the whole `[1, S, 4096]` prefix would materialize an
+        // `[1, S, vocab]` (~GB) tensor and an `S×4096×vocab` matmul just to drop all but one row (F-129).
+        let last_hidden = hidden.take_axis(Array::from_slice(&[n - 1], &[1]), 1)?;
+        let logits = self.backbone.lm_head(&last_hidden)?; // [1, 1, vocab]
         let vocab = logits.shape()[2];
-        let last = logits
-            .take_axis(Array::from_slice(&[n - 1], &[1]), 1)?
-            .reshape(&[vocab])?;
+        let last = logits.reshape(&[vocab])?;
         Ok((cache, last, ids.len()))
     }
 
@@ -484,6 +486,12 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
+        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
+        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
+        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
+        if steps == 0 {
+            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
+        }
         let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
         let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
         let ts_arr = if opts.enable_timestep_shift {
@@ -727,12 +735,14 @@ impl T2iModel {
         let hidden = self
             .backbone
             .forward_cached(embeds, t, h, w, Path::Und, &mut cache, true)?;
-        let logits = self.backbone.lm_head(&hidden)?;
+        // Slice the last hidden row before `lm_head` — only its logits are used, and the prefix here
+        // includes image-context blocks, so the full `[1, S, vocab]` projection is the worst case of
+        // F-129 (an `S×4096×vocab` matmul + ~GB tensor) repeated per CFG cache.
         let s = t.len() as i32;
+        let last_hidden = hidden.take_axis(Array::from_slice(&[s - 1], &[1]), 1)?;
+        let logits = self.backbone.lm_head(&last_hidden)?;
         let vocab = logits.shape()[2];
-        let last = logits
-            .take_axis(Array::from_slice(&[s - 1], &[1]), 1)?
-            .reshape(&[vocab])?;
+        let last = logits.reshape(&[vocab])?;
         let img_temporal = (*t.iter().max().unwrap_or(&0) + 1) as usize;
         Ok((cache, last, img_temporal))
     }
@@ -1069,13 +1079,12 @@ impl T2iModel {
         let hs = self
             .backbone
             .forward_cached(&embeds, &t, &hh, &ww, Path::Und, cache, true)?;
-        let logits = self.backbone.lm_head(&hs)?;
+        // Same one-row-kept pattern as the prefill paths (F-129): slice the kept hidden row (the `end`
+        // token at index `n_img`) before `lm_head` instead of projecting all `n_img + 1` rows.
+        let last_hidden = hs.take_axis(Array::from_slice(&[n_img], &[1]), 1)?;
+        let logits = self.backbone.lm_head(&last_hidden)?;
         let vocab = logits.shape()[2];
-        let last = logits
-            .take_axis(Array::from_slice(&[n_img], &[1]), 1)?
-            .reshape(&[vocab])?
-            .as_slice::<f32>()
-            .to_vec();
+        let last = logits.reshape(&[vocab])?.as_slice::<f32>().to_vec();
         let _ = (token_h, token_w);
         Ok((last, t_idx + 2))
     }
@@ -1273,6 +1282,12 @@ impl T2iModel {
         )?;
 
         let steps = opts.num_steps;
+        // `steps == 0` yields an empty trajectory (and a 0/0 NaN schedule), so the callers' final
+        // `.last().expect("at least one step")` would panic. Surface a typed error instead (F-125);
+        // the registered `Generator` rejects this upstream, but `interleave_gen`/`vqa` reach here too.
+        if steps == 0 {
+            return Err(Error::Msg("sensenova: num_steps must be >= 1".into()));
+        }
         let lin: Vec<f32> = (0..=steps).map(|i| i as f32 / steps as f32).collect();
         let lin_arr = Array::from_slice(&lin, &[(steps + 1) as i32]);
         let ts_arr = if opts.enable_timestep_shift {

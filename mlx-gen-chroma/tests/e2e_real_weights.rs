@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{LoadSpec, Progress, WeightsSource};
+use mlx_gen::{CancelFlag, LoadSpec, Progress, WeightsSource};
 use mlx_gen_chroma::{encode_prompt, load_chroma, ChromaVariant};
 use mlx_rs::ops::{abs, concatenate_axis, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -90,8 +90,19 @@ fn run_image_parity(variant: ChromaVariant, repo: &str, fixture: &str, guidance:
 
     let init = g.require("init_latents").unwrap();
     let mut nop = |_p: Progress| {};
+    let cancel = CancelFlag::default();
     let final_latents = model
-        .denoise(PROMPT, NEG, W, H, STEPS, guidance, init.clone(), &mut nop)
+        .denoise(
+            PROMPT,
+            NEG,
+            W,
+            H,
+            STEPS,
+            guidance,
+            init.clone(),
+            &cancel,
+            &mut nop,
+        )
         .unwrap();
     let fl_l2 = rel_l2(&final_latents, g.require("final_latents").unwrap());
     let img = model.decode(&final_latents, W, H).unwrap();

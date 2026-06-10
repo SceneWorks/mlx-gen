@@ -12,38 +12,20 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
+    Result, WeightsSource,
 };
-use mlx_rs::{Array, Dtype};
 
 use crate::loader;
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, decoded_to_image, denoise_with_progress,
-    encode_init_latents, init_time_step, qwen_scheduler, unpack_latents,
+    add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
+    encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, resolve_run_params,
+    LIGHTNING_SAMPLER,
 };
-use crate::sampler::{lightning, FlowMatchSampler};
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
-
-/// Qwen-Image default inference steps (the fork's `num_inference_steps`).
-const DEFAULT_STEPS: u32 = 4;
-/// Qwen-Image default CFG guidance (the fork's `guidance=4.0`).
-const DEFAULT_GUIDANCE: f32 = 4.0;
-/// Empty/whitespace negative prompts fall back to a single space (the fork's `QwenPromptEncoder`).
-const NEGATIVE_FALLBACK: &str = " ";
-
-/// The few-step **Lightning** acceleration sampler (sc-2909): the official lightx2v
-/// Qwen-Image-Lightning recipe — static flow-match shift 3.0 (no terminal rescale) + CFG-off single
-/// forward. Selected per request via `req.sampler`; requires the matching distillation LoRA (e.g.
-/// `lightx2v/Qwen-Image-Lightning`) supplied via `spec.adapters`. `req.sampler == None` is the
-/// production flow-match path.
-pub(crate) const LIGHTNING_SAMPLER: &str = "lightning";
-/// Lightning default steps — must match the loaded LoRA variant (4-step or 8-step). 8 is the
-/// higher-quality default (the fork README's `--steps 8`); set `req.steps` to match a 4-step LoRA.
-const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
 /// Registry id for Qwen-Image (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "qwen_image";
@@ -147,20 +129,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 impl QwenImage {
-    /// Prompt → conditioning embeds (bf16): apply the system template, tokenize, run the text
-    /// encoder, drop the 34 template tokens. An empty prompt is allowed only for the negative
-    /// branch (the caller substitutes a space).
-    fn encode_prompt(&self, prompt: &str) -> Result<Array> {
-        let t = self.tokenizer.tokenize(prompt)?;
-        if t.input_ids.shape()[1] == 0 {
-            return Err(Error::Msg("qwen_image: empty prompt".into()));
-        }
-        let embeds = self.text_encoder.encode(&t.input_ids, &t.attention_mask)?;
-        // PARITY-BF16 (sc-2609): round embeds to bf16 to match the fork (Qwen is bf16-native on disk,
-        // so this is near-lossless here — unlike Z-Image's f32 checkpoint; flip to f32 with the rest).
-        Ok(embeds.as_dtype(Dtype::Bfloat16)?)
-    }
-
     /// Extract the single img2img init image + its strength from the request's conditioning. The
     /// per-reference strength wins over `req.strength`. Qwen-Image T2I img2img conditions on exactly
     /// one init image, so more than one `Reference` is an error (the multi-image edit path is
@@ -202,29 +170,21 @@ impl Generator for QwenImage {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
-        // `req.sampler == "lightning"` selects the few-step Lightning recipe (sc-2909): a static-shift
-        // schedule + CFG-off single forward + its own step default. An unset sampler is production.
-        let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
-        let default_steps = if is_lightning {
-            LIGHTNING_DEFAULT_STEPS
-        } else {
-            DEFAULT_STEPS
-        };
-        let steps = req.steps.unwrap_or(default_steps) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Shared step/sampler/guidance/seed resolution (F-117); `req.sampler == "lightning"` selects
+        // the few-step recipe, else the production resolution-dependent schedule.
+        let params = resolve_run_params(req, req.width, req.height);
 
         // img2img: a single `Reference` image, with a per-reference strength overriding `req.strength`.
         // `start_step = 0` for pure txt2img (the fork's `Config.init_time_step`).
         let reference = self.resolve_reference(req)?;
         let start_step = match reference {
-            Some((_, strength)) => init_time_step(steps, strength),
+            Some((_, strength)) => init_time_step(params.steps, strength),
             None => 0,
         };
         let is_img2img = start_step > 0;
         // Lightning is the CFG-distilled few-step *txt2img* recipe; an init image (img2img) is out of
         // scope (its blend seeds a different trajectory than the distillation targets).
-        if is_lightning && is_img2img {
+        if params.is_lightning && is_img2img {
             return Err(Error::Msg(
                 "qwen_image: the lightning sampler is txt2img-only (no img2img init image)".into(),
             ));
@@ -232,61 +192,54 @@ impl Generator for QwenImage {
 
         // Positive conditioning (bf16) always. The negative branch is only built for true CFG; the
         // Lightning LoRAs are CFG-distilled, so Lightning runs CFG-off (a single forward/step).
-        let pos = self.encode_prompt(&req.prompt)?;
-        let neg = if is_lightning {
+        let pos = encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
+        let neg = if params.is_lightning {
             None
         } else {
-            let neg_prompt = match req.negative_prompt.as_deref() {
-                Some(s) if !s.trim().is_empty() => s,
-                _ => NEGATIVE_FALLBACK,
-            };
-            Some(self.encode_prompt(neg_prompt)?)
+            Some(encode_prompt(
+                &self.tokenizer,
+                &self.text_encoder,
+                negative_or_fallback(req),
+                MODEL_ID,
+            )?)
         };
 
-        // Build the sampler once (seed-independent): the static-shift Lightning schedule, or the
-        // production `qwen_scheduler` (resolution-dependent; img2img indexes `sigma(start_step)` for
-        // the blend, so it must match the fork's `config.scheduler.sigmas`).
-        let sampler = if is_lightning {
-            lightning(steps)
-        } else {
-            FlowMatchSampler::new(qwen_scheduler(steps, req.width, req.height).sigmas)
-        };
-
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            // Latents stay f32 through the loop: the fork keeps txt2img/img2img noise f32, and MLX
-            // promotes the bf16 transformer weights to f32 per-op (only `prompt_embeds` is bf16).
-            let noise = create_noise(seed, req.width, req.height)?;
-            let latents = if is_img2img {
-                // VAE-encode the init image to packed clean latents (f32), then blend with the noise
-                // at `sigma = sigmas[init_time_step]` (the fork's `create_for_txt2img_or_img2img`).
-                let (image, _) = reference.expect("is_img2img implies a reference");
-                let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
-                let sigma = sampler.sigma(start_step);
-                add_noise_by_interpolation(&clean, &noise, sigma)?
-            } else {
-                noise
-            };
-            let latents = denoise_with_progress(
-                &self.transformer,
-                &sampler,
-                latents,
-                &pos,
-                neg.as_ref(),
-                guidance,
-                req.width,
-                req.height,
-                start_step,
-                &req.cancel,
-                on_progress,
-            )?;
-
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents, req.width, req.height)?;
-            let decoded = self.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        let images = decode_and_collect(
+            &self.vae,
+            req.count,
+            params.base_seed,
+            req.width,
+            req.height,
+            on_progress,
+            |seed, progress| {
+                // Latents stay f32 through the loop: the fork keeps txt2img/img2img noise f32, and MLX
+                // promotes the bf16 transformer weights to f32 per-op (only `prompt_embeds` is bf16).
+                let noise = create_noise(seed, req.width, req.height)?;
+                let latents = if is_img2img {
+                    // VAE-encode the init image to packed clean latents (f32), then blend with the
+                    // noise at `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
+                    let (image, _) = reference.expect("is_img2img implies a reference");
+                    let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
+                    let sigma = params.sampler.sigma(start_step);
+                    add_noise_by_interpolation(&clean, &noise, sigma)?
+                } else {
+                    noise
+                };
+                denoise_with_progress(
+                    &self.transformer,
+                    &params.sampler,
+                    latents,
+                    &pos,
+                    neg.as_ref(),
+                    params.guidance,
+                    req.width,
+                    req.height,
+                    start_step,
+                    &req.cancel,
+                    progress,
+                )
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }

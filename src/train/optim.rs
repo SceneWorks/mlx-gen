@@ -22,6 +22,7 @@
 //! All trainable LoRA/LoKr factors are f32 (and 2-D), so the updates compute in f32; the per-family
 //! trainers keep their own gradient accumulation + `clip_grad_norm` + LR schedule and call `step`.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -302,12 +303,18 @@ impl Prodigy {
         let mut d_denom = 0.0f32;
         for (k, g) in grads.iter() {
             let Some(p) = params.get(k) else { continue };
-            let st = self.state.entry(k.clone()).or_insert_with(|| ProdigyState {
-                exp_avg: Array::zeros::<f32>(p.shape()).unwrap(),
-                exp_avg_sq: Array::zeros::<f32>(p.shape()).unwrap(),
-                s: Array::zeros::<f32>(p.shape()).unwrap(),
-                p0: p.clone(),
-            });
+            // `Array::zeros` is fallible, so build the initial state with `?` rather than `.unwrap()`
+            // in an `or_insert_with` closure — an allocation failure mid-training surfaces as a typed
+            // `Error`, not a process abort (F-008).
+            let st = match self.state.entry(k.clone()) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => e.insert(ProdigyState {
+                    exp_avg: Array::zeros::<f32>(p.shape())?,
+                    exp_avg_sq: Array::zeros::<f32>(p.shape())?,
+                    s: Array::zeros::<f32>(p.shape())?,
+                    p0: p.clone(),
+                }),
+            };
             // delta_numerator += (d/d0)·dlr·⟨g, p0 − p⟩
             let dot = sum_all(&multiply(g, &subtract(&st.p0, p)?)?)?;
             delta_numerator += (d / d0) * dlr * dot;

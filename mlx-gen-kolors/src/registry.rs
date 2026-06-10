@@ -29,7 +29,7 @@ use mlx_gen_sdxl::{
 
 use crate::ip_adapter::load_kolors_ip_adapter;
 use crate::model::{kolors_time_ids, DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
-use crate::sampler::KolorsEulerSampler;
+use crate::sampler::{KolorsEulerSampler, NUM_TRAIN_TIMESTEPS};
 use crate::Kolors;
 
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
@@ -392,6 +392,17 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.count, caps.max_count
         )));
     }
+    // `steps == 0` divides by zero in `KolorsEulerSampler::new` (`num_train_timesteps / num_steps`),
+    // and `steps > 1100` (the train-timestep count) makes `step_ratio == 0` so every timestep
+    // collapses to 1 — silent garbage. Reject both at the request boundary (F-124). `None` falls back
+    // to DEFAULT_STEPS.
+    if let Some(steps) = req.steps {
+        if steps == 0 || steps as usize > NUM_TRAIN_TIMESTEPS {
+            return Err(Error::Msg(format!(
+                "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS} (got {steps})"
+            )));
+        }
+    }
     if req.width < caps.min_size
         || req.height < caps.min_size
         || req.width > caps.max_size
@@ -472,6 +483,46 @@ mod tests {
             !err.contains("no generator registered"),
             "kolors should resolve in the registry; got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_bad_steps() {
+        // F-124: `steps == 0` would divide by zero in the sampler; `steps > NUM_TRAIN_TIMESTEPS`
+        // collapses every timestep to 1. Both must be rejected at the request boundary; `None` and an
+        // in-range count pass.
+        let caps = descriptor().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        for bad in [Some(0), Some(NUM_TRAIN_TIMESTEPS as u32 + 1)] {
+            let req = GenerationRequest {
+                steps: bad,
+                ..base.clone()
+            };
+            let err = validate_request(&caps, &req).unwrap_err().to_string();
+            assert!(err.contains("steps must be in"), "steps={bad:?} got: {err}");
+        }
+        for ok in [None, Some(1), Some(50), Some(NUM_TRAIN_TIMESTEPS as u32)] {
+            let req = GenerationRequest {
+                steps: ok,
+                ..base.clone()
+            };
+            assert!(validate_request(&caps, &req).is_ok(), "steps={ok:?}");
+        }
+    }
+
+    #[test]
+    fn sampler_rejects_zero_steps() {
+        // The defensive guard in `KolorsEulerSampler::new` (reached via `kolors`) returns a typed error
+        // rather than panicking on the divide-by-zero (F-124).
+        let err = match KolorsEulerSampler::kolors(0, mlx_rs::Dtype::Float32) {
+            Ok(_) => panic!("num_steps == 0 must error, not build a sampler"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("num_steps must be >= 1"), "got: {err}");
     }
 
     #[test]

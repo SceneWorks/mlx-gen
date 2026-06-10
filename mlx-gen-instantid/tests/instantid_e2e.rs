@@ -181,7 +181,7 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
         ..Default::default()
     };
     let out = model
-        .generate_with(&req, &ref_face.embedding, &kps)
+        .generate_with(&req, &ref_face.embedding, &kps, &mut |_| {})
         .expect("generate");
     assert_eq!((out.width, out.height), (size, size), "output dims");
     // Not a degenerate (all-zero / NaN→0) image.
@@ -287,7 +287,7 @@ fn instantid_pose_mode_preserves_identity() {
         ..Default::default()
     };
     let out = model
-        .generate_pose(&req, &ref_img, &dance_01_keypoints())
+        .generate_pose(&req, &ref_img, &dance_01_keypoints(), &mut |_| {})
         .expect("generate pose");
     assert_eq!((out.width, out.height), (size, size), "square pose output");
     let nonzero = out.pixels.iter().filter(|&&p| p != 0).count();
@@ -362,7 +362,7 @@ fn instantid_face_restore_improves_identity() {
         ..Default::default()
     };
     let base = model
-        .generate_pose(&req, &ref_img, &dance_01_keypoints())
+        .generate_pose(&req, &ref_img, &dance_01_keypoints(), &mut |_| {})
         .expect("generate pose");
     let base_face = model
         .largest_face(&base.pixels, size as usize, size as usize)
@@ -375,7 +375,7 @@ fn instantid_face_restore_improves_identity() {
         ..req.clone()
     };
     let restored = model
-        .restore_face(&restore_req, &base, &ref_face.embedding)
+        .restore_face(&restore_req, &base, &ref_face.embedding, &mut |_| {})
         .expect("restore face");
     assert_eq!(
         (restored.width, restored.height),
@@ -439,7 +439,7 @@ fn instantid_view_angle_preserves_identity() {
         ..Default::default()
     };
     let out = model
-        .generate_angle(&req, &ref_img, view)
+        .generate_angle(&req, &ref_img, view, &mut |_| {})
         .expect("generate view angle");
     save_png("instantid_e2e_angle_out.png", &out);
 
@@ -457,5 +457,72 @@ fn instantid_view_angle_preserves_identity() {
         cos > 0.4,
         "view-angle identity not preserved: ArcFace-cosine {cos:.4} (a turned view reduces cosine \
          vs a frontal reference; expected a clear positive signal)"
+    );
+}
+
+#[test]
+#[ignore = "needs SDXL base + InstantID + converted ip-adapter + face goldens + reference"]
+fn instantid_honors_cancellation() {
+    // sc-4380 (F-096 sibling): InstantID must honor the engine cancellation contract.
+    // 1) A pre-cancelled request aborts before any tensor work.
+    // 2) A flag tripped mid-denoise (from the progress callback) stops the loop at the next step.
+    let paths = InstantIdPaths {
+        sdxl_base: sdxl_base(),
+        identitynet: instantid_controlnet(),
+        ip_adapter: golden_path("instantid/ip-adapter.safetensors"),
+    };
+    let scrfd = golden("scrfd_10g.safetensors");
+    let arcface = golden("arcface_iresnet100.safetensors");
+    let model = InstantId::load(&paths)
+        .expect("load InstantID")
+        .with_face(&scrfd, &arcface)
+        .expect("attach face stack");
+
+    let g = golden("instantid_e2e_ref.safetensors");
+    let wh = g.require("ref_wh").unwrap().as_slice::<i32>().to_vec();
+    let ref_img = Image {
+        width: wh[0] as u32,
+        height: wh[1] as u32,
+        pixels: g.require("ref_img").unwrap().as_slice::<u8>().to_vec(),
+    };
+
+    // Pre-cancelled: aborts immediately with the canonical error.
+    let req = InstantIdRequest {
+        prompt: "a portrait photo".into(),
+        width: 512,
+        height: 512,
+        steps: 8,
+        ..Default::default()
+    };
+    req.cancel.cancel();
+    let err = model
+        .generate(&req, &ref_img, &mut |_| {})
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("generation cancelled"), "got: {err}");
+
+    // Mid-denoise: trip the flag from the first Step callback; the loop must stop early.
+    let req = InstantIdRequest {
+        prompt: "a portrait photo".into(),
+        width: 512,
+        height: 512,
+        steps: 8,
+        ..Default::default()
+    };
+    let cancel = req.cancel.clone();
+    let mut steps_seen = 0u32;
+    let err = model
+        .generate(&req, &ref_img, &mut |p| {
+            if let mlx_gen::Progress::Step { current, .. } = p {
+                steps_seen = steps_seen.max(current);
+                cancel.cancel();
+            }
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("generation cancelled"), "got: {err}");
+    assert!(
+        (1..=2).contains(&steps_seen),
+        "denoise should stop right after the cancel trip (saw step {steps_seen})"
     );
 }

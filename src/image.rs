@@ -152,6 +152,17 @@ fn resize_u8(
     filter: &dyn Fn(f64) -> f64,
 ) -> Vec<f32> {
     let c = 3usize;
+    // The inner loops index `src[(y*in_w + xmin + k)*c + ch]` trusting the caller's `in_h`/`in_w`. A
+    // buffer inconsistent with those dims (e.g. a request-supplied conditioning image whose
+    // `pixels.len()` doesn't match `width*height*3`) would otherwise panic deep in the loop with an
+    // opaque out-of-bounds index. Fail fast at the top with a clear message (F-007). All three public
+    // entry points funnel through here, and this is a no-op for every well-formed image.
+    assert!(
+        src.len() >= in_h * in_w * c,
+        "resize_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} RGB image (need {})",
+        src.len(),
+        in_h * in_w * c
+    );
     let bias = 1i64 << (PRECISION_BITS - 1);
 
     // Horizontal pass: (in_h, in_w) -> (in_h, out_w).
@@ -350,6 +361,24 @@ pub fn union_masks(a: &Image, b: &Image) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_accepts_correctly_sized_buffer() {
+        // A well-formed 2×2 RGB buffer (12 bytes) resizes without panicking (the F-007 guard is a
+        // no-op for valid inputs).
+        let src = vec![0u8; 2 * 2 * 3];
+        let out = resize_bicubic_u8(&src, 2, 2, 4, 4);
+        assert_eq!(out.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "pixel buffer too small")]
+    fn resize_rejects_undersized_buffer() {
+        // F-007: claiming a 4×4 image from an 8-byte buffer must fail fast with a clear message,
+        // not an opaque out-of-bounds index deep in the resample loop.
+        let src = vec![0u8; 8];
+        let _ = resize_bilinear_u8(&src, 4, 4, 2, 2);
+    }
 
     #[test]
     fn outpaint_border_mask_keeps_centered_source() {

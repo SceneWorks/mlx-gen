@@ -19,7 +19,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result, WeightsSource};
+use mlx_gen::{CancelFlag, Error, Progress, Result, WeightsSource};
 
 use mlx_gen_face::{Face, FaceAnalysis};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -105,6 +105,10 @@ pub struct InstantIdRequest {
     /// OpenPose `controlnet_conditioning_scale` — used only by [`InstantId::generate_pose`].
     pub openpose_scale: f32,
     pub seed: u64,
+    /// Cooperative cancellation, checked before each denoise step and between phases (sc-4380;
+    /// the engine contract every registry provider honors — see F-096). `Clone` shares the flag,
+    /// so the caller keeps a handle to cancel an in-flight generation.
+    pub cancel: CancelFlag,
 }
 
 impl Default for InstantIdRequest {
@@ -120,6 +124,7 @@ impl Default for InstantIdRequest {
             controlnet_scale: DEFAULT_CONTROLNET_SCALE,
             openpose_scale: DEFAULT_OPENPOSE_SCALE,
             seed: 0,
+            cancel: CancelFlag::default(),
         }
     }
 }
@@ -234,11 +239,16 @@ impl InstantId {
 
     /// Full T2I: letterbox the reference to the output size (the sc-2009 kps-distortion rule), detect
     /// the largest face, then generate. Requires [`with_face`](Self::with_face).
-    pub fn generate(&self, req: &InstantIdRequest, reference: &Image) -> Result<Image> {
+    pub fn generate(
+        &self,
+        req: &InstantIdRequest,
+        reference: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         let canvas = kps::letterbox(reference, req.width, req.height);
         let face = self.largest_face(&canvas.pixels, req.height as usize, req.width as usize)?;
         let kps: Vec<(f32, f32)> = face.kps.iter().map(|p| (p[0], p[1])).collect();
-        self.generate_with(req, &face.embedding, &kps)
+        self.generate_with(req, &face.embedding, &kps, on_progress)
     }
 
     /// **Multi-view angle generation** (sc-3117): rotate the reference identity to a named view from
@@ -252,6 +262,7 @@ impl InstantId {
         req: &InstantIdRequest,
         reference: &Image,
         view_angle: &str,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let side = req.width;
         let view = kps::view_angle_kps(view_angle, side).ok_or_else(|| {
@@ -268,7 +279,7 @@ impl InstantId {
             height: side,
             ..req.clone()
         };
-        self.generate_with(&sq, &face.embedding, &kps)
+        self.generate_with(&sq, &face.embedding, &kps, on_progress)
     }
 
     /// **Multi-view angle generation from caller-supplied landmarks** (sc-4425): the data-driven
@@ -311,7 +322,12 @@ impl InstantId {
         req: &InstantIdRequest,
         embedding: &[f32],
         kps: &[(f32, f32)],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Honor the engine cancellation contract (sc-4380 / F-096): bail before any tensor work.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
                 "instantid: ArcFace embedding must be 512-d, got {}",
@@ -357,13 +373,14 @@ impl InstantId {
             &pooled,
             &time_ids,
             req.guidance,
-            &Default::default(),
-            &mut |_| {},
+            &req.cancel,
+            on_progress,
             &control_ctx,
             &face_tokens, // IdentityNet cross-attn conditioning = face tokens
             &face_tokens, // UNet IP tokens = face tokens
             req.ip_adapter_scale,
         )?;
+        on_progress(Progress::Decoding);
         decode_image(&self.vae, &latents)
     }
 
@@ -418,6 +435,7 @@ impl InstantId {
         req: &InstantIdRequest,
         reference: &Image,
         keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let side = req.width;
         // Identity from the reference (letterboxed to the square canvas).
@@ -432,7 +450,13 @@ impl InstantId {
             height: side,
             ..req.clone()
         };
-        self.generate_pose_with(&sq, &face.embedding, face_kps.as_deref(), keypoints)
+        self.generate_pose_with(
+            &sq,
+            &face.embedding,
+            face_kps.as_deref(),
+            keypoints,
+            on_progress,
+        )
     }
 
     /// Re-place the reference's 5-point face landmarks at a pose's head box. Mirrors
@@ -479,7 +503,12 @@ impl InstantId {
         embedding: &[f32],
         face_kps: Option<&[(f32, f32)]>,
         keypoints: &[BodyPoint],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Honor the engine cancellation contract (sc-4380 / F-096): bail before any tensor work.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
                 "instantid: ArcFace embedding must be 512-d, got {}",
@@ -547,13 +576,14 @@ impl InstantId {
             &pooled,
             &time_ids,
             req.guidance,
-            &Default::default(),
-            &mut |_| {},
+            &req.cancel,
+            on_progress,
             &controls,
             &face_tokens, // ControlNet cross-attn conditioning = face tokens (both branches)
             &face_tokens, // UNet IP tokens = face tokens
             ip_scale,
         )?;
+        on_progress(Progress::Decoding);
         decode_image(&self.vae, &latents)
     }
 
@@ -573,7 +603,12 @@ impl InstantId {
         req: &InstantIdRequest,
         base: &Image,
         embedding: &[f32],
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Cancel between phases (sc-4380): the restore re-render is a full second denoise pass.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Msg("generation cancelled".into()));
+        }
         let face = self
             .face
             .as_ref()
@@ -613,7 +648,7 @@ impl InstantId {
             height: side,
             ..req.clone()
         };
-        let restored = self.generate_with(&restore_req, embedding, &kps)?;
+        let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
         let small_f = resize_lanczos_u8(
             &restored.pixels,
             side as usize,

@@ -9,15 +9,123 @@
 
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtract, sum_axes};
 use mlx_rs::transforms::eval;
-use mlx_rs::{random, Array};
+use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, DiffusionSampler, Error, FlowMatchEuler, Image, Progress, Result};
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{
+    default_seed, CancelFlag, DiffusionSampler, Error, FlowMatchEuler, GenerationRequest, Image,
+    Progress, Result,
+};
 
 use crate::control_transformer::QwenControlNet;
+use crate::sampler::{lightning, FlowMatchSampler};
+use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
+
+/// Default production inference steps (the fork's `qwen_image` signature default).
+pub const DEFAULT_STEPS: u32 = 4;
+/// Default true-CFG guidance scale.
+pub const DEFAULT_GUIDANCE: f32 = 4.0;
+/// Negative-prompt fallback (a single space) for the true-CFG branch when the request omits one.
+pub const NEGATIVE_FALLBACK: &str = " ";
+/// `req.sampler` value selecting the few-step Lightning recipe (sc-2909).
+pub const LIGHTNING_SAMPLER: &str = "lightning";
+/// Default step count for the Lightning recipe.
+pub const LIGHTNING_DEFAULT_STEPS: u32 = 8;
+
+/// Per-run scalars shared by all three Qwen generators: the Lightning flag, resolved step count and
+/// guidance, the per-batch base seed, and the (seed-independent) sampler. Extracted so the three
+/// `generate` paths can't drift apart (F-117).
+pub struct RunParams {
+    pub is_lightning: bool,
+    pub steps: usize,
+    pub guidance: f32,
+    pub base_seed: u64,
+    pub sampler: FlowMatchSampler,
+}
+
+/// Resolve the shared run parameters from a request: `sampler == "lightning"` selects the few-step
+/// static-shift schedule + its step default; otherwise the production resolution-dependent
+/// `qwen_scheduler`. Identical across T2I/Edit/Control (F-117).
+pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> RunParams {
+    let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
+    let default_steps = if is_lightning {
+        LIGHTNING_DEFAULT_STEPS
+    } else {
+        DEFAULT_STEPS
+    };
+    let steps = req.steps.unwrap_or(default_steps) as usize;
+    let sampler = if is_lightning {
+        lightning(steps)
+    } else {
+        FlowMatchSampler::new(qwen_scheduler(steps, width, height).sigmas)
+    };
+    RunParams {
+        is_lightning,
+        steps,
+        guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+        base_seed: req.seed.unwrap_or_else(default_seed),
+        sampler,
+    }
+}
+
+/// The true-CFG negative prompt: the request's negative when non-blank, else [`NEGATIVE_FALLBACK`].
+/// Shared by the T2I and Control generators (the Edit path conditions differently).
+pub fn negative_or_fallback(req: &GenerationRequest) -> &str {
+    match req.negative_prompt.as_deref() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => NEGATIVE_FALLBACK,
+    }
+}
+
+/// Prompt → conditioning embeds (bf16): tokenize, run the text encoder, round to bf16 (the fork is
+/// bf16-native on disk). Shared verbatim by the T2I and Control generators; `model_id` only labels
+/// the empty-prompt error. The Edit generator uses its own vision-conditioned `encode_edit`.
+pub fn encode_prompt(
+    tokenizer: &TextTokenizer,
+    text_encoder: &QwenTextEncoder,
+    prompt: &str,
+    model_id: &str,
+) -> Result<Array> {
+    let t = tokenizer.tokenize(prompt)?;
+    if t.input_ids.shape()[1] == 0 {
+        return Err(Error::Msg(format!("{model_id}: empty prompt")));
+    }
+    // PARITY-BF16 (sc-2609): round embeds to bf16 to match the fork (Qwen is bf16-native on disk).
+    let embeds = text_encoder.encode(&t.input_ids, &t.attention_mask)?;
+    Ok(embeds.as_dtype(Dtype::Bfloat16)?)
+}
+
+/// The per-count seed → final-latents → decode → collect loop shared by all three generators
+/// (F-117). `denoise_one(seed, on_progress)` runs the variant-specific denoise for one sample and
+/// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
+/// tick, unpack + VAE-decode, and image collection identically for every variant.
+pub fn decode_and_collect<F>(
+    vae: &QwenVae,
+    count: u32,
+    base_seed: u64,
+    width: u32,
+    height: u32,
+    on_progress: &mut dyn FnMut(Progress),
+    mut denoise_one: F,
+) -> Result<Vec<Image>>
+where
+    F: FnMut(u64, &mut dyn FnMut(Progress)) -> Result<Array>,
+{
+    let mut images = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let seed = base_seed.wrapping_add(i as u64);
+        let latents = denoise_one(seed, on_progress)?;
+        on_progress(Progress::Decoding);
+        let unpacked = unpack_latents(&latents, width, height)?;
+        let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+        images.push(decoded_to_image(&decoded)?);
+    }
+    Ok(images)
+}
 
 /// VAE latent channel count.
 pub const LATENT_CHANNELS: i32 = 16;

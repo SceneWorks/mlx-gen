@@ -134,6 +134,96 @@ sides run MLX Metal, so parity is near-bit.
 | `kolors_ip_adapter_golden.safetensors` | `dump_kolors_ip_adapter_golden.py` | `mlx-gen-kolors/tests/ip_adapter_parity.rs` | sc-3098 Kolors IP-Adapter-Plus components. `Kwai-Kolors/Kolors-IP-Adapter-Plus`: CLIP-**ViT-L/14-336** tower (transformers `CLIPVisionModelWithProjection`) + the IP-Adapter-Plus Resampler (a faithful torch port of the Tencent `Resampler`, dim 2048/depth 4/dim_head 64/heads 12 — loaded from `image_proj.*` with zero missing keys, pinning the config). Bundles `image` (raw u8 ref), `pixels` (CLIP-preprocessed NHWC [1,336,336,3]), `penultimate` ([1,577,1024]), `tokens` ([1,16,2048]). Gates: preprocess **byte-exact**, encoder penultimate cosine ~0.9997 (peak ~1.7e-2 = 24-layer f32 floor), resampler tokens peak_rel ~1.5e-3. Two Rust-only gates: `ip_scale=0` byte-identical to plain T2I (f32) + scale>0 perturbs & renders coherently. |
 | `kolors_chatglm_golden.safetensors` | `dump_kolors_chatglm_golden.py` | `tests/chatglm_parity.rs` | sc-3091 ChatGLM3-6B text encoder. Diffusers `KolorsPipeline` `ChatGLMModel` (`text_encoder/` fp16 shards, ~12.5 GB) run with `output_hidden_states=True` on two fixed inputs — `packed` (pure causal) and `padded` (right-pad → causal+padding mask) — for BOTH f32 and fp16 (`f16_` prefix). Bundles per case/dtype: `input_ids`/`attention_mask` + all 29 hidden states (permuted `[S,B,H]→[B,S,H]`) + `context` (`hidden_states[-2]`) + `pooled` (`hidden_states[-1]` last token). f32 worst hidden ~1.1e-3 (flat over depth = Metal-vs-CPU floor), fp16 worst ~1.7e-3. |
 
+### LTX-2.3 video (`mlx-gen-ltx`)
+
+Dumped from the frozen `mflux` fork's LTX reference (`~/repos/mflux`). Components feed staged parity
+tests; the e2e/i2v/av goldens gate the full pipeline. Several scripts also write shared input bundles
+(`transformer.safetensors`, `upsampler.safetensors`, `vae_decoder.safetensors`, `connector.safetensors`,
+`audio_vae.safetensors`) next to the golden — those are reused inputs, not goldens themselves.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `ltx_s0_golden.safetensors` | `dump_ltx_s0_golden.py` | `tests/s0_parity.rs` | sc-2679 S0 spike. |
+| `ltx_block_golden.safetensors` | `dump_ltx_block_golden.py` | `tests/block_parity.rs` | single DiT block forward. |
+| `ltx_dit_golden.safetensors` (+ `_bf16`) | `dump_ltx_dit_golden.py` | `tests/dit_parity.rs` | full DiT forward (f32 + bf16). |
+| `ltx_connector_golden.safetensors` | `dump_ltx_connector_golden.py` | `tests/connector_parity.rs` | TE→DiT connector. |
+| `ltx_gemma_golden.safetensors` (+ `_q8`/`_q4`) | `dump_ltx_gemma_golden.py` | `tests/gemma_parity.rs` | Gemma-3-12B TE, 49 hidden states; quant suffixes gate TE-quant (sc-2686). |
+| `ltx_te_golden.safetensors` | `dump_ltx_te_golden.py` | `tests/te_parity.rs` | text encoder + connector chain. |
+| `ltx_vae_golden.safetensors` | `dump_ltx_vae_golden.py` | `tests/vae_parity.rs` | VAE encode/decode. |
+| `ltx_vae_tiling_golden.safetensors` | `dump_ltx_vae_tiling_golden.py` | `tests/vae_parity.rs` | tiled VAE decode. |
+| `ltx_upsampler_golden.safetensors` | `dump_ltx_upsampler_golden.py` | `tests/upsampler_parity.rs` | latent upsampler. |
+| `ltx_pipeline_golden.safetensors` | `dump_ltx_pipeline_golden.py` | `tests/pipeline_parity.rs` | staged pipeline integration. |
+| `ltx_e2e_golden.safetensors` (+ `ltx_e2e_te`, `_q4`, `_q4_bf16`) | `dump_ltx_e2e_golden.py`, `dump_ltx_e2e_te.py` | `tests/e2e_parity.rs` | txt2v e2e (dense + Q4); the `_te` variant isolates the encode stage. |
+| `ltx_i2v_golden.safetensors` (+ `_bf16`) | `dump_ltx_i2v_golden.py` | `tests/i2v_parity.rs` | image-to-video (sc-2818). |
+| `ltx_keyframe_cond_golden.safetensors` | `dump_ltx_keyframe_cond_golden.py` | `tests/keyframe_cond_parity.rs` | keyframe-append / IC-LoRA conditioning (epic 3040). |
+| `ltx_replace_mask_golden.safetensors` | `dump_ltx_replace_mask_golden.py` | `tests/replace_mask_parity.rs` | replace-latent video mode (epic 3040). |
+| `ltx_lora_golden.safetensors` | `dump_ltx_lora_golden.py` | `tests/lora_real_weights.rs` | LoRA/LoKr in generate (sc-2687). |
+| `ltx_audio_vae_golden.safetensors` | `dump_ltx_audio_vae_golden.py` | `tests/audio_vae_parity.rs` | AV audio VAE. |
+| `ltx_av_dit_golden.safetensors` (+ `_bf16`) | `dump_ltx_av_dit_golden.py` | `tests/av_dit_parity.rs`, `tests/perf.rs` | audio-video joint DiT (`AvDiT`). |
+| `ltx_av_e2e_golden.safetensors` | `dump_ltx_av_e2e_golden.py` | `tests/av_e2e_parity.rs` | AV e2e. |
+| `ltx_av_lora_e2e_golden.safetensors` | `dump_ltx_av_lora_e2e_golden.py` | `tests/av_lora_e2e_parity.rs` | AV e2e with LoRA (sc-2687). |
+| `ltx_vocoder_golden.safetensors` | `dump_ltx_vocoder_golden.py` | `tests/vocoder_parity.rs` | audio vocoder. |
+
+### Wan-VACE video (`mlx-gen-wan`, sc-3388)
+
+Wan/VACE controllable-video goldens (the broader Wan converter/quant goldens live in `tests/fixtures/`
+and the `convert_*`/`*_parity` tests run weight-gated). Dumped from the diffusers Wan-VACE reference.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `wanvace_cond_golden.safetensors` | `dump_wanvace_cond_golden.py` | `tests/wanvace_cond_parity.rs` | VACE conditioning construction. |
+| `wanvace_transformer_golden.safetensors` (+ `wanvace_bisect`) | `dump_wanvace_transformer_golden.py`, `dump_wanvace_bisect.py` | `tests/wanvace_transformer_parity.rs` | VACE transformer forward (+ a bisection debug bundle). |
+| `wanvace_real_io.safetensors` | `dump_wanvace_real_golden.py` | `tests/wanvace_real_parity.rs`, `tests/wanvace_lora_real_parity.rs` | real-weight e2e I/O. |
+| `wanvace_lora_real_io.safetensors`, `wanvace_real_lora.safetensors` | `dump_wanvace_lora_real_golden.py` | `tests/wanvace_lora_real_parity.rs` | real-weight LoRA e2e. |
+
+### SVD image-to-video (`mlx-gen-svd`)
+
+Stable-Video-Diffusion goldens, dumped from the diffusers `StableVideoDiffusionPipeline` reference.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `svd_clip_preprocess_golden.safetensors` | `dump_svd_clip_preprocess_golden.py` | `tests/clip_preprocess_parity.rs` | CLIP image preprocess. |
+| `svd_image_encoder_golden.safetensors` | `dump_svd_image_encoder_golden.py` | `tests/image_encoder_parity.rs` | CLIP image encoder (conditioning). |
+| `svd_unet_golden.safetensors` | `dump_svd_unet_golden.py` | `tests/unet_parity.rs` | temporal U-Net forward. |
+| `svd_vae_golden.safetensors` | `dump_svd_vae_golden.py` | `tests/vae_parity.rs` | temporal VAE decode. |
+| `svd_scheduler_golden.safetensors` | `dump_svd_scheduler_golden.py` | `tests/scheduler_parity.rs` | EulerDiscrete (SVD) scheduler math. |
+| `svd_pipeline_golden.safetensors` | `dump_svd_pipeline_golden.py` | `tests/pipeline_parity.rs` | full pipeline integration. |
+
+### SenseNova-U1 unified AR + image gen (`mlx-gen-sensenova`, epic 3180)
+
+Two tiers: weight-free **synthetic** goldens (`*_golden.safetensors`) that gate the math on CI-sized
+inputs, and **real-weight** goldens (`*_realweight_golden.safetensors`) for the 35 GB e2e paths.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `tokenizer_golden.safetensors` | `build_sensenova_tokenizer.py` | `tests/tokenizer_parity.rs` | builds + validates the snapshot `tokenizer.json`. |
+| `backbone_golden.safetensors` | `dump_sensenova_backbone_golden.py` | `tests/backbone_parity.rs`, `tests/quant_smoke.rs` | dense dual-path Qwen3 backbone (sc-3182). |
+| `vision_golden.safetensors` | `dump_sensenova_vision_golden.py` | `tests/vision_parity.rs` | Conv patch-embed vision tower (sc-3183). |
+| `fm_golden.safetensors` | `dump_sensenova_fm_golden.py` | `tests/fm_parity.rs` | flow-matching head + sampler (sc-3184). |
+| `runtime_golden.safetensors` | `dump_sensenova_runtime_golden.py` | `tests/runtime_parity.rs` | AR KvCache + decode runtime (sc-3187). |
+| `t2i_golden.safetensors` | `dump_sensenova_t2i_golden.py` | `tests/t2i_parity.rs`, `tests/it2i_parity.rs` | T2I denoise (synthetic). |
+| `t2i_realweight_golden.safetensors` | `dump_sensenova_t2i_realweight.py` | `tests/t2i_realweight.rs`, `tests/it2i_realweight.rs` | T2I real-weight e2e (sc-3188). |
+| `it2i_golden.safetensors` | `dump_sensenova_it2i_golden.py` | `tests/it2i_parity.rs` | image-edit / Character (synthetic, sc-3189). |
+| `it2i_realweight_golden.safetensors` | `dump_sensenova_it2i_realweight.py` | `tests/it2i_realweight.rs` | image-edit real-weight e2e. |
+| `vqa_golden.safetensors` | `dump_sensenova_vqa_golden.py` | `tests/vqa_parity.rs` | VQA token stream (synthetic, sc-3191). |
+| `vqa_realweight_golden.safetensors` | `dump_sensenova_vqa_realweight.py` | `tests/vqa_realweight.rs` | VQA real-weight greedy decode. |
+| `interleave_golden.safetensors` | `dump_sensenova_interleave_golden.py` | `tests/interleave_parity.rs` | interleaved doc gen (synthetic, sc-3190). |
+| `interleave_realweight_golden.safetensors` | `dump_sensenova_interleave_realweight.py` | `tests/interleave_realweight.rs` | interleave real-weight e2e. |
+| `distill_golden.safetensors` | `dump_sensenova_distill_golden.py` | `tests/distill_parity.rs` | fast 8-step distill-LoRA merge (sc-3192). |
+| `fast_realweight_golden.safetensors` | `dump_sensenova_fast_realweight.py` | `tests/fast_realweight.rs` | fast variant real-weight e2e. |
+
+### Chroma (`mlx-gen-chroma`, epic 3531)
+
+FLUX-derived DiT with a distilled-guidance Approximator; T5-only conditioning. Dumped from the
+diffusers `ChromaPipeline` reference.
+
+| golden | dump script | consumed by | notes |
+|---|---|---|---|
+| `chroma_tiny_io.safetensors`, `chroma_tiny_weights.safetensors` | `dump_chroma_golden.py` | `tests/transformer_parity.rs`, `tests/approximator_parity.rs`, `tests/adapter_routing.rs` | tiny synthetic DiT + Approximator forward (+ LoRA/LoKr routing). |
+| `chroma_text_mask.safetensors` | `dump_chroma_text_mask_golden.py` | `tests/text_mask_parity.rs` | MMDiT text-mask construction. |
+| `chroma_e2e.safetensors` (`_hd`/`_base`/`_flash`) | `dump_chroma_e2e_golden.py {hd,base,flash}` | `tests/e2e_real_weights.rs` | full e2e parity for all three variants. |
+| _(tokenizer build, no golden)_ | `build_chroma_t5_tokenizer.py` | — | materializes the T5 `tokenizer.json` into the snapshot `tokenizer/` dir. |
+
 ### Weight-independent
 
 | golden | dump script | consumed by | notes |
@@ -152,3 +242,16 @@ A mismatch across a *different machine/GPU* is possible (Metal float results are
 bit-identical cross-device) and isn't necessarily a bug — treat `CHECKSUMS.txt` as "what this
 baseline produced," not a hard cross-machine contract. Only the goldens present when the file was
 generated are listed.
+
+> **Coverage caveat (F-153):** the committed `CHECKSUMS.txt` was last blessed against the
+> Z-Image / Qwen / FLUX.2 / SDXL families and does **not** yet list the LTX, Wan-VACE, SVD,
+> SenseNova, or Chroma goldens documented in the manifest above. It can only be regenerated on a
+> machine that actually holds the (gitignored, weights-dependent) goldens. **Re-bless from the full
+> directory** so every family is covered, rather than hand-editing a subset:
+>
+> ```sh
+> cd tools/golden && shasum -a 256 *.safetensors > CHECKSUMS.txt   # after a full re-dump
+> ```
+>
+> Until that next full re-dump, the `shasum -c` tripwire silently passes for any family it doesn't
+> list — so the manifest above is the source of truth for *what should exist*.

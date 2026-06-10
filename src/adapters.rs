@@ -195,6 +195,22 @@ pub fn conv_lora_delta(
     let src = up.dtype(); // f16 for kohya/community LoRAs; f32 makes the round-trip a no-op.
     let ds = down.shape(); // [rank, in, kH, kW]
     let us = up.shape(); // [out, rank, 1, 1]
+                         // A malformed conv LoRA with 2-D factors would panic on the `ds[2]`/`ds[3]` slice below; surface a
+                         // typed error up front instead, matching the tucker reconstructors' style (F-006).
+    if ds.len() != 4 || us.len() != 4 {
+        return Err(format!(
+            "conv LoRA: expected 4-D factors (down [rank,in,kH,kW], up [out,rank,1,1]), got down \
+             {ds:?} up {us:?}"
+        )
+        .into());
+    }
+    if us[1] != ds[0] {
+        return Err(format!(
+            "conv LoRA: rank mismatch between factors — down[0]={} but up[1]={} (down {ds:?} up {us:?})",
+            ds[0], us[1]
+        )
+        .into());
+    }
     let (r, cin, kh, kw) = (ds[0], ds[1], ds[2], ds[3]);
     let out = us[0];
     let down2 = down.reshape(&[r, cin * kh * kw])?; // [rank, in·kH·kW]
@@ -411,10 +427,6 @@ impl AdaptableLinear {
         matches!(self.base, LinearBase::Quantized(_))
     }
 
-    /// Diagnostic accessor: the quantized base's `(packed_weight, scales, biases, bias, group_size,
-    /// bits)`, or `None` if the base is still dense. Used by the sc-2604 Q8 root-cause diagnostic to
-    /// byte-compare the *loaded* model's quantization against the fork's `mx.quantize` (the
-    /// `qmm_smallk` probe only exercised the free `quantize` op, not `try_from_linear`).
     /// Diagnostic accessor: the dense base's `(weight, bias)`, or `None` if already quantized.
     /// Used by the sc-2604 diagnostic to inspect the loaded weight dtype before quantization.
     pub fn dense_weight(&self) -> Option<(&Array, Option<&Array>)> {
@@ -424,6 +436,10 @@ impl AdaptableLinear {
         }
     }
 
+    /// Diagnostic accessor: the quantized base's `(packed_weight, scales, biases, bias, group_size,
+    /// bits)`, or `None` if the base is still dense. Used by the sc-2604 Q8 root-cause diagnostic to
+    /// byte-compare the *loaded* model's quantization against the fork's `mx.quantize` (the
+    /// `qmm_smallk` probe only exercised the free `quantize` op, not `try_from_linear`).
     #[allow(clippy::type_complexity)]
     pub fn quantized_params(&self) -> Option<(&Array, &Array, &Array, Option<&Array>, i32, i32)> {
         match &self.base {
@@ -932,6 +948,26 @@ mod tests {
                 .unwrap()
                 .item::<bool>()
         );
+    }
+
+    #[test]
+    fn conv_lora_delta_rejects_non_4d_factors() {
+        // F-006: a malformed conv LoRA with 2-D factors must surface a typed error, not panic on the
+        // `ds[2]`/`ds[3]` slice. And a rank mismatch between the factors is rejected too.
+        let down2d = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        let up = Array::from_slice(&[10.0f32, 20.0], &[2, 1, 1, 1]);
+        let err = conv_lora_delta(&down2d, &up, 1.0, 1.0, 1.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("4-D factors"), "got: {err}");
+
+        // 4-D but mismatched rank: down rank 1, up rank 2.
+        let down = Array::from_slice(&[1.0f32, 2.0], &[1, 1, 1, 2]);
+        let up_bad = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2, 1, 1]);
+        let err = conv_lora_delta(&down, &up_bad, 1.0, 1.0, 1.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rank mismatch"), "got: {err}");
     }
 
     #[test]

@@ -18,7 +18,12 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
 use mlx_gen::sampler::AlphaSchedule;
-use mlx_gen::{DiffusionSampler, Result};
+use mlx_gen::{DiffusionSampler, Error, Result};
+
+/// Kolors' `num_train_timesteps` — the length of the `scaled_linear` schedule the sampler interpolates
+/// over. `num_steps` must lie in `1..=NUM_TRAIN_TIMESTEPS`: `0` divides by zero below, and a value above
+/// it makes `step_ratio == 0` so every timestep collapses to a single value.
+pub const NUM_TRAIN_TIMESTEPS: usize = 1100;
 
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
 pub struct KolorsEulerSampler {
@@ -38,7 +43,14 @@ pub struct KolorsEulerSampler {
 impl KolorsEulerSampler {
     /// Kolors defaults: `num_train_timesteps=1100`, β₀=0.00085, β₁=0.014, `steps_offset=1`.
     pub fn kolors(num_steps: usize, model_dtype: Dtype) -> Result<Self> {
-        Self::new(1100, 0.00085, 0.014, 1, num_steps, model_dtype)
+        Self::new(
+            NUM_TRAIN_TIMESTEPS,
+            0.00085,
+            0.014,
+            1,
+            num_steps,
+            model_dtype,
+        )
     }
 
     /// The img2img variant of [`Self::kolors`]: build the full `num_steps` schedule, then slice it at
@@ -83,6 +95,11 @@ impl KolorsEulerSampler {
         num_steps: usize,
         model_dtype: Dtype,
     ) -> Result<Self> {
+        // Defensive: `num_steps == 0` divides by zero at `num_train_timesteps / num_steps` below
+        // (F-124). The request boundary rejects this, but guard here so any caller gets a typed error.
+        if num_steps == 0 {
+            return Err(Error::Msg("kolors sampler: num_steps must be >= 1".into()));
+        }
         let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end)?;
         // Per-train-step Karras sigma √((1-ᾱ)/ᾱ) (the `alphas_cumprod` field is public).
         let full: Vec<f64> = sched
