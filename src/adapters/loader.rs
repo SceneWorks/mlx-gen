@@ -34,7 +34,7 @@ use super::{
 };
 use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
-use crate::Result;
+use crate::{Error, Result};
 
 /// PEFT LoKr per-module factor suffixes; each factor is full (`lokr_w1`/`lokr_w2`) or
 /// low-rank (`_a` @ `_b`). Exact-suffix matched, so order is for readability only.
@@ -143,9 +143,18 @@ pub fn parse_lokr(w: &Weights) -> Result<LokrFile> {
 /// and `Array::as_slice::<f32>()` `unwrap`s a hard dtype-mismatch (it never casts), so reading a bf16
 /// scalar that way panics. Cast to f32 first (exact for the small integer alphas these files carry, and
 /// a no-op when already f32); a `[]`- or `[1]`-shaped scalar both read as a one-element slice.
+///
+/// A size-0 `alpha` tensor (a malformed third-party adapter file) has no data pointer to borrow, so
+/// `as_slice` — `try_as_slice().unwrap()` — would panic rather than fall through to the trailing
+/// `first()`. Guard it like [`crate::array::host_i32`] so one bad file fails its single job with a
+/// typed error instead of aborting the worker.
 fn scalar_alpha(a: &Array) -> Result<Option<f32>> {
+    if a.size() == 0 {
+        return Ok(None);
+    }
     Ok(a.as_dtype(Dtype::Float32)?
-        .as_slice::<f32>()
+        .try_as_slice::<f32>()
+        .map_err(|e| Error::Msg(format!("scalar_alpha: not a readable scalar array: {e}")))?
         .first()
         .copied())
 }
@@ -1174,6 +1183,16 @@ mod tests {
         assert!(all_close(&got, &want, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    #[test]
+    fn scalar_alpha_empty_tensor_returns_none_not_panic() {
+        // sc-3959 (F-001): a malformed third-party adapter with a zero-length `.alpha` tensor must
+        // fail gracefully. Before the guard, `as_slice::<f32>()` (== `try_as_slice().unwrap()`)
+        // panicked on the size-0 array, aborting the whole worker; now it reads as `None`.
+        let empty = Array::from_slice(&[] as &[f32], &[0]);
+        assert_eq!(empty.size(), 0);
+        assert_eq!(scalar_alpha(&empty).unwrap(), None);
     }
 
     #[test]
