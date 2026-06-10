@@ -222,24 +222,34 @@ pub fn build_target_state_dict(src: &Weights) -> Result<HashMap<String, Array>> 
 /// fork's `_safetensors_header_keys`. The format is an 8-byte little-endian header length followed
 /// by that many UTF-8 JSON bytes mapping `name → { "shape": [...], "dtype": ..., "data_offsets": … }`.
 fn safetensors_header_shapes(path: &Path) -> Result<HashMap<String, Vec<i64>>> {
-    let bytes = std::fs::read(path)?;
-    if bytes.len() < 8 {
+    use std::io::Read;
+
+    // Read ONLY the 8-byte length prefix + the `n` header bytes — never the (multi-GB) weight body
+    // (F-097: `std::fs::read` of the whole shard transiently doubled converter peak RSS just to parse
+    // a few-KB header, at the worst moment — while the converted map is also resident).
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len < 8 {
         return Err(Error::Msg(format!(
             "{}: too small to be a safetensors file",
             path.display()
         )));
     }
-    let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
-    let end = 8usize
-        .checked_add(n)
-        .filter(|&e| e <= bytes.len())
-        .ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: safetensors header length out of range",
-                path.display()
-            ))
-        })?;
-    let header: serde_json::Value = serde_json::from_slice(&bytes[8..end]).map_err(|e| {
+    let mut len_buf = [0u8; 8];
+    file.read_exact(&mut len_buf)?;
+    let n = u64::from_le_bytes(len_buf);
+    // A safetensors header is JSON metadata (KB–MB), never gigabytes; it must also fit in the file
+    // after the 8-byte prefix. Reject an out-of-range / absurd length rather than allocating it.
+    const MAX_HEADER: u64 = 256 << 20; // 256 MiB — far above any real header
+    if n > MAX_HEADER || 8 + n > file_len {
+        return Err(Error::Msg(format!(
+            "{}: safetensors header length out of range",
+            path.display()
+        )));
+    }
+    let mut header_bytes = vec![0u8; n as usize];
+    file.read_exact(&mut header_bytes)?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes).map_err(|e| {
         Error::Msg(format!(
             "{}: bad safetensors header JSON: {e}",
             path.display()
@@ -416,6 +426,44 @@ mod tests {
     /// Exact (bit-equal) array comparison via `all_close` with zero tolerance.
     fn exact_eq(a: &Array, b: &Array) -> bool {
         a.shape() == b.shape() && all_close(a, b, 0.0, 0.0, false).unwrap().item::<bool>()
+    }
+
+    /// F-097: the header reader parses shapes from the prefix + JSON header alone, ignoring the
+    /// (here, deliberately present) weight body, and rejects an out-of-range header length.
+    #[test]
+    fn header_shapes_reads_header_without_body() {
+        use std::io::Write;
+        let header =
+            br#"{"w":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"__metadata__":{"a":"b"}}"#;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(&[7u8; 24]); // the "weights" body — must not be needed.
+        let path = std::env::temp_dir().join("mlx_gen_flux2_hdr_ok.safetensors");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+
+        let shapes = safetensors_header_shapes(&path).unwrap();
+        assert_eq!(shapes.len(), 1, "__metadata__ is skipped");
+        assert_eq!(shapes.get("w"), Some(&vec![2i64, 3]));
+        std::fs::remove_file(&path).ok();
+
+        // A header length larger than the file is rejected (not allocated).
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&(1u64 << 40).to_le_bytes()); // claims a 1 TiB header
+        bad.extend_from_slice(b"{}");
+        let bad_path = std::env::temp_dir().join("mlx_gen_flux2_hdr_bad.safetensors");
+        std::fs::File::create(&bad_path)
+            .unwrap()
+            .write_all(&bad)
+            .unwrap();
+        let err = safetensors_header_shapes(&bad_path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("header length out of range"), "{err}");
+        std::fs::remove_file(&bad_path).ok();
     }
 
     /// `chunk3` row-splits `[3·d, c]` into three `[d, c]` chunks, in order.
