@@ -610,19 +610,7 @@ fn sample_token(
         .collect();
 
     if sampling.top_p < 1.0 {
-        probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        let total: f32 = probs.iter().map(|x| x.1).sum();
-        let threshold = sampling.top_p.max(0.0) * total;
-        let mut cum = 0.0;
-        let mut keep = probs.len();
-        for (n, x) in probs.iter().enumerate() {
-            cum += x.1;
-            if cum >= threshold {
-                keep = n + 1;
-                break;
-            }
-        }
-        probs.truncate(keep.max(1));
+        probs = nucleus_select(&probs, sampling.top_p);
     }
 
     let total: f32 = probs.iter().map(|x| x.1).sum();
@@ -637,6 +625,50 @@ fn sample_token(
         }
     }
     Ok(probs.last().map(|x| x.0).unwrap_or(0) as i32)
+}
+
+/// Top-p (nucleus) selection: the highest-probability `(token, weight)` pairs in descending order
+/// whose cumulative weight first reaches `top_p · total`. Found with a partial **max-heap** selection
+/// — popped only until the threshold — instead of sorting all `vocab` entries every token (F-011); the
+/// finding's "partial-select before the host sort". For distinct weights (the universal case for a
+/// real softmax) the kept set and its order are identical to a full descending `sort_unstable_by`.
+/// At least one token is always kept.
+fn nucleus_select(probs: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    /// `(token, weight)` ordered by weight for a max-heap (`total_cmp` is a total order over f32).
+    struct ByWeight(usize, f32);
+    impl PartialEq for ByWeight {
+        fn eq(&self, o: &Self) -> bool {
+            self.1.total_cmp(&o.1) == Ordering::Equal
+        }
+    }
+    impl Eq for ByWeight {}
+    impl PartialOrd for ByWeight {
+        fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+            Some(self.cmp(o))
+        }
+    }
+    impl Ord for ByWeight {
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.1.total_cmp(&o.1)
+        }
+    }
+
+    let total: f32 = probs.iter().map(|x| x.1).sum();
+    let threshold = top_p.max(0.0) * total;
+    let mut heap: BinaryHeap<ByWeight> = probs.iter().map(|&(i, p)| ByWeight(i, p)).collect();
+    let mut kept: Vec<(usize, f32)> = Vec::new();
+    let mut cum = 0.0f32;
+    while let Some(ByWeight(i, p)) = heap.pop() {
+        kept.push((i, p));
+        cum += p;
+        if cum >= threshold {
+            break;
+        }
+    }
+    kept
 }
 
 fn argmax_f32(v: &[f32]) -> i32 {
@@ -732,6 +764,44 @@ mod tests {
     use super::super::{decode_generated, encode_chat_prompt, load_tokenizer};
     use super::*;
     use crate::media::Image;
+
+    #[test]
+    fn nucleus_select_matches_full_sort() {
+        // F-011: the partial max-heap nucleus selection must return exactly the same kept set and
+        // descending order as the previous full-sort-then-truncate, for distinct weights.
+        fn reference(probs: &[(usize, f32)], top_p: f32) -> Vec<(usize, f32)> {
+            let mut p = probs.to_vec();
+            p.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            let total: f32 = p.iter().map(|x| x.1).sum();
+            let threshold = top_p.max(0.0) * total;
+            let mut cum = 0.0;
+            let mut keep = p.len();
+            for (n, x) in p.iter().enumerate() {
+                cum += x.1;
+                if cum >= threshold {
+                    keep = n + 1;
+                    break;
+                }
+            }
+            p.truncate(keep.max(1));
+            p
+        }
+        let probs: Vec<(usize, f32)> = [3.1, 0.2, 9.4, 1.7, 0.05, 5.5, 2.2, 0.9]
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| (i, w))
+            .collect();
+        for top_p in [0.0_f32, 0.3, 0.5, 0.8, 0.95, 0.999] {
+            assert_eq!(
+                nucleus_select(&probs, top_p),
+                reference(&probs, top_p),
+                "top_p={top_p}"
+            );
+        }
+        // A single dominating weight keeps exactly one token even at high top_p.
+        let spike: Vec<(usize, f32)> = [(0usize, 1000.0f32), (1, 0.001), (2, 0.001)].to_vec();
+        assert_eq!(nucleus_select(&spike, 0.9).len(), 1);
+    }
 
     #[test]
     fn default_llama_config_matches_joycaption() {
