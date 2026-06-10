@@ -240,7 +240,8 @@ impl Generator for KolorsGenerator {
                 };
                 Some(ControlContext {
                     controlnet: cn,
-                    control_image: img,
+                    // Precompute the step-invariant conditioning embedding once per run (F-069).
+                    cond_embed: cn.embed_cond(&img)?,
                     scale,
                 })
             }

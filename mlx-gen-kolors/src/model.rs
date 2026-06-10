@@ -291,8 +291,9 @@ impl Kolors {
             cimg
         };
         let cc = ControlContext {
+            // Precompute the step-invariant conditioning embedding once per run (F-069).
+            cond_embed: controlnet.embed_cond(&cimg)?,
             controlnet,
-            control_image: cimg,
             scale: control_scale,
         };
 
