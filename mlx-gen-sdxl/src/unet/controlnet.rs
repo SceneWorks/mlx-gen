@@ -22,7 +22,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use super::block::{BlockSpec, UNetBlock2D};
-use super::embeddings::{SinusoidalPositionalEncoding, TimestepEmbedding};
+use super::embeddings::{text_time_temb, SinusoidalPositionalEncoding, TimestepEmbedding};
 use super::nchw_to_nhwc;
 use super::resnet::ResnetBlock2D;
 use super::transformer::Transformer2D;
@@ -248,16 +248,19 @@ impl ControlNet {
             None => encoder_x,
         };
 
-        // Timestep + SDXL `text_time` embedding (identical to the UNet).
-        let t = Array::from_slice(&vec![timestep; batch as usize], &[batch]);
-        let temb = self.timesteps.forward(&t)?.as_dtype(dtype)?;
-        let mut temb = self.time_embedding.forward(&temb)?;
-        let emb = self.add_time_proj.forward(time_ids)?;
-        let es = emb.shape();
-        let emb = emb.reshape(&[es[0], es[1] * es[2]])?.as_dtype(dtype)?;
-        let emb = mlx_rs::ops::concatenate_axis(&[text_emb, &emb], -1)?;
-        let emb = self.add_embedding.forward(&emb)?;
-        temb = add(&temb, &emb)?;
+        // Timestep + SDXL `text_time` embedding — shared verbatim with the UNet (the encoder-copy
+        // contract requires bit-identity; F-070).
+        let temb = text_time_temb(
+            &self.timesteps,
+            &self.time_embedding,
+            &self.add_time_proj,
+            &self.add_embedding,
+            timestep,
+            text_emb,
+            time_ids,
+            batch,
+            dtype,
+        )?;
 
         // conv_in + conditioning embedding (precomputed once per run — step-invariant, F-069).
         let mut x = self.conv_in.forward(x)?;

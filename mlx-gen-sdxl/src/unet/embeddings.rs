@@ -5,7 +5,7 @@
 use std::f32::consts::PI;
 
 use mlx_rs::ops::{add, concatenate_axis, cos, exp, multiply, sin};
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
@@ -127,6 +127,47 @@ impl TimestepEmbedding {
         let x = silu_glue(&x)?;
         self.linear2.forward(&x)
     }
+}
+
+/// The SDXL timestep + `text_time` micro-conditioning embedding, shared verbatim by
+/// [`UNet2DConditionModel::forward_core`](crate::unet::UNet2DConditionModel) and
+/// [`ControlNet::forward`](crate::unet::ControlNet) — the encoder-copy contract requires the two to
+/// stay bit-identical, so the sequence lives in one place (F-070). Returns the summed `temb`.
+///
+/// Sequence: broadcast the scalar `timestep` to the batch → sinusoidal `timesteps` (f32) → cast to
+/// `dtype` → `time_embedding` MLP; in parallel the `time_ids` sinusoidal (`add_time_proj`, f32) is
+/// flattened, cast to `dtype`, concatenated with the (model-dtype) pooled `text_emb`, and run
+/// through `add_embedding`; the two are summed.
+#[allow(clippy::too_many_arguments)]
+pub fn text_time_temb(
+    timesteps: &SinusoidalPositionalEncoding,
+    time_embedding: &TimestepEmbedding,
+    add_time_proj: &SinusoidalPositionalEncoding,
+    add_embedding: &TimestepEmbedding,
+    timestep: f32,
+    text_emb: &Array,
+    time_ids: &Array,
+    batch: i32,
+    dtype: Dtype,
+) -> Result<Array> {
+    // Timestep embedding (broadcast the scalar time to the batch). The sinusoidal encoding runs in
+    // f32 (its `sigmas` table is f32), then the reference casts to the model dtype *before* the
+    // `time_embedding` MLP (`temb = self.timesteps(t).astype(x.dtype)`), so the MLP runs in the model
+    // dtype. The cast is a no-op for the f32 path.
+    let t = Array::from_slice(&vec![timestep; batch as usize], &[batch]);
+    let temb = timesteps.forward(&t)?.as_dtype(dtype)?;
+    let temb = time_embedding.forward(&temb)?;
+
+    // SDXL `text_time` added conditioning: concat(pooled_text, flattened sinusoidal time_ids).
+    // `time_ids` stays f32 through its sinusoidal (the reference builds it f32), then the flattened
+    // result is cast to the model dtype before concat with the (model-dtype) pooled text
+    // (`...flatten(1).astype(x.dtype)`).
+    let emb = add_time_proj.forward(time_ids)?; // [B, 6, 256]
+    let es = emb.shape();
+    let emb = emb.reshape(&[es[0], es[1] * es[2]])?.as_dtype(dtype)?; // flatten(1) → [B, 1536]
+    let emb = concatenate_axis(&[text_emb, &emb], -1)?; // [B, 2816]
+    let emb = add_embedding.forward(&emb)?;
+    Ok(add(&temb, &emb)?)
 }
 
 #[cfg(test)]
