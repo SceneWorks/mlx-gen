@@ -113,32 +113,54 @@ pub fn remap_transformer_keys(w: &mut Weights) {
     }
 }
 
-/// diffusers VAE checkpoint (`decoder.*`, flat conv names, NCHW conv weights) → the crate's
-/// internal decoder naming (`conv.`/`norm.` wrappers) with conv weights transposed to NHWC
-/// `[out,kH,kW,in]`. Inserts the remapped (un-prefixed) keys alongside the originals.
-pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
+/// Map one diffusers VAE key *suffix* (the part after the `decoder.`/`encoder.` prefix) to its
+/// internal target suffix and whether the tensor is an NCHW→NHWC conv weight needing transpose.
+/// Pure (no `Weights`), so the remap's regression-prone naming/transpose logic is unit-testable
+/// without a checkpoint fixture. `sampler_substr` is the resample-conv path that also carries a
+/// conv weight: `.upsamplers.0.conv.` for the decoder up path, `.downsamplers.0.conv.` for the
+/// encoder down path.
+fn vae_key_target(rest: &str, sampler_substr: &str) -> (String, bool) {
+    match rest {
+        "conv_in.weight" => ("conv_in.conv.weight".into(), true),
+        "conv_in.bias" => ("conv_in.conv.bias".into(), false),
+        "conv_out.weight" => ("conv_out.conv.weight".into(), true),
+        "conv_out.bias" => ("conv_out.conv.bias".into(), false),
+        "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
+        "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
+        _ => {
+            let is_conv_w = rest.ends_with(".weight")
+                && (rest.contains(".conv1.")
+                    || rest.contains(".conv2.")
+                    || rest.contains(".conv_shortcut.")
+                    || rest.contains(sampler_substr));
+            (rest.to_string(), is_conv_w)
+        }
+    }
+}
+
+/// Remap a diffusers VAE sub-tree (`{prefix}*`, flat conv names, NCHW conv weights) → the crate's
+/// internal `conv.`/`norm.` wrapper naming, conv weights transposed to NHWC `[out,kH,kW,in]`.
+/// Inserts the remapped keys alongside the originals. `keep_prefix` controls whether `{prefix}` is
+/// retained on the target key — the encoder keeps it, the decoder drops it, and both must coexist in
+/// one `Weights`. Shared by [`remap_vae_decoder`]/[`remap_vae_encoder`] (F-037).
+fn remap_vae_tree(
+    w: &mut Weights,
+    prefix: &str,
+    keep_prefix: bool,
+    sampler_substr: &str,
+) -> Result<()> {
     let keys: Vec<String> = w
         .keys()
-        .filter(|k| k.starts_with("decoder."))
+        .filter(|k| k.starts_with(prefix))
         .map(String::from)
         .collect();
     for k in keys {
-        let rest = k.strip_prefix("decoder.").unwrap();
-        let (target, transpose): (String, bool) = match rest {
-            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
-            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
-            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
-            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
-            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
-            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
-            _ => {
-                let is_conv_w = rest.ends_with(".weight")
-                    && (rest.contains(".conv1.")
-                        || rest.contains(".conv2.")
-                        || rest.contains(".conv_shortcut.")
-                        || rest.contains(".upsamplers.0.conv."));
-                (rest.to_string(), is_conv_w)
-            }
+        let rest = k.strip_prefix(prefix).unwrap();
+        let (suffix, transpose) = vae_key_target(rest, sampler_substr);
+        let target = if keep_prefix {
+            format!("{prefix}{suffix}")
+        } else {
+            suffix
         };
         let t = w.require(&k)?.clone();
         let t = if transpose {
@@ -151,43 +173,68 @@ pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
     Ok(())
 }
 
-/// diffusers VAE checkpoint (`encoder.*`, flat conv names, NCHW conv weights) → the crate's
-/// internal encoder naming (`conv.`/`norm.` wrappers) with conv weights transposed to NHWC.
-/// Keeps the `encoder.` prefix (the decoder remap drops its prefix; both must coexist in one
-/// `Weights`). Mirrors [`remap_vae_decoder`] but for the down path (`downsamplers` not
-/// `upsamplers`).
+/// diffusers VAE checkpoint (`decoder.*`) → internal decoder naming, conv weights transposed to
+/// NHWC. Drops the `decoder.` prefix (the encoder remap keeps its prefix; both coexist in one
+/// `Weights`). Up path → `upsamplers`.
+pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
+    remap_vae_tree(w, "decoder.", false, ".upsamplers.0.conv.")
+}
+
+/// diffusers VAE checkpoint (`encoder.*`) → internal encoder naming, conv weights transposed to
+/// NHWC. Keeps the `encoder.` prefix. Down path → `downsamplers`.
 pub fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
-    let keys: Vec<String> = w
-        .keys()
-        .filter(|k| k.starts_with("encoder."))
-        .map(String::from)
-        .collect();
-    for k in keys {
-        let rest = k.strip_prefix("encoder.").unwrap();
-        let (suffix, transpose): (String, bool) = match rest {
-            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
-            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
-            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
-            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
-            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
-            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
-            _ => {
-                let is_conv_w = rest.ends_with(".weight")
-                    && (rest.contains(".conv1.")
-                        || rest.contains(".conv2.")
-                        || rest.contains(".conv_shortcut.")
-                        || rest.contains(".downsamplers.0.conv."));
-                (rest.to_string(), is_conv_w)
-            }
-        };
-        let target = format!("encoder.{suffix}");
-        let t = w.require(&k)?.clone();
-        let t = if transpose {
-            t.transpose_axes(&[0, 2, 3, 1])? // NCHW -> NHWC conv weight
-        } else {
-            t
-        };
-        w.insert(target, t);
+    remap_vae_tree(w, "encoder.", true, ".downsamplers.0.conv.")
+}
+
+#[cfg(test)]
+mod vae_remap_tests {
+    use super::vae_key_target;
+
+    const UP: &str = ".upsamplers.0.conv.";
+    const DOWN: &str = ".downsamplers.0.conv.";
+
+    #[test]
+    fn special_conv_and_norm_keys_map_and_transpose() {
+        assert_eq!(
+            vae_key_target("conv_in.weight", UP),
+            ("conv_in.conv.weight".to_string(), true)
+        );
+        assert_eq!(
+            vae_key_target("conv_in.bias", UP),
+            ("conv_in.conv.bias".to_string(), false)
+        );
+        assert_eq!(
+            vae_key_target("conv_out.weight", UP),
+            ("conv_out.conv.weight".to_string(), true)
+        );
+        // conv_norm_out is a norm, never transposed.
+        assert_eq!(
+            vae_key_target("conv_norm_out.weight", UP),
+            ("conv_norm_out.norm.weight".to_string(), false)
+        );
     }
-    Ok(())
+
+    #[test]
+    fn resnet_conv_weights_transpose_but_keep_name() {
+        let (t, tr) = vae_key_target("mid_block.resnets.1.conv2.weight", UP);
+        assert_eq!(t, "mid_block.resnets.1.conv2.weight");
+        assert!(tr, "resnet conv2 weight transposes");
+        // The matching bias is not a conv weight.
+        assert_eq!(
+            vae_key_target("mid_block.resnets.1.conv2.bias", UP),
+            ("mid_block.resnets.1.conv2.bias".to_string(), false)
+        );
+        // A norm weight inside a resnet is not a conv → no transpose.
+        assert!(!vae_key_target("up_blocks.0.resnets.0.norm1.weight", UP).1);
+    }
+
+    #[test]
+    fn sampler_substr_is_path_specific() {
+        // The up path's upsampler conv counts as a conv weight only under the decoder substr...
+        assert!(vae_key_target("up_blocks.0.upsamplers.0.conv.weight", UP).1);
+        assert!(!vae_key_target("up_blocks.0.upsamplers.0.conv.weight", DOWN).1);
+        // ...and symmetrically for the down path's downsampler conv under the encoder substr.
+        assert!(vae_key_target("down_blocks.2.downsamplers.0.conv.weight", DOWN).1);
+        assert!(!vae_key_target("down_blocks.2.downsamplers.0.conv.weight", UP).1);
+    }
 }
