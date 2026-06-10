@@ -46,6 +46,11 @@ const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_58, 0.275_777_11];
 const CLIP_SIZE: usize = 224;
 /// VAE spatial compression (8×).
 const VAE_SCALE: u32 = 8;
+/// Upper bound on a `Reference` image's dimensions. The reference is resized to the output size, but
+/// the source buffer (and the resize's intermediate f32 work) scale with the *input* dims, so an
+/// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
+/// while capping the source at a few hundred MB.
+const MAX_REFERENCE_DIM: u32 = 8192;
 
 /// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
 pub fn descriptor() -> ModelDescriptor {
@@ -141,11 +146,40 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Reject a `Reference` image with zero/oversized dims or a pixel buffer that isn't `w*h*3` RGB8,
+/// using usize math so the length never wraps (F-164). Run once at the request boundary in
+/// [`Svd::validate`] so the downstream resizes can't panic OOB or balloon host memory.
+fn validate_reference_image(img: &Image) -> Result<()> {
+    if img.width == 0 || img.height == 0 {
+        return Err(Error::Msg(format!(
+            "svd_xt: reference image has a zero dimension ({}x{})",
+            img.width, img.height
+        )));
+    }
+    if img.width > MAX_REFERENCE_DIM || img.height > MAX_REFERENCE_DIM {
+        return Err(Error::Msg(format!(
+            "svd_xt: reference image {}x{} exceeds the {MAX_REFERENCE_DIM}px dimension cap",
+            img.width, img.height
+        )));
+    }
+    if img.pixels.len() != img.width as usize * img.height as usize * 3 {
+        return Err(Error::Msg(format!(
+            "svd_xt: reference image pixel buffer {} != {}x{}x3 (RGB8)",
+            img.pixels.len(),
+            img.width,
+            img.height
+        )));
+    }
+    Ok(())
+}
+
 /// An RGB8 [`Image`] → NHWC f32 `[1, out_h, out_w, 3]` in `[0, 1]` for the VAE conditioning image:
 /// PIL **lanczos** resize (matching diffusers' `VideoProcessor.preprocess`, `resample = "lanczos"`),
 /// then rescale to `[0, 1]`. (Identity when the input already matches the target size.)
 fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> {
-    if img.pixels.len() != (img.width * img.height * 3) as usize {
+    // usize math: `width * height * 3` in u32 wraps for large dims (e.g. 65536² → 0), which would let
+    // an empty/short buffer pass and then index OOB in the resize (F-164).
+    if img.pixels.len() != img.width as usize * img.height as usize * 3 {
         return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
     }
     let resized = mlx_gen::image::resize_lanczos_u8(
@@ -174,7 +208,7 @@ impl Svd {
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing`
     /// to 224 (gaussian-blur + align-corners bicubic, in `[-1,1]`) → CLIP mean/std normalize.
     fn clip_embeds(&self, img: &Image) -> Result<Array> {
-        if img.pixels.len() != (img.width * img.height * 3) as usize {
+        if img.pixels.len() != img.width as usize * img.height as usize * 3 {
             return Err(Error::Msg("svd_xt: reference image must be RGB8".into()));
         }
         let unit = crate::preprocess::resize_with_antialiasing_unit(
@@ -234,8 +268,10 @@ impl Generator for Svd {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
-        // image→video needs the single Reference input.
-        self.reference(req)?;
+        // image→video needs the single Reference input — the one input not covered by the shared
+        // size-range validation, so bound it here (F-164).
+        let img = self.reference(req)?;
+        validate_reference_image(img)?;
         Ok(())
     }
 
@@ -366,4 +402,48 @@ fn frames_to_images(decoded: &Array) -> Result<Vec<Image>> {
 
 inventory::submit! {
     mlx_gen::ModelRegistration { descriptor, load }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn img(w: u32, h: u32, len: usize) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; len],
+        }
+    }
+
+    #[test]
+    fn validate_reference_image_guards_size_and_buffer() {
+        // F-164: the old `(w*h*3) as u32` wraps to 0 at 65536², so an empty buffer would pass and the
+        // resize would index OOB. usize math makes the length check honest and rejects it.
+        let overflow = img(65536, 65536, 0);
+        assert_eq!(
+            65536u32.wrapping_mul(65536).wrapping_mul(3),
+            0,
+            "the u32 product really does wrap to 0"
+        );
+        assert!(validate_reference_image(&overflow).is_err());
+
+        // Oversized but self-consistent dims are rejected by the cap (unbounded host allocation).
+        let huge = MAX_REFERENCE_DIM + 1;
+        assert!(validate_reference_image(&img(huge, 1, huge as usize * 3)).is_err());
+
+        // Zero dimension and a short/long buffer are rejected.
+        assert!(validate_reference_image(&img(0, 8, 0)).is_err());
+        assert!(validate_reference_image(&img(8, 8, 8 * 8 * 3 - 1)).is_err());
+
+        // A well-formed in-range RGB8 reference passes.
+        assert!(validate_reference_image(&img(64, 48, 64 * 48 * 3)).is_ok());
+        // Exactly at the cap is allowed.
+        assert!(validate_reference_image(&img(
+            MAX_REFERENCE_DIM,
+            1,
+            MAX_REFERENCE_DIM as usize * 3
+        ))
+        .is_ok());
+    }
 }
