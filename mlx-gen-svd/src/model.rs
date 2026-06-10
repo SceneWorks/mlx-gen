@@ -51,6 +51,17 @@ const VAE_SCALE: u32 = 8;
 /// unbounded reference drives multi-GB host allocations (F-164). 8192 is far above any real photo
 /// while capping the source at a few hundred MB.
 const MAX_REFERENCE_DIM: u32 = 8192;
+/// Output `width`/`height` must be divisible by this: VAE 8× spatial compression then the UNet's 3
+/// stride-2 downsamples / nearest-2× upsamples (another 8×). An unaligned size fails deep in
+/// `UpBlock::forward` on a skip-concat shape mismatch instead of at validation (F-165).
+const SIZE_ALIGN: u32 = VAE_SCALE * 8;
+/// Upper bound on requested output `frames`. SVD-XT is the 25-frame variant; the per-frame latents +
+/// `added_time_ids` scale linearly, so an unbounded count drives a giant allocation. 64 leaves
+/// generous headroom over the default without letting the request balloon memory.
+const MAX_FRAMES: u32 = 64;
+/// Upper bound on requested denoise `steps` — generous over the default 25; guards a pathological
+/// value from pinning the GPU for an unbounded time.
+const MAX_STEPS: u32 = 200;
 
 /// Stable identity + advertised capabilities for SVD-XT (image→video, no audio).
 pub fn descriptor() -> ModelDescriptor {
@@ -144,6 +155,35 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         pipeline: SvdPipeline::new(image_encoder, vae, unet, SchedulerConfig::default()),
         descriptor: descriptor(),
     }))
+}
+
+/// The SVD-specific request validation the core `Capabilities::validate_request` leaves to each model
+/// (size alignment + the allocation/compute knob bounds) — F-165. Pulled out so it is unit-testable
+/// without a loaded model.
+fn validate_output_params(req: &GenerationRequest) -> Result<()> {
+    // The SVD UNet needs `width`/`height` divisible by 64; an unaligned size fails deep in
+    // `UpBlock::forward` on a skip-concat shape mismatch mid-denoise instead of at validation.
+    if !req.width.is_multiple_of(SIZE_ALIGN) || !req.height.is_multiple_of(SIZE_ALIGN) {
+        return Err(Error::Msg(format!(
+            "svd_xt: {}x{} must be a multiple of {SIZE_ALIGN} (VAE 8× × UNet 8×)",
+            req.width, req.height
+        )));
+    }
+    if let Some(frames) = req.frames {
+        if frames == 0 || frames > MAX_FRAMES {
+            return Err(Error::Msg(format!(
+                "svd_xt: frames {frames} out of range 1..={MAX_FRAMES}"
+            )));
+        }
+    }
+    if let Some(steps) = req.steps {
+        if steps == 0 || steps > MAX_STEPS {
+            return Err(Error::Msg(format!(
+                "svd_xt: steps {steps} out of range 1..={MAX_STEPS}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Reject a `Reference` image with zero/oversized dims or a pixel buffer that isn't `w*h*3` RGB8,
@@ -268,6 +308,8 @@ impl Generator for Svd {
         self.descriptor
             .capabilities
             .validate_request(MODEL_ID, req)?;
+        // Model-specific alignment + knob bounds the core contract leaves to each model (F-165).
+        validate_output_params(req)?;
         // image→video needs the single Reference input — the one input not covered by the shared
         // size-range validation, so bound it here (F-164).
         let img = self.reference(req)?;
@@ -414,6 +456,32 @@ mod tests {
             height: h,
             pixels: vec![0u8; len],
         }
+    }
+
+    #[test]
+    fn validate_output_params_enforces_alignment_and_bounds() {
+        // F-165: 64-aligned sizes pass; an unaligned one is rejected at validation (not deep in
+        // UpBlock), and frames/steps are bounded.
+        let req = |w: u32, h: u32, frames: Option<u32>, steps: Option<u32>| GenerationRequest {
+            width: w,
+            height: h,
+            frames,
+            steps,
+            ..Default::default()
+        };
+        assert!(validate_output_params(&req(1024, 576, None, None)).is_ok()); // 576 = 9×64
+        let err = validate_output_params(&req(700, 704, None, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiple of 64"), "got: {err}");
+        assert!(validate_output_params(&req(704, 700, None, None)).is_err()); // height unaligned
+
+        // frames / steps bounds.
+        assert!(validate_output_params(&req(512, 512, Some(MAX_FRAMES), None)).is_ok());
+        assert!(validate_output_params(&req(512, 512, Some(MAX_FRAMES + 1), None)).is_err());
+        assert!(validate_output_params(&req(512, 512, Some(0), None)).is_err());
+        assert!(validate_output_params(&req(512, 512, None, Some(MAX_STEPS + 1))).is_err());
+        assert!(validate_output_params(&req(512, 512, None, Some(0))).is_err());
     }
 
     #[test]
