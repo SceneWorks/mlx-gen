@@ -25,19 +25,8 @@ use mlx_gen::WeightsSource;
 use mlx_gen_z_image::{load_control_transformer, load_transformer, set_compile_glue};
 use mlx_rs::{random, Array, Dtype};
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-}
+mod common;
+use common::snapshot_opt as snapshot;
 
 /// The Fun-Controlnet-Union checkpoint: env `CONTROL_WEIGHTS`, else the first `.safetensors` in the
 /// HF cache. `None` ⇒ the control test skips.

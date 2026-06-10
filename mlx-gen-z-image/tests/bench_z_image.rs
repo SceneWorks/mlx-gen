@@ -13,7 +13,6 @@
 //! (`decoded_to_image` reads the buffer). mlx-rs 0.25 exposes no peak-memory API, so memory is not
 //! reported here — see the fork measurements in memory for the bf16 envelope.
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use mlx_gen::{FlowMatchEuler, GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
@@ -30,20 +29,8 @@ const STEPS: usize = 4;
 const RUNS: usize = 3;
 const PROMPT: &str = "a fox";
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::snapshot;
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());

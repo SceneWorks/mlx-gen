@@ -35,20 +35,8 @@ const Q8_GOLDEN: &str = concat!(
 );
 
 /// Locate the base Z-Image-Turbo snapshot dir (env override, else the HF cache).
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::snapshot;
 
 /// Locate the Fun-Controlnet-Union checkpoint (env override `CONTROL_WEIGHTS`, else the golden's
 /// recorded path, else the HF cache). Returned as a single-file `WeightsSource`.

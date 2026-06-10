@@ -9,8 +9,6 @@
 //!
 //! Run: cargo test -p mlx-gen-z-image --release --test q8_xemb_diag -- --ignored --nocapture
 
-use std::path::PathBuf;
-
 use mlx_gen::weights::Weights;
 use mlx_gen_z_image::load_transformer;
 use mlx_rs::ops::{eq, quantize, quantized_matmul};
@@ -21,20 +19,8 @@ const PROBE: &str = concat!(
     "/../tools/golden/q8_xemb_probe.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::{rel, snapshot};
 
 fn bf16(a: &Array) -> Array {
     a.as_dtype(Dtype::Bfloat16).unwrap()
@@ -45,21 +31,6 @@ fn f32(a: &Array) -> Array {
 }
 
 /// `(peak_rel, mean_rel)` vs golden `b`, both read as f32.
-fn rel(a: &Array, b: &Array) -> (f32, f32) {
-    let n = b.shape().iter().product::<i32>();
-    let a = f32(a).reshape(&[n]).unwrap();
-    let b = f32(b).reshape(&[n]).unwrap();
-    let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    let mabs = (ys.iter().map(|y| y.abs()).sum::<f32>() / ys.len() as f32).max(1e-12);
-    let max_diff = xs
-        .iter()
-        .zip(ys)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    let mean_diff = xs.iter().zip(ys).map(|(x, y)| (x - y).abs()).sum::<f32>() / xs.len() as f32;
-    (max_diff / peak, mean_diff / mabs)
-}
-
 fn all_eq(a: &Array, b: &Array) -> bool {
     a.shape() == b.shape() && eq(a, b).unwrap().all(None).unwrap().item::<bool>()
 }

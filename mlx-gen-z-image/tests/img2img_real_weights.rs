@@ -9,8 +9,6 @@
 //! `load(id, spec).generate(req)` API with a `Conditioning::Reference` and confirms the rendered
 //! image matches the fork's img2img golden.
 
-use std::path::PathBuf;
-
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     Conditioning, FlowMatchEuler, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
@@ -27,20 +25,8 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/z_image_img2img_golden.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::snapshot;
 
 /// `(peak-relative, mean-relative)` error vs the golden tensor `b`.
 fn rel_errors(a: &Array, b: &Array) -> (f32, f32) {

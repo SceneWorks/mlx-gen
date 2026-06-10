@@ -8,8 +8,6 @@
 //! intermediates; the final test drives the **public** `load(id, spec).generate(req)` API and
 //! confirms the rendered image matches the fork's golden.
 
-use std::path::PathBuf;
-
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     FlowMatchEuler, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
@@ -34,20 +32,8 @@ const Q4_GOLDEN: &str = concat!(
 );
 
 /// Locate the Z-Image-Turbo snapshot dir (env override, else the HF cache).
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::snapshot;
 
 /// Peak-relative error `max|a-b| / max|b|` — the meaningful metric for high-dynamic-range
 /// tensors compared against a bf16 golden.

@@ -10,7 +10,7 @@
 //! is written that reloads through the real inference path (`apply_z_image_adapters`) onto a fresh
 //! transformer — the round-trip contract, for both the LoRA and LoKr adapter kinds.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -18,20 +18,8 @@ use mlx_gen::{
     TrainingProgress, TrainingRequest, WeightsSource,
 };
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+mod common;
+use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir`.
 fn make_dataset(dir: &Path) -> Vec<TrainingItem> {

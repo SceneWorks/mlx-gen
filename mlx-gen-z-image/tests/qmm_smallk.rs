@@ -27,20 +27,8 @@ fn bf16(a: &Array) -> Array {
 }
 
 /// `(peak-relative, mean-relative)` error vs golden `b`.
-fn rel(a: &Array, b: &Array) -> (f32, f32) {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let b = b.as_dtype(Dtype::Float32).unwrap().reshape(&[n]).unwrap();
-    let (xs, ys) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = ys.iter().fold(0f32, |m, &v| m.max(v.abs())).max(1e-12);
-    let mabs = (ys.iter().map(|y| y.abs()).sum::<f32>() / ys.len() as f32).max(1e-12);
-    let max_diff = xs
-        .iter()
-        .zip(ys)
-        .fold(0f32, |m, (&x, &y)| m.max((x - y).abs()));
-    let mean_diff = xs.iter().zip(ys).map(|(x, y)| (x - y).abs()).sum::<f32>() / xs.len() as f32;
-    (max_diff / peak, mean_diff / mabs)
-}
+mod common;
+use common::rel;
 
 #[test]
 #[ignore = "needs tools/golden/qmm_smallK_probe.safetensors (tools/probe_qmm_smallK.py)"]
