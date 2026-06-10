@@ -155,12 +155,7 @@ impl Generator for QwenImageEdit {
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
         validate_request(&self.descriptor.capabilities, req)?;
-        if reference_images(req).is_empty() {
-            return Err(Error::Msg(
-                "qwen_image_edit requires a Reference or MultiReference conditioning image".into(),
-            ));
-        }
-        Ok(())
+        validate_reference_images(req)
     }
 
     fn generate(
@@ -297,6 +292,37 @@ fn reference_images(req: &GenerationRequest) -> Vec<&Image> {
     out
 }
 
+/// Require at least one reference image, each with nonzero dims and a `w*h*3` pixel buffer. The edit
+/// path feeds reference pixels straight into `resize_bicubic_u8`/`resize_lanczos_u8` (which index
+/// `src[(y*in_w + x)*3 + ch]`) and `condition_resize_dims` (which divides by the dims), so an
+/// undersized buffer panics OOB, an oversized one reads garbage, and a zero dimension yields NaN dims
+/// — exactly what the T2I path already rejects in `preprocess_init_image` (F-112). Validate once here,
+/// at the request boundary, so a malformed `qwen_image_edit` request errors cleanly instead of
+/// crashing the engine.
+fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
+    let refs = reference_images(req);
+    if refs.is_empty() {
+        return Err(Error::Msg(
+            "qwen_image_edit requires a Reference or MultiReference conditioning image".into(),
+        ));
+    }
+    for img in refs {
+        let (w, h) = (img.width as usize, img.height as usize);
+        if w == 0 || h == 0 {
+            return Err(Error::Msg(format!(
+                "qwen_image_edit: reference image has a zero dimension ({w}x{h})"
+            )));
+        }
+        if img.pixels.len() != w * h * 3 {
+            return Err(Error::Msg(format!(
+                "qwen_image_edit: reference image pixel buffer {} != {w}x{h}x3",
+                img.pixels.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
 inventory::submit! {
     ModelRegistration { descriptor, load }
 }
@@ -336,6 +362,73 @@ mod tests {
         // validate_request (size/conditioning) passes, but the edit generator needs a reference.
         assert!(validate_request(&caps, &req).is_ok());
         assert!(reference_images(&req).is_empty());
+    }
+
+    #[test]
+    fn validate_reference_images_rejects_bad_buffers() {
+        use mlx_gen::Conditioning;
+        let reference = |image| GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image,
+                strength: None,
+            }],
+            ..Default::default()
+        };
+
+        // No reference at all.
+        assert!(validate_reference_images(&GenerationRequest::default()).is_err());
+
+        // Short pixel buffer (would index OOB in the resize inner loop).
+        let short = reference(Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3 - 1],
+        });
+        assert!(validate_reference_images(&short)
+            .unwrap_err()
+            .to_string()
+            .contains("pixel buffer"));
+
+        // Oversized buffer (would silently read garbage).
+        let long = reference(Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3 + 5],
+        });
+        assert!(validate_reference_images(&long).is_err());
+
+        // Zero dimension (would drive condition_resize_dims to NaN).
+        let zero = reference(Image {
+            width: 0,
+            height: 8,
+            pixels: Vec::new(),
+        });
+        assert!(validate_reference_images(&zero)
+            .unwrap_err()
+            .to_string()
+            .contains("zero dimension"));
+
+        // A well-formed reference passes. One bad image in a MultiReference still fails.
+        let good_img = Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3],
+        };
+        assert!(validate_reference_images(&reference(good_img.clone())).is_ok());
+        let mixed = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![
+                    good_img,
+                    Image {
+                        width: 8,
+                        height: 8,
+                        pixels: vec![0u8; 4],
+                    },
+                ],
+            }],
+            ..Default::default()
+        };
+        assert!(validate_reference_images(&mixed).is_err());
     }
 
     #[test]
