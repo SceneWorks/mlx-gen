@@ -944,8 +944,12 @@ impl T2iModel {
             let pre = "<image>\n".repeat(images.len() - count);
             q = format!("{pre}{q}");
         }
-        // VQA uses the neo1_0 default (empty) system message, not SYSTEM_MESSAGE_FOR_GEN.
-        let base = build_neo1_query(&q, "");
+        // VQA uses the neo1_0 default (empty) system message, not SYSTEM_MESSAGE_FOR_GEN. Prime an
+        // empty `<think></think>` block so the model answers directly without a chain-of-thought —
+        // matching the reference `chat(think=False)` (`modeling_neo_chat.py`:
+        // `get_prompt() + '<think>\n\n</think>\n\n'`) and the engine's own no-think interleave path.
+        // Without it the greedy decode spends its whole budget reasoning and never emits the answer.
+        let base = format!("{}<think>\n\n</think>\n\n", build_neo1_query(&q, ""));
         let ids = if images.is_empty() {
             tokenizer.encode_ids(&base, true)?
         } else {

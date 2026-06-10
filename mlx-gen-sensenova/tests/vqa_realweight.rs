@@ -137,3 +137,41 @@ fn vqa_realweight_matches_reference() {
     println!("  vqa(): {answer:?}");
     assert!(!answer.is_empty(), "vqa returned empty answer");
 }
+
+/// sc-3905 regression: with a *small* token budget, [`T2iModel::vqa`] must still return an answer —
+/// proving it primes the empty `<think></think>` block (matching the reference `chat(think=False)`)
+/// instead of spending the whole budget on a `<think>` reasoning run. Text-only, so it needs only
+/// the checkpoint (no golden). Before the prime fix this returned an unclosed-`<think>` stream that a
+/// downstream `_strip_reasoning` would erase to "".
+#[test]
+#[ignore = "needs the local 35GB checkpoint; run with --ignored"]
+fn vqa_primes_no_think_on_small_budget() {
+    let snap = snapshot_dir();
+    if !snap.exists() {
+        eprintln!("skipping: snapshot missing at {}", snap.display());
+        return;
+    }
+    let cfg = NeoChatConfig::from_dir(&snap).expect("config");
+    let weights = load_raw(&snap).expect("weights");
+    let tokenizer = load_tokenizer(&snap).expect("tokenizer");
+    let model = T2iModel::from_weights(&weights, &cfg).expect("build T2iModel");
+
+    let answer = model
+        .vqa(
+            &tokenizer,
+            "What is 2 + 2? Reply with just the number.",
+            &[],
+            32,
+            Sampler::Greedy,
+        )
+        .expect("vqa");
+    println!("small-budget vqa answer: {answer:?}");
+    assert!(
+        !answer.trim().is_empty(),
+        "small-budget vqa must answer (no-think prime), got empty"
+    );
+    assert!(
+        !answer.contains("<think>"),
+        "no-think prime should suppress the reasoning block, got: {answer:?}"
+    );
+}
