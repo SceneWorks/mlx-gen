@@ -71,14 +71,18 @@ pub fn best_output_size(width: u32, height: u32, dw: u32, dh: u32, max_area: usi
     let ow = (area * ratio).sqrt();
     let oh = area / ow;
 
+    // Each grid-aligned dimension is clamped to at least one cell (F-030): for a degenerate `max_area`
+    // (or an extreme aspect ratio) the `floor(.. / d) * d` could otherwise hit 0, making `area / 0`
+    // produce Inf/NaN — a NaN ratio comparison then silently picks a branch or a `(0, …)` size that
+    // blows up later in a reshape. For every production input (dims ≫ grid) the clamp is a no-op.
     // Option 1: align width first, derive height from the remaining area. (`int(x // d * d)`.)
-    let ow1 = (ow / dw_f).floor() * dw_f;
-    let oh1 = (area / ow1 / dh_f).floor() * dh_f;
+    let ow1 = ((ow / dw_f).floor() * dw_f).max(dw_f);
+    let oh1 = ((area / ow1 / dh_f).floor() * dh_f).max(dh_f);
     let ratio1 = ow1 / oh1;
 
     // Option 2: align height first, derive width.
-    let oh2 = (oh / dh_f).floor() * dh_f;
-    let ow2 = (area / oh2 / dw_f).floor() * dw_f;
+    let oh2 = ((oh / dh_f).floor() * dh_f).max(dh_f);
+    let ow2 = ((area / oh2 / dw_f).floor() * dw_f).max(dw_f);
     let ratio2 = ow2 / oh2;
 
     let dist1 = (ratio / ratio1).max(ratio1 / ratio);
@@ -743,6 +747,18 @@ mod tests {
         assert!((w * h) as usize <= 704 * 1280, "must fit within max_area");
         assert_eq!(w % 16, 0);
         assert_eq!(h % 16, 0);
+    }
+
+    #[test]
+    fn best_output_size_clamps_degenerate_area_to_one_grid_cell() {
+        // F-030: a `max_area` smaller than one grid cell would floor a dimension to 0 and divide by
+        // it (Inf/NaN, a silent (0, …) result). The guard clamps every dimension to ≥ one cell.
+        let (w, h) = best_output_size(8, 8, 16, 16, 100); // ideal ≈ 10×10 < the 16-px cell
+        assert!(w >= 16 && h >= 16, "got {w}x{h}");
+        assert_eq!((w % 16, h % 16), (0, 0));
+        // An extreme aspect ratio (one side floors to 0) is also clamped, not Inf/NaN.
+        let (w2, h2) = best_output_size(4096, 1, 16, 16, 16 * 16);
+        assert!(w2 >= 16 && h2 >= 16, "got {w2}x{h2}");
     }
 
     #[test]
