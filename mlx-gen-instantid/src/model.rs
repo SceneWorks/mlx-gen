@@ -362,7 +362,7 @@ impl InstantId {
 
         // Ancestral Euler over the seeded prior (fp16).
         let prior = seeded_prior(&self.sampler, req.seed, req.width, req.height)?;
-        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time());
+        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
         let d = Denoiser {
             unet: &self.unet,
             sampler: &ancestral,
@@ -565,7 +565,7 @@ impl InstantId {
 
         // Ancestral Euler over the seeded prior (fp16).
         let prior = seeded_prior(&self.sampler, req.seed, side, side)?;
-        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time());
+        let ancestral = AncestralEuler::new(&self.sampler, req.steps, self.sampler.max_time())?;
         let d = Denoiser {
             unet: &self.unet,
             sampler: &ancestral,

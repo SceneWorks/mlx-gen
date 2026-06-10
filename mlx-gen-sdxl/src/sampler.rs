@@ -21,12 +21,14 @@ use crate::config::{BetaSchedule, DiffusionConfig};
 /// the exact one the reference sees after `…astype(mx.float16)`. Used to reproduce the vendored
 /// `float16=True` schedule (`_linspace(...).astype(float16)`, the f16 interp `delta_x`) where a
 /// straight host-f32 value would be 1 ULP off and the chaos-sensitive ancestral sampler amplifies it.
-fn round_to_f16(v: f32) -> f32 {
-    Array::from_slice(&[v], &[1])
-        .as_dtype(Dtype::Float16)
-        .and_then(|a| a.as_dtype(Dtype::Float32))
-        .map(|a| a.as_slice::<f32>()[0])
-        .unwrap_or(v)
+///
+/// Returns `Err` on an MLX cast failure — never the un-rounded `v`. A silently un-rounded timestep is
+/// 1 ULP off and seeds the chaotic ancestral trajectory (sc-2400 S6), i.e. the exact silent parity
+/// break this rounding exists to prevent; surface it loudly instead.
+fn round_to_f16(v: f32) -> Result<f32> {
+    let f16 = Array::from_slice(&[v], &[1]).as_dtype(Dtype::Float16)?;
+    let f32 = f16.as_dtype(Dtype::Float32)?;
+    Ok(f32.as_slice::<f32>()[0])
 }
 
 /// A discrete Euler / Euler-Ancestral sampler over a precomputed sigma table.
@@ -124,8 +126,8 @@ impl EulerSampler {
         let hi = (lo + 1).min(last);
         let raw = t - lo as f32;
         let (delta, one_minus) = if delta_f16 {
-            let d = round_to_f16(raw);
-            (d, round_to_f16(1.0 - d))
+            let d = round_to_f16(raw)?;
+            (d, round_to_f16(1.0 - d)?)
         } else {
             (raw, 1.0 - raw)
         };
@@ -143,7 +145,7 @@ impl EulerSampler {
     /// start` — NOT `start + (0−start)·i/n` (which divides last). `i/n` is f32-inexact (e.g. 1/5),
     /// so the two orders differ by 1 ULP in the timestep `t`, and a 1-ULP `t` shifts the U-Net's
     /// sinusoidal embedding enough to seed the chaotic ancestral trajectory (sc-2400 S6).
-    pub fn timesteps(&self, num_steps: usize, start_time: f32) -> Vec<(f32, f32)> {
+    pub fn timesteps(&self, num_steps: usize, start_time: f32) -> Result<Vec<(f32, f32)>> {
         let n = num_steps as f32;
         let mut steps: Vec<f32> = (0..=num_steps)
             .map(|i| {
@@ -156,10 +158,10 @@ impl EulerSampler {
         // f16 `t` the reference does (a 1-ULP `t` seeds the chaotic ancestral trajectory — sc-2400 S6).
         if self.dtype == Dtype::Float16 {
             for s in &mut steps {
-                *s = round_to_f16(*s);
+                *s = round_to_f16(*s)?;
             }
         }
-        steps.windows(2).map(|w| (w[0], w[1])).collect()
+        Ok(steps.windows(2).map(|w| (w[0], w[1])).collect())
     }
 
     /// Sample the prior latents `noise · σ_last · (σ_last² + 1).rsqrt()` (f32, global RNG). `shape`
@@ -299,11 +301,11 @@ pub struct AncestralEuler<'a> {
 impl<'a> AncestralEuler<'a> {
     /// Bake in one run's schedule. `start_time` is `max_time` for txt2img, `max_time·strength` for
     /// img2img; `num_steps` is the effective step count (img2img runs `int(steps·strength)`).
-    pub fn new(inner: &'a EulerSampler, num_steps: usize, start_time: f32) -> Self {
-        Self {
+    pub fn new(inner: &'a EulerSampler, num_steps: usize, start_time: f32) -> Result<Self> {
+        Ok(Self {
             inner,
-            schedule: inner.timesteps(num_steps, start_time),
-        }
+            schedule: inner.timesteps(num_steps, start_time)?,
+        })
     }
 }
 
@@ -362,16 +364,39 @@ mod tests {
         // img2img at strength ≤ 1/steps rounds to 0 steps; the schedule must produce no `(t, t_prev)`
         // pairs so the denoise loop is a no-op (and never invokes the σ=0 ancestral step → NaN).
         let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
-        assert!(s.timesteps(0, 0.0).is_empty());
-        assert!(s.timesteps(0, 1000.0).is_empty());
+        assert!(s.timesteps(0, 0.0).unwrap().is_empty());
+        assert!(s.timesteps(0, 1000.0).unwrap().is_empty());
     }
 
     #[test]
     fn timesteps_span_start_to_zero() {
         let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
-        let ts = s.timesteps(4, 1000.0);
+        let ts = s.timesteps(4, 1000.0).unwrap();
         assert_eq!(ts.len(), 4);
         assert_eq!(ts[0].0, 1000.0);
         assert!((ts.last().unwrap().1 - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn round_to_f16_rounds_and_is_fallible_ok() {
+        // F-067: returns Ok with the actually-rounded value — never the un-rounded input (a 1-ULP
+        // un-rounded `t` seeds the chaotic ancestral trajectory, the exact silent parity break this
+        // rounding prevents). 1.0 is f16-exact (round-trips identically); 0.1 is not (must move to
+        // the nearest f16 value), so an un-rounded-fallback regression would surface here.
+        assert_eq!(round_to_f16(1.0).unwrap(), 1.0);
+        let r = round_to_f16(0.1).unwrap();
+        assert_ne!(
+            r, 0.1_f32,
+            "0.1 is not f16-representable; rounding must change it"
+        );
+        assert!(
+            (r - 0.1).abs() < 1e-3,
+            "but stays within f16 resolution of 0.1"
+        );
+        assert_eq!(
+            round_to_f16(r).unwrap(),
+            r,
+            "rounding an f16-exact value is a no-op"
+        );
     }
 }

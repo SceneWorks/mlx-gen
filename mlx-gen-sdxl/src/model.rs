@@ -435,14 +435,14 @@ impl Generator for Sdxl {
                 // The kept region is noised to each step's "next" time `t_prev` (schedule[i].1).
                 let t_prev: Vec<f32> = self
                     .sampler
-                    .timesteps(eff, start_step)
+                    .timesteps(eff, start_step)?
                     .into_iter()
                     .map(|(_, tp)| tp)
                     .collect();
                 let blend = InpaintBlend::new(&self.sampler, mask_latent, x_0, noise, t_prev);
                 (
                     x_t,
-                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
+                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)?),
                     Some(blend),
                 )
             } else if let Some((image, strength)) = reference.filter(|_| !ip_mode) {
@@ -457,7 +457,7 @@ impl Generator for Sdxl {
                 let eff = (steps as f32 * strength) as usize;
                 (
                     x_t,
-                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)),
+                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)?),
                     None,
                 )
             } else {
@@ -465,7 +465,7 @@ impl Generator for Sdxl {
                 let prior = self.sampler.sample_prior(&latent_shape)?;
                 (
                     prior,
-                    Box::new(AncestralEuler::new(&self.sampler, steps, max_time)),
+                    Box::new(AncestralEuler::new(&self.sampler, steps, max_time)?),
                     None,
                 )
             };
