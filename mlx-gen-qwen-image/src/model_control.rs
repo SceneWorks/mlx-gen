@@ -17,35 +17,24 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, ControlKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Result, WeightsSource,
 };
-use mlx_rs::{Array, Dtype};
 
 use crate::control_transformer::QwenControlNet;
 use crate::loader;
-use crate::model::{validate_request, LIGHTNING_SAMPLER};
+use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decoded_to_image, denoise_control_with_progress, encode_init_latents,
-    qwen_scheduler, unpack_latents,
+    create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
+    encode_prompt, negative_or_fallback, resolve_run_params, LIGHTNING_SAMPLER,
 };
-use crate::sampler::{lightning, FlowMatchSampler};
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
 
 /// Registry id for the Qwen-Image ControlNet (strict pose) variant.
 pub const MODEL_ID: &str = "qwen_image_control";
-
-/// Default inference steps (the base T2I flow-match default).
-const DEFAULT_STEPS: u32 = 4;
-/// Default CFG guidance (the base T2I default).
-const DEFAULT_GUIDANCE: f32 = 4.0;
-/// Empty/whitespace negative prompts fall back to a single space (the base `QwenPromptEncoder`).
-const NEGATIVE_FALLBACK: &str = " ";
-/// Lightning default steps — must match the loaded distillation LoRA variant (4- or 8-step).
-const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
 /// The control variant's identity + capabilities — the base Qwen-Image T2I surface (true CFG /
 /// negative prompt / guidance / Lightning) plus the **required** `Control` (pose skeleton)
@@ -143,16 +132,6 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 impl QwenImageControl {
-    /// Prompt → conditioning embeds (bf16), identical to the base T2I `encode_prompt`.
-    fn encode_prompt(&self, prompt: &str) -> Result<Array> {
-        let t = self.tokenizer.tokenize(prompt)?;
-        if t.input_ids.shape()[1] == 0 {
-            return Err(Error::Msg("qwen_image_control: empty prompt".into()));
-        }
-        let embeds = self.text_encoder.encode(&t.input_ids, &t.attention_mask)?;
-        Ok(embeds.as_dtype(Dtype::Bfloat16)?)
-    }
-
     /// Extract the required pose control image + its scale. v1 is **pose-only**: a non-`Pose`
     /// `ControlKind` (canny/depth/other) is rejected rather than silently treated as pose, even
     /// though the Union weights support it.
@@ -205,34 +184,22 @@ impl Generator for QwenImageControl {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
-        let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
-        let default_steps = if is_lightning {
-            LIGHTNING_DEFAULT_STEPS
-        } else {
-            DEFAULT_STEPS
-        };
-        let steps = req.steps.unwrap_or(default_steps) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Shared step/sampler/guidance/seed resolution (F-117).
+        let params = resolve_run_params(req, req.width, req.height);
 
         let (control_image, control_scale) = self.resolve_control(req)?;
 
         // Positive conditioning always; negative only for true CFG (Lightning is CFG-distilled).
-        let pos = self.encode_prompt(&req.prompt)?;
-        let neg = if is_lightning {
+        let pos = encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
+        let neg = if params.is_lightning {
             None
         } else {
-            let neg_prompt = match req.negative_prompt.as_deref() {
-                Some(s) if !s.trim().is_empty() => s,
-                _ => NEGATIVE_FALLBACK,
-            };
-            Some(self.encode_prompt(neg_prompt)?)
-        };
-
-        let sampler = if is_lightning {
-            lightning(steps)
-        } else {
-            FlowMatchSampler::new(qwen_scheduler(steps, req.width, req.height).sigmas)
+            Some(encode_prompt(
+                &self.tokenizer,
+                &self.text_encoder,
+                negative_or_fallback(req),
+                MODEL_ID,
+            )?)
         };
 
         // VAE-encode + pack the pose skeleton to the control latent `[1, seq, 64]` (constant across
@@ -240,32 +207,33 @@ impl Generator for QwenImageControl {
         // the control image with the VAE and `_pack_latents` 2×2, identical to the noise packing).
         let control_cond = encode_init_latents(&self.vae, control_image, req.width, req.height)?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let noise = create_noise(seed, req.width, req.height)?;
-            let latents = denoise_control_with_progress(
-                &self.transformer,
-                &self.controlnet,
-                &sampler,
-                noise,
-                &control_cond,
-                &pos,
-                neg.as_ref(),
-                guidance,
-                control_scale,
-                req.width,
-                req.height,
-                0,
-                &req.cancel,
-                on_progress,
-            )?;
-
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents, req.width, req.height)?;
-            let decoded = self.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
+        let images = decode_and_collect(
+            &self.vae,
+            req.count,
+            params.base_seed,
+            req.width,
+            req.height,
+            on_progress,
+            |seed, progress| {
+                let noise = create_noise(seed, req.width, req.height)?;
+                denoise_control_with_progress(
+                    &self.transformer,
+                    &self.controlnet,
+                    &params.sampler,
+                    noise,
+                    &control_cond,
+                    &pos,
+                    neg.as_ref(),
+                    params.guidance,
+                    control_scale,
+                    req.width,
+                    req.height,
+                    0,
+                    &req.cancel,
+                    progress,
+                )
+            },
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
