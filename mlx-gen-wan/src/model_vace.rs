@@ -36,7 +36,7 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::tiling::TilingConfig;
 
-use crate::adapters::merge_vace_adapters;
+use crate::adapters::{merge_vace_adapters, warn_skipped_adapters};
 use crate::config::WanVaceConfig;
 use crate::pipeline::{align_dim, decode_to_frames, frames_to_images, preprocess_i2v_image};
 use crate::scheduler::SolverKind;
@@ -136,14 +136,7 @@ impl WanVace {
                 self.adapters.len()
             )));
         }
-        if !report.skipped.is_empty() {
-            eprintln!(
-                "{}: {} adapter target(s) not present in this checkpoint, skipped: {:?}",
-                MODEL_ID_VACE,
-                report.skipped.len(),
-                report.skipped
-            );
-        }
+        warn_skipped_adapters(MODEL_ID_VACE, &report.skipped);
         Ok(())
     }
 }

@@ -453,6 +453,21 @@ fn merge_one_loha_thirdparty(
     Ok(())
 }
 
+/// Emit a single, uniform warning for adapter targets that aren't present in the loaded checkpoint —
+/// a *partial* skip, distinct from the hard "matched no module" error the model entries return. The
+/// three Wan `Generator` load paths (`model.rs` ×2, `model_vace.rs`) share this so the message can't
+/// drift (F-026); `eprintln!` is the only channel available at load time (no `Progress` callback, no
+/// workspace logging facade). A no-op when nothing was skipped.
+pub(crate) fn warn_skipped_adapters(model_id: &str, skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    eprintln!(
+        "{model_id}: {} adapter target(s) not present in this checkpoint, skipped: {skipped:?}",
+        skipped.len()
+    );
+}
+
 /// Merge every adapter in `specs` that targets `expert` into the expert weight map `w` (sc-2683 LoRA /
 /// sc-2393 LoKr). Shared
 /// specs (`moe_expert == None`) are applied first, then this expert's specific ones (`Some(expert)`),

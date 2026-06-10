@@ -26,7 +26,7 @@ use mlx_gen::{
 use mlx_rs::random;
 use mlx_rs::Array;
 
-use crate::adapters::merge_wan_adapters;
+use crate::adapters::{merge_wan_adapters, warn_skipped_adapters};
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
     align_dim, best_output_size, build_i2v_y, build_ti2v_keyframe_z, build_ti2v_mask,
@@ -133,14 +133,7 @@ impl Wan {
                 self.adapters.len()
             )));
         }
-        if !report.skipped.is_empty() {
-            eprintln!(
-                "{}: {} adapter target(s) not present in this checkpoint, skipped: {:?}",
-                self.descriptor.id,
-                report.skipped.len(),
-                report.skipped
-            );
-        }
+        warn_skipped_adapters(self.descriptor.id, &report.skipped);
         Ok(())
     }
 }
@@ -518,13 +511,7 @@ impl Wan14b {
         skipped.extend(high.skipped);
         skipped.sort();
         skipped.dedup();
-        if !skipped.is_empty() {
-            eprintln!(
-                "{}: {} LoRA target(s) not present in this checkpoint, skipped: {skipped:?}",
-                self.descriptor.id,
-                skipped.len()
-            );
-        }
+        warn_skipped_adapters(self.descriptor.id, &skipped);
         Ok(())
     }
 }
