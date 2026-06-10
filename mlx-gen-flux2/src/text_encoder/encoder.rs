@@ -7,7 +7,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::{join, Qwen3DecoderLayer, TextRope};
 
@@ -174,20 +174,35 @@ impl Qwen3TextEncoder {
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
-        // hidden_states[0] = embeddings; hidden_states[i+1] = output of layer i.
+        // hidden_states index 0 = embeddings; index k = output of layer k-1. Only states a/b_/c are
+        // used (9/18/27), and the final norm is never applied — so run layers only up to the highest
+        // needed index and keep just those states, not all 37 (F-098): layers past max(out_layers)
+        // cannot influence the result. Bit-identical to running all 36 + indexing.
+        let [a, b_, c] = self.out_layers;
+        let max_idx = a.max(b_).max(c);
+        let needed = [a, b_, c];
+
         let mut hidden = self.embed(input_ids)?;
-        let mut hidden_states: Vec<Array> = Vec::with_capacity(self.layers.len() + 1);
-        hidden_states.push(hidden.clone());
-        for layer in &self.layers {
+        let mut saved: Vec<(usize, Array)> = Vec::with_capacity(3);
+        if needed.contains(&0) {
+            saved.push((0, hidden.clone()));
+        }
+        for (i, layer) in self.layers.iter().take(max_idx).enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-            hidden_states.push(hidden.clone());
+            let idx = i + 1;
+            if needed.contains(&idx) {
+                saved.push((idx, hidden.clone()));
+            }
         }
 
-        let [a, b_, c] = self.out_layers;
-        Ok(concatenate_axis(
-            &[&hidden_states[a], &hidden_states[b_], &hidden_states[c]],
-            2,
-        )?)
+        let pick = |idx: usize| -> Result<&Array> {
+            saved
+                .iter()
+                .find(|(k, _)| *k == idx)
+                .map(|(_, v)| v)
+                .ok_or_else(|| Error::Msg(format!("flux2 te: hidden state {idx} not captured")))
+        };
+        Ok(concatenate_axis(&[pick(a)?, pick(b_)?, pick(c)?], 2)?)
     }
 }
 
