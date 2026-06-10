@@ -11,8 +11,8 @@ categories = ["science"]
 [dependencies]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
-mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "e59ffd88014340e6a49b26de95446b8b76a57932" }
+mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
 serde_json = "1"
 # Link-time self-registration of the `Generator` into the core registry (sc-3194).
-inventory = "0.3"
+inventory = { workspace = true }
