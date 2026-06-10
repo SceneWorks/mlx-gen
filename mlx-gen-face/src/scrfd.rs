@@ -23,8 +23,10 @@ use mlx_gen::array::scalar;
 use mlx_gen::nn;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
-use mlx_rs::ops::{add, max_axes, maximum, mean_axes, multiply, sigmoid};
+use mlx_rs::ops::{add, max_axes, mean_axes, multiply, sigmoid};
 use mlx_rs::Array;
+
+use crate::common::{relu, Conv};
 
 /// Backbone residual-block counts per stage.
 const STAGE_BLOCKS: [usize; 4] = [3, 4, 2, 3];
@@ -40,10 +42,6 @@ pub struct Detection {
     pub score: f32,
 }
 
-fn relu(x: &Array) -> Result<Array> {
-    Ok(maximum(x, scalar(0.0))?)
-}
-
 /// 2×2 stride-2 pooling over NHWC via reshape + reduce over the two size-2 axes (exact for even dims).
 fn pool2x2(x: &Array, avg: bool) -> Result<Array> {
     let s = x.shape();
@@ -54,23 +52,6 @@ fn pool2x2(x: &Array, avg: bool) -> Result<Array> {
     } else {
         max_axes(&r, &[2, 4], false)?
     })
-}
-
-struct Conv {
-    w: Array,
-    b: Array,
-}
-
-impl Conv {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
-    }
-    fn forward(&self, x: &Array, stride: i32, padding: i32) -> Result<Array> {
-        nn::conv2d(x, &self.w, Some(&self.b), stride, padding)
-    }
 }
 
 /// `Conv(c1,3×3,stride)+Relu → Conv(c2,3×3,s1) → + identity(/downsample) → Relu`.

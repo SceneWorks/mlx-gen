@@ -19,23 +19,20 @@
 //! `tools/convert_bisenet.py`). The mask is a coarse argmax → tolerant; parity is mask IoU ≈ 1.0.
 //! Input: NHWC `[B,512,512,3]`, `(rgb/255 - mean) / std` with ImageNet mean/std. fp32, OHWI weights.
 
-use mlx_gen::array::scalar;
-use mlx_gen::nn::{conv2d, upsample_nearest};
+use mlx_gen::nn::upsample_nearest;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::ops::indexing::{argmax_axis, IndexOp, IntoStrideBy};
 use mlx_rs::ops::{add, concatenate_axis, matmul, maximum, mean_axes, multiply, pad, sigmoid};
 use mlx_rs::Array;
 
+use crate::common::{relu, Conv, ConvW};
+
 /// PuLID background labels → whitened in the `face_features_image`.
 pub const BG_LABELS: [u32; 8] = [0, 16, 18, 7, 8, 9, 14, 15];
 /// ImageNet normalization (the facexlib parse-net preprocessing).
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
-
-fn relu(x: &Array) -> Result<Array> {
-    Ok(maximum(x, scalar(0.0))?)
-}
 
 /// Global average pool over the NHWC spatial axes → `[B,1,1,C]`.
 fn global_avg(x: &Array) -> Result<Array> {
@@ -96,42 +93,6 @@ fn upsample_bilinear_ac(x: &Array, out_h: i32, out_w: i32) -> Result<Array> {
     // cols: [out_w,w] · [b*out_h,w,c] -> [b*out_h,out_w,c]
     let out = matmul(&wx, &mid)?;
     Ok(out.reshape(&[b, out_h, out_w, c])?)
-}
-
-/// A biased convolution (BN folded in at conversion).
-struct Conv {
-    w: Array,
-    b: Array,
-}
-impl Conv {
-    fn load(w: &Weights, p: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{p}.weight"))?.clone(),
-            b: w.require(&format!("{p}.bias"))?.clone(),
-        })
-    }
-    fn forward(&self, x: &Array, stride: i32, padding: i32) -> Result<Array> {
-        conv2d(x, &self.w, Some(&self.b), stride, padding)
-    }
-    /// ConvBNReLU = biased conv → ReLU.
-    fn forward_relu(&self, x: &Array, stride: i32, padding: i32) -> Result<Array> {
-        relu(&self.forward(x, stride, padding)?)
-    }
-}
-
-/// A bias-less convolution (the FFM SE 1×1s and the final 1×1 head — no BN).
-struct ConvW {
-    w: Array,
-}
-impl ConvW {
-    fn load(w: &Weights, p: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{p}.weight"))?.clone(),
-        })
-    }
-    fn forward(&self, x: &Array) -> Result<Array> {
-        conv2d(x, &self.w, None, 1, 0)
-    }
 }
 
 /// ResNet18 `BasicBlock`: `conv1(stride)→relu→conv2 (+ downsample) → relu`.

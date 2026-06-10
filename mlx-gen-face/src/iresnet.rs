@@ -27,6 +27,8 @@ use mlx_gen::Result;
 use mlx_rs::ops::{add, maximum, minimum, multiply};
 use mlx_rs::Array;
 
+use crate::common::Conv;
+
 /// iresnet100 block counts per layer (`layer1..layer4`).
 const LAYERS: [usize; 4] = [3, 13, 30, 3];
 /// Flattened head input = 512 channels × 7 × 7 feature map.
@@ -45,25 +47,6 @@ fn prelu(x: &Array, slope: &Array) -> Result<Array> {
 /// broadcasting over the last axis for both NHWC maps and `[N, C]` feature vectors).
 fn affine(x: &Array, scale: &Array, shift: &Array) -> Result<Array> {
     Ok(add(&multiply(x, scale)?, shift)?)
-}
-
-/// A biased convolution (the BN-folded convs all carry a bias).
-struct Conv {
-    w: Array,
-    b: Array,
-}
-
-impl Conv {
-    fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
-            b: w.require(&format!("{prefix}.bias"))?.clone(),
-        })
-    }
-
-    fn forward(&self, x: &Array, stride: i32, padding: i32) -> Result<Array> {
-        nn::conv2d(x, &self.w, Some(&self.b), stride, padding)
-    }
 }
 
 /// A folded BatchNorm (per-channel `scale`/`shift`).

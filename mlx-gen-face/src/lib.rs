@@ -18,6 +18,7 @@
 
 pub mod align;
 pub mod bisenet;
+pub(crate) mod common;
 pub mod face;
 pub mod iresnet;
 pub mod scrfd;
