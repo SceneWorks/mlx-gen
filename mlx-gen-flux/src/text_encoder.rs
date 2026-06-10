@@ -323,8 +323,14 @@ impl T5TextEncoder {
     /// unmasked. `mask = None` is **byte-identical** to [`forward`](Self::forward).
     pub fn forward_masked(&self, tokens: &Array, mask: Option<&Array>) -> Result<Array> {
         let mut hidden = self.shared.forward(tokens)?;
-        for block in &self.blocks {
-            hidden = block.forward(&hidden, mask)?;
+        // The relative-position bias depends only on seq_len and is identical across all blocks (only
+        // block 0 carries the table; every other block clones it), so compute it once here and share
+        // it instead of rebuilding the O(L²) gather inside each of the 24 blocks (F-099).
+        if let Some(block0) = self.blocks.first() {
+            let bias = block0.attn.position_bias(hidden.shape()[1])?;
+            for block in &self.blocks {
+                hidden = block.forward(&hidden, mask, &bias)?;
+            }
         }
         t5_rms_norm(&hidden, &self.final_ln_w, 1e-6)
     }
@@ -343,8 +349,8 @@ impl T5Block {
         })
     }
 
-    fn forward(&self, hidden: &Array, mask: Option<&Array>) -> Result<Array> {
-        let hidden = self.attn.forward(hidden, mask)?;
+    fn forward(&self, hidden: &Array, mask: Option<&Array>, bias: &Array) -> Result<Array> {
+        let hidden = self.attn.forward(hidden, mask, bias)?;
         self.ff.forward(&hidden)
     }
 
@@ -394,17 +400,18 @@ impl T5Attention {
         })
     }
 
-    fn forward(&self, hidden: &Array, mask: Option<&Array>) -> Result<Array> {
+    /// `bias` is the shared relative-position bias for this seq_len, precomputed once per forward in
+    /// [`T5TextEncoder::forward_masked`] (it is identical across all blocks — F-099).
+    fn forward(&self, hidden: &Array, mask: Option<&Array>, bias: &Array) -> Result<Array> {
         let normed = t5_rms_norm(hidden, &self.ln_w, 1e-6)?;
         let q = shape_t5(&self.q.forward(&normed)?)?;
         let k = shape_t5(&self.k.forward(&normed)?)?;
         let v = shape_t5(&self.v.forward(&normed)?)?;
         let scores = matmul(&q, &k.transpose_axes(&[0, 1, 3, 2])?)?;
-        let bias = self.position_bias(hidden.shape()[1])?;
         // Chroma key-padding mask (epic 3531): additive, broadcast over query/heads. `None` for FLUX.
         let biased = match mask {
-            Some(m) => add(&add(&scores, &bias)?, m)?,
-            None => add(&scores, &bias)?,
+            Some(m) => add(&add(&scores, bias)?, m)?,
+            None => add(&scores, bias)?,
         };
         let weights = softmax_axis(&biased, -1, false)?;
         let attn = unshape_t5(&matmul(&weights, &v)?)?;
