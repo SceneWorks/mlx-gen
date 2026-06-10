@@ -239,6 +239,14 @@ fn parse_pickle(data: &[u8]) -> Result<Vec<(String, Val)>> {
             0x8a => {
                 // LONG1: 1-byte length, then little-endian signed
                 let n = r.u8()? as usize;
+                // An i64 holds at most 8 bytes; torch never emits a wider int for the metadata this
+                // VM reads. Reject n > 8 — otherwise `(b as i64) << (8 * i)` shifts by >= 64, which
+                // panics in debug and silently masks to a wrong value in release (F-016).
+                if n > 8 {
+                    return Err(Error::Msg(format!(
+                        "pickle: LONG1 length {n} exceeds 8 bytes (i64)"
+                    )));
+                }
                 let bytes = r.take(n)?;
                 let mut v: i64 = 0;
                 for (i, &b) in bytes.iter().enumerate() {
@@ -803,6 +811,24 @@ mod tests {
             }
             _ => panic!("expected a tensor spec"),
         }
+    }
+
+    /// F-016: a LONG1 length > 8 would shift by >= 64 (`(b as i64) << (8*i)`), panicking in debug and
+    /// silently masking to a wrong value in release. It must be rejected with a typed error instead.
+    #[test]
+    fn parse_rejects_oversized_long1() {
+        let mut p: Vec<u8> = Vec::new();
+        p.extend_from_slice(&[0x80, 2]); // PROTO 2
+        p.push(0x8a); // LONG1
+        p.push(9); // length 9 > 8
+        p.extend_from_slice(&[0u8; 9]);
+        p.push(b'.'); // STOP (unreached — the length check fires first)
+
+        let err = parse_pickle(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("LONG1 length 9 exceeds 8 bytes"),
+            "expected a LONG1-length error, got: {err}"
+        );
     }
 
     #[test]
