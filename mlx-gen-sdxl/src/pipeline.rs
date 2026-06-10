@@ -457,19 +457,23 @@ pub fn seeded_prior(sampler: &EulerSampler, seed: u64, width: u32, height: u32) 
     ])
 }
 
-/// Preprocess an init image for img2img: PIL-LANCZOS resize to the target dims (no-op when already
-/// sized), normalize `[0,255] → [-1,1]`, lay out NHWC `[1, H, W, 3]` f32 — the input the VAE encoder
-/// expects. Uses the core PIL-exact resampler (`resize_lanczos_u8`).
-pub fn preprocess_init_image(
+/// Shared resize/validate/layout for the SDXL image preprocessors: PIL-LANCZOS resize to the target
+/// dims (no-op when already sized) via the core PIL-exact resampler (`resize_lanczos_u8`), apply the
+/// per-pixel `normalize`, and lay out NHWC `[1, H, W, 3]` f32. `kind` names the image in the
+/// buffer-size error. The init (`[-1,1]`) and control (`[0,1]`) preprocessors differ ONLY in
+/// `normalize`, so the resize/validation logic lives here once (F-071).
+fn preprocess_image(
     image: &Image,
     target_width: u32,
     target_height: u32,
+    kind: &str,
+    normalize: impl Fn(f32) -> f32,
 ) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (target_width as usize, target_height as usize);
     if image.pixels.len() != iw * ih * 3 {
         return Err(Error::Msg(format!(
-            "sdxl init image pixel buffer {} != {iw}x{ih}x3",
+            "sdxl {kind} image pixel buffer {} != {iw}x{ih}x3",
             image.pixels.len()
         )));
     }
@@ -478,8 +482,21 @@ pub fn preprocess_init_image(
     } else {
         resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
     };
-    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    let norm: Vec<f32> = resized.iter().map(|&v| normalize(v)).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
+}
+
+/// Preprocess an init image for img2img: PIL-LANCZOS resize to the target dims (no-op when already
+/// sized), normalize `[0,255] → [-1,1]`, lay out NHWC `[1, H, W, 3]` f32 — the input the VAE encoder
+/// expects.
+pub fn preprocess_init_image(
+    image: &Image,
+    target_width: u32,
+    target_height: u32,
+) -> Result<Array> {
+    preprocess_image(image, target_width, target_height, "init", |v| {
+        2.0 * (v / 255.0) - 1.0
+    })
 }
 
 /// Preprocess a ControlNet control image (sc-3058): LANCZOS resize to the target dims, normalize
@@ -490,21 +507,7 @@ pub fn preprocess_control_image(
     target_width: u32,
     target_height: u32,
 ) -> Result<Array> {
-    let (iw, ih) = (image.width as usize, image.height as usize);
-    let (tw, th) = (target_width as usize, target_height as usize);
-    if image.pixels.len() != iw * ih * 3 {
-        return Err(Error::Msg(format!(
-            "sdxl control image pixel buffer {} != {iw}x{ih}x3",
-            image.pixels.len()
-        )));
-    }
-    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
-        image.pixels.iter().map(|&p| p as f32).collect()
-    } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
-    };
-    let norm: Vec<f32> = resized.iter().map(|&v| v / 255.0).collect();
-    Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
+    preprocess_image(image, target_width, target_height, "control", |v| v / 255.0)
 }
 
 /// img2img init latents: preprocess the image → VAE-encode mean `[1, h, w, 4]` (NHWC). The fork's
@@ -546,4 +549,53 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
 pub fn decode_image(vae: &Autoencoder, latents: &Array) -> Result<Image> {
     let decoded = vae.decode(latents)?;
     decoded_to_image(&decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-071: the init and control preprocessors share the resize/validate/layout helper and differ
+    /// only in normalization — init maps `[0,255]→[-1,1]`, control maps `[0,255]→[0,1]`. Use a
+    /// same-size image so the resampler is a no-op and the per-pixel normalization is what's asserted.
+    #[test]
+    fn preprocess_normalizations_and_layout() {
+        // 2×1 RGB: pixel A = (255,255,255), pixel B = (0,0,0).
+        let img = Image {
+            width: 2,
+            height: 1,
+            pixels: vec![255, 255, 255, 0, 0, 0],
+        };
+
+        let init = preprocess_init_image(&img, 2, 1).unwrap();
+        assert_eq!(init.shape(), &[1, 1, 2, 3]); // NHWC [1, H, W, 3]
+        let s = init.as_slice::<f32>();
+        assert_eq!(s[0], 1.0); // 255 → +1
+        assert_eq!(s[3], -1.0); // 0 → −1
+
+        let control = preprocess_control_image(&img, 2, 1).unwrap();
+        let c = control.as_slice::<f32>();
+        assert_eq!(c[0], 1.0); // 255 → 1
+        assert_eq!(c[3], 0.0); // 0 → 0
+    }
+
+    /// The shared buffer-size validation rejects a mismatched pixel buffer and names the image kind
+    /// (so the two wrappers stay distinguishable in the error).
+    #[test]
+    fn preprocess_rejects_wrong_buffer_with_kind() {
+        let bad = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 8], // not 4·4·3
+        };
+        let e = preprocess_init_image(&bad, 4, 4).unwrap_err().to_string();
+        assert!(e.contains("init"), "init error should name the kind: {e}");
+        let e = preprocess_control_image(&bad, 4, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("control"),
+            "control error should name the kind: {e}"
+        );
+    }
 }
