@@ -803,6 +803,20 @@ mod tests {
     }
 
     #[test]
+    fn stage_sigmas_are_exact() {
+        // F-046: lock the production distilled sigma lists (single source of truth now schedule.rs
+        // is gone). These are chaos-sensitive — a silent edit would drift the render.
+        assert_eq!(STAGE1_SIGMAS.len(), 9); // 8 steps
+        assert_eq!(STAGE2_SIGMAS.len(), 4); // 3 steps
+        assert_eq!(STAGE1_SIGMAS[0], 1.0);
+        assert_eq!(*STAGE1_SIGMAS.last().unwrap(), 0.0);
+        assert_eq!(STAGE2_SIGMAS[0], 0.909_375);
+        assert_eq!(*STAGE2_SIGMAS.last().unwrap(), 0.0);
+        // The stage boundary: stage 2 starts at stage 1's σ index 5 (the 0.909375 re-noise anchor).
+        assert_eq!(STAGE1_SIGMAS[5], STAGE2_SIGMAS[0]);
+    }
+
+    #[test]
     fn euler_step_matches_reference_formula() {
         // x' = denoised + σ_next·(x − denoised)/σ.
         let x = arr(&[1.0, 2.0, 3.0, 4.0], &[4]);

@@ -14,7 +14,7 @@ use mlx_gen::weights::Weights;
 
 use mlx_gen_ltx::positions::create_position_grid;
 use mlx_gen_ltx::rope::{apply_split_rotary_emb, precompute_split_freqs_cis};
-use mlx_gen_ltx::schedule::{DEFAULT_STAGE_1_SIGMAS, DEFAULT_STAGE_2_SIGMAS};
+use mlx_gen_ltx::{STAGE1_SIGMAS, STAGE2_SIGMAS};
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -106,6 +106,8 @@ fn sigma_schedules_match_reference() {
         .unwrap()
         .as_slice::<f32>()
         .to_vec();
-    assert_eq!(s1, DEFAULT_STAGE_1_SIGMAS.to_vec());
-    assert_eq!(s2, DEFAULT_STAGE_2_SIGMAS.to_vec());
+    // Gate the **production** pipeline constants against the golden (F-046: the old test gated a
+    // now-deleted duplicate in schedule.rs, leaving these never cross-checked).
+    assert_eq!(s1, STAGE1_SIGMAS.to_vec());
+    assert_eq!(s2, STAGE2_SIGMAS.to_vec());
 }

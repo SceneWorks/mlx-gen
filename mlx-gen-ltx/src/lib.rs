@@ -43,7 +43,6 @@ pub mod model;
 pub mod pipeline;
 pub mod positions;
 pub mod rope;
-pub mod schedule;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod training;
