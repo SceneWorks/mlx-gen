@@ -411,10 +411,6 @@ impl AdaptableLinear {
         matches!(self.base, LinearBase::Quantized(_))
     }
 
-    /// Diagnostic accessor: the quantized base's `(packed_weight, scales, biases, bias, group_size,
-    /// bits)`, or `None` if the base is still dense. Used by the sc-2604 Q8 root-cause diagnostic to
-    /// byte-compare the *loaded* model's quantization against the fork's `mx.quantize` (the
-    /// `qmm_smallk` probe only exercised the free `quantize` op, not `try_from_linear`).
     /// Diagnostic accessor: the dense base's `(weight, bias)`, or `None` if already quantized.
     /// Used by the sc-2604 diagnostic to inspect the loaded weight dtype before quantization.
     pub fn dense_weight(&self) -> Option<(&Array, Option<&Array>)> {
@@ -424,6 +420,10 @@ impl AdaptableLinear {
         }
     }
 
+    /// Diagnostic accessor: the quantized base's `(packed_weight, scales, biases, bias, group_size,
+    /// bits)`, or `None` if the base is still dense. Used by the sc-2604 Q8 root-cause diagnostic to
+    /// byte-compare the *loaded* model's quantization against the fork's `mx.quantize` (the
+    /// `qmm_smallk` probe only exercised the free `quantize` op, not `try_from_linear`).
     #[allow(clippy::type_complexity)]
     pub fn quantized_params(&self) -> Option<(&Array, &Array, &Array, Option<&Array>, i32, i32)> {
         match &self.base {
