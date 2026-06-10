@@ -108,7 +108,8 @@ def main():
     OUT.parent.mkdir(parents=True, exist_ok=True)
 
     # InstantID ip-adapter.bin = {"image_proj": {...}, "ip_adapter": {...}}.
-    state = torch.load(str(IP_BIN), map_location="cpu")
+    # weights_only=True: plain tensor dict, so don't execute pickle from a third-party file (F-152).
+    state = torch.load(str(IP_BIN), map_location="cpu", weights_only=True)
     image_proj = {k: v.float() for k, v in state["image_proj"].items()}
 
     res = Resampler()

@@ -55,7 +55,9 @@ EXPECTED_CN_CONFIG = {
 
 def convert_ip_adapter(src: Path, out: Path) -> Path:
     """Split `ip-adapter.bin` (pickle) → one safetensors with `image_proj.*` + `ip_adapter.*`."""
-    state = torch.load(str(src / "ip-adapter.bin"), map_location="cpu")
+    # weights_only=True: ip-adapter.bin is a plain tensor state dict, so refuse to execute arbitrary
+    # pickle opcodes from a third-party artifact (unsafe default on torch < 2.6 — F-152).
+    state = torch.load(str(src / "ip-adapter.bin"), map_location="cpu", weights_only=True)
     assert set(state) >= {"image_proj", "ip_adapter"}, f"unexpected top keys: {list(state)}"
 
     tensors = {}

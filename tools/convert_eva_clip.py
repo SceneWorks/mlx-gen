@@ -18,6 +18,7 @@ Usage:
     /private/tmp/pulidenv/bin/python tools/convert_eva_clip.py [--out PATH] [--dtype f16|f32]
 """
 import argparse
+import hashlib
 import os
 
 import numpy as np
@@ -26,6 +27,14 @@ EVA_CKPT = os.path.expanduser(
     "~/.cache/huggingface/hub/models--QuanSun--EVA-CLIP/snapshots/"
     "11afd202f2ae80869d6cef18b1ec775e79bd8d12/EVA02_CLIP_L_336_psz14_s6B.pt"
 )
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def remap_visual(visual_sd: dict) -> dict:
@@ -48,10 +57,33 @@ def remap_visual(visual_sd: dict) -> dict:
 
 
 def load_visual_state_dict() -> dict:
-    """Load the raw checkpoint and return the `visual.`-stripped state dict (torch tensors)."""
+    """Load the raw checkpoint and return the `visual.`-stripped state dict (torch tensors).
+
+    Loads with `weights_only=True` so a tampered third-party `.pt` cannot execute arbitrary pickle
+    opcodes on the dev machine (F-152) — EVA02-CLIP ships a plain tensor state dict, so this is the
+    normal path. If a checkpoint genuinely needs full unpickling, opt in explicitly by setting
+    `EVA_CLIP_SHA256` to the file's verified SHA-256: the file is hashed and checked before the unsafe
+    `weights_only=False` load, which refuses on mismatch (and refuses outright if no hash is set).
+    """
     import torch
 
-    sd = torch.load(EVA_CKPT, map_location="cpu", weights_only=False)
+    try:
+        sd = torch.load(EVA_CKPT, map_location="cpu", weights_only=True)
+    except Exception as e:  # noqa: BLE001 — fall back only behind an explicit, hash-verified opt-in
+        expected = os.environ.get("EVA_CLIP_SHA256")
+        if not expected:
+            raise SystemExit(
+                f"convert_eva_clip: {EVA_CKPT} could not be loaded with weights_only=True ({e}).\n"
+                "Refusing to unpickle a third-party checkpoint unsafely. If you trust this exact "
+                "file, verify it and re-run with EVA_CLIP_SHA256=<sha256> to allow weights_only=False."
+            ) from e
+        actual = _sha256(EVA_CKPT)
+        if actual.lower() != expected.lower():
+            raise SystemExit(
+                f"convert_eva_clip: SHA-256 mismatch for {EVA_CKPT}\n"
+                f"  expected {expected}\n  actual   {actual}"
+            )
+        sd = torch.load(EVA_CKPT, map_location="cpu", weights_only=False)
     if isinstance(sd, dict) and "state_dict" in sd:
         sd = sd["state_dict"]
     return {k[len("visual."):]: v for k, v in sd.items() if k.startswith("visual.")}
