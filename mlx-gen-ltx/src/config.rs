@@ -256,6 +256,24 @@ impl LtxConfig {
             "audio_connector_attention_head_dim",
             cfg.audio_connector_attention_head_dim,
         );
+        // Audio latent channels + 1-D audio RoPE max position. Previously never read despite the
+        // struct doc claiming every field is parsed (F-047) — a checkpoint with non-default values
+        // would have been silently ignored. `audio_positional_embedding_max_pos` ships as a 1-element
+        // array (`[20]`).
+        cfg.audio_in_channels = get_i32(t, "audio_in_channels", cfg.audio_in_channels);
+        cfg.audio_out_channels = get_i32(t, "audio_out_channels", cfg.audio_out_channels);
+        cfg.audio_positional_embedding_max_pos = get_i32_array_first(
+            t,
+            "audio_positional_embedding_max_pos",
+            cfg.audio_positional_embedding_max_pos,
+        );
+        // Cross-modal gate timestep multiplier (the converter emits this as a float — handled by the
+        // now float-aware `get_i32`).
+        cfg.av_ca_timestep_scale_multiplier = get_i32(
+            t,
+            "av_ca_timestep_scale_multiplier",
+            cfg.av_ca_timestep_scale_multiplier,
+        );
 
         // caption_channels derivation (generate_av.py lines 1484–1498).
         let no_caption_proj =
@@ -728,10 +746,26 @@ fn parse_vae_blocks(v: Option<&Value>) -> Option<Vec<VaeBlock>> {
     Some(out)
 }
 
+/// A single JSON number → `i32`, accepting both integer- and float-typed JSON (this crate's own
+/// converter emits some integer config values as floats, e.g. `av_ca_timestep_scale_multiplier:
+/// 1000.0` — `as_i64` returns `None` for those, which would silently drop the value, F-047).
+fn json_i32(n: &Value) -> Option<i32> {
+    n.as_i64()
+        .map(|x| x as i32)
+        .or_else(|| n.as_f64().map(|f| f as i32))
+}
+
 fn get_i32(v: &Value, key: &str, default: i32) -> i32 {
+    v.get(key).and_then(json_i32).unwrap_or(default)
+}
+
+/// First element of a JSON int array `key` (float-aware), or `default` if absent/empty. Used for the
+/// single-element audio RoPE max-pos array (`audio_positional_embedding_max_pos = [20]`).
+fn get_i32_array_first(v: &Value, key: &str, default: i32) -> i32 {
     v.get(key)
-        .and_then(Value::as_i64)
-        .map(|n| n as i32)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(json_i32)
         .unwrap_or(default)
 }
 
@@ -743,13 +777,10 @@ fn get_bool(v: &Value, key: &str, default: bool) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// Read a JSON int array `key` → `Vec<i32>` (None if absent/empty).
+/// Read a JSON int array `key` → `Vec<i32>` (None if absent/empty). Float-aware (F-047).
 fn get_i32_vec(v: &Value, key: &str) -> Option<Vec<i32>> {
     let arr = v.get(key)?.as_array()?;
-    let out: Vec<i32> = arr
-        .iter()
-        .filter_map(|n| n.as_i64().map(|x| x as i32))
-        .collect();
+    let out: Vec<i32> = arr.iter().filter_map(json_i32).collect();
     (!out.is_empty()).then_some(out)
 }
 
@@ -758,8 +789,8 @@ fn get_i32_3(v: &Value, key: &str, default: [i32; 3]) -> [i32; 3] {
         Some(a) if a.len() == 3 => {
             let mut out = default;
             for (i, slot) in out.iter_mut().enumerate() {
-                if let Some(n) = a[i].as_i64() {
-                    *slot = n as i32;
+                if let Some(n) = json_i32(&a[i]) {
+                    *slot = n;
                 }
             }
             out
@@ -849,6 +880,31 @@ mod tests {
         assert_eq!(cfg.connector_num_learnable_registers, 128);
         assert_eq!(cfg.connector_positional_embedding_max_pos, 4096);
         assert!(cfg.connector_apply_gated_attention);
+    }
+
+    #[test]
+    fn from_embedded_parses_audio_and_av_fields_with_non_default_values() {
+        // F-047: these four fields were never read, so the reference test passed only because the
+        // defaults equalled the shipped values. Feed NON-default values to prove they're parsed —
+        // including `av_ca_timestep_scale_multiplier` as a *float* (the converter emits it that way,
+        // which `as_i64` silently dropped before the float-aware getter).
+        let t = serde_json::json!({
+            "audio_in_channels": 256,
+            "audio_out_channels": 257,
+            "audio_positional_embedding_max_pos": [42],
+            "av_ca_timestep_scale_multiplier": 2000.0,
+        });
+        let cfg = LtxConfig::from_embedded_transformer(&t);
+        assert_eq!(cfg.audio_in_channels, 256);
+        assert_eq!(cfg.audio_out_channels, 257);
+        assert_eq!(cfg.audio_positional_embedding_max_pos, 42);
+        assert_eq!(cfg.av_ca_timestep_scale_multiplier, 2000);
+        // The float-typed integer is read via the same getter for the non-audio multiplier too.
+        let t2 = serde_json::json!({ "timestep_scale_multiplier": 3000.0 });
+        assert_eq!(
+            LtxConfig::from_embedded_transformer(&t2).timestep_scale_multiplier,
+            3000
+        );
     }
 
     #[test]
