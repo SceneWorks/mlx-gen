@@ -2,18 +2,12 @@
 members = ["mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma"]
 resolver = "2"
 
-[package]
-name = "mlx-gen"
-version = "0.0.0"
-edition = "2021"
-description = "Rust-native generative image & video model inference on Apple MLX (work in progress; name reserved)."
-license = "Apache-2.0"
-repository = "https://github.com/michaeltrefry/mlx-gen"
-keywords = ["mlx", "apple-silicon", "diffusion", "inference", "generative"]
-categories = ["science"]
-readme = "README.md"
-
-[dependencies]
+# Single source of truth for the deps shared across the root and all 16 member crates (F-151). The
+# next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of 17 synchronized
+# ones — a missed crate would otherwise produce two distinct `mlx-rs` builds, cross-crate `Array`
+# type-mismatch errors, and a doubled (very expensive) MLX-from-source build. Members opt in with
+# `<dep> = { workspace = true }`.
+[workspace.dependencies]
 # mlx-rs fork pinned to our own GitHub copy by commit SHA (supply-chain capture — immune to the
 # upstream fork being yanked/deleted). `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX
 # core v0.31.1 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
@@ -35,3 +29,21 @@ inventory = "0.3"
 # HF tokenizers (same Rust core `transformers` wraps) — loads tokenizer.json directly.
 # onig only (no progressbar/http): byte-level BPE for Qwen/CLIP/T5 needs just the regex.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[package]
+name = "mlx-gen"
+version = "0.0.0"
+edition = "2021"
+description = "Rust-native generative image & video model inference on Apple MLX (work in progress; name reserved)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "inference", "generative"]
+categories = ["science"]
+readme = "README.md"
+
+[dependencies]
+# Shared pins live in [workspace.dependencies] above (F-151).
+mlx-rs = { workspace = true }
+thiserror = { workspace = true }
+inventory = { workspace = true }
+tokenizers = { workspace = true }
