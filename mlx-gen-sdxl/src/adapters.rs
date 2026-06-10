@@ -4,13 +4,15 @@
 //! **LoKr** (`<module>.lokr_w1/w2` (+ low-rank `_a`/`_b`), `networkType=lokr` + `alpha`/`rank` meta):
 //! the vendored SDXL path *rejects* LoKr, so there is no fork to match — Rust is strictly more
 //! capable. The delta is reconstructed with the validated LyCORIS formula (`reconstruct_lokr_delta`,
-//! f32 for the f32-everywhere SDXL path) and merged (`W += δ·scale`), chaos-safe like LoRA. Keys
+//! in f32) and merged (`W += δ·scale`) at the U-Net's load dtype, chaos-safe like LoRA. Keys
 //! resolve through the same kohya table (`lora_unet_<flat>.lokr_*`) or bare/PEFT dotted paths.
 //!
-//! **LoRA** — two on-disk formats, both **merged into the dense f32 U-Net weights at load** (`W += δ`, NOT a
-//! forward-time residual): SDXL's ancestral sampler is chaos-sensitive, and a residual's
-//! `W·x + δ·x` differs from the merged `(W+δ)·x` by ~1 ULP, which cascades to a visible whole-image
-//! divergence. Merging reproduces the vendored merged-weight forward bit-for-bit.
+//! **LoRA** — two on-disk formats, both **merged into the dense U-Net weights at load** (`W += δ`,
+//! NOT a forward-time residual): the delta is reconstructed in f32 and merged at the U-Net's load
+//! dtype — **fp16 in production** (`model::load`), f32 in the stage gates. SDXL's ancestral sampler
+//! is chaos-sensitive, and a residual's `W·x + δ·x` differs from the merged `(W+δ)·x` by ~1 ULP,
+//! which cascades to a visible whole-image divergence. Merging reproduces the vendored merged-weight
+//! forward bit-for-bit.
 //!
 //! - **kohya** (`lora_unet_<diffusers path, `.`→`_`>.lora_down/up.weight` + optional `.alpha`) — what
 //!   `pipe.save_lora_weights()` and most HF community SDXL LoRAs (incl. LCM-LoRA) ship. The
