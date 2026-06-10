@@ -947,10 +947,15 @@ pub fn apply_adapter_specs_autoprefix(
     let mut bfl: Option<Vec<BflTarget>> = None;
     let mut combined = ApplyReport::default();
     for spec in specs {
+        // Load + classify the file once: the dispatch chain below (and the fallback that used to
+        // delegate to `apply_adapter_specs`, re-reading the file) all key off `is_lokr`, so hoist both
+        // the loaded `Weights` and `is_lokr(&w)` into locals rather than re-reading/re-evaluating
+        // them up to four times per spec (F-004).
         let w = Weights::from_file(&spec.path)?;
+        let is_lokr_w = is_lokr(&w);
         // BFL / ComfyUI fused→split naming (sc-2743) is the orthogonal axis to kohya flattening and
         // shares the `lora_unet_` prefix, so it must be detected BEFORE `is_kohya`. (LoKr first.)
-        let is_bfl_file = if is_lokr(&w) {
+        let is_bfl_file = if is_lokr_w {
             false
         } else {
             if bfl.is_none() {
@@ -958,7 +963,7 @@ pub fn apply_adapter_specs_autoprefix(
             }
             is_bfl(&w, bfl.as_ref().unwrap())
         };
-        let report = if !is_lokr(&w) && is_lokr_keys(&w) {
+        let report = if !is_lokr_w && is_lokr_keys(&w) {
             // Third-party LyCORIS LoKr (sc-3642): `lokr_*` keys, no `networkType` stamp. Detect by
             // keys and route BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the
             // `lora_unet_` prefix, so is_kohya would otherwise claim it and apply nothing.
@@ -969,7 +974,7 @@ pub fn apply_adapter_specs_autoprefix(
             apply_loha_thirdparty(host, &w, spec.scale)?
         } else if is_bfl_file {
             apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
-        } else if !is_lokr(&w) && is_kohya(&w) {
+        } else if !is_lokr_w && is_kohya(&w) {
             // kohya LoRA: dots are flattened to underscores, so keys resolve through the table
             // rather than the prefix-strip path. (LoKr keeps dotted paths; checked first.)
             if kohya.is_none() {
@@ -977,12 +982,24 @@ pub fn apply_adapter_specs_autoprefix(
             }
             apply_lora_kohya(host, &w, spec.scale, kohya.as_ref().unwrap())?
         } else {
-            let prefix = if is_lokr(&w) {
-                None
-            } else {
-                detect_lora_prefix(&w)
-            };
-            apply_adapter_specs(host, std::slice::from_ref(spec), prefix)?
+            // Plain PEFT/diffusers LoRA (the common case) or a metadata-LoKr. The earlier branches
+            // already excluded third-party LoKr/LoHa keys, so call the leaf appliers directly with the
+            // already-loaded `w` instead of re-reading the file via `apply_adapter_specs` (F-004).
+            match spec.kind {
+                AdapterKind::Lokr => apply_lokr(host, &w, spec.scale)?,
+                AdapterKind::Lora => {
+                    if is_lokr_w {
+                        // The file's metadata is authoritative; a kind/metadata mismatch is a caller
+                        // error (matches `apply_adapter_specs`).
+                        return Err(format!(
+                            "adapter {} declared Lora but its metadata says networkType=lokr",
+                            spec.path.display()
+                        )
+                        .into());
+                    }
+                    apply_lora_peft(host, &w, spec.scale, detect_lora_prefix(&w))?
+                }
+            }
         };
         combined.applied += report.applied;
         combined.unmatched_paths.extend(report.unmatched_paths);
