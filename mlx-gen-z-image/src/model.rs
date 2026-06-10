@@ -237,6 +237,18 @@ impl Generator for ZImageTurbo {
         // seed-independent — build it once. See SCHEDULE_SHIFT.
         let scheduler = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
 
+        // VAE-encode the init image once: the clean latents depend only on the init image + target
+        // dims, not the per-image seed, so they're constant across the count loop (F-034). Only the
+        // noise (and its blend) vary per image.
+        let clean = if is_img2img {
+            let (image, _) = reference.expect("is_img2img implies a reference");
+            Some(encode_init_latents(
+                &self.vae, image, req.width, req.height,
+            )?)
+        } else {
+            None
+        };
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // Distinct seed per image in a batch (the fork's `seed + i` convention).
@@ -246,13 +258,11 @@ impl Generator for ZImageTurbo {
             // a *different* (higher-precision) noise realization, not just sharper — so it changes the
             // output, not only its crispness. Revisit alongside the other f32 flips.
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
-            let latents = if is_img2img {
-                // VAE-encode the init image to clean latents (f32), then blend with the noise at
-                // `sigma = sigmas[init_time_step]` (the fork's `create_for_txt2img_or_img2img`).
-                let (image, _) = reference.expect("is_img2img implies a reference");
-                let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
+            let latents = if let Some(clean) = &clean {
+                // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[init_time_step]`
+                // (the fork's `create_for_txt2img_or_img2img`).
                 let sigma = scheduler.sigmas[start_step];
-                add_noise_by_interpolation(&clean, &noise, sigma)?
+                add_noise_by_interpolation(clean, &noise, sigma)?
             } else {
                 noise
             };

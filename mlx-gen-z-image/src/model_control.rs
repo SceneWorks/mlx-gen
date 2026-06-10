@@ -261,6 +261,18 @@ impl Generator for ZImageTurboControl {
         let control_context =
             encode_control_context(&self.vae, control_image, req.width, req.height)?;
 
+        // VAE-encode the init image once too: like control_context, the clean img2img latents depend
+        // only on the init image + dims, not the per-image seed, so they're constant across the batch
+        // (F-034). Only the noise (and its blend) vary per image.
+        let clean = if is_img2img {
+            let (image, _) = reference.expect("is_img2img implies a reference");
+            Some(encode_init_latents(
+                &self.vae, image, req.width, req.height,
+            )?)
+        } else {
+            None
+        };
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
@@ -268,11 +280,9 @@ impl Generator for ZImageTurboControl {
             // PARITY-BF16 (sc-2609): bf16 matches the fork's seed→image mapping; f32 is a different
             // (higher-precision) realization, not just sharper. Revisit with the other f32 flips.
             let noise = create_noise(seed, req.width, req.height)?.as_dtype(Dtype::Bfloat16)?;
-            let latents = if is_img2img {
-                let (image, _) = reference.expect("is_img2img implies a reference");
-                let clean = encode_init_latents(&self.vae, image, req.width, req.height)?;
+            let latents = if let Some(clean) = &clean {
                 let sigma = scheduler.sigmas[start_step];
-                add_noise_by_interpolation(&clean, &noise, sigma)?
+                add_noise_by_interpolation(clean, &noise, sigma)?
             } else {
                 noise
             };
