@@ -15,7 +15,24 @@
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::Array;
 
+use crate::array::scalar;
 use crate::Result;
+
+/// The flow-match (rectified-flow) forward-Euler update on the velocity field:
+/// `x_{i+1} = x + velocity·(σ_{i+1} − σ_i)`, with `dt = σ_{i+1} − σ_i` (negative; the schedule
+/// descends to 0). This is the single numerically load-bearing line of flow-match denoising — shared
+/// by [`FlowMatchEuler::step`] and [`crate::sampler::FlowMatchSampler::step`] so a fix to one can't
+/// silently miss the other (F-009). Computed in the latents' dtype (no upcast), exactly matching the
+/// fork's `LinearScheduler.step` / `FlowMatchEulerDiscreteScheduler.step`.
+pub(crate) fn flow_match_euler_step(
+    sigmas: &[f32],
+    x: &Array,
+    velocity: &Array,
+    i: usize,
+) -> Result<Array> {
+    let dt = sigmas[i + 1] - sigmas[i];
+    Ok(add(x, &multiply(velocity, scalar(dt))?)?)
+}
 
 /// A flow-match Euler denoising schedule.
 pub struct FlowMatchEuler {
@@ -60,13 +77,10 @@ impl FlowMatchEuler {
         1.0 - self.sigmas[t]
     }
 
-    /// One Euler step: `x_{t+1} = x_t + (sigma[t+1] - sigma[t]) * velocity`.
+    /// One Euler step: `x_{t+1} = x_t + (sigma[t+1] - sigma[t]) * velocity`. Delegates to the shared
+    /// [`flow_match_euler_step`] (the same update [`crate::sampler::FlowMatchSampler`] uses).
     pub fn step(&self, latents: &Array, velocity: &Array, t: usize) -> Result<Array> {
-        let dt = self.sigmas[t + 1] - self.sigmas[t];
-        Ok(add(
-            latents,
-            &multiply(velocity, Array::from_slice(&[dt], &[1]))?,
-        )?)
+        flow_match_euler_step(&self.sigmas, latents, velocity, t)
     }
 }
 
@@ -163,5 +177,29 @@ mod tests {
         let a = compute_mu(6400, 4);
         let b = compute_mu(6400, 8);
         assert!((a - b).abs() < 1e-6);
+    }
+
+    /// F-009: `FlowMatchEuler::step` and `FlowMatchSampler::step` now share one update, so they must
+    /// produce byte-identical results for the same sigmas, latents, and velocity at every step.
+    #[test]
+    fn scheduler_and_sampler_steps_are_identical() {
+        use crate::sampler::{DiffusionSampler, FlowMatchSampler};
+        use mlx_rs::ops::eq;
+
+        let sigmas = vec![1.0_f32, 0.9, 0.75, 0.5, 0.0];
+        let euler = FlowMatchEuler {
+            sigmas: sigmas.clone(),
+        };
+        let sampler = FlowMatchSampler::new(sigmas.clone());
+        let x = Array::from_slice(&[0.1_f32, -0.2, 0.3, 0.4], &[1, 4]);
+        let v = Array::from_slice(&[0.5_f32, 0.6, -0.7, 0.8], &[1, 4]);
+        for i in 0..euler.num_steps() {
+            let a = euler.step(&x, &v, i).unwrap();
+            let b = sampler.step(&v, &x, i).unwrap();
+            assert!(
+                eq(&a, &b).unwrap().all(None).unwrap().item::<bool>(),
+                "step {i}: scheduler and sampler diverged"
+            );
+        }
     }
 }
