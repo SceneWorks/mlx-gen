@@ -28,6 +28,24 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+/// Cached step-invariant control-forward inputs: the base patchify metadata + RoPE freqs, plus the
+/// embedded control context `c_emb` (which depends only on the constant `control_context` and the
+/// image keep-mask, not the latent or timestep). Built once by
+/// [`ZImageControlTransformer::prepare_control`] and reused for every denoise step (F-042), avoiding
+/// the per-step re-patchify of the constant control context.
+pub(crate) struct ControlPrepared {
+    cap_tokens: Array,
+    x_size: (i32, i32, i32),
+    x_keep: Array,
+    cap_keep: Array,
+    img_pad: i32,
+    x_freqs: Array,
+    cap_freqs: Array,
+    unified_freqs: Array,
+    /// Control embedding, already padded + `expand_dims(0)` — the input to the control refiner.
+    c_emb: Array,
+}
+
 /// Channel count of the VAE-encoded control context (16 control latent + 1 mask + 16 inpaint).
 pub const CONTROL_IN_DIM: i32 = 33;
 /// Base `layers` indices the 15 control layers inject into (the fork's `CONTROL_LAYERS_PLACES`).
@@ -175,12 +193,79 @@ impl ZImageControlTransformer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Build the [`ControlPrepared`] step-invariant inputs (base patchify metadata + RoPE freqs +
+    /// the embedded constant control context) for a latent of shape `dims` and caption `cap_feats`
+    /// under control context `cc`. A denoise loop builds this once and reuses it every step via
+    /// [`forward_with_control`](Self::forward_with_control) (F-042).
+    pub(crate) fn prepare_control(
+        &self,
+        dims: (i32, i32, i32, i32),
+        cap_feats: &Array,
+        cc: &Array,
+    ) -> Result<ControlPrepared> {
+        let cfg = &self.base.cfg;
+        let meta = self.base.patchify_meta(dims, cap_feats)?;
+        let x_freqs = self.base.rope.forward(&meta.x_pos_ids)?;
+        let cap_freqs = self.base.rope.forward(&meta.cap_pos_ids)?;
+        let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
+
+        // Control context embedding (the constant the fork re-patchified every step). The control
+        // patch embedder runs at the control context's dtype and the embedding is NOT recast —
+        // exactly like the fork (`c_emb = control_all_x_embedder(c_tokens)`, no cast). The fork feeds
+        // `control_context` as **f32** (only the latents + cap_feats are bf16), so the whole control
+        // branch promotes to f32, and its f32 hints promote the bf16 image/caption stream to f32 when
+        // added — i.e. the control path is **mixed precision** (bf16 base embeddings, f32 control
+        // branch), NOT pure bf16. Reproducing that dtype flow is what matches the fork (sc-2720);
+        // forcing the branch to bf16 diverges (~1.6% px>8 vs ~0.04%).
+        //
+        // (This GEMM was once forced to f32 to dodge the pmetal NAX 16-bit dense-GEMM miscompile — a
+        // Metal compile-target bug fixed at the macOS-26.2 target, sc-2772. That forcing is gone; the
+        // dtype now flows from the caller's `control_context`, which is f32, so the branch is f32
+        // regardless — but it is no longer *forced*, and a bf16 control_context would run bf16.)
+        let c_tokens = patchify_control(cc, cfg.patch_size, cfg.f_patch_size)?;
+        let mut c_emb = self.control_x_embedder.forward(&c_tokens)?;
+        c_emb = apply_pad(&c_emb, &meta.x_keep, &self.base.x_pad_token)?;
+        let c_emb = c_emb.expand_dims(0)?;
+
+        Ok(ControlPrepared {
+            cap_tokens: meta.cap_tokens,
+            x_size: meta.x_size,
+            x_keep: meta.x_keep,
+            cap_keep: meta.cap_keep,
+            img_pad: meta.img_pad,
+            x_freqs,
+            cap_freqs,
+            unified_freqs,
+            c_emb,
+        })
+    }
+
+    /// Single-shot control forward: build the [`ControlPrepared`] and run one step. Bit-identical to
+    /// caching `prepare_control` across a denoise loop (the prep depends only on the loop-constant
+    /// dims + caption + control context). `cap`, when `Some`, collects the named per-stage
+    /// intermediates for the capture variant.
     fn forward_control(
         &self,
         x: &Array,
         timestep: f32,
         cap_feats: &Array,
         cc: &Array,
+        control_context_scale: f32,
+        cap: Option<&mut Vec<(&'static str, Array)>>,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let prep = self.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, cc)?;
+        self.forward_with_control(&prep, x, timestep, control_context_scale, cap)
+    }
+
+    /// Run the dual-injection control DiT for one denoise step against a cached [`ControlPrepared`].
+    /// Only the latent values and timestep vary per step; the metadata, freqs, and control embedding
+    /// come from `prep`. `cap`, when `Some`, records the named per-stage intermediates.
+    pub(crate) fn forward_with_control(
+        &self,
+        prep: &ControlPrepared,
+        x: &Array,
+        timestep: f32,
         control_context_scale: f32,
         mut cap: Option<&mut Vec<(&'static str, Array)>>,
     ) -> Result<Array> {
@@ -197,44 +282,32 @@ impl ZImageControlTransformer {
         let t_emb = self.base.t_embedder.forward(&t)?;
         record!("t_emb", t_emb);
 
-        let patched = self.base.patchify(x, cap_feats)?;
-        record!("x_tokens", patched.x_tokens); // pre-embed patchify output (the x-embedder input)
+        let x_tokens = self.base.patchify_image_tokens(x, prep.img_pad)?;
+        record!("x_tokens", x_tokens); // pre-embed patchify output (the x-embedder input)
 
         // Image stream: embed → set padded positions to x_pad_token → (control refiner) → noise refiner.
-        let mut x_emb = self.base.x_embedder.forward(&patched.x_tokens)?;
-        x_emb = apply_pad(&x_emb, &patched.x_keep, &self.base.x_pad_token)?;
-        let x_freqs = self.base.rope.forward(&patched.x_pos_ids)?;
+        let mut x_emb = self.base.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.base.x_pad_token)?;
         let mut x_emb = x_emb.expand_dims(0)?;
         record!("x_emb", x_emb);
 
-        // Control refiner pass: build the control context embedding (reusing the image's pad mask /
-        // RoPE), run the parallel control refiner, collect the per-block hints + threaded state.
-        let c_tokens = patchify_control(cc, cfg.patch_size, cfg.f_patch_size)?;
-        // The control patch embedder runs at the control context's dtype and the embedding is NOT
-        // recast — exactly like the fork (`c_emb = control_all_x_embedder(c_tokens)`, no cast). The
-        // fork feeds `control_context` as **f32** (only the latents + cap_feats are bf16), so the
-        // whole control branch promotes to f32, and its f32 hints promote the bf16 image/caption
-        // stream to f32 when added — i.e. the control path is **mixed precision** (bf16 base
-        // embeddings, f32 control branch), NOT pure bf16. Reproducing that dtype flow is what
-        // matches the fork (sc-2720); forcing the branch to bf16 diverges (~1.6% px>8 vs ~0.04%).
-        //
-        // (This GEMM was once forced to f32 to dodge the pmetal NAX 16-bit dense-GEMM miscompile — a
-        // Metal compile-target bug fixed at the macOS-26.2 target, sc-2772. That forcing is gone; the
-        // dtype now flows from the caller's `control_context`, which is f32, so the branch is f32
-        // regardless — but it is no longer *forced*, and a bf16 control_context would run bf16.)
-        let mut c_emb = self.control_x_embedder.forward(&c_tokens)?;
-        c_emb = apply_pad(&c_emb, &patched.x_keep, &self.base.x_pad_token)?;
-        let c_emb = c_emb.expand_dims(0)?;
-        record!("c_emb", c_emb);
-        let (refiner_hints, threaded_control) =
-            self.run_control_blocks(&self.control_noise_refiner, c_emb, &x_emb, &x_freqs, &t_emb)?;
+        // Control refiner pass: reuse the cached control embedding, run the parallel control refiner,
+        // collect the per-block hints + threaded state.
+        record!("c_emb", prep.c_emb);
+        let (refiner_hints, threaded_control) = self.run_control_blocks(
+            &self.control_noise_refiner,
+            prep.c_emb.clone(),
+            &x_emb,
+            &prep.x_freqs,
+            &t_emb,
+        )?;
         record!("refiner_hint0", refiner_hints[0]);
         record!("refiner_hint1", refiner_hints[1]);
         record!("threaded", threaded_control);
 
         // Noise refiner (with control hints).
         for (i, layer) in self.base.noise_refiner.iter().enumerate() {
-            x_emb = layer.forward(&x_emb, &x_freqs, &t_emb)?;
+            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
             if let Some(n) = hint_index(&CONTROL_REFINER_PLACES, i) {
                 x_emb = add_hint(&x_emb, &refiner_hints[n], control_context_scale)?;
             }
@@ -242,20 +315,18 @@ impl ZImageControlTransformer {
         record!("x_refined", x_emb);
 
         // Caption stream: RMSNorm → linear → set padded to cap_pad_token → context refiner.
-        let cap_normed = rms_norm(&patched.cap_tokens, &self.base.cap_norm_w, cfg.norm_eps)?;
+        let cap_normed = rms_norm(&prep.cap_tokens, &self.base.cap_norm_w, cfg.norm_eps)?;
         let mut cap_emb = self.base.cap_linear.forward(&cap_normed)?;
-        cap_emb = apply_pad(&cap_emb, &patched.cap_keep, &self.base.cap_pad_token)?;
-        let cap_freqs = self.base.rope.forward(&patched.cap_pos_ids)?;
+        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.base.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.base.context_refiner {
-            cap_emb = layer.forward(&cap_emb, &cap_freqs)?;
+            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
         }
         record!("cap_refined", cap_emb);
 
         // Unify image + caption.
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
-        let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
 
         // Main control pass: thread the (refined) control state + caption through the 15 control
         // layers to produce the hints for the unified main loop.
@@ -264,7 +335,7 @@ impl ZImageControlTransformer {
             &self.control_layers,
             control_unified,
             &unified,
-            &unified_freqs,
+            &prep.unified_freqs,
             &t_emb,
         )?;
         record!("main_hint0", main_hints[0]);
@@ -272,7 +343,7 @@ impl ZImageControlTransformer {
 
         // Main layers (with control hints).
         for (i, layer) in self.base.layers.iter().enumerate() {
-            unified = layer.forward(&unified, &unified_freqs, &t_emb)?;
+            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
             if let Some(n) = hint_index(&CONTROL_LAYERS_PLACES, i) {
                 unified = add_hint(&unified, &main_hints[n], control_context_scale)?;
             }
@@ -285,7 +356,7 @@ impl ZImageControlTransformer {
         let head = unified
             .reshape(&[unified.shape()[1], embed_dim])?
             .take_axis(row_indices(x_len), 0)?;
-        let out = self.base.unpatchify(&head, patched.x_size)?;
+        let out = self.base.unpatchify(&head, prep.x_size)?;
         Ok(out.multiply(scalar(-1.0))?)
     }
 

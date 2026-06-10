@@ -83,11 +83,15 @@ pub fn denoise_with_progress(
 ) -> Result<Array> {
     let mut latents = latents;
     let total = (scheduler.num_steps() - start_step) as u32;
+    // The patchify metadata + RoPE freqs depend only on the (loop-constant) latent dims and caption,
+    // so build them once and reuse across steps instead of rederiving them every forward (F-042).
+    let sh = latents.shape();
+    let prep = transformer.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
     for t in start_step..scheduler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
-        let velocity = transformer.forward(&latents, scheduler.timestep(t), cap_feats)?;
+        let velocity = transformer.forward_with(&prep, &latents, scheduler.timestep(t))?;
         latents = scheduler.step(&latents, &velocity, t)?;
         on_progress(Progress::Step {
             current: (t - start_step) as u32 + 1,
@@ -136,16 +140,21 @@ pub fn denoise_control_with_progress(
 ) -> Result<Array> {
     let mut latents = latents;
     let total = (scheduler.num_steps() - start_step) as u32;
+    // Patchify metadata, RoPE freqs, and the embedded (constant) control context depend only on the
+    // loop-constant latent dims + caption + control context — build once and reuse every step (F-042).
+    let sh = latents.shape();
+    let prep =
+        transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
     for t in start_step..scheduler.num_steps() {
         if cancel.is_cancelled() {
             return Err(Error::Msg("generation cancelled".into()));
         }
-        let velocity = transformer.forward(
+        let velocity = transformer.forward_with_control(
+            &prep,
             &latents,
             scheduler.timestep(t),
-            cap_feats,
-            Some(control_context),
             control_context_scale,
+            None,
         )?;
         latents = scheduler.step(&latents, &velocity, t)?;
         on_progress(Progress::Step {

@@ -201,39 +201,61 @@ impl ZImageTransformer {
         &self.x_embedder
     }
 
-    /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].
-    /// Returns the latent-shaped velocity `(C, F, H, W)`.
-    pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
+    /// Build the [`Prepared`] step-invariant inputs (patchify metadata + RoPE freqs) for a latent of
+    /// shape `dims = (C, F, H, W)` and caption `cap_feats`. These depend only on the dims and caption,
+    /// so a denoise loop builds this once and reuses it for every step's [`forward_with`](Self::forward_with),
+    /// avoiding the per-step host-side Vec rebuilds and the `host_i32` RoPE-gather readbacks (F-042).
+    pub(crate) fn prepare(
+        &self,
+        dims: (i32, i32, i32, i32),
+        cap_feats: &Array,
+    ) -> Result<Prepared> {
+        let meta = self.patchify_meta(dims, cap_feats)?;
+        let x_freqs = self.rope.forward(&meta.x_pos_ids)?;
+        let cap_freqs = self.rope.forward(&meta.cap_pos_ids)?;
+        let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
+        Ok(Prepared {
+            cap_tokens: meta.cap_tokens,
+            x_size: meta.x_size,
+            x_keep: meta.x_keep,
+            cap_keep: meta.cap_keep,
+            img_pad: meta.img_pad,
+            x_freqs,
+            cap_freqs,
+            unified_freqs,
+        })
+    }
+
+    /// Run the DiT for one denoise step against a cached [`Prepared`]. `x` is the current latent
+    /// `(C, F, H, W)` (same dims as `prep` was built for) and `timestep` ∈ [0,1]; only the latent
+    /// values and timestep vary across steps. Returns the latent-shaped velocity `(C, F, H, W)`.
+    pub(crate) fn forward_with(&self, prep: &Prepared, x: &Array, timestep: f32) -> Result<Array> {
         let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
         let t_emb = self.t_embedder.forward(&t)?;
 
-        let patched = self.patchify(x, cap_feats)?;
-
-        // Image stream: embed -> set padded positions to x_pad_token -> noise refiner.
-        let mut x_emb = self.x_embedder.forward(&patched.x_tokens)?;
-        x_emb = apply_pad(&x_emb, &patched.x_keep, &self.x_pad_token)?;
-        let x_freqs = self.rope.forward(&patched.x_pos_ids)?;
+        // Image stream: patchify (the only value-dependent step) -> embed -> pad -> noise refiner.
+        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
+        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
         let mut x_emb = x_emb.expand_dims(0)?;
         for layer in &self.noise_refiner {
-            x_emb = layer.forward(&x_emb, &x_freqs, &t_emb)?;
+            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
         }
 
         // Caption stream: RMSNorm -> linear -> set padded to cap_pad_token -> context refiner.
-        let cap_normed = rms_norm(&patched.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
+        let cap_normed = rms_norm(&prep.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
         let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
-        cap_emb = apply_pad(&cap_emb, &patched.cap_keep, &self.cap_pad_token)?;
-        let cap_freqs = self.rope.forward(&patched.cap_pos_ids)?;
+        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
         let mut cap_emb = cap_emb.expand_dims(0)?;
         for layer in &self.context_refiner {
-            cap_emb = layer.forward(&cap_emb, &cap_freqs)?;
+            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
         }
 
         // Unify and run the main stack.
         let x_len = x_emb.shape()[1];
         let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
-        let unified_freqs = concatenate_axis(&[&x_freqs, &cap_freqs], 0)?;
         for layer in &self.layers {
-            unified = layer.forward(&unified, &unified_freqs, &t_emb)?;
+            unified = layer.forward(&unified, &prep.unified_freqs, &t_emb)?;
         }
 
         // Final layer + unpatchify (only the real image tokens survive).
@@ -242,11 +264,62 @@ impl ZImageTransformer {
         let head = unified
             .reshape(&[unified.shape()[1], embed_dim])? // drop batch dim (size 1)
             .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
-        let out = self.unpatchify(&head, patched.x_size)?;
+        let out = self.unpatchify(&head, prep.x_size)?;
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
     }
 
-    pub(crate) fn patchify(&self, image: &Array, cap_feats: &Array) -> Result<Patchified> {
+    /// `x`: latent `(C, F, H, W)`; `cap_feats`: `(cap_len, cap_feat_dim)`; `timestep` in [0,1].
+    /// Returns the latent-shaped velocity `(C, F, H, W)`. Single-shot convenience: builds the
+    /// [`Prepared`] and runs one [`forward_with`](Self::forward_with) — bit-identical to caching
+    /// `prepare` across steps, since the prep depends only on the (loop-constant) dims + caption.
+    pub fn forward(&self, x: &Array, timestep: f32, cap_feats: &Array) -> Result<Array> {
+        let sh = x.shape();
+        let prep = self.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
+        self.forward_with(&prep, x, timestep)
+    }
+
+    /// Step-invariant half of [`patchify`](Self::patchify): the caption + image position-ids, keep
+    /// masks, padded caption tokens, and image-token padding — everything derived from the latent
+    /// *dims* and the caption, but not the latent *values*. Hoisted so a denoise loop can build it
+    /// once (F-042); [`patchify`](Self::patchify) and [`prepare`](Self::prepare) both call it.
+    pub(crate) fn patchify_meta(
+        &self,
+        dims: (i32, i32, i32, i32),
+        cap_feats: &Array,
+    ) -> Result<PatchMeta> {
+        let (pf, ph, pw) = (
+            self.cfg.f_patch_size,
+            self.cfg.patch_size,
+            self.cfg.patch_size,
+        );
+        let (_c, f, h, w) = dims;
+        let (ft, ht, wt) = (f / pf, h / ph, w / pw);
+
+        // Caption: pad to a multiple of 32; pos ids = [(1+i), 0, 0]; keep-mask zeros padding.
+        let cap_ori = cap_feats.shape()[0];
+        let (cap_pos, cap_keep, cap_pad) = caption_pos_keep(cap_ori);
+        let cap_total = cap_ori + cap_pad;
+        let cap_tokens = pad_rows(cap_feats, cap_pad)?;
+
+        // Image: pos ids start after the caption block; pad the token count to a multiple of 32.
+        let (img_pos, img_keep, img_pad) = image_pos_keep(ft, ht, wt, cap_total);
+        let img_total = ft * ht * wt + img_pad;
+
+        Ok(PatchMeta {
+            cap_tokens,
+            x_size: (f, h, w),
+            x_pos_ids: Array::from_slice(&img_pos, &[img_total, 3]),
+            cap_pos_ids: Array::from_slice(&cap_pos, &[cap_total, 3]),
+            x_keep: Array::from_slice(&img_keep, &[img_total, 1]),
+            cap_keep: Array::from_slice(&cap_keep, &[cap_total, 1]),
+            img_pad,
+        })
+    }
+
+    /// Per-step half of [`patchify`](Self::patchify): reshape the latent `(C,F,H,W)` into patch
+    /// tokens `(ft·ht·wt, pF·pH·pW·C)` and pad to the multiple-of-32 count from `patchify_meta`.
+    /// This is the only part of patchify that depends on the latent *values*.
+    pub(crate) fn patchify_image_tokens(&self, image: &Array, img_pad: i32) -> Result<Array> {
         let (pf, ph, pw) = (
             self.cfg.f_patch_size,
             self.cfg.patch_size,
@@ -255,49 +328,11 @@ impl ZImageTransformer {
         let sh = image.shape();
         let (c, f, h, w) = (sh[0], sh[1], sh[2], sh[3]);
         let (ft, ht, wt) = (f / pf, h / ph, w / pw);
-
-        // Caption: pad to a multiple of 32; pos ids = [(1+i), 0, 0]; keep-mask zeros padding.
-        let cap_ori = cap_feats.shape()[0];
-        let cap_pad = (-(cap_ori as i64)).rem_euclid(32) as i32;
-        let cap_total = cap_ori + cap_pad;
-        let cap_pos: Vec<i32> = (0..cap_total).flat_map(|i| [1 + i, 0, 0]).collect();
-        let cap_keep: Vec<f32> = (0..cap_total)
-            .map(|i| if i < cap_ori { 1.0 } else { 0.0 })
-            .collect();
-        let cap_tokens = pad_rows(cap_feats, cap_pad)?;
-
-        // Image: patchify (C,F,H,W) -> (tokens, pF·pH·pW·C), pad to a multiple of 32.
         let tokens = image
             .reshape(&[c, ft, pf, ht, ph, wt, pw])
             .and_then(|t| t.transpose_axes(&[1, 3, 5, 2, 4, 6, 0]))
             .and_then(|t| t.reshape(&[ft * ht * wt, pf * ph * pw * c]))?;
-        let img_ori = ft * ht * wt;
-        let img_pad = (-(img_ori as i64)).rem_euclid(32) as i32;
-        let img_total = img_ori + img_pad;
-        let s0 = cap_total + 1; // image positions start after the caption block
-        let mut img_pos: Vec<i32> = Vec::with_capacity((img_total * 3) as usize);
-        for fi in 0..ft {
-            for hi in 0..ht {
-                for wi in 0..wt {
-                    img_pos.extend_from_slice(&[s0 + fi, hi, wi]);
-                }
-            }
-        }
-        img_pos.extend(std::iter::repeat_n(0, (img_pad * 3) as usize)); // padded pos ids = 0
-        let img_keep: Vec<f32> = (0..img_total)
-            .map(|i| if i < img_ori { 1.0 } else { 0.0 })
-            .collect();
-        let x_tokens = pad_rows(&tokens, img_pad)?;
-
-        Ok(Patchified {
-            x_tokens,
-            cap_tokens,
-            x_size: (f, h, w),
-            x_pos_ids: Array::from_slice(&img_pos, &[img_total, 3]),
-            cap_pos_ids: Array::from_slice(&cap_pos, &[cap_total, 3]),
-            x_keep: Array::from_slice(&img_keep, &[img_total, 1]),
-            cap_keep: Array::from_slice(&cap_keep, &[cap_total, 1]),
-        })
+        pad_rows(&tokens, img_pad)
     }
 
     pub(crate) fn unpatchify(&self, x: &Array, size: (i32, i32, i32)) -> Result<Array> {
@@ -316,14 +351,72 @@ impl ZImageTransformer {
     }
 }
 
-pub(crate) struct Patchified {
-    pub(crate) x_tokens: Array,
+/// The step-invariant patchify metadata produced by `patchify_meta` — the caption/image position
+/// ids, keep masks, padded caption tokens, and output size; everything except the value-dependent
+/// `x_tokens` (which `patchify_image_tokens` produces per step). `img_pad` is the count of padding
+/// image tokens, threaded to `patchify_image_tokens` so the per-step path pads identically.
+pub(crate) struct PatchMeta {
     pub(crate) cap_tokens: Array,
     pub(crate) x_size: (i32, i32, i32),
     pub(crate) x_pos_ids: Array,
     pub(crate) cap_pos_ids: Array,
     pub(crate) x_keep: Array,
     pub(crate) cap_keep: Array,
+    pub(crate) img_pad: i32,
+}
+
+/// Cached step-invariant forward inputs — the patchify metadata plus the gathered RoPE freqs — that
+/// [`ZImageTransformer::forward_with`] reuses for every denoise step (F-042).
+pub(crate) struct Prepared {
+    pub(crate) cap_tokens: Array,
+    pub(crate) x_size: (i32, i32, i32),
+    pub(crate) x_keep: Array,
+    pub(crate) cap_keep: Array,
+    pub(crate) img_pad: i32,
+    pub(crate) x_freqs: Array,
+    pub(crate) cap_freqs: Array,
+    pub(crate) unified_freqs: Array,
+}
+
+/// Caption position-ids `[(1+i), 0, 0]` and keep-mask (1 for real tokens, 0 for padding), with the
+/// pad count that rounds `cap_ori` up to a multiple of 32. Pure (no MLX) so the metadata arithmetic
+/// is unit-testable.
+pub(crate) fn caption_pos_keep(cap_ori: i32) -> (Vec<i32>, Vec<f32>, i32) {
+    let cap_pad = (-(cap_ori as i64)).rem_euclid(32) as i32;
+    let cap_total = cap_ori + cap_pad;
+    let pos: Vec<i32> = (0..cap_total).flat_map(|i| [1 + i, 0, 0]).collect();
+    let keep: Vec<f32> = (0..cap_total)
+        .map(|i| if i < cap_ori { 1.0 } else { 0.0 })
+        .collect();
+    (pos, keep, cap_pad)
+}
+
+/// Image patch position-ids `[s0 + fi, hi, wi]` (raster `f,h,w` order, `s0 = cap_total + 1` so image
+/// positions follow the caption block) and keep-mask, with the pad count rounding `ft·ht·wt` up to a
+/// multiple of 32. Padding rows get pos id `[0,0,0]` and keep 0. Pure so it is unit-testable.
+pub(crate) fn image_pos_keep(
+    ft: i32,
+    ht: i32,
+    wt: i32,
+    cap_total: i32,
+) -> (Vec<i32>, Vec<f32>, i32) {
+    let img_ori = ft * ht * wt;
+    let img_pad = (-(img_ori as i64)).rem_euclid(32) as i32;
+    let img_total = img_ori + img_pad;
+    let s0 = cap_total + 1;
+    let mut pos: Vec<i32> = Vec::with_capacity((img_total * 3) as usize);
+    for fi in 0..ft {
+        for hi in 0..ht {
+            for wi in 0..wt {
+                pos.extend_from_slice(&[s0 + fi, hi, wi]);
+            }
+        }
+    }
+    pos.extend(std::iter::repeat_n(0, (img_pad * 3) as usize));
+    let keep: Vec<f32> = (0..img_total)
+        .map(|i| if i < img_ori { 1.0 } else { 0.0 })
+        .collect();
+    (pos, keep, img_pad)
 }
 
 /// `[0, 1, …, n-1]` as an int32 index array for `take_axis`.
@@ -396,5 +489,37 @@ impl AdaptableHost for ZImageTransformer {
             out.extend(prefixed_paths(&format!("context_refiner.{i}"), b));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod patch_meta_tests {
+    use super::{caption_pos_keep, image_pos_keep};
+
+    #[test]
+    fn caption_pos_keep_pads_to_32_and_masks() {
+        let (pos, keep, pad) = caption_pos_keep(3);
+        assert_eq!(pad, 29); // 3 -> 32
+        assert_eq!(pos.len(), 32 * 3);
+        assert_eq!(keep.len(), 32);
+        assert_eq!(&pos[0..6], &[1, 0, 0, 2, 0, 0]); // pos id = (1 + i, 0, 0)
+        assert_eq!(keep[2], 1.0);
+        assert_eq!(keep[3], 0.0); // first padding row
+                                  // An exact multiple of 32 needs no padding.
+        assert_eq!(caption_pos_keep(32).2, 0);
+    }
+
+    #[test]
+    fn image_pos_keep_rasters_fhw_after_caption_and_pads() {
+        // cap_total = 33, dims ft=1 ht=2 wt=2 -> 4 real tokens, padded to 32.
+        let (pos, keep, pad) = image_pos_keep(1, 2, 2, 33);
+        assert_eq!(pad, 28); // 4 -> 32
+        assert_eq!(pos.len(), 32 * 3);
+        assert_eq!(keep.len(), 32);
+        // s0 = cap_total + 1 = 34; raster order (f, h, w).
+        assert_eq!(&pos[0..12], &[34, 0, 0, 34, 0, 1, 34, 1, 0, 34, 1, 1]);
+        assert_eq!(&pos[12..15], &[0, 0, 0]); // first padding row -> zeroed pos id
+        assert_eq!(keep[3], 1.0);
+        assert_eq!(keep[4], 0.0);
     }
 }
