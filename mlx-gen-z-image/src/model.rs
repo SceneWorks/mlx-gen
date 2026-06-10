@@ -285,6 +285,9 @@ impl Generator for ZImageTurbo {
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
+/// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2).
+const SIZE_MULTIPLE: u32 = 16;
+
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
     if req.prompt.is_empty() {
         return Err(mlx_gen::Error::Msg(
@@ -305,6 +308,15 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
         return Err(mlx_gen::Error::Msg(format!(
             "{}x{} out of supported range {}..={}",
             req.width, req.height, caps.min_size, caps.max_size
+        )));
+    }
+    // The pipeline needs dims divisible by VAE downsample (8) × patch (2) = 16. A non-multiple either
+    // blows up deep in `patchify`'s reshape with a cryptic mlx error, or truncates in `create_noise`
+    // and silently returns a smaller image than requested (F-033) — reject it clearly at the boundary.
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(mlx_gen::Error::Msg(format!(
+            "{}x{} must be a multiple of {SIZE_MULTIPLE} (VAE 8 × patch 2)",
+            req.width, req.height
         )));
     }
     if req.guidance.is_some() && !caps.supports_guidance {
@@ -380,6 +392,31 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_non_multiple_of_16_size() {
+        // F-033: in-range dims that aren't a multiple of 16 must be rejected at the boundary, not
+        // crash in patchify (1000×1000) or silently truncate (257×257).
+        let caps = descriptor().capabilities;
+        for (w, h) in [(1000, 1000), (257, 257), (512, 520)] {
+            let req = GenerationRequest {
+                prompt: "a fox".into(),
+                width: w,
+                height: h,
+                ..Default::default()
+            };
+            let err = validate_request(&caps, &req).unwrap_err().to_string();
+            assert!(err.contains("multiple of 16"), "{w}x{h} got: {err}");
+        }
+        // A multiple-of-16 in-range request still passes.
+        let ok = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 512,
+            height: 768,
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &ok).is_ok());
     }
 
     #[test]
