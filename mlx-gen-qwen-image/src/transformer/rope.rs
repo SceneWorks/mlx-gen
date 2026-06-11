@@ -8,18 +8,35 @@
 //! `[-(N - N/2), …, -1, 0, …, N/2 - 1]` (`scale_rope`). The text stream applies a single scalar
 //! position `max(H/2, W/2) + t` across all 64 frequencies.
 
+use std::cell::RefCell;
+
 use mlx_rs::Array;
 
 use mlx_gen::Result;
 
+/// `(img_cos, img_sin, txt_cos, txt_sin)`.
+type RopeTables = (Array, Array, Array, Array);
+/// The step-cache slot: the `(shapes, txt_seq)` key plus the tables it produced.
+type RopeCache = Option<(Vec<(usize, usize)>, usize, RopeTables)>;
+
 pub struct QwenRope3d {
     theta: f32,
     axes_dim: [i32; 3],
+    /// Step-cache (F-115): the cos/sin tables depend only on `(shapes, txt_seq)`, which are constant
+    /// across a denoise's steps, so cache the last build and reuse it — the Wan step-cache (sc-2853).
+    /// Bit-identical to recomputing; the `&self` `forward_multi` writes through interior mutability
+    /// (like the flux2 KV cache). Rebuilds whenever the key changes (e.g. CFG branches with different
+    /// `txt_seq`), so it never returns stale tables.
+    cache: RefCell<RopeCache>,
 }
 
 impl QwenRope3d {
     pub fn new(theta: f32, axes_dim: [i32; 3]) -> Self {
-        Self { theta, axes_dim }
+        Self {
+            theta,
+            axes_dim,
+            cache: RefCell::new(None),
+        }
     }
 
     /// The Qwen-Image default: θ=10000, axes `[16, 56, 56]` (Σ/2 = 64 = head_dim/2).
@@ -50,11 +67,13 @@ impl QwenRope3d {
     /// drives the **frame axis** position (so the reference's frame freqs differ from the noise's),
     /// while height/width stay per-image **centered** (`scale_rope`). The text base is
     /// `max_i(max(h_i/2, w_i/2))`. Image tables are `(Σ h_i·w_i, 64)`.
-    pub fn forward_multi(
-        &self,
-        shapes: &[(usize, usize)],
-        txt_seq: usize,
-    ) -> Result<(Array, Array, Array, Array)> {
+    pub fn forward_multi(&self, shapes: &[(usize, usize)], txt_seq: usize) -> Result<RopeTables> {
+        // Step-cache hit: the same `(shapes, txt_seq)` as the previous call (every step of a denoise).
+        if let Some((k_shapes, k_txt, tables)) = self.cache.borrow().as_ref() {
+            if k_shapes.as_slice() == shapes && *k_txt == txt_seq {
+                return Ok(tables.clone());
+            }
+        }
         let (o0, o1, o2) = (
             self.omega(self.axes_dim[0]),
             self.omega(self.axes_dim[1]),
@@ -116,11 +135,51 @@ impl QwenRope3d {
         }
 
         let h = half as i32;
-        Ok((
+        let tables = (
             Array::from_slice(&img_cos, &[total_seq as i32, h]),
             Array::from_slice(&img_sin, &[total_seq as i32, h]),
             Array::from_slice(&txt_cos, &[txt_seq as i32, h]),
             Array::from_slice(&txt_sin, &[txt_seq as i32, h]),
-        ))
+        );
+        *self.cache.borrow_mut() = Some((shapes.to_vec(), txt_seq, tables.clone()));
+        Ok(tables)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat(t: &RopeTables) -> Vec<f32> {
+        let mut v = Vec::new();
+        for a in [&t.0, &t.1, &t.2, &t.3] {
+            v.extend_from_slice(a.as_slice::<f32>());
+        }
+        v
+    }
+
+    /// F-115: the step-cache returns bit-identical tables for a repeated `(shapes, txt_seq)` key,
+    /// rebuilds correctly when the key changes (never stale), and equals a fresh recompute.
+    #[test]
+    fn rope_step_cache_is_bit_identical_and_key_safe() {
+        let rope = QwenRope3d::qwen_image();
+        let a1 = rope.forward_multi(&[(4, 4)], 8).unwrap();
+        let a2 = rope.forward_multi(&[(4, 4)], 8).unwrap(); // cache hit
+        assert_eq!(flat(&a1), flat(&a2), "repeated key must be bit-identical");
+
+        // A different key rebuilds; returning to the first key must again match the original build,
+        // not the intervening one — i.e. the key guards against stale tables.
+        let _b = rope.forward_multi(&[(2, 2)], 8).unwrap();
+        let a3 = rope.forward_multi(&[(4, 4)], 8).unwrap();
+        assert_eq!(
+            flat(&a1),
+            flat(&a3),
+            "key change must not leave stale tables"
+        );
+
+        // The cache must equal a fresh (cache-cold) recompute for the same key.
+        let fresh = QwenRope3d::qwen_image();
+        let f = fresh.forward_multi(&[(4, 4)], 8).unwrap();
+        assert_eq!(flat(&a1), flat(&f), "cache must equal a fresh recompute");
     }
 }

@@ -240,6 +240,20 @@ impl QwenTransformer {
             let k = r.len().max(1);
             n.div_ceil(k)
         });
+        // Pre-scale the (few, ~5) control residuals once, before the 60-block loop (F-115): the
+        // `control_scale` scalar and each `res[idx]·scale` product used to be rebuilt inside the loop
+        // — the same scalar 60×, the same 5 products ~12× each. The injected value is unchanged.
+        let scaled_residuals = match controlnet_residuals {
+            Some(res) => {
+                let scale = Array::from_slice(&[control_scale], &[1]);
+                Some(
+                    res.iter()
+                        .map(|r| Ok(multiply(r, &scale)?))
+                        .collect::<Result<Vec<_>>>()?,
+                )
+            }
+            None => None,
+        };
         for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(
                 &hidden,
@@ -253,13 +267,12 @@ impl QwenTransformer {
                 modulate_index.as_ref(),
             )?;
             encoder = e;
-            // After each base block, add the (scaled) control residual for this block's group —
+            // After each base block, add the pre-scaled control residual for this block's group —
             // diffusers `hidden_states = hidden_states + controlnet_block_samples[i // interval]`.
-            hidden = match (controlnet_residuals, interval) {
+            hidden = match (&scaled_residuals, interval) {
                 (Some(res), Some(interval)) => {
                     let idx = (i / interval).min(res.len() - 1);
-                    let scale = Array::from_slice(&[control_scale], &[1]);
-                    add(&h, &multiply(&res[idx], &scale)?)?
+                    add(&h, &res[idx])?
                 }
                 _ => h,
             };
