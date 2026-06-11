@@ -678,8 +678,8 @@ impl MaskDecoder {
     fn stability_scores(&self, masks: &Array) -> Result<Array> {
         let sh = masks.shape();
         let flat = masks.reshape(&[sh[0], sh[1], -1])?;
-        let area_i = mean_count_gt(&flat, self.stability_delta)?;
-        let area_u = mean_count_gt(&flat, -self.stability_delta)?;
+        let area_i = count_gt(&flat, self.stability_delta)?;
+        let area_u = count_gt(&flat, -self.stability_delta)?;
         let ratio = ops::divide(&area_i, &area_u)?;
         let ones = ops::ones::<f32>(area_u.shape())?;
         Ok(ops::r#where(
@@ -713,7 +713,7 @@ impl MaskDecoder {
 }
 
 /// `count(x > thresh)` over the last axis as f32 (helper for the stability score).
-fn mean_count_gt(x: &Array, thresh: f32) -> Result<Array> {
+fn count_gt(x: &Array, thresh: f32) -> Result<Array> {
     let mask = x
         .gt(Array::from_f32(thresh))?
         .as_dtype(mlx_rs::Dtype::Float32)?;
