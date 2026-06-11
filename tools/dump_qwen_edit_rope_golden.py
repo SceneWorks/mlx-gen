@@ -6,7 +6,7 @@ latents (image index 0) concatenated with the reference (index 1, frame-axis off
 the max over both grids). This is the novel core of the Edit transformer path.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/musing-mclaren-676094/tools/dump_qwen_edit_rope_golden.py
+    cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_edit_rope_golden.py
 Output (gitignored): tools/golden/qwen_edit_rope_golden.safetensors
 """
 

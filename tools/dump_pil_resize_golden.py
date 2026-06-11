@@ -3,7 +3,7 @@ PIL parity (sc-2465 — the fixed-point resampler that closed the Edit e2e gap).
 a sawtooth gradient (maximizes the cliff disagreement that exposed the f64-vs-fixed-point bug) and a
 smooth ramp. Image/weight-free.
 
-cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/quirky-mcclintock-9e1911/tools/dump_pil_resize_golden.py
+cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_pil_resize_golden.py
 Output (gitignored): tools/golden/pil_resize_golden.safetensors
 """
 

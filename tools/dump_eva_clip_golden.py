@@ -15,7 +15,7 @@ explicit-softmax attention path (deterministic), which the MLX SDPA port matches
 Run:
     cd /Users/michael/Repos/SceneWorks/apps/worker/scene_worker/_vendor/pulid_flux && \
       PYTHONPATH=. /private/tmp/pulidenv/bin/python \
-      /Users/michael/Repos/mlx-gen/.claude/worktrees/objective-snyder-2a2b40/tools/dump_eva_clip_golden.py
+      /path/to/mlx-gen/tools/dump_eva_clip_golden.py
 Output: tools/golden/eva_clip_golden.safetensors
 """
 import os

@@ -11,7 +11,7 @@ it is ~28 GB + the ~2.7 GB f32 vision tower — run on a machine with enough RAM
 anyway). Mirrors `dump_qwen_text_encoder_golden.py`.
 
 Run from the mflux fork venv:
-    cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/musing-mclaren-676094/tools/dump_qwen_vl_encoder_golden.py
+    cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_vl_encoder_golden.py
 Output (gitignored): tools/golden/qwen_vl_encoder_golden.safetensors
 """
 

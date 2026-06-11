@@ -2,7 +2,7 @@
 synthetic edit reference, to compare against the Rust `tokenize_edit`. Light (tokenizer + image
 processor only, no model). sc-2465 slice 7a debugging.
 
-Run: cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/musing-mclaren-676094/tools/dump_qwen_edit_tokenize_debug.py
+Run: cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_edit_tokenize_debug.py
 Output (gitignored): tools/golden/qwen_edit_tokenize_debug.safetensors
 """
 

@@ -3,7 +3,7 @@ reordered, block0, blocks_all, merger, final) at grid (1,28,28) on the real pixe
 `__call__`, to find the first stage that diverges from the Rust port. Loads vision weights (bf16).
 sc-2465 slice 7a debugging.
 
-Run: cd ~/repos/mflux && uv run python ~/Repos/mlx-gen/.claude/worktrees/musing-mclaren-676094/tools/dump_qwen_edit_vision_stages_debug.py
+Run: cd ~/repos/mflux && uv run python /path/to/mlx-gen/tools/dump_qwen_edit_vision_stages_debug.py
 Output (gitignored): tools/golden/qwen_edit_vision_stages_debug.safetensors
 """
 

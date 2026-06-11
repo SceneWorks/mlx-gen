@@ -9,7 +9,7 @@ reference `pulid.encoders_transformer.IDFormer`, runs it in float32 on determini
 Run:
     cd /Users/michael/Repos/SceneWorks/apps/worker/scene_worker/_vendor/pulid_flux && \
       PYTHONPATH=. /private/tmp/pulidenv/bin/python \
-      /Users/michael/Repos/mlx-gen/.claude/worktrees/objective-snyder-2a2b40/tools/dump_idformer_golden.py
+      /path/to/mlx-gen/tools/dump_idformer_golden.py
 Output: tools/golden/idformer_golden.safetensors
 """
 import glob
