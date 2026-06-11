@@ -25,7 +25,14 @@ use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
 
-/// Default production inference steps (the fork's `qwen_image` signature default).
+/// Default non-Lightning step count when a request omits `req.steps`. This mirrors the fork's
+/// `qwen_image` *function-signature* default of 4 — NOT its recommended production usage: the fork's
+/// own README runs 30 steps for every non-Lightning (non-distilled, true-CFG) example. 4 steps on
+/// the true-CFG path is heavily under-denoised, so any caller relying on this default gets a quality
+/// cliff that can look like an engine bug (F-123). Production callers (SceneWorks) pass an explicit
+/// `req.steps` (~30) and never hit this. Kept at 4 to match the fork verbatim rather than silently
+/// diverge; raising it to the fork's documented 30 is an owner decision (surfaced on sc-4139).
+/// The distilled Lightning path uses [`LIGHTNING_DEFAULT_STEPS`] instead.
 pub const DEFAULT_STEPS: u32 = 4;
 /// Default true-CFG guidance scale.
 pub const DEFAULT_GUIDANCE: f32 = 4.0;
