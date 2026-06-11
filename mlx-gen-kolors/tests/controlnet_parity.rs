@@ -158,7 +158,17 @@ fn kolors_controlnet_scale0_is_base() {
         mlx_rs::random::normal::<f32>(&[1, h / 8, w / 8, 4], None, None, None).unwrap();
 
     let base = kolors
-        .denoise_latents(&init_noise, &pos, &neg, steps, cfg, h, w)
+        .denoise_latents(
+            &init_noise,
+            &pos,
+            &neg,
+            steps,
+            cfg,
+            h,
+            w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
+        )
         .unwrap();
     let s0 = kolors
         .denoise_controlnet_latents(
@@ -172,6 +182,8 @@ fn kolors_controlnet_scale0_is_base() {
             0.0,
             h,
             w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
         )
         .unwrap();
     let (p0, _) = rel(&s0, &base);
@@ -201,6 +213,8 @@ fn kolors_controlnet_scale0_is_base() {
             0.7,
             h,
             w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
         )
         .unwrap();
     let (pon, mon) = rel(&s_on, &base);

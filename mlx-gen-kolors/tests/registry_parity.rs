@@ -16,12 +16,13 @@ use std::path::PathBuf;
 // binary. Without a reference to *some* symbol of `mlx-gen-kolors`, the linker dead-strips the whole
 // crate and `mlx_gen::load("kolors", …)` finds no registration. The same applies to the SceneWorks
 // worker — the consumer must `use mlx_gen_kolors as _;` (or otherwise reference it) to register it.
-use mlx_gen_kolors as _;
+use mlx_gen_kolors::Kolors;
 
 use mlx_gen::{
     Conditioning, ControlKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Precision,
     Progress, Quant, WeightsSource,
 };
+use mlx_rs::Dtype;
 
 fn snap(env: &str, repo: &str) -> PathBuf {
     if let Ok(p) = std::env::var(env) {
@@ -138,6 +139,86 @@ fn registry_img2img() {
     }];
     assert_coherent(run(&base_spec(), &req), 1);
     println!("✓ registry img2img (Reference) renders coherently");
+}
+
+fn images_of(out: GenerationOutput) -> Vec<Image> {
+    match out {
+        GenerationOutput::Images(v) => v,
+        _ => panic!("expected Images"),
+    }
+}
+
+/// F-146 drift guard: the registry's production count loop now drives the same
+/// `Kolors::denoise_*_latents` assembly the struct API uses, so a seed-matched single image must be
+/// **byte-identical** across the two surfaces. If they ever diverge (a wiring change applied to one
+/// surface but not the other — exactly the duplication this finding removed), this fails. fp16, to
+/// match the registry's dense dtype.
+#[test]
+#[ignore = "needs the Kolors snapshot + tokenizer.json"]
+fn registry_t2i_matches_direct() {
+    let req = t2i_req();
+    let reg = images_of(run(&base_spec(), &req)).remove(0);
+
+    let kolors = Kolors::load(&kolors_snap(), Dtype::Float16).expect("direct load");
+    let direct = kolors
+        .generate(
+            &req.prompt,
+            req.negative_prompt.as_deref().unwrap(),
+            req.steps.unwrap() as usize,
+            req.guidance.unwrap(),
+            req.seed.unwrap(),
+            req.height as i32,
+            req.width as i32,
+        )
+        .expect("direct generate");
+
+    assert_eq!(
+        (reg.width, reg.height),
+        (direct.width, direct.height),
+        "dims"
+    );
+    assert!(
+        reg.pixels == direct.pixels,
+        "registry T2I must be byte-identical to the struct-API generate (single denoise assembly)"
+    );
+    println!("✓ registry T2I == direct generate, byte-identical (F-146 single assembly)");
+}
+
+/// F-146 drift guard for the img2img assembly — the one with the trickiest RNG order (VAE-encode the
+/// init *before* the noise draw). Byte-identity across surfaces proves the registry's delegated
+/// `denoise_img2img_latents` call preserves that order.
+#[test]
+#[ignore = "needs the Kolors snapshot + tokenizer.json"]
+fn registry_img2img_matches_direct() {
+    let strength = 0.6f32;
+    let img = test_image();
+    let mut req = t2i_req();
+    req.conditioning = vec![Conditioning::Reference {
+        image: img.clone(),
+        strength: Some(strength),
+    }];
+    let reg = images_of(run(&base_spec(), &req)).remove(0);
+
+    let kolors = Kolors::load(&kolors_snap(), Dtype::Float16).expect("direct load");
+    let direct = kolors
+        .img2img(
+            &img,
+            &req.prompt,
+            req.negative_prompt.as_deref().unwrap(),
+            req.steps.unwrap() as usize,
+            strength,
+            req.guidance.unwrap(),
+            req.seed.unwrap(),
+            req.height as i32,
+            req.width as i32,
+        )
+        .expect("direct img2img");
+
+    assert!(
+        reg.pixels == direct.pixels,
+        "registry img2img must be byte-identical to the struct-API img2img (RNG order preserved)"
+    );
+    println!("✓ registry img2img == direct img2img, byte-identical (F-146 single assembly)");
 }
 
 #[test]

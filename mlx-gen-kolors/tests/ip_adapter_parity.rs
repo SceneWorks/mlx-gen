@@ -186,10 +186,32 @@ fn kolors_ip_scale0_is_base() {
         mlx_rs::random::normal::<f32>(&[1, h / 8, w / 8, 4], None, None, None).unwrap();
 
     let base = kolors
-        .denoise_latents(&init_noise, &pos, &neg, steps, cfg, h, w)
+        .denoise_latents(
+            &init_noise,
+            &pos,
+            &neg,
+            steps,
+            cfg,
+            h,
+            w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
+        )
         .unwrap();
     let s0 = kolors
-        .denoise_ip_latents(&ip_tokens, &init_noise, &pos, &neg, steps, cfg, 0.0, h, w)
+        .denoise_ip_latents(
+            &ip_tokens,
+            &init_noise,
+            &pos,
+            &neg,
+            steps,
+            cfg,
+            0.0,
+            h,
+            w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
+        )
         .unwrap();
     let bytes_eq = {
         let n = base.shape().iter().product::<i32>();
@@ -204,7 +226,19 @@ fn kolors_ip_scale0_is_base() {
     println!("✓ ip_scale=0 is byte-identical to plain T2I at f32 (decoupled-attn wiring verified)");
 
     let s_on = kolors
-        .denoise_ip_latents(&ip_tokens, &init_noise, &pos, &neg, steps, cfg, 0.7, h, w)
+        .denoise_ip_latents(
+            &ip_tokens,
+            &init_noise,
+            &pos,
+            &neg,
+            steps,
+            cfg,
+            0.7,
+            h,
+            w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
+        )
         .unwrap();
     let (pon, mon) = rel(&s_on, &base);
     println!("ip_scale-0.7 vs base (f32): peak_rel={pon:.3e} mean_rel={mon:.3e}");

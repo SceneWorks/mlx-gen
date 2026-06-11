@@ -13,23 +13,21 @@
 //! worker, or this crate's own test binary) links `mlx-gen-kolors`. The core `mlx-gen` crate does
 //! **not** depend on the model crates (by design); there is no root-crate dependency to add.
 
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, DiffusionSampler,
-    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, ModelRegistration, Progress, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, ControlKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Progress, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::{
-    decode_image, denoise, denoise_control, denoise_ip, encode_init_latents, load_controlnet,
-    preprocess_control_image, ControlContext, ControlNet, Denoiser, IpImageEncoder,
+    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
-use crate::model::{kolors_time_ids, DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
-use crate::sampler::{KolorsEulerSampler, NUM_TRAIN_TIMESTEPS};
+use crate::model::{DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
+use crate::sampler::NUM_TRAIN_TIMESTEPS;
 use crate::Kolors;
 
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
@@ -204,11 +202,9 @@ impl Generator for KolorsGenerator {
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let cfg = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let cfg_on = cfg > 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let (h, w) = (req.height as i32, req.width as i32);
-        let dtype = self.kolors.dtype();
         let ip_mode = self.ip_encoder.is_some();
 
         let reference = self.resolve_reference(req)?;
@@ -221,43 +217,19 @@ impl Generator for KolorsGenerator {
             ));
         }
 
-        // Conditioning is seed-independent — encode the prompts once. CFG batch order [pos, neg]
-        // (`mlx_gen_sdxl::denoise` reads row 0 as cond, row 1 as uncond).
+        // Conditioning is seed-independent — encode the prompts once and hand the (context, pooled)
+        // tuples to the per-mode `Kolors::denoise_*_latents` methods, which assemble the CFG batch +
+        // time_ids. Routing every mode through those methods keeps a single denoise assembly shared
+        // with the struct API + parity gates — only the real cancel/progress differ here (F-146).
         let pos = self.kolors.encode(&req.prompt)?;
         let neg = self.kolors.encode(negative)?;
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, h, w);
 
-        // Build the (seed-independent) ControlNet context once.
-        let control_ctx = match control {
-            Some((image, scale)) => {
-                let cn = self.control.as_ref().expect("validated above");
-                let img = preprocess_control_image(image, w as u32, h as u32)?;
-                let img = if cfg_on {
-                    concatenate_axis(&[&img, &img], 0)?
-                } else {
-                    img
-                };
-                Some(ControlContext {
-                    controlnet: cn,
-                    // Precompute the step-invariant conditioning embedding once per run (F-069).
-                    cond_embed: cn.embed_cond(&img)?,
-                    scale,
-                })
-            }
-            None => None,
-        };
-
-        // IP-Adapter image tokens (seed-independent) — CFG-batched [tokens, zeros].
+        // IP-Adapter image tokens are seed-independent — encode the reference once (the
+        // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
         let ip = match (ip_mode, reference) {
             (true, Some((image, strength))) => {
                 let tokens = self.ip_encoder.as_ref().unwrap().tokens(image)?;
-                let sh = tokens.shape();
-                let zeros = mlx_rs::ops::zeros::<f32>(sh)?.as_dtype(tokens.dtype())?;
-                let batched = concatenate_axis(&[&tokens, &zeros], 0)?;
-                let scale = strength.unwrap_or(IP_DEFAULT_SCALE);
-                Some((batched, scale))
+                Some((tokens, strength.unwrap_or(IP_DEFAULT_SCALE)))
             }
             _ => None,
         };
@@ -278,55 +250,63 @@ impl Generator for KolorsGenerator {
             let seed = base_seed.wrapping_add(i as u64);
             random::seed(seed)?;
 
-            // Per-mode sampler + init latents.
-            let (latents, sampler) = if let Some((image, strength)) = img2img {
-                let sampler = KolorsEulerSampler::kolors_img2img(steps, strength, dtype)?;
-                let x0 = encode_init_latents(self.kolors.vae(), image, w as u32, h as u32)?;
-                let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-                (sampler.add_noise(&x0, &noise)?, sampler)
-            } else {
-                let sampler = KolorsEulerSampler::kolors(steps, dtype)?;
-                let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-                (sampler.scale_initial_noise(&noise)?, sampler)
-            };
-
-            let d = Denoiser {
-                unet: self.kolors.unet(),
-                sampler: &sampler,
-            };
-            let latents = if let Some(cc) = &control_ctx {
-                denoise_control(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
+            // Draw this image's initial noise, then dispatch to the matching denoise assembly. Only
+            // one global-RNG draw happens per image (the noise); the img2img VAE-encode below draws
+            // none, so the per-image output stays byte-identical to the struct API's RNG order.
+            let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+            let latents = if let Some((image, scale)) = control {
+                self.kolors.denoise_controlnet_latents(
+                    self.control.as_ref().expect("validated above"),
+                    &noise,
+                    image,
+                    &pos,
+                    &neg,
+                    steps,
                     cfg,
+                    scale,
+                    h,
+                    w,
                     &req.cancel,
                     on_progress,
-                    cc,
                 )?
             } else if let Some((tokens, scale)) = &ip {
-                denoise_ip(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
+                self.kolors.denoise_ip_latents(
+                    tokens,
+                    &noise,
+                    &pos,
+                    &neg,
+                    steps,
                     cfg,
+                    *scale,
+                    h,
+                    w,
                     &req.cancel,
                     on_progress,
-                    tokens,
-                    *scale,
+                )?
+            } else if let Some((image, strength)) = img2img {
+                let x0 = encode_init_latents(self.kolors.vae(), image, w as u32, h as u32)?;
+                self.kolors.denoise_img2img_latents(
+                    &x0,
+                    &noise,
+                    &pos,
+                    &neg,
+                    steps,
+                    strength,
+                    cfg,
+                    h,
+                    w,
+                    &req.cancel,
+                    on_progress,
                 )?
             } else {
-                denoise(
-                    &d,
-                    latents,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
+                self.kolors.denoise_latents(
+                    &noise,
+                    &pos,
+                    &neg,
+                    steps,
                     cfg,
+                    h,
+                    w,
                     &req.cancel,
                     on_progress,
                 )?
@@ -423,6 +403,7 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sampler::KolorsEulerSampler;
 
     #[test]
     fn descriptor_is_kolors() {

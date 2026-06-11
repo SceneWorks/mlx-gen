@@ -153,7 +153,17 @@ fn kolors_t2i_matches_diffusers() {
     let r_pos = kolors.encode(prompt).expect("encode pos");
     let r_neg = kolors.encode(negative).expect("encode neg");
     let r_latents = kolors
-        .denoise_latents(init_noise, &r_pos, &r_neg, steps, cfg, h, w)
+        .denoise_latents(
+            init_noise,
+            &r_pos,
+            &r_neg,
+            steps,
+            cfg,
+            h,
+            w,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_p| {},
+        )
         .expect("denoise");
     let image = kolors.decode(&r_latents).expect("decode");
 
