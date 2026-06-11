@@ -1067,14 +1067,9 @@ impl T2iModel {
         let ti = t_idx as i32;
         let mut t = vec![ti + 1; n_img as usize];
         t.push(ti + 2);
-        let mut hh = Vec::with_capacity(n_img as usize + 1);
-        let mut ww = Vec::with_capacity(n_img as usize + 1);
-        for i in 0..n_img {
-            hh.push(i / token_w);
-            ww.push(i % token_w);
-        }
-        hh.push(0);
-        ww.push(0);
+        // Row-major 2D position ids for the merged image grid (+ trailing `img_end` token), with the
+        // `n_img == token_h * token_w` cross-check that the old `let _ = (token_h, token_w);` hid (F-135).
+        let (hh, ww) = merged_grid_position_ids(n_img, token_h, token_w)?;
         let hs = self
             .backbone
             .forward_cached(&embeds, &t, &hh, &ww, Path::Und, cache, true)?;
@@ -1084,7 +1079,6 @@ impl T2iModel {
         let logits = self.backbone.lm_head(&last_hidden)?;
         let vocab = logits.shape()[2];
         let last = logits.reshape(&[vocab])?.as_slice::<f32>().to_vec();
-        let _ = (token_h, token_w);
         Ok((last, t_idx + 2))
     }
 
@@ -1405,6 +1399,34 @@ fn step_schedule(opts: &T2iOptions) -> Result<Vec<f32>> {
     Ok(ts_arr.as_slice::<f32>().to_vec())
 }
 
+/// 2D position ids for an appended image's `n_img` merged-grid tokens followed by the trailing
+/// `img_end` token: row-major `(i / token_w, i % token_w)` for the image rows, then `(0, 0)` for the
+/// end token. Cross-checks the merged-grid token count against the caller's expected
+/// `token_h × token_w` grid so an `n_img != token_h * token_w` mismatch surfaces instead of silently
+/// mis-placing the position ids (the loop assumes exactly `token_w` columns per row; F-135).
+fn merged_grid_position_ids(
+    n_img: i32,
+    token_h: i32,
+    token_w: i32,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    if n_img != token_h * token_w {
+        return Err(Error::Msg(format!(
+            "sensenova append_generated_image: re-encoded image has {n_img} merged tokens but the \
+             caller's grid is {token_h}×{token_w} ({} expected)",
+            token_h * token_w
+        )));
+    }
+    let mut hh = Vec::with_capacity(n_img as usize + 1);
+    let mut ww = Vec::with_capacity(n_img as usize + 1);
+    for i in 0..n_img {
+        hh.push(i / token_w);
+        ww.push(i % token_w);
+    }
+    hh.push(0);
+    ww.push(0);
+    Ok((hh, ww))
+}
+
 fn cfg_blend(
     v_cond: &Array,
     v_uncond: &Array,
@@ -1673,6 +1695,20 @@ mod tests {
             on <= cn + 1e-4,
             "global-norm output {on} exceeds cond norm {cn}"
         );
+    }
+
+    #[test]
+    fn merged_grid_position_ids_builds_rows_and_guards_mismatch() {
+        // F-135: row-major (i/token_w, i%token_w) for the image grid, then (0,0) for the trailing
+        // `img_end` token; the count is cross-checked against token_h × token_w.
+        let (hh, ww) = merged_grid_position_ids(6, 2, 3).unwrap();
+        assert_eq!(hh, vec![0, 0, 0, 1, 1, 1, 0]);
+        assert_eq!(ww, vec![0, 1, 2, 0, 1, 2, 0]);
+
+        // A merged-grid token count that doesn't match the caller's grid is rejected, not silently
+        // mis-placed (the bug the old blanket suppression hid).
+        assert!(merged_grid_position_ids(5, 2, 3).is_err());
+        assert!(merged_grid_position_ids(6, 3, 3).is_err());
     }
 
     #[test]
