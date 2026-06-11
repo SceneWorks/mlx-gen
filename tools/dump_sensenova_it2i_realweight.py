@@ -21,17 +21,12 @@ import sys
 
 import torch
 from safetensors.torch import save_file
-from transformers import AutoTokenizer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from sensenova_u1.models.neo_unify.modeling_neo_chat import NEOChatModel
+from _sensenova_common import load_model_and_tokenizer
 from sensenova_u1.models.neo_unify.utils import SYSTEM_MESSAGE_FOR_GEN
 
-SNAP = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots/"
-    "bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-)
 PROMPT = "make the sky a vivid purple"
 W, H = 256, 256
 SRC_W, SRC_H = 256, 256
@@ -58,10 +53,7 @@ def preprocess(src: torch.Tensor, ps: int):
 
 @torch.no_grad()
 def main() -> None:
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"loading {SNAP} on {device} (f32)…", flush=True)
-    tok = AutoTokenizer.from_pretrained(SNAP, trust_remote_code=True)
-    model = NEOChatModel.from_pretrained(SNAP, torch_dtype=torch.float32, trust_remote_code=True).to(device).eval()
+    model, tok, device = load_model_and_tokenizer(dtype=torch.float32)
     model.config.t_eps = 0.02
     model.img_context_token_id = tok.convert_tokens_to_ids("<IMG_CONTEXT>")
     model.img_start_token_id = tok.convert_tokens_to_ids("<img>")

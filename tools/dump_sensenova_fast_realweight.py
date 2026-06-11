@@ -22,18 +22,13 @@ import sys
 
 import torch
 from safetensors.torch import save_file
-from transformers import AutoTokenizer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from sensenova_u1.models.neo_unify.modeling_neo_chat import NEOChatModel
+from _sensenova_common import load_model_and_tokenizer, lora_glob
 from sensenova_u1.models.neo_unify.utils import SYSTEM_MESSAGE_FOR_GEN
 from sensenova_u1.utils.lora import load_and_merge_lora_weight_from_safetensors
 
-SNAP = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots/"
-    "bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-)
 LORA_FILE = "SenseNova-U1-8B-MoT-LoRA-8step-V1.0.safetensors"
 PROMPT = "a red fox sitting in a snowy forest, soft morning light"
 W, H = 256, 256
@@ -45,9 +40,7 @@ SEED = 1234
 def _resolve_lora() -> str:
     if "SENSENOVA_DISTILL_LORA" in os.environ:
         return os.environ["SENSENOVA_DISTILL_LORA"]
-    pat = os.path.expanduser(
-        "~/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT-LoRAs/snapshots/*/" + LORA_FILE
-    )
+    pat = lora_glob(LORA_FILE)
     hits = glob.glob(pat)
     if not hits:
         raise FileNotFoundError(f"distill LoRA not found; download it or set SENSENOVA_DISTILL_LORA ({pat})")
@@ -56,15 +49,8 @@ def _resolve_lora() -> str:
 
 @torch.no_grad()
 def main() -> None:
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
     lora_path = _resolve_lora()
-    print(f"loading {SNAP} on {device} (bf16)…", flush=True)
-    tok = AutoTokenizer.from_pretrained(SNAP, trust_remote_code=True)
-    model = (
-        NEOChatModel.from_pretrained(SNAP, torch_dtype=torch.bfloat16, trust_remote_code=True)
-        .to(device)
-        .eval()
-    )
+    model, tok, device = load_model_and_tokenizer(dtype=torch.bfloat16)
     print(f"merging distill LoRA {lora_path}", flush=True)
     model = load_and_merge_lora_weight_from_safetensors(model, lora_path)
     model.config.t_eps = 0.02

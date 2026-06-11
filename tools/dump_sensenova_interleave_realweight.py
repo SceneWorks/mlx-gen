@@ -20,16 +20,11 @@ import sys
 
 import torch
 from safetensors.torch import save_file
-from transformers import AutoTokenizer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-from sensenova_u1.models.neo_unify.modeling_neo_chat import NEOChatModel
+from _sensenova_common import load_model_and_tokenizer
 
-SNAP = os.path.expanduser(
-    "~/.cache/huggingface/hub/models--sensenova--SenseNova-U1-8B-MoT/snapshots/"
-    "bfa9b436503cb8aed4f2bc60e3236710cc77468d"
-)
 PROMPT = "Show me a simple red circle, then briefly describe it."
 W, H = 256, 256
 NUM_STEPS = 8
@@ -52,10 +47,7 @@ DEFAULT_SYSTEM_MESSAGE = (
 
 @torch.no_grad()
 def main() -> None:
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    print(f"loading {SNAP} on {device} (bf16)…", flush=True)
-    tok = AutoTokenizer.from_pretrained(SNAP, trust_remote_code=True)
-    model = NEOChatModel.from_pretrained(SNAP, torch_dtype=torch.bfloat16, trust_remote_code=True).to(device).eval()
+    model, tok, device = load_model_and_tokenizer(dtype=torch.bfloat16)
 
     # Capture per-image noise: the only [1,3,H,W] randn in interleave_gen is the image init.
     orig_randn = torch.randn
