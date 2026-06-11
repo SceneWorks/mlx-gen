@@ -34,10 +34,22 @@ impl Quant {
 }
 
 /// Compute precision for dense (non-quantized) weights.
+///
+/// [`Bf16`](Self::Bf16) doubles as the registry's **"dense default / no precision override"
+/// sentinel**, not a literal request for bf16 tensors: each provider maps it to its own native
+/// dense dtype. Most providers do run bf16 under it (e.g. sensenova), but the SDXL-family loaders
+/// (kolors, instantid) run **fp16** — they still gate on `Bf16` and reject `Fp32` because a
+/// precision override is not wired, then load at `Dtype::Float16`. So an audit of dtype behavior
+/// through `LoadSpec` must read `Bf16` as "the provider's default dense dtype", which is not
+/// universally bf16. (A distinct `Precision::Default`/`Dense` sentinel would make this explicit but
+/// would touch every provider's match arm — deferred; this note is the documented contract.)
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Precision {
+    /// Dense default — the provider's native dense dtype (bf16 for most, fp16 for the SDXL family).
+    /// See the type-level note: this is the "no override" sentinel, not a literal bf16 request.
     #[default]
     Bf16,
+    /// Full-precision override, honored only by providers that wire it (others reject it at `load`).
     Fp32,
 }
 

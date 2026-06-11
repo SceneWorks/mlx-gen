@@ -96,9 +96,10 @@ pub struct KolorsGenerator {
 /// Kolors-IP-Adapter-Plus snapshot dir (sc-3098), whose K/V pairs are installed into the (pre-quant)
 /// U-Net. `spec.adapters` (LoRA/LoKr) is rejected — not ported (sc-3874).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // fp16 dense path (SDXL-family production dtype). `Precision` is the registry's dense sentinel;
-    // a precision override is not wired (the VAE is always f32, the rest fp16), so reject it rather
-    // than silently ignore.
+    // fp16 dense path (SDXL-family production dtype). `Precision::Bf16` is the registry's
+    // "dense default / no override" sentinel here — NOT a literal bf16 request — mapped to fp16
+    // for this SDXL-family loader (see the `Precision` enum note). A precision override is not
+    // wired (the VAE is always f32, the rest fp16), so reject it rather than silently ignore.
     if spec.precision != mlx_gen::Precision::Bf16 {
         return Err(Error::Msg(
             "kolors: precision override is not wired; the dense path runs fp16 (SDXL-family \
