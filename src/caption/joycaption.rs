@@ -15,6 +15,16 @@ use crate::{Error, Result};
 pub mod language;
 pub mod vision;
 
+/// Join a weight-key `prefix` and `leaf` with a `.` (no leading dot when `prefix` is empty) — the
+/// `tree_flatten`-style key builder shared by the JoyCaption language + vision submodules (F-014).
+pub(super) fn join(prefix: &str, leaf: &str) -> String {
+    if prefix.is_empty() {
+        leaf.to_owned()
+    } else {
+        format!("{prefix}.{leaf}")
+    }
+}
+
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
 pub const JOY_CAPTION_FAMILY: &str = "joycaption";
 

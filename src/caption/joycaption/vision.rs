@@ -336,13 +336,7 @@ fn linear_opt(x: &Array, w: &Array, b: Option<&Array>) -> Result<Array> {
     Ok(if let Some(b) = b { add(&y, b)? } else { y })
 }
 
-fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_owned()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
+use super::join;
 
 #[cfg(test)]
 mod tests {

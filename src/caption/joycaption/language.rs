@@ -738,13 +738,7 @@ fn req_bf16(w: &Weights, key: &str) -> Result<Array> {
     Ok(w.require(key)?.as_dtype(Dtype::Bfloat16)?)
 }
 
-fn join(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_owned()
-    } else {
-        format!("{prefix}.{name}")
-    }
-}
+use super::join;
 
 fn half_min_bf16() -> f32 {
     -3.389_531_4e38
