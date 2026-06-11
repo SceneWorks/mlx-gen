@@ -6,7 +6,7 @@
 //! `attention.{BasicTransformerBlock,TemporalBasicTransformerBlock}`. NHWC I/O.
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, matmul, multiply, sigmoid, subtract};
+use mlx_rs::ops::{add, broadcast_to, matmul, multiply, sigmoid, split, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
@@ -32,14 +32,13 @@ fn lin(w: &Weights, name: &str) -> Result<(Array, Array)> {
 /// `out` is `ff.net.2`. `value · gelu(gate) → out`.
 fn geglu(x: &Array, proj: &(Array, Array), out: &(Array, Array)) -> Result<Array> {
     let p = linear(x, &proj.0, &proj.1)?;
+    // Split the fused `[..., 2·inner]` projection into the contiguous value/gate halves on-device.
+    // `split(_, 2, last)` returns `[p[..0:inner], p[..inner:2·inner]]` — identical to the previous
+    // `take_axis` gathers but without the per-call host index vectors + gather kernels in the hot
+    // UNet loop, and it keeps the single fused matmul (one GEMM, not two half-width ones) — F-172.
     let last = (p.shape().len() - 1) as i32;
-    let two_inner = p.shape()[p.shape().len() - 1];
-    let inner = two_inner / 2;
-    let v_idx = Array::from_slice(&(0..inner).collect::<Vec<i32>>(), &[inner]);
-    let g_idx = Array::from_slice(&(inner..two_inner).collect::<Vec<i32>>(), &[inner]);
-    let value = p.take_axis(&v_idx, last)?;
-    let gate = p.take_axis(&g_idx, last)?;
-    let y = multiply(&value, &gelu_exact(&gate)?)?;
+    let halves = split(&p, 2, last)?;
+    let y = multiply(&halves[0], &gelu_exact(&halves[1])?)?;
     linear(&y, &out.0, &out.1)
 }
 
@@ -267,5 +266,39 @@ impl TransformerSpatioTemporal {
 
         let tokens = linear(&tokens, &self.proj_out.0, &self.proj_out.1)?;
         Ok(add(&tokens.reshape(&[bf, h_, w_, c])?, &residual)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geglu_split_matches_index_gather() {
+        // F-172: `split(_, 2, last)` must produce the same value/gate halves as the previous
+        // `take_axis` index-gather split (contiguous `[0:inner]` / `[inner:2·inner]`), so the
+        // GEGLU output is unchanged by dropping the per-call host index vectors.
+        let p = Array::from_slice(&(0..12).map(|i| i as f32).collect::<Vec<_>>(), &[2, 6]);
+        let last = 1;
+        let (two_inner, inner) = (6, 3);
+        let v_idx = Array::from_slice(&(0..inner).collect::<Vec<i32>>(), &[inner]);
+        let g_idx = Array::from_slice(&(inner..two_inner).collect::<Vec<i32>>(), &[inner]);
+        // Both `take_axis` and `split` return non-contiguous views, so raw `as_slice` would expose
+        // *physical* (not logical) order (sc-2919). Flatten via `reshape` (forces a contiguous
+        // row-major copy) so the comparison is on the logical values the downstream `multiply`/`gelu`
+        // in `geglu` actually consume.
+        let logical = |a: &Array| {
+            let n: i32 = a.shape().iter().product();
+            a.reshape(&[n]).unwrap().as_slice::<f32>().to_vec()
+        };
+        let halves = split(&p, 2, last).unwrap();
+        assert_eq!(
+            logical(&halves[0]),
+            logical(&p.take_axis(&v_idx, last).unwrap())
+        );
+        assert_eq!(
+            logical(&halves[1]),
+            logical(&p.take_axis(&g_idx, last).unwrap())
+        );
     }
 }
