@@ -39,15 +39,12 @@ pub fn encode_prompt(
     Ok((embeds, text_mask))
 }
 
-/// Per-row count of real (non-pad) tokens — a contiguous prefix.
-fn real_lengths(input_ids: &Array, pad: i32) -> (usize, usize, Vec<usize>) {
+/// Per-row count of real (non-pad) tokens — a contiguous prefix. Returns `Result` so an MLX cast
+/// failure surfaces as the crate's `Error` to the worker instead of aborting the process (F-104).
+fn real_lengths(input_ids: &Array, pad: i32) -> Result<(usize, usize, Vec<usize>)> {
     let b = input_ids.shape()[0] as usize;
     let l = input_ids.shape()[1] as usize;
-    let ids: Vec<i32> = input_ids
-        .as_dtype(Dtype::Int32)
-        .unwrap()
-        .as_slice::<i32>()
-        .to_vec();
+    let ids: Vec<i32> = input_ids.as_dtype(Dtype::Int32)?.as_slice::<i32>().to_vec();
     let lens = (0..b)
         .map(|bi| {
             ids[bi * l..(bi + 1) * l]
@@ -56,13 +53,13 @@ fn real_lengths(input_ids: &Array, pad: i32) -> (usize, usize, Vec<usize>) {
                 .count()
         })
         .collect();
-    (b, l, lens)
+    Ok((b, l, lens))
 }
 
 /// The additive T5 key-padding mask `[B,1,1,L]` = `(1 - real) * NEG` (real = `id != pad`),
 /// broadcastable to the T5 attention scores.
 pub fn t5_key_mask(input_ids: &Array, pad: i32) -> Result<Array> {
-    let (b, l, lens) = real_lengths(input_ids, pad);
+    let (b, l, lens) = real_lengths(input_ids, pad)?;
     let mut data = vec![0f32; b * l];
     for (bi, &len) in lens.iter().enumerate() {
         for (i, slot) in data[bi * l..(bi + 1) * l].iter_mut().enumerate() {
@@ -75,7 +72,7 @@ pub fn t5_key_mask(input_ids: &Array, pad: i32) -> Result<Array> {
 /// The transformer per-token mask `(arange(L) <= seq_lengths)` as `[B, L]` f32 — **keeps one extra
 /// padding token** past the content (Chroma's `_get_t5_prompt_embeds` quirk).
 pub fn transformer_text_mask(input_ids: &Array, pad: i32) -> Result<Array> {
-    let (b, l, lens) = real_lengths(input_ids, pad);
+    let (b, l, lens) = real_lengths(input_ids, pad)?;
     let mut out = vec![0f32; b * l];
     for (bi, &len) in lens.iter().enumerate() {
         for (i, slot) in out[bi * l..(bi + 1) * l].iter_mut().enumerate() {
