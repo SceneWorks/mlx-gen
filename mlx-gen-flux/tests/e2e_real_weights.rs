@@ -270,7 +270,7 @@ fn e2e_tokenizer_matches_golden() {
     let g = golden();
     let prompt = g.metadata("prompt").unwrap().to_string();
     let t5_tok = mlx_gen_flux::load_t5_tokenizer(&snapshot(), variant()).unwrap();
-    let clip_tok = mlx_gen_flux::load_clip_tokenizer(&snapshot()).unwrap();
+    let clip_tok = mlx_gen_flux::load_clip_tokenizer().unwrap();
     let t5_ids = t5_tok.tokenize(&prompt).unwrap().input_ids;
     let clip_ids = clip_tok.tokenize(&prompt).unwrap().input_ids;
     let gi = |k: &str| {

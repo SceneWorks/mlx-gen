@@ -44,7 +44,7 @@ fn first_diff(rust: &[i32], golden: &[i32]) -> usize {
 fn clip_and_t5_tokenizer_match_fork_battery() {
     let g = Weights::from_file(battery_path()).unwrap();
     let count: usize = g.metadata("count").unwrap().parse().unwrap();
-    let clip_tok = load_clip_tokenizer(&snapshot()).unwrap();
+    let clip_tok = load_clip_tokenizer().unwrap();
     let t5_tok = load_t5_tokenizer(&snapshot(), FluxVariant::Schnell).unwrap();
 
     let mut failures = 0;

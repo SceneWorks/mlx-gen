@@ -25,7 +25,7 @@ fn flux_text_path_runs_on_real_weights() {
     };
 
     let t5_tok = load_t5_tokenizer(&root, variant).unwrap();
-    let clip_tok = load_clip_tokenizer(&root).unwrap();
+    let clip_tok = load_clip_tokenizer().unwrap();
     let t5 = load_t5_encoder(&root).unwrap();
     let clip = load_clip_encoder(&root).unwrap();
 

@@ -73,7 +73,7 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
     };
 
     let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
-    let clip_tokenizer = loader::load_clip_tokenizer(root)?;
+    let clip_tokenizer = loader::load_clip_tokenizer()?;
     let mut text_encoders = FluxTextEncoders {
         t5: loader::load_t5_encoder(root)?,
         clip: loader::load_clip_encoder(root)?,

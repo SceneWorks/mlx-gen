@@ -14,8 +14,31 @@ use crate::ip_adapter::FluxIpAdapter;
 use crate::text_encoder::{ClipTextEncoder, T5TextEncoder};
 use crate::transformer::{FluxTransformer, FluxTransformerConfig};
 
-pub fn load_clip_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    load_tokenizer(root, FluxTokenizerKind::Clip, FluxVariant::Schnell)
+/// Load the CLIP tokenizer. **Vendored** — the HF-faithful `clip_tokenizer.json` is compiled into the
+/// crate (sc-2787), NOT read from the snapshot: the FLUX repo ships CLIP only as `vocab.json` +
+/// `merges.txt`, which the core byte-level path mis-tokenizes (silently corrupting the pooled
+/// conditioning). So this takes **no snapshot path** — a customized `tokenizer/vocab.json` in the
+/// snapshot is intentionally NOT consulted (F-105).
+pub fn load_clip_tokenizer() -> Result<TextTokenizer> {
+    build_clip_tokenizer()
+}
+
+/// The vendored CLIP tokenizer build (shared by [`load_clip_tokenizer`] and the `Clip` arm of
+/// [`load_tokenizer`]). `max_length` is CLIP's fixed 77 (variant-independent).
+fn build_clip_tokenizer() -> Result<TextTokenizer> {
+    let config = TokenizerConfig {
+        max_length: FluxTokenizerKind::Clip.max_length(FluxVariant::Schnell), // 77, variant-independent
+        pad_token_id: FluxTokenizerKind::Clip.pad_token_id(),
+        chat_template: ChatTemplate::None,
+        pad_to_max_length: true,
+    };
+    // The FLUX repo ships CLIP only as `vocab.json`+`merges.txt` (no `tokenizer.json`), and the core
+    // byte-level `from_clip_bpe` mis-tokenizes CLIP (GPT-2 byte-level vs CLIP's lowercased word-BPE
+    // with `</w>`), silently corrupting the pooled conditioning on every render (sc-2787). Load the
+    // vendored, HF-faithful CLIP `tokenizer.json` compiled into the crate and NEVER fall back to the
+    // broken path — a missing/invalid asset errors loudly.
+    const CLIP_TOKENIZER_JSON: &str = include_str!("../assets/clip_tokenizer.json");
+    TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)
 }
 
 pub fn load_t5_tokenizer(root: &Path, variant: FluxVariant) -> Result<TextTokenizer> {
@@ -167,15 +190,8 @@ fn load_tokenizer(
         pad_to_max_length: true,
     };
     match kind {
-        FluxTokenizerKind::Clip => {
-            // The FLUX repo ships CLIP only as `vocab.json`+`merges.txt` (no `tokenizer.json`), and
-            // the core byte-level `from_clip_bpe` mis-tokenizes CLIP (GPT-2 byte-level vs CLIP's
-            // lowercased word-BPE with `</w>`), silently corrupting the pooled conditioning on every
-            // render (sc-2787). Load the vendored, HF-faithful CLIP `tokenizer.json` compiled into the
-            // crate and NEVER fall back to the broken path — a missing/invalid asset errors loudly.
-            const CLIP_TOKENIZER_JSON: &str = include_str!("../assets/clip_tokenizer.json");
-            TextTokenizer::from_json_str(CLIP_TOKENIZER_JSON, config)
-        }
+        // CLIP is vendored (compiled-in), independent of `root`/`variant` — see [`build_clip_tokenizer`].
+        FluxTokenizerKind::Clip => build_clip_tokenizer(),
         FluxTokenizerKind::T5 => {
             // T5 ships a real `tokenizer.json` in `tokenizer_2/` (verified fork-identical); use it,
             // erroring loudly if absent rather than guessing.
