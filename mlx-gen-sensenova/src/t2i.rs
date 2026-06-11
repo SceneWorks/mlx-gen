@@ -527,6 +527,13 @@ impl T2iModel {
                 &cond, token_h, token_w, text_len, cache_cond, &z, t, opts.t_eps,
             )?;
 
+            // CFG-interval gate for the T2I path: **inclusive** both ends, a faithful port of the
+            // reference `modeling_neo_chat.py:1799`
+            // `if t >= cfg_interval[0] and t <= cfg_interval[1] and cfg_scale > 1`. The it2i/edit path
+            // (`it2i_denoise`) deliberately uses a DIFFERENT gate — exclusive `(i0, i1)` plus an
+            // `i0 == 0` always-on override — because ITS reference (lines 901/1246/1557) does; see
+            // there. At the default `(0.0, 1.0)` both are always-on, so the divergence only surfaces
+            // for a custom `cfg_interval` (F-130).
             let v_pred = if needs_cfg && t >= opts.cfg_interval.0 && t <= opts.cfg_interval.1 {
                 let (cache_u, tlu) = cache_uncond.as_mut().unwrap();
                 let v_uncond =
@@ -1316,6 +1323,12 @@ impl T2iModel {
             }
             let t = timesteps[i];
             let t_next = timesteps[i + 1];
+            // CFG-interval gate for the it2i/edit path: **exclusive** `(i0, i1)` OR an `i0 == 0`
+            // always-on override — a faithful port of the reference `modeling_neo_chat.py` lines
+            // 901/1246/1557: `use_cfg = (t > cfg_interval[0] and t < cfg_interval[1]) or
+            // cfg_interval[0] == 0`. Note the reference's own quirk: `i1` is ignored whenever
+            // `i0 == 0`. The T2I `denoise` uses the DIFFERENT inclusive form (ref line 1799); they
+            // diverge only for a custom `cfg_interval` (F-130).
             let use_cfg = (t > i0 && t < i1) || i0 == 0.0;
 
             let (z, cond_emb) =
