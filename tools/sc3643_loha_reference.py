@@ -8,7 +8,7 @@ modules and emits, per case, the third-party `<case>.safetensors` (per-module
 asserts the reconstruction matches — on-device A/B via `~/mlx-flux-venv`.
 
 Cases: linear (`hada_w1_a@hada_w1_b ⊙ hada_w2_a@hada_w2_b`), conv-non-tucker (k folded into dim 1),
-and conv-tucker (`hada_t1`/`hada_t2`). Run: `~/mlx-flux-venv/bin/python scripts/sc3643_loha_reference.py`.
+and conv-tucker (`hada_t1`/`hada_t2`). Run: `~/mlx-flux-venv/bin/python tools/sc3643_loha_reference.py`.
 """
 
 import json
@@ -20,7 +20,9 @@ from safetensors.torch import save_file
 
 from lycoris import LycorisNetwork, create_lycoris
 
-OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "sc3643_loha"
+from _paths import fixture
+
+OUT = Path(fixture("tests/fixtures/sc3643_loha"))
 
 
 def build(module, *, dim, alpha, tucker):

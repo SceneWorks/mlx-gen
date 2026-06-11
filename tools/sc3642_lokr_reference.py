@@ -14,7 +14,7 @@ Builds REAL lycoris LoKr adapters over toy Linear/Conv2d modules and emits, per 
 
 The Rust test (src/adapters/loader.rs) loads both and asserts the reconstructed delta matches
 within tolerance — the on-device A/B that replaces a torch-on-Linux golden (torch lives in
-`~/mlx-flux-venv`). Run: `~/mlx-flux-venv/bin/python scripts/sc3642_lokr_reference.py`.
+`~/mlx-flux-venv`). Run: `~/mlx-flux-venv/bin/python tools/sc3642_lokr_reference.py`.
 
 Cases cover the four reconstruction shapes a real file hits:
   - linear_w1full_w2lr  : full lokr_w1 + decomposed lokr_w2_a@lokr_w2_b   (common SDXL-attn LoKr)
@@ -33,7 +33,9 @@ from safetensors.torch import save_file
 
 from lycoris import LycorisNetwork, create_lycoris
 
-OUT = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "sc3642_lokr"
+from _paths import fixture
+
+OUT = Path(fixture("tests/fixtures/sc3642_lokr"))
 
 
 def build(module: nn.Module, *, dim: int, alpha: float, factor: int, tucker: bool, decompose_both: bool):
