@@ -1281,6 +1281,11 @@ impl T2iModel {
         if needs_uncond && uncond.is_none() {
             return Err(uncond_cache_err());
         }
+        // Reject CFG-Zero* up front (before any forward), mirroring the reference `it2i_generate`'s
+        // `assert cfg_norm in ['none','global','channel']` — it is a T2I-only blend mode (F-131).
+        if opts.cfg_norm == CfgNorm::CfgZeroStar {
+            return Err(cfg_zero_star_it2i_err());
+        }
 
         let noise_scale = self.noise_scale_for(grid_h, grid_w);
         let mut image = multiply(
@@ -1450,10 +1455,25 @@ fn cfg_blend(
     }
 }
 
+/// `cfg_norm=cfg_zero_star` is a T2I-only blend mode (optimized-scale projection + step-0 zeroing,
+/// done inside [`cfg_blend`]), NOT a post-rescale — so it has no place on the it2i/edit path. The
+/// reference `it2i_generate` asserts `cfg_norm in ['none','global','channel']`; we mirror that with a
+/// typed error rather than letting it silently degrade to plain CFG (F-131).
+fn cfg_zero_star_it2i_err() -> Error {
+    Error::Msg(
+        "sensenova it2i: cfg_norm=cfg_zero_star is T2I-only — the it2i/edit path supports only \
+         none/global/channel (matching the reference it2i_generate assert)"
+            .into(),
+    )
+}
+
 /// Apply the post-blend `cfg_norm` rescale (`it2i_generate`): clamp the guided velocity's norm to
-/// the condition velocity's (global = whole-tensor, channel = per-token). `None` is a no-op.
+/// the condition velocity's (global = whole-tensor, channel = per-token). `None` is a no-op;
+/// `CfgZeroStar` is rejected (it is a T2I-only blend mode, not a post-rescale — see
+/// [`cfg_zero_star_it2i_err`]).
 fn apply_cfg_norm(v: Array, out_cond: &Array, norm: CfgNorm) -> Result<Array> {
     match norm {
+        CfgNorm::None => Ok(v),
         CfgNorm::Global => {
             let nc = frobenius(out_cond)?;
             let nv = frobenius(&v)?;
@@ -1467,7 +1487,7 @@ fn apply_cfg_norm(v: Array, out_cond: &Array, norm: CfgNorm) -> Result<Array> {
             let s = minimum(&ratio, Array::from_f32(1.0))?;
             multiply(&v, &s).map_err(Error::from)
         }
-        _ => Ok(v),
+        CfgNorm::CfgZeroStar => Err(cfg_zero_star_it2i_err()),
     }
 }
 
@@ -1629,6 +1649,17 @@ mod tests {
         let v_uncond = Array::from_slice(&[1.0f32, 1.0], &[1, 1, 2]);
         let out = cfg_blend(&v_cond, &v_uncond, 3.0, CfgNorm::CfgZeroStar, 0).unwrap();
         assert_eq!(slice(&out), vec![0.0, 0.0]);
+    }
+
+    /// F-131: `apply_cfg_norm` (the it2i/edit post-blend rescale) rejects `CfgZeroStar` rather than
+    /// silently no-op'ing it (the old `_ => Ok(v)` arm); None/Global/Channel still apply.
+    #[test]
+    fn it2i_cfg_norm_rejects_cfg_zero_star() {
+        let v = Array::from_slice(&[2.0f32, 4.0], &[1, 1, 2]);
+        let cond = Array::from_slice(&[1.0f32, 1.0], &[1, 1, 2]);
+        assert!(apply_cfg_norm(v.clone(), &cond, CfgNorm::CfgZeroStar).is_err());
+        assert!(apply_cfg_norm(v.clone(), &cond, CfgNorm::None).is_ok());
+        assert!(apply_cfg_norm(v, &cond, CfgNorm::Global).is_ok());
     }
 
     #[test]
