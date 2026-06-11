@@ -117,14 +117,31 @@ mod tests {
         }
     }
 
+    /// F-121: `lightning(n)` takes no width/height (μ is the constant `ln 3`, base_shift == max_shift),
+    /// unlike the production `qwen_scheduler` whose μ comes from the latent sequence length. Test the
+    /// CONTRAST that gives "resolution-independent" meaning: the production schedule genuinely changes
+    /// across resolutions, while Lightning is the single schedule that differs from both. (The old test
+    /// compared `lightning(8)` to itself — only proving determinism.)
     #[test]
     fn lightning_is_resolution_independent() {
-        // base_shift == max_shift ⇒ μ is constant ⇒ the schedule ignores width/height.
-        let a = lightning(8);
-        let b = lightning(8);
-        for i in 0..=8 {
-            assert_eq!(a.sigma(i), b.sigma(i));
-        }
+        let light = lightning(8);
+        let light_sigmas: Vec<f32> = (0..=light.num_steps()).map(|i| light.sigma(i)).collect();
+
+        let lo = qwen_scheduler(8, 512, 512).sigmas;
+        let hi = qwen_scheduler(8, 1024, 1024).sigmas;
+
+        assert_ne!(
+            lo, hi,
+            "production qwen_scheduler must depend on resolution"
+        );
+        assert_ne!(
+            light_sigmas, lo,
+            "lightning must differ from the 512² production schedule"
+        );
+        assert_ne!(
+            light_sigmas, hi,
+            "lightning must differ from the 1024² production schedule"
+        );
     }
 
     #[test]
