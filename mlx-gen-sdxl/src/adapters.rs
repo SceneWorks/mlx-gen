@@ -621,7 +621,7 @@ mod tests {
 
     /// sc-3671: the SDXL crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub
     /// helpers) bit-for-bit against the lycoris reference fixtures (`<repo>/tests/fixtures`, generated
-    /// by `scripts/sc364{2,3}_*reference.py` through `~/mlx-flux-venv`), and detects + resolves the
+    /// by `tools/sc364{2,3}_*reference.py` through `~/mlx-flux-venv`), and detects + resolves the
     /// trainer-flattened keys. The merge onto the UNet is the existing `merge_dense_delta` path.
     #[test]
     fn thirdparty_lycoris_reconstructs_against_reference_f32() {

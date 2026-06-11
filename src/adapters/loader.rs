@@ -2140,7 +2140,7 @@ mod tests {
 
     /// sc-3642: a third-party (non-peft / lycoris) LoKr reconstructs the SAME per-module delta the
     /// `lycoris` library produces. Fixtures (real lycoris adapters + ground-truth deltas) come from
-    /// `scripts/sc3642_lokr_reference.py` via `~/mlx-flux-venv` — the on-device A/B. Covers the four
+    /// `tools/sc3642_lokr_reference.py` via `~/mlx-flux-venv` — the on-device A/B. Covers the four
     /// shapes: full-w1 + decomposed-w2, both-decomposed, both-full (scale forced to 1), and conv
     /// `lokr_t2` tucker.
     #[test]
@@ -2218,7 +2218,7 @@ mod tests {
     }
 
     /// sc-3643: a third-party (non-peft / lycoris) LoHa reconstructs the SAME per-module delta the
-    /// `lycoris` library produces. Fixtures from `scripts/sc3643_loha_reference.py` via `~/mlx-flux-venv`.
+    /// `lycoris` library produces. Fixtures from `tools/sc3643_loha_reference.py` via `~/mlx-flux-venv`.
     /// Covers linear, conv (kernel folded into the factors), and conv `hada_t1/t2` tucker.
     #[test]
     fn thirdparty_loha_matches_lycoris_reference() {
