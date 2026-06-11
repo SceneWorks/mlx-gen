@@ -492,8 +492,12 @@ impl SvdVae {
     }
 
     /// Encode `[B, H, W, 3]` (NHWC, in roughly `[-1, 1]`) → latent **mean** `[B, H/8, W/8, 4]` (raw,
-    /// **unscaled** — `latent_dist.mode()`). Multiply by [`scaling_factor`](Self::scaling_factor) for
-    /// the diffusion-space conditioning latent.
+    /// **unscaled** — `latent_dist.mode()`). This is the **image-conditioning** latent that gets
+    /// channel-concatenated into the UNet input, and it is fed through **unscaled** by design:
+    /// diffusers SVD `_encode_vae_image` does **not** apply [`scaling_factor`](Self::scaling_factor)
+    /// to it (unlike the denoised diffusion latent, which the pipeline divides by it before
+    /// [`decode`](Self::decode)). Scaling this conditioning latent would break image-conditioning
+    /// parity — do not "fix" the call site to multiply it.
     pub fn encode_mode(&self, image: &Array) -> Result<Array> {
         let moments = linear(&self.encoder.forward(image)?, &self.quant.0, &self.quant.1)?;
         // `DiagonalGaussian.mode()` = the mean = the first half of the channel axis.
