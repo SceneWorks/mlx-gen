@@ -16,7 +16,9 @@ pub mod model;
 pub mod registry;
 pub mod sampler;
 pub mod tokenizer;
+pub mod training;
 pub mod unet;
 
 pub use model::Kolors;
 pub use registry::{descriptor, KolorsGenerator, MODEL_ID};
+pub use training::{load_trainer, KolorsTrainer};

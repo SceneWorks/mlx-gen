@@ -17,3 +17,5 @@ mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 mlx-rs = { workspace = true }
 # Link-time model registration (the `mlx_gen` registry; mirrors mlx-gen-sdxl). sc-3874.
 inventory = { workspace = true }
+# Decode training-dataset images for the LoRA/LoKr trainer (sc-4568); mirrors mlx-gen-sdxl.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
