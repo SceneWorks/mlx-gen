@@ -11,7 +11,7 @@
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Image, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Image, Progress, Result};
 
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_ip,
@@ -117,22 +117,19 @@ impl Kolors {
         decode_image(&self.vae, latents)
     }
 
-    /// Crate-internal accessors for the registry [`Generator`](crate::registry) wrapper, which owns
-    /// the production count/cancel/progress denoise loop and needs the loaded U-Net / VAE / compute
-    /// dtype to drive the SDXL denoise primitives directly.
-    pub(crate) fn unet(&self) -> &UNet2DConditionModel {
-        &self.unet
-    }
+    /// Crate-internal VAE accessor for the registry [`Generator`](crate::registry) wrapper, which
+    /// VAE-encodes the img2img init and decodes the final latents around the per-mode denoise
+    /// methods it now drives directly (F-146).
     pub(crate) fn vae(&self) -> &Autoencoder {
         &self.vae
     }
-    pub(crate) fn dtype(&self) -> Dtype {
-        self.dtype
-    }
 
     /// Run the CFG denoise loop from a (raw, unit-normal) initial-noise tensor `init_noise`
-    /// `[1, h, w, 4]` — split out so the parity gate can feed diffusers' exact noise. `pos`/`neg` are
-    /// the `(context, pooled)` from [`encode`](Self::encode). Returns the final latents `[1, h, w, 4]`.
+    /// `[1, h, w, 4]`. The single denoise assembly for plain T2I: the parity gate feeds diffusers'
+    /// exact noise with a no-op `cancel`/`on_progress`, and the registry's production count loop
+    /// drives it with the real request `CancelFlag` + progress sink — so the two surfaces can't drift
+    /// (F-146). `pos`/`neg` are the `(context, pooled)` from [`encode`](Self::encode). Returns the
+    /// final latents `[1, h, w, 4]`.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_latents(
         &self,
@@ -143,6 +140,8 @@ impl Kolors {
         cfg: f32,
         height: i32,
         width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
@@ -157,7 +156,6 @@ impl Kolors {
             unet: &self.unet,
             sampler: &sampler,
         };
-        let cancel = CancelFlag::new();
         denoise(
             &d,
             latents,
@@ -165,8 +163,8 @@ impl Kolors {
             &pooled,
             &time_ids,
             cfg,
-            &cancel,
-            &mut |_p| {},
+            cancel,
+            on_progress,
         )
     }
 
@@ -188,8 +186,17 @@ impl Kolors {
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
         let neg = self.encode(negative)?;
-        let latents =
-            self.denoise_latents(&init_noise, &pos, &neg, num_steps, cfg, height, width)?;
+        let latents = self.denoise_latents(
+            &init_noise,
+            &pos,
+            &neg,
+            num_steps,
+            cfg,
+            height,
+            width,
+            &CancelFlag::new(),
+            &mut |_p| {},
+        )?;
         self.decode(&latents)
     }
 
@@ -211,6 +218,8 @@ impl Kolors {
         cfg: f32,
         height: i32,
         width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
@@ -224,7 +233,6 @@ impl Kolors {
             unet: &self.unet,
             sampler: &sampler,
         };
-        let cancel = CancelFlag::new();
         denoise(
             &d,
             latents,
@@ -232,8 +240,8 @@ impl Kolors {
             &pooled,
             &time_ids,
             cfg,
-            &cancel,
-            &mut |_p| {},
+            cancel,
+            on_progress,
         )
     }
 
@@ -273,6 +281,8 @@ impl Kolors {
             cfg,
             height,
             width,
+            &CancelFlag::new(),
+            &mut |_p| {},
         )?;
         self.decode(&latents)
     }
@@ -297,6 +307,8 @@ impl Kolors {
         control_scale: f32,
         height: i32,
         width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
@@ -313,7 +325,10 @@ impl Kolors {
             cimg
         };
         let cc = ControlContext {
-            // Precompute the step-invariant conditioning embedding once per run (F-069).
+            // The conditioning embedding is step-invariant, computed once per denoise here (F-069).
+            // Under the registry's count loop this runs once per image rather than once per run; the
+            // cost is a single embed forward ≪ the count × N-step denoise, so it stays negligible
+            // while keeping this the single denoise assembly shared with production (F-146).
             cond_embed: controlnet.embed_cond(&cimg)?,
             controlnet,
             scale: control_scale,
@@ -323,7 +338,6 @@ impl Kolors {
             unet: &self.unet,
             sampler: &sampler,
         };
-        let cancel = CancelFlag::new();
         denoise_control(
             &d,
             latents,
@@ -331,8 +345,8 @@ impl Kolors {
             &pooled,
             &time_ids,
             cfg,
-            &cancel,
-            &mut |_p| {},
+            cancel,
+            on_progress,
             &cc,
         )
     }
@@ -370,6 +384,8 @@ impl Kolors {
             control_scale,
             height,
             width,
+            &CancelFlag::new(),
+            &mut |_p| {},
         )?;
         self.decode(&latents)
     }
@@ -399,6 +415,8 @@ impl Kolors {
         ip_scale: f32,
         height: i32,
         width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         use mlx_rs::ops::{concatenate_axis, zeros};
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
@@ -416,7 +434,6 @@ impl Kolors {
             unet: &self.unet,
             sampler: &sampler,
         };
-        let cancel = CancelFlag::new();
         denoise_ip(
             &d,
             latents,
@@ -424,8 +441,8 @@ impl Kolors {
             &pooled,
             &time_ids,
             cfg,
-            &cancel,
-            &mut |_p| {},
+            cancel,
+            on_progress,
             &tokens,
             ip_scale,
         )
@@ -464,6 +481,8 @@ impl Kolors {
             ip_scale,
             height,
             width,
+            &CancelFlag::new(),
+            &mut |_p| {},
         )?;
         self.decode(&latents)
     }
