@@ -33,7 +33,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::linear;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 use crate::image_encoder::Sam2ImageEncoder;
@@ -532,7 +532,7 @@ impl Sam2VideoPredictor {
         let per = frames
             .iter()
             .map(|f| preprocess(f, video_h as usize, video_w as usize))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let images = concatenate_axis(&per.iter().collect::<Vec<_>>(), 0)?;
         Ok(self.init_state_from_pixels(images, video_h, video_w))
     }
@@ -582,7 +582,13 @@ impl Sam2VideoPredictor {
         points: &[[f32; 2]],
         labels: &[i32],
     ) -> Result<Array> {
-        assert_eq!(points.len(), labels.len(), "points/labels length mismatch");
+        if points.len() != labels.len() {
+            return Err(Error::Msg(format!(
+                "sam2 add_correction_points: points/labels length mismatch ({} vs {})",
+                points.len(),
+                labels.len()
+            )));
+        }
         let sx = IMAGE_SIZE as f32 / state.video_w as f32;
         let sy = IMAGE_SIZE as f32 / state.video_h as f32;
         let flat: Vec<f32> = points.iter().flat_map(|p| [p[0] * sx, p[1] * sy]).collect();
@@ -746,11 +752,13 @@ impl Sam2VideoPredictor {
     /// `[1,1,256,256]` in propagation order, starting from the prompted frame.
     pub fn propagate(&self, state: &mut VideoState) -> Result<Vec<(i32, Array)>> {
         self.preflight(state)?;
-        let start = *state
-            .cond
-            .keys()
-            .min()
-            .expect("a prompt is required before propagation");
+        let start = *state.cond.keys().min().ok_or_else(|| {
+            Error::Msg(
+                "sam2 propagate: a prompt is required before propagation (no conditioning frames \
+                 — call add_box/add_correction_points first)"
+                    .into(),
+            )
+        })?;
         let mut results = Vec::new();
         for frame_idx in start..state.num_frames {
             if let Some(out) = state.cond.get(&frame_idx) {

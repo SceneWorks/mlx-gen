@@ -12,7 +12,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_bilinear_u8;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 use crate::image_encoder::Sam2ImageEncoder;
@@ -24,8 +24,14 @@ const SIZE: usize = 1024;
 
 /// SAM2 preprocessing: resize an RGB8 HWC image to 1024² (square stretch, bilinear), `/255`, then
 /// ImageNet-normalize → NCHW `[1, 3, 1024, 1024]` f32. Byte-faithful to the spike's `preprocess`.
-pub fn preprocess(rgb: &[u8], in_h: usize, in_w: usize) -> Array {
-    assert_eq!(rgb.len(), in_h * in_w * 3, "rgb must be HWC RGB8");
+pub fn preprocess(rgb: &[u8], in_h: usize, in_w: usize) -> Result<Array> {
+    let expected = in_h * in_w * 3;
+    if rgb.len() != expected {
+        return Err(Error::Msg(format!(
+            "sam2 preprocess: rgb must be HWC RGB8 ({expected} bytes for {in_h}x{in_w}), got {}",
+            rgb.len()
+        )));
+    }
     let resized = resize_bilinear_u8(rgb, in_h, in_w, SIZE, SIZE); // HWC f32 in [0,255]
     let mut nchw = vec![0f32; 3 * SIZE * SIZE];
     for y in 0..SIZE {
@@ -36,7 +42,7 @@ pub fn preprocess(rgb: &[u8], in_h: usize, in_w: usize) -> Array {
             }
         }
     }
-    Array::from_slice(&nchw, &[1, 3, SIZE as i32, SIZE as i32])
+    Ok(Array::from_slice(&nchw, &[1, 3, SIZE as i32, SIZE as i32]))
 }
 
 /// Scale a box from original pixel space to the 1024² input space (`orig · 1024/W, · 1024/H`).
@@ -167,7 +173,7 @@ impl Sam2Segmenter {
 
     /// End-to-end: an RGB8 HWC image + a box in original pixel space → binary `L` mask `[H, W]`.
     pub fn segment(&self, rgb: &[u8], in_h: u32, in_w: u32, box_xyxy: [f32; 4]) -> Result<Array> {
-        let pixels = preprocess(rgb, in_h as usize, in_w as usize);
+        let pixels = preprocess(rgb, in_h as usize, in_w as usize)?;
         let box_1024 = box_to_1024(box_xyxy, in_w, in_h);
         self.segment_from_pixels(&pixels, box_1024, in_w, in_h)
     }
@@ -192,7 +198,7 @@ mod tests {
         // A flat mid-gray image: every normalized value = (128/255 - mean)/std, per channel.
         let (h, w) = (8usize, 5usize);
         let rgb = vec![128u8; h * w * 3];
-        let pix = preprocess(&rgb, h, w);
+        let pix = preprocess(&rgb, h, w).unwrap();
         assert_eq!(pix.shape(), &[1, 3, 1024, 1024]);
         let v = pix.as_slice::<f32>();
         let expect_c0 = (128.0 / 255.0 - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
@@ -204,6 +210,13 @@ mod tests {
         // channel 1 starts at offset 1024*1024.
         let expect_c1 = (128.0 / 255.0 - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
         assert!((v[1024 * 1024] - expect_c1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn preprocess_rejects_wrong_length_buffer() {
+        // F-170: a malformed RGB buffer returns Err, not a panic. 3×2×3 = 18 bytes expected.
+        assert!(preprocess(&[0u8; 5], 3, 2).is_err());
+        assert!(preprocess(&[0u8; 18], 3, 2).is_ok());
     }
 
     #[test]
