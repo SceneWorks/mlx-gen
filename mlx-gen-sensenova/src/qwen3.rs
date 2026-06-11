@@ -300,6 +300,23 @@ pub struct Qwen3Backbone {
     rope_theta_hw: f32,
 }
 
+/// Precomputed tri-axis RoPE tables (`(cos, sin)` per temporal/H/W axis) and the additive block
+/// mask for a fixed set of position indexes and cache prefix length. These are invariant across the
+/// denoise steps of a given cache (the indexes and `past` don't change in use-only mode), so the
+/// gen-path denoise loops build one per cache via [`Qwen3Backbone::prepare_rope_mask`] and reuse it
+/// for every step instead of rebuilding inside each `predict_v` call — the mask alone is a CPU
+/// `q × (past+q)` f32 fill, ~1–5M entries at 1024² (F-139).
+pub struct RopeMask {
+    cos_t: Array,
+    sin_t: Array,
+    cos_h: Array,
+    sin_h: Array,
+    cos_w: Array,
+    sin_w: Array,
+    mask: Array,
+    n_tokens: i32,
+}
+
 impl Qwen3Backbone {
     /// Build from a checkpoint, `prefix` = the `language_model` namespace (e.g. `"language_model"`).
     pub fn from_weights(w: &Weights, cfg: &NeoChatConfig, prefix: &str) -> Result<Self> {
@@ -457,13 +474,50 @@ impl Qwen3Backbone {
         cache: &mut KvCache,
         append: bool,
     ) -> Result<Array> {
+        let rm = self.prepare_rope_mask(temporal, height, width, cache.len())?;
+        self.forward_prepared(embeds, &rm, path, cache, append)
+    }
+
+    /// Build the tri-axis RoPE tables + block mask for `(temporal, height, width)` position indexes
+    /// at cache prefix length `past`. Hoisted out of [`forward_cached`] so the denoise loops can
+    /// build it once per cache and reuse it across all steps (F-139); see [`RopeMask`].
+    pub fn prepare_rope_mask(
+        &self,
+        temporal: &[i32],
+        height: &[i32],
+        width: &[i32],
+        past: i32,
+    ) -> Result<RopeMask> {
         let dt = (self.head_dim / 2) as usize;
         let dhw = (self.head_dim / 4) as usize;
         let (cos_t, sin_t) = rope_cos_sin(temporal, dt, self.rope_theta)?;
         let (cos_h, sin_h) = rope_cos_sin(height, dhw, self.rope_theta_hw)?;
         let (cos_w, sin_w) = rope_cos_sin(width, dhw, self.rope_theta_hw)?;
-        let mask = cached_block_mask(cache.len(), temporal)?;
+        let mask = cached_block_mask(past, temporal)?;
+        Ok(RopeMask {
+            cos_t,
+            sin_t,
+            cos_h,
+            sin_h,
+            cos_w,
+            sin_w,
+            mask,
+            n_tokens: temporal.len() as i32,
+        })
+    }
 
+    /// The decoder stack over `embeds` using a prebuilt [`RopeMask`]. Identical to [`forward_cached`]
+    /// once the RoPE/mask are built; split out so the per-step builds can be hoisted (F-139). The
+    /// `RopeMask`'s `past` must match `cache.len()` — true within a denoise run (use-only `append =
+    /// false` leaves the cache length fixed).
+    pub fn forward_prepared(
+        &self,
+        embeds: &Array,
+        rm: &RopeMask,
+        path: Path,
+        cache: &mut KvCache,
+        append: bool,
+    ) -> Result<Array> {
         let mut hidden = embeds.clone();
         for (i, layer) in self.layers.iter().enumerate() {
             let (input_ln, post_ln, attn, mlp) = match path {
@@ -482,15 +536,15 @@ impl Qwen3Backbone {
             };
             let normed = rms_norm(&hidden, input_ln, self.eps)?;
             let attn_out = self.attention_cached(
-                &normed, attn, &cos_t, &sin_t, &cos_h, &sin_h, &cos_w, &sin_w, &mask, cache, i,
-                append,
+                &normed, attn, &rm.cos_t, &rm.sin_t, &rm.cos_h, &rm.sin_h, &rm.cos_w, &rm.sin_w,
+                &rm.mask, cache, i, append,
             )?;
             hidden = add(&hidden, &attn_out)?;
             let normed = rms_norm(&hidden, post_ln, self.eps)?;
             hidden = add(&hidden, &mlp.forward(&normed)?)?;
         }
         if append {
-            cache.seq_len += temporal.len() as i32;
+            cache.seq_len += rm.n_tokens;
         }
 
         let final_norm = match path {

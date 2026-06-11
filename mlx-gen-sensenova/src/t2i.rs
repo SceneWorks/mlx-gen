@@ -32,7 +32,7 @@ use crate::fm::{
     apply_time_schedule, euler_step, patchify, patchify_channel_first, unpatchify, velocity,
     FmHead, TimestepEmbedder,
 };
-use crate::qwen3::{KvCache, Path, Qwen3Backbone};
+use crate::qwen3::{KvCache, Path, Qwen3Backbone, RopeMask};
 use crate::runtime::{argmax, Sampler, SplitMix64, SPLITMIX64_INCREMENT};
 use crate::text::{build_neo1_query, image_indexes, text_indexes, tokens, SYSTEM_MESSAGE_FOR_GEN};
 use crate::vision::NeoVisionEmbedder;
@@ -283,26 +283,38 @@ impl T2iModel {
         scale.min(self.noise_scale_max_value)
     }
 
-    /// Run the gen-path velocity prediction for one diffusion step against a prefilled cache
-    /// (`_t2i_predict_v`): `forward_cached` (Gen path, use-only) over the image block, `fm_head` →
-    /// `x_pred`, then the flow-matching velocity. `image_embeds` is the vision+timestep conditioned
-    /// image block `[1, L, hidden]`; `text_len` is the prefix length the block sits after.
-    #[allow(clippy::too_many_arguments)]
-    fn predict_v(
+    /// Build the gen-path [`RopeMask`] for the image block: the `image_indexes` positions for a
+    /// `token_h × token_w` grid sitting after `text_len` prefix tokens, with the block mask at cache
+    /// prefix length `past`. Invariant across denoise steps, so the loops build it once per cache and
+    /// reuse it for every step / guidance branch (F-139).
+    fn prepare_gen(
         &self,
-        image_embeds: &Array,
         token_h: i32,
         token_w: i32,
         text_len: usize,
+        past: i32,
+    ) -> Result<RopeMask> {
+        let (it, ih, iw) = image_indexes(token_h as usize, token_w as usize, text_len);
+        self.backbone.prepare_rope_mask(&it, &ih, &iw, past)
+    }
+
+    /// Run the gen-path velocity prediction for one diffusion step against a prefilled cache
+    /// (`_t2i_predict_v`): `forward_prepared` (Gen path, use-only) over the image block with the
+    /// per-cache [`RopeMask`] from [`Self::prepare_gen`], `fm_head` → `x_pred`, then the
+    /// flow-matching velocity. `image_embeds` is the vision+timestep conditioned image block
+    /// `[1, L, hidden]`.
+    fn predict_v(
+        &self,
+        image_embeds: &Array,
+        rm: &RopeMask,
         cache: &mut KvCache,
         z: &Array,
         t: f32,
         t_eps: f32,
     ) -> Result<Array> {
-        let (it, ih, iw) = image_indexes(token_h as usize, token_w as usize, text_len);
-        let hidden =
-            self.backbone
-                .forward_cached(image_embeds, &it, &ih, &iw, Path::Gen, cache, false)?;
+        let hidden = self
+            .backbone
+            .forward_prepared(image_embeds, rm, Path::Gen, cache, false)?;
         let x_pred = self.fm_head.forward(&hidden)?;
         velocity(&x_pred, z, t, t_eps)
     }
@@ -491,6 +503,13 @@ impl T2iModel {
         let noise_embed = self.noise_scale_embed(noise_scale, l)?;
 
         let needs_cfg = opts.cfg_scale > 1.0 && cache_uncond.is_some();
+        // The RoPE tables + block mask are invariant across steps for a given cache, so build them
+        // once per cache instead of inside every `predict_v` call (F-139).
+        let rm_cond = self.prepare_gen(token_h, token_w, text_len, cache_cond.len())?;
+        let rm_uncond = match cache_uncond.as_ref() {
+            Some((cu, tlu)) => Some(self.prepare_gen(token_h, token_w, *tlu, cu.len())?),
+            None => None,
+        };
         let mut traj = Vec::with_capacity(steps);
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
@@ -501,9 +520,7 @@ impl T2iModel {
 
             let (z, cond) = self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
 
-            let v_cond = self.predict_v(
-                &cond, token_h, token_w, text_len, cache_cond, &z, t, opts.t_eps,
-            )?;
+            let v_cond = self.predict_v(&cond, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
 
             // CFG-interval gate for the T2I path: **inclusive** both ends, a faithful port of the
             // reference `modeling_neo_chat.py:1799`
@@ -513,9 +530,9 @@ impl T2iModel {
             // there. At the default `(0.0, 1.0)` both are always-on, so the divergence only surfaces
             // for a custom `cfg_interval` (F-130).
             let v_pred = if needs_cfg && t >= opts.cfg_interval.0 && t <= opts.cfg_interval.1 {
-                let (cache_u, tlu) = cache_uncond.as_mut().unwrap();
-                let v_uncond =
-                    self.predict_v(&cond, token_h, token_w, *tlu, cache_u, &z, t, opts.t_eps)?;
+                let (cache_u, _tlu) = cache_uncond.as_mut().unwrap();
+                let rm_u = rm_uncond.as_ref().unwrap();
+                let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale, opts.cfg_norm, i)?
             } else {
                 v_cond
@@ -1285,6 +1302,18 @@ impl T2iModel {
 
         let (cfg, img_cfg) = (opts.cfg_scale, opts.img_cfg_scale);
         let (i0, i1) = opts.cfg_interval;
+        // The RoPE tables + block mask are invariant across steps for a given cache, so build one per
+        // cache (cond + the optional img/uncond) up front instead of inside every `predict_v` call
+        // — up to 3 guidance branches × `num_steps` identical ~MB mask builds otherwise (F-139).
+        let rm_cond = self.prepare_gen(token_h, token_w, cond_t, cache_cond.len())?;
+        let rm_img = match img.as_ref() {
+            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.len())?),
+            None => None,
+        };
+        let rm_uncond = match uncond.as_ref() {
+            Some((c, tl)) => Some(self.prepare_gen(token_h, token_w, *tl, c.len())?),
+            None => None,
+        };
         let mut traj = Vec::with_capacity(steps);
         for i in 0..steps {
             if let Some(r) = reporter.as_ref() {
@@ -1302,34 +1331,36 @@ impl T2iModel {
 
             let (z, cond_emb) =
                 self.step_cond_embeds(&image, grid_h, grid_w, l, t, &noise_embed)?;
-            let out_cond = self.predict_v(
-                &cond_emb, token_h, token_w, cond_t, cache_cond, &z, t, opts.t_eps,
-            )?;
+            let out_cond = self.predict_v(&cond_emb, &rm_cond, cache_cond, &z, t, opts.t_eps)?;
 
             let mut v_pred = if !use_cfg || (cfg == 1.0 && img_cfg == 1.0) {
                 out_cond.clone()
             } else if img_cfg == 1.0 {
-                let (c, tl) = img.as_mut().ok_or_else(img_cache_err)?;
-                let oi = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
+                let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
+                let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
+                let oi = self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?;
                 add(
                     &oi,
                     &multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?,
                 )?
             } else if cfg == img_cfg {
-                let (c, tl) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                let ou = self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?;
+                let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
+                let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
+                let ou = self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?;
                 add(
                     &ou,
                     &multiply(&subtract(&out_cond, &ou)?, Array::from_f32(cfg))?,
                 )?
             } else {
                 let oi = {
-                    let (c, tl) = img.as_mut().ok_or_else(img_cache_err)?;
-                    self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
+                    let rm_i = rm_img.as_ref().ok_or_else(img_cache_err)?;
+                    let (c, _) = img.as_mut().ok_or_else(img_cache_err)?;
+                    self.predict_v(&cond_emb, rm_i, c, &z, t, opts.t_eps)?
                 };
                 let ou = {
-                    let (c, tl) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
-                    self.predict_v(&cond_emb, token_h, token_w, *tl, c, &z, t, opts.t_eps)?
+                    let rm_u = rm_uncond.as_ref().ok_or_else(uncond_cache_err)?;
+                    let (c, _) = uncond.as_mut().ok_or_else(uncond_cache_err)?;
+                    self.predict_v(&cond_emb, rm_u, c, &z, t, opts.t_eps)?
                 };
                 let a = multiply(&subtract(&out_cond, &oi)?, Array::from_f32(cfg))?;
                 let b = multiply(&subtract(&oi, &ou)?, Array::from_f32(img_cfg))?;
