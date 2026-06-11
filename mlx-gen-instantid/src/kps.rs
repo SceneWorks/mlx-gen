@@ -200,12 +200,18 @@ fn clip_line(w: i32, h: i32, pt1: &mut (i32, i32), pt2: &mut (i32, i32)) -> bool
 }
 
 /// One channel-3 horizontal span `[xl, xr]` inclusive at row `y` (OpenCV `ICV_HLINE`, pix_size=3).
-/// Caller guarantees `0 <= y < h`; clamps to the row and no-ops when `xl > xr`.
+/// No-ops when `xl > xr`. Performs **no clamping** — the caller guarantees `0 <= y < h` and
+/// `0 <= xl, xr < w`; a negative `xl` would wrap through `as usize` and a too-large `xr` would index
+/// out of bounds. The callers in this module (`line8`, `poly_fill`) clip to the canvas first.
 #[inline]
 fn hline(img: &mut [u8], w: i32, y: i32, xl: i32, xr: i32, color: [u8; 3]) {
     if xl > xr {
         return;
     }
+    debug_assert!(
+        y >= 0 && xl >= 0 && xr < w,
+        "hline: caller must clip to the canvas (got y={y}, xl={xl}, xr={xr}, w={w})"
+    );
     let row = (y as usize) * (w as usize) * 3;
     let mut off = row + (xl as usize) * 3;
     for _ in xl..=xr {
@@ -722,4 +728,33 @@ pub fn view_angle_kps(angle: &str, side: u32) -> Option<[(f32, f32); 5]> {
             }
             out
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-092: `hline` fills exactly the inclusive `[xl, xr]` span at row `y` (no clamping of its own),
+    /// and no-ops when `xl > xr`. Confirms the in-bounds contract the doc now puts on the caller.
+    #[test]
+    fn hline_fills_inclusive_span_and_noops_when_reversed() {
+        let (w, h) = (5i32, 3i32);
+        let mut img = vec![0u8; (w * h) as usize * 3];
+        hline(&mut img, w, 1, 1, 3, [10, 20, 30]); // row 1, cols 1..=3
+
+        let px = |x: i32, y: i32| {
+            let o = (y as usize * w as usize + x as usize) * 3;
+            [img[o], img[o + 1], img[o + 2]]
+        };
+        assert_eq!(px(0, 1), [0, 0, 0], "col 0 untouched");
+        assert_eq!(px(1, 1), [10, 20, 30]);
+        assert_eq!(px(3, 1), [10, 20, 30]);
+        assert_eq!(px(4, 1), [0, 0, 0], "col 4 untouched");
+        assert_eq!(px(1, 0), [0, 0, 0], "other rows untouched");
+
+        // Reversed span is a no-op (leaves the buffer unchanged).
+        let before = img.clone();
+        hline(&mut img, w, 2, 4, 1, [99, 99, 99]);
+        assert_eq!(img, before);
+    }
 }
