@@ -10,7 +10,7 @@ use mlx_gen::{
 };
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
-use mlx_rs::Dtype;
+use mlx_rs::{Array, Dtype};
 
 use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
 use crate::image_encoder::FluxIpImageEncoder;
@@ -270,82 +270,20 @@ impl Flux1 {
         injector: Option<&dyn crate::transformer::DitImageInjector>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate(req)?;
         let transformer = self.transformer()?;
-        let vae = self.vae()?;
-        let base_seed = req.seed.unwrap_or_else(default_seed);
-        // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
-        // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
-        // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
-        // loads at `scale≈0.125` via `spec.adapters`, not a different scheduler). An unset sampler is
-        // the base flow-match path; `validate_request` rejects any name not in the descriptor.
-        let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
-        let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
-        let steps = req.steps.unwrap_or(def_steps) as usize;
-        let guidance = if self.variant.supports_guidance() {
-            req.guidance.unwrap_or(def_guidance)
-        } else {
-            0.0
-        };
-        // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787, verified
-        // against the bf16 golden's per-tensor dtypes): the latents (`create_noise` → f32) and the
-        // main residual stream stay f32 — the fork's scheduler casts the noise prediction to
-        // `latents.dtype` (f32) and its T5 `prompt_embeds` is f32 (T5LayerNorm upcast). Only the CLIP
-        // pooled embedding and the time/text/guidance conditioning run bf16 (handled in the encoders
-        // and `TimeTextEmbed`). So latents are NOT cast to bf16 here — that would diverge from the
-        // fork. (The old "f32 everywhere to dodge the x_embedder bf16 GEMM bug" is obsolete: that bug
-        // is fixed by sc-2772, and the fork runs the x_embedder in f32 anyway because latents are f32.)
         let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
-        let sigmas = build_linear_sigmas(
-            steps,
-            req.width,
-            req.height,
-            self.variant.requires_sigma_shift(),
-        )?;
-        // Drive the denoise through the swappable `DiffusionSampler` seam (sc-2769). FLUX's impl is the
-        // flow-match Euler sampler over these sigmas: `scale_model_input` is identity, `timestep(t)` is
-        // `sigmas[t]` (fed straight to the transformer), and `step` is `x + v·(σ_{t+1}−σ_t)` — exactly
-        // the proven inline loop, so the base render stays bit-exact (guarded by the e2e parity test).
-        let sampler = FlowMatchSampler::new(sigmas);
-        let n_steps = sampler.num_steps();
-
-        // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine,
-        // gated residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
-        // compile_parity.rs) and a per-step win at production geometry. Process-global, idempotent.
-        crate::transformer::set_compile_glue(true);
-
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let mut latents = create_noise(seed, req.width, req.height)?;
-            for t in 0..n_steps {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Msg("generation cancelled".into()));
-                }
-                let x_in = sampler.scale_model_input(&latents, t)?;
-                let velocity = transformer.forward_injected(
-                    &x_in,
-                    &prompt_embeds,
-                    &pooled_prompt_embeds,
-                    sampler.timestep(t),
-                    guidance,
-                    req.width,
-                    req.height,
-                    injector,
-                )?;
-                latents = sampler.step(&velocity, &latents, t)?;
-                on_progress(Progress::Step {
-                    current: t as u32 + 1,
-                    total: n_steps as u32,
-                });
-            }
-
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents, req.width, req.height)?;
-            let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
-        Ok(GenerationOutput::Images(images))
+        self.run_denoise(req, on_progress, |x_in, _t, timestep, guidance| {
+            transformer.forward_injected(
+                x_in,
+                &prompt_embeds,
+                &pooled_prompt_embeds,
+                timestep,
+                guidance,
+                req.width,
+                req.height,
+                injector,
+            )
+        })
     }
 
     /// Dual-branch real-CFG denoise — the seam PuLID-FLUX `true_cfg > 1.0` (sc-3075) uses. Each step
@@ -365,10 +303,62 @@ impl Flux1 {
         timestep_to_start_cfg: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        self.validate(req)?;
         let transformer = self.transformer()?;
+        let (pos_embeds, pos_pooled) = self.encode_prompt(&req.prompt)?;
+        let (neg_embeds, neg_pooled) = self.encode_prompt(neg_prompt)?;
+        self.run_denoise(req, on_progress, |x_in, t, timestep, guidance| {
+            let pos = transformer.forward_injected(
+                x_in,
+                &pos_embeds,
+                &pos_pooled,
+                timestep,
+                guidance,
+                req.width,
+                req.height,
+                Some(pos_injector),
+            )?;
+            if t >= timestep_to_start_cfg {
+                let neg = transformer.forward_injected(
+                    x_in,
+                    &neg_embeds,
+                    &neg_pooled,
+                    timestep,
+                    guidance,
+                    req.width,
+                    req.height,
+                    Some(neg_injector),
+                )?;
+                // neg + true_cfg · (pos − neg)
+                Ok(add(
+                    &neg,
+                    &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?,
+                )?)
+            } else {
+                Ok(pos)
+            }
+        })
+    }
+
+    /// Shared denoise scaffold for the injector generators (F-108): resolve seed / sampler / steps /
+    /// guidance, build the flow-match sigmas + sampler, enable the compile-glue, and run the
+    /// per-count → per-step loop (cancel check → `scale_model_input` → `velocity_fn` → `step` →
+    /// progress → unpack/decode). `velocity_fn(x_in, step_idx, timestep, guidance)` returns the step's
+    /// velocity — the only thing that differs between the single-branch and CFG paths. Bit-identical
+    /// to the prior inline loops (the base render stays e2e-parity-exact).
+    fn run_denoise(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+        mut velocity_fn: impl FnMut(&Array, usize, f32, f32) -> Result<Array>,
+    ) -> Result<GenerationOutput> {
+        self.validate(req)?;
         let vae = self.vae()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
+        // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
+        // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
+        // loads at `scale≈0.125` via `spec.adapters`, not a different scheduler). An unset sampler is
+        // the base flow-match path; `validate_request` rejects any name not in the descriptor.
         let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
         let (def_steps, def_guidance) = profile_defaults(self.variant, sampler_name);
         let steps = req.steps.unwrap_or(def_steps) as usize;
@@ -377,16 +367,23 @@ impl Flux1 {
         } else {
             0.0
         };
-        let (pos_embeds, pos_pooled) = self.encode_prompt(&req.prompt)?;
-        let (neg_embeds, neg_pooled) = self.encode_prompt(neg_prompt)?;
+        // The FLUX diffusion path is MIXED precision, matching the mflux reference (sc-2787): the
+        // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
+        // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
+        // So latents are NOT cast to bf16 — that would diverge from the fork.
         let sigmas = build_linear_sigmas(
             steps,
             req.width,
             req.height,
             self.variant.requires_sigma_shift(),
         )?;
+        // Drive the denoise through the swappable `DiffusionSampler` seam (sc-2769): `scale_model_input`
+        // is identity, `timestep(t)` is `sigmas[t]` (fed straight to the transformer), `step` is
+        // `x + v·(σ_{t+1}−σ_t)`.
         let sampler = FlowMatchSampler::new(sigmas);
         let n_steps = sampler.num_steps();
+        // sc-2963: run the MMDiT's fusable elementwise glue (adaLN affine, gated residual, tanh-GELU
+        // FFN, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Global, idempotent.
         crate::transformer::set_compile_glue(true);
 
         let mut images = Vec::with_capacity(req.count as usize);
@@ -398,32 +395,7 @@ impl Flux1 {
                     return Err(Error::Msg("generation cancelled".into()));
                 }
                 let x_in = sampler.scale_model_input(&latents, t)?;
-                let pos = transformer.forward_injected(
-                    &x_in,
-                    &pos_embeds,
-                    &pos_pooled,
-                    sampler.timestep(t),
-                    guidance,
-                    req.width,
-                    req.height,
-                    Some(pos_injector),
-                )?;
-                let velocity = if t >= timestep_to_start_cfg {
-                    let neg = transformer.forward_injected(
-                        &x_in,
-                        &neg_embeds,
-                        &neg_pooled,
-                        sampler.timestep(t),
-                        guidance,
-                        req.width,
-                        req.height,
-                        Some(neg_injector),
-                    )?;
-                    // neg + true_cfg · (pos − neg)
-                    add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?)?
-                } else {
-                    pos
-                };
+                let velocity = velocity_fn(&x_in, t, sampler.timestep(t), guidance)?;
                 latents = sampler.step(&velocity, &latents, t)?;
                 on_progress(Progress::Step {
                     current: t as u32 + 1,
