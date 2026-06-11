@@ -378,7 +378,7 @@ impl FlowUniPC {
                     vec![0.5]
                 } else {
                     let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order);
-                    solve_linear(&r, &b)
+                    solve_linear(&r, &b)?
                 };
                 // pred_res = Σ ρ·D1 ; x_t -= (α_t·B_h)·pred_res. (rhos_p.len() == d1s.len().)
                 let mut pred_res = fscale(&d1s[0], rhos_p[0])?;
@@ -452,7 +452,7 @@ impl FlowUniPC {
             vec![0.5]
         } else {
             let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order + 1);
-            solve_linear(&r, &b)
+            solve_linear(&r, &b)?
         };
 
         // corr = Σ ρ_k·D1_k + ρ_last·D1_t ; x_t = x_t_ − (α_t·B_h)·corr
@@ -557,10 +557,12 @@ fn build_rb(
 
 /// Solve `R·x = b` for a small dense square system via Gaussian elimination with partial pivoting
 /// (f64) — the host-side stand-in for `np.linalg.solve` (LAPACK LU). For the order-2 systems Wan
-/// actually builds this matches LAPACK to f64 round-off.
+/// actually builds this matches LAPACK to f64 round-off. A (near-)singular system returns `Err`
+/// rather than silently propagating NaN/Inf into the latents, mirroring how `np.linalg.solve`
+/// raises `LinAlgError` (F-020); reachable only via a custom `solver_order > 2` with degenerate `rks`.
 // Index loops read clearer than iterator adapters for a matrix solve.
 #[allow(clippy::needless_range_loop)]
-fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
+fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
     let n = b.len();
     let mut a: Vec<Vec<f64>> = r.to_vec();
     let mut x = b.to_vec();
@@ -578,6 +580,15 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         a.swap(col, piv);
         x.swap(col, piv);
         let diag = a[col][col];
+        // The largest-magnitude pivot in this column is ~0 ⇒ the system is (near-)singular; dividing
+        // by it (here and in back-substitution) would yield NaN/Inf that silently corrupts the
+        // trajectory. Error instead, like `np.linalg.solve` (F-020).
+        if diag.abs() < 1e-12 {
+            return Err(Error::Msg(format!(
+                "wan scheduler: singular {n}x{n} system in solve_linear (near-zero pivot \
+                 {diag:.3e} at column {col}) — degenerate rks for the configured solver_order"
+            )));
+        }
         for row in (col + 1)..n {
             let factor = a[row][col] / diag;
             if factor != 0.0 {
@@ -588,7 +599,7 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
             }
         }
     }
-    // Back-substitution.
+    // Back-substitution (each `a[col][col]` is a pivot already checked non-zero above).
     for col in (0..n).rev() {
         let mut sum = x[col];
         for c in (col + 1)..n {
@@ -596,7 +607,7 @@ fn solve_linear(r: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         }
         x[col] = sum / a[col][col];
     }
-    x
+    Ok(x)
 }
 
 #[cfg(test)]
@@ -689,9 +700,20 @@ mod tests {
         // [[2,1],[1,3]] x = [3,5] → x = [0.8, 1.4].
         let r = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
         let b = vec![3.0, 5.0];
-        let x = solve_linear(&r, &b);
+        let x = solve_linear(&r, &b).unwrap();
         assert!((x[0] - 0.8).abs() < 1e-12);
         assert!((x[1] - 1.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn solve_linear_singular_errs() {
+        // F-020: a singular system (row 2 = 2 × row 1) errors instead of returning NaN/Inf.
+        let r = vec![vec![1.0, 2.0], vec![2.0, 4.0]];
+        let b = vec![1.0, 2.0];
+        match solve_linear(&r, &b) {
+            Ok(x) => panic!("singular system must error, got {x:?}"),
+            Err(e) => assert!(e.to_string().contains("singular"), "got: {e}"),
+        }
     }
 
     #[test]
