@@ -24,12 +24,12 @@ from mflux.models.common.config import ModelConfig as MC
 from mflux.models.common.config.config import Config
 from mflux.models.flux2.variants import Flux2Klein
 
-from _paths import fixture
+from _paths import fixture, mflux_asset
 
 BITS = int(os.environ.get("BITS", "8"))
 PROMPT = "a red fox resting in fresh snow under soft winter light"
 SEED, STEPS, SIZE, GUIDANCE, STRENGTH = 0, 4, 256, 1.0, 0.6
-ASSET = "/Users/michael/repos/mflux/src/mflux/assets/flux2_klein_edit.jpg"
+ASSET = mflux_asset("flux2_klein_edit.jpg")
 
 # Byte-identical u8 init pixels (LANCZOS resize to 256² then a lossless PNG; the in-pipeline resize
 # is a no-op).

@@ -8,17 +8,16 @@ base `LatentState` and dumps the **appended** tokens / positions / denoise-mask 
 base tokens) for a couple of frame indices. The base state is trivial (zeros), so the appended slice
 fully isolates the new math.
 
-Reference: `/Users/michael/Repos/Wan2GP/models/ltx2/ltx_core/conditioning/types/keyframe_cond.py`.
+Reference: `<LTX2_SRC>/ltx2/ltx_core/conditioning/types/keyframe_cond.py`.
 
-Run (needs torch + einops in the reference venv):
-    LTX2_SRC=/Users/michael/Repos/Wan2GP/models \
-      /Users/michael/repos/mflux/.venv-0312/bin/python tools/dump_ltx_keyframe_cond_golden.py
+Run (needs torch + einops in the reference venv); LTX2_SRC points at your Wan2GP `models` dir:
+    LTX2_SRC=<path-to-Wan2GP>/models \
+      python tools/dump_ltx_keyframe_cond_golden.py
 Writes `mlx-gen-ltx/tests/fixtures/ltx_keyframe_cond_golden.safetensors`.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -26,9 +25,11 @@ import numpy as np
 import torch
 from safetensors.numpy import save_file
 
-from _paths import fixture
+from _paths import fixture, require_env
 
-LTX2_SRC = os.environ.get("LTX2_SRC", "/Users/michael/Repos/Wan2GP/models")
+LTX2_SRC = require_env(
+    "LTX2_SRC", "set it to your Wan2GP `models` dir (the one holding `ltx2/ltx_core`)"
+)
 sys.path.insert(0, LTX2_SRC)
 
 from ltx2.ltx_core.components.patchifiers import VideoLatentPatchifier  # noqa: E402

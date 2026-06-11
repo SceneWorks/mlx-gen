@@ -23,11 +23,11 @@ from mflux.models.common.config.config import Config  # noqa: E402
 from mflux.models.flux2.variants import Flux2KleinEdit  # noqa: E402
 from mflux.models.flux2.variants.edit.flux2_klein_edit_helpers import _Flux2KleinEditHelpers  # noqa: E402
 
-from _paths import fixture  # noqa: E402
+from _paths import fixture, mflux_asset  # noqa: E402
 
 PROMPT = "make it look like a cold winter morning"
 SEED, STEPS, SIZE, GUIDANCE = 0, 4, 256, 1.0
-ASSET = "/Users/michael/repos/mflux/src/mflux/assets/flux2_klein_edit.jpg"
+ASSET = mflux_asset("flux2_klein_edit.jpg")
 
 # Resize the reference to 256² (LANCZOS) and persist as a lossless PNG so both the fork and the Rust
 # test consume byte-identical u8 pixels.

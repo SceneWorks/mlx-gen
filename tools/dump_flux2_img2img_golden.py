@@ -29,11 +29,11 @@ from mflux.models.flux2.latent_creator.flux2_latent_creator import Flux2LatentCr
 from mflux.models.flux2.variants import Flux2Klein  # noqa: E402
 from mflux.models.flux2.variants.edit.flux2_klein_edit_helpers import _Flux2KleinEditHelpers  # noqa: E402
 
-from _paths import fixture  # noqa: E402
+from _paths import fixture, mflux_asset  # noqa: E402
 
 PROMPT = "a red fox resting in fresh snow under soft winter light"
 SEED, STEPS, SIZE, GUIDANCE, STRENGTH = 0, 4, 256, 1.0, 0.6
-ASSET = "/Users/michael/repos/mflux/src/mflux/assets/flux2_klein_edit.jpg"
+ASSET = mflux_asset("flux2_klein_edit.jpg")
 
 # Resize the init image to 256² (LANCZOS) and persist as a lossless PNG so the fork and the Rust
 # test consume byte-identical u8 pixels (and the in-pipeline LANCZOS resize is a no-op).
