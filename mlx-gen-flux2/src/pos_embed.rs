@@ -43,6 +43,11 @@ impl Flux2PosEmbed {
         for (i, &dim) in self.axes_dim.iter().enumerate() {
             // omega[j] = 1 / theta^((2j)/dim), j in 0..dim/2 — the fork's
             // `1.0 / (theta ** (arange(0, dim, 2) / dim))`, computed in f32.
+            // Host `f32::powf` is fine here (unlike FLUX.1, which builds omega with MLX ops —
+            // `power`/`divide` — to bit-match a frozen mflux fork whose ~4e-7 host-vs-MLX `powf`
+            // drift the chaotic 57-block stack amplifies, sc-2787). FLUX.2 has no frozen-fork
+            // bit-parity contract, so the static omega table is computed host-side. If FLUX.2 ever
+            // needs MLX-reference parity, switch this to the FLUX.1 MLX-op pattern.
             let half = dim / 2;
             let omega: Vec<f32> = (0..half)
                 .map(|j| {
