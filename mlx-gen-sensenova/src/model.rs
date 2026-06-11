@@ -235,10 +235,11 @@ impl Generator for SenseNova {
     }
 
     fn validate(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID, req)?;
-        validate_dims_and_steps(req)
+        // Use the descriptor's own id so the base and `_fast` variants attribute rejections to the
+        // right model (F-143).
+        let id = self.descriptor.id;
+        self.descriptor.capabilities.validate_request(id, req)?;
+        validate_dims_and_steps(id, req)
     }
 
     fn generate(
@@ -291,11 +292,12 @@ impl Generator for SenseNova {
 }
 
 /// Request-boundary checks beyond the capability surface: 32-pixel alignment per side and a positive
-/// step count. Factored out so it can be unit-tested without loaded weights.
-fn validate_dims_and_steps(req: &GenerationRequest) -> Result<()> {
+/// step count. Factored out so it can be unit-tested without loaded weights. `id` is the rejecting
+/// model's descriptor id (base or `_fast`) so the error attributes to the right variant (F-143).
+fn validate_dims_and_steps(id: &str, req: &GenerationRequest) -> Result<()> {
     if !req.width.is_multiple_of(CELL) || !req.height.is_multiple_of(CELL) {
         return Err(Error::Msg(format!(
-            "sensenova_u1_8b: {}x{} must be a multiple of {CELL} per side",
+            "{id}: {}x{} must be a multiple of {CELL} per side",
             req.width, req.height
         )));
     }
@@ -303,7 +305,7 @@ fn validate_dims_and_steps(req: &GenerationRequest) -> Result<()> {
     // panic on `.last().expect("at least one step")` (F-125). Reject it at the boundary; `None` falls
     // back to the variant default.
     if req.steps == Some(0) {
-        return Err(Error::Msg("sensenova_u1_8b: steps must be >= 1".into()));
+        return Err(Error::Msg(format!("{id}: steps must be >= 1")));
     }
     Ok(())
 }
@@ -422,8 +424,19 @@ mod tests {
         // Capability floor passes (in range) but the 32-alignment check rejects 300.
         assert!(d.capabilities.validate_request(MODEL_ID, &req).is_ok());
         assert!(!300u32.is_multiple_of(CELL));
-        let err = validate_dims_and_steps(&req).unwrap_err().to_string();
+        let err = validate_dims_and_steps(MODEL_ID, &req)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("multiple of"), "got: {err}");
+        // F-143: the rejecting model's own id is in the message, so the fast variant attributes the
+        // error to `sensenova_u1_8b_fast`, not the hardcoded base id.
+        let fast_err = validate_dims_and_steps(MODEL_ID_FAST, &req)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            fast_err.contains(MODEL_ID_FAST),
+            "fast id should appear: {fast_err}"
+        );
     }
 
     #[test]
@@ -436,7 +449,9 @@ mod tests {
             steps: Some(0),
             ..Default::default()
         };
-        let err = validate_dims_and_steps(&bad).unwrap_err().to_string();
+        let err = validate_dims_and_steps(MODEL_ID, &bad)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("steps must be >= 1"), "got: {err}");
 
         for steps in [None, Some(1), Some(50)] {
@@ -446,7 +461,10 @@ mod tests {
                 steps,
                 ..Default::default()
             };
-            assert!(validate_dims_and_steps(&ok).is_ok(), "steps={steps:?}");
+            assert!(
+                validate_dims_and_steps(MODEL_ID, &ok).is_ok(),
+                "steps={steps:?}"
+            );
         }
     }
 }
