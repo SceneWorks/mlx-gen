@@ -100,10 +100,17 @@ impl FluxIpAdapter {
             );
             blocks.push((k, v));
         }
-        if blocks.len() != NUM_DOUBLE_BLOCKS {
+        // The loop always produces exactly `NUM_DOUBLE_BLOCKS` pairs (a missing key errors via
+        // `w.require`), so a `blocks.len()` check is dead. Instead reject a checkpoint that carries
+        // MORE adapter blocks than FLUX.1 has — an extra `double_blocks.{NUM_DOUBLE_BLOCKS}.*` K/V
+        // pair would otherwise be silently ignored, masking a block-count / model mismatch (F-103).
+        let extra = format!(
+            "double_blocks.{NUM_DOUBLE_BLOCKS}.processor.ip_adapter_double_stream_k_proj.weight"
+        );
+        if w.get(&extra).is_some() {
             return Err(Error::Msg(format!(
-                "flux ip-adapter: expected {NUM_DOUBLE_BLOCKS} double-block K/V pairs, got {}",
-                blocks.len()
+                "flux ip-adapter: checkpoint carries more than {NUM_DOUBLE_BLOCKS} double-block \
+                 adapters (found {extra:?}) — the block count does not match FLUX.1"
             )));
         }
         Ok(Self { proj_model, blocks })
