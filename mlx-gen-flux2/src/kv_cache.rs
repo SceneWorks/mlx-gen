@@ -6,12 +6,13 @@
 //! Rust analog of the fork's `Flux2KVCache`
 //! (`models/flux2/model/flux2_transformer/flux2_kv_cache.py`).
 //!
-//! **Why plain mutable state, not `compile_with_state`.** The whole `mlx-gen` workspace runs the
-//! model forward eagerly (no `mx.compile`), so there is no compiled graph that needs a mutable-state
-//! threading mechanism. The 2.4× speedup comes entirely from the cache *reducing work* on steps
-//! 1..N (only `[txt, target]` queries, and no ref K/V recompute) — exactly as in the fork, which
-//! also disables compile for this path. The cache is therefore an ordinary interior-mutability
-//! container the `&self` transformer forward writes on step 0 and reads thereafter.
+//! **Why plain mutable state, not `compile_with_state`.** The model forward is **not** whole-graph
+//! compiled — only stateless elementwise chains (the adaLN modulate / gated residuals, sc-2963) run
+//! through `mx.compile`, and the cache never participates in one — so there is no compiled graph that
+//! needs a mutable-state threading mechanism. The 2.4× speedup comes entirely from the cache
+//! *reducing work* on steps 1..N (only `[txt, target]` queries, and no ref K/V recompute) — exactly
+//! as in the fork, which also disables compile for this path. The cache is therefore an ordinary
+//! interior-mutability container the `&self` transformer forward writes on step 0 and reads thereafter.
 //!
 //! **Token layout** (mflux order, which the Rust transformer already matches): the joint attention
 //! sequence is `[txt, target, ref]`. The reference tokens are the trailing `num_ref` slice. In
