@@ -495,18 +495,22 @@ impl Generator {
         self.resblocks[idx].forward(x)
     }
 
-    /// Diagnostic: NLC intermediates `(after_conv_pre, after_up_loop, after_act_post)` for bisection.
-    #[doc(hidden)]
-    pub fn forward_stages(&self, x: &Array) -> Result<(Array, Array, Array)> {
-        let x = x.transpose_axes(&[0, 1, 3, 2])?;
+    /// `(B, C, T, F)` mel/feature input → NLC `(B, T, C·F)` → `conv_pre`. The 4-axis transpose
+    /// requires 4-D input, so a non-4-D tensor errors here rather than silently passing through (the
+    /// old `if sh.len() == 4 { … } else { x }` fallback was dead — F-056). Shared by `forward` and
+    /// `forward_stages`.
+    fn pre(&self, x: &Array) -> Result<Array> {
+        let x = x.transpose_axes(&[0, 1, 3, 2])?; // (B, C, F, T)
         let sh = x.shape();
-        let x = {
-            let (b, s, c, t) = (sh[0], sh[1], sh[2], sh[3]);
-            x.reshape(&[b, s * c, t])?
-        };
-        let mut x = x.transpose_axes(&[0, 2, 1])?;
-        x = self.conv_pre.forward(&x)?;
-        let after_conv_pre = x.clone();
+        let (b, s, c, t) = (sh[0], sh[1], sh[2], sh[3]);
+        let x = x.reshape(&[b, s * c, t])?.transpose_axes(&[0, 2, 1])?; // (B, T, C·F)
+        self.conv_pre.forward(&x)
+    }
+
+    /// The upsampling loop, shared by `forward` and `forward_stages` so the diagnostic can't drift
+    /// from production (F-056): per stage, optional leaky pre-act → transposed-conv upsample → mean
+    /// of the `num_kernels` AMP/res-block outputs.
+    fn up_loop(&self, mut x: Array) -> Result<Array> {
         for i in 0..self.ups.len() {
             if !self.bigvgan {
                 x = leaky(&x, LRELU_SLOPE)?;
@@ -519,6 +523,15 @@ impl Generator {
             let refs: Vec<&Array> = outs.iter().collect();
             x = mean_axes(&stack_axis(&refs, 0)?, &[0], false)?;
         }
+        Ok(x)
+    }
+
+    /// Diagnostic: NLC intermediates `(after_conv_pre, after_up_loop, after_act_post)` for bisection.
+    #[doc(hidden)]
+    pub fn forward_stages(&self, x: &Array) -> Result<(Array, Array, Array)> {
+        let x = self.pre(x)?;
+        let after_conv_pre = x.clone();
+        let x = self.up_loop(x)?;
         let after_up_loop = x.clone();
         let after_act_post = if self.bigvgan {
             self.act_post.as_ref().unwrap().forward(&x)?
@@ -530,30 +543,8 @@ impl Generator {
 
     /// `x` is the mel/feature input `(B, C, T, F)` (stereo `C=2`). Returns the waveform `(B, C_out, T)`.
     pub fn forward(&self, x: &Array) -> Result<Array> {
-        // (B, C, T, F) → (B, C, F, T) → (B, C·F, T) → (B, T, C·F) NLC.
-        let x = x.transpose_axes(&[0, 1, 3, 2])?;
-        let sh = x.shape();
-        let x = if sh.len() == 4 {
-            let (b, s, c, t) = (sh[0], sh[1], sh[2], sh[3]);
-            x.reshape(&[b, s * c, t])?
-        } else {
-            x
-        };
-        let mut x = x.transpose_axes(&[0, 2, 1])?; // (B, T, C·F)
-        x = self.conv_pre.forward(&x)?;
-
-        for i in 0..self.ups.len() {
-            if !self.bigvgan {
-                x = leaky(&x, LRELU_SLOPE)?;
-            }
-            x = self.ups[i].forward(&x)?;
-            let start = i * self.num_kernels;
-            let outs: Vec<Array> = (start..start + self.num_kernels)
-                .map(|idx| self.resblocks[idx].forward(&x))
-                .collect::<Result<Vec<_>>>()?;
-            let refs: Vec<&Array> = outs.iter().collect();
-            x = mean_axes(&stack_axis(&refs, 0)?, &[0], false)?;
-        }
+        let x = self.pre(x)?;
+        let mut x = self.up_loop(x)?;
 
         if self.bigvgan {
             x = self.act_post.as_ref().unwrap().forward(&x)?;
