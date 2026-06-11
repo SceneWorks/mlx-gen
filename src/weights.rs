@@ -16,6 +16,15 @@ pub struct Weights {
 }
 
 impl Weights {
+    /// An empty weights container — for building small in-memory fixtures (e.g. checkpoint-remap unit
+    /// tests that assert `remap_*_keys` produces the aliased names without a real snapshot).
+    pub fn empty() -> Self {
+        Self {
+            tensors: HashMap::new(),
+            metadata: HashMap::new(),
+        }
+    }
+
     /// Load a single `.safetensors` file (tensors + metadata).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let (tensors, metadata) = Array::load_safetensors_with_metadata(path.as_ref())?;

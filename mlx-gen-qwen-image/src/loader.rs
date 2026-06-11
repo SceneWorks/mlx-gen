@@ -282,9 +282,11 @@ fn transform_vae_tensor(src_key: &str, t: &Array) -> Result<Array> {
 mod tests {
     use super::*;
 
+    /// F-120: exercise the PRODUCTION `remap_transformer_keys` over an in-memory `Weights` fixture
+    /// (not a duplicated copy of the rename table), so a regression in the real table fails CI. One
+    /// representative key from each rename family; the aliased name must be present after the remap.
     #[test]
     fn transformer_renames() {
-        // a representative key from each rename family.
         let cases = [
             (
                 "transformer_blocks.7.attn.to_out.0.weight",
@@ -295,31 +297,45 @@ mod tests {
                 "transformer_blocks.12.img_mod_linear.bias",
             ),
             (
-                "transformer_blocks.3.txt_mlp.net.0.proj.weight",
-                "transformer_blocks.3.txt_ff.mlp_in.weight",
+                "transformer_blocks.5.txt_mod.1.weight",
+                "transformer_blocks.5.txt_mod_linear.weight",
+            ),
+            (
+                "transformer_blocks.3.img_mlp.net.0.proj.weight",
+                "transformer_blocks.3.img_ff.mlp_in.weight",
             ),
             (
                 "transformer_blocks.3.img_mlp.net.2.weight",
                 "transformer_blocks.3.img_ff.mlp_out.weight",
             ),
+            (
+                "transformer_blocks.3.txt_mlp.net.0.proj.weight",
+                "transformer_blocks.3.txt_ff.mlp_in.weight",
+            ),
+            (
+                "transformer_blocks.3.txt_mlp.net.2.weight",
+                "transformer_blocks.3.txt_ff.mlp_out.weight",
+            ),
         ];
-        const RENAMES: &[(&str, &str)] = &[
-            (".attn.to_out.0.", ".attn.attn_to_out.0."),
-            (".img_mod.1.", ".img_mod_linear."),
-            (".txt_mod.1.", ".txt_mod_linear."),
-            (".img_mlp.net.0.proj.", ".img_ff.mlp_in."),
-            (".img_mlp.net.2.", ".img_ff.mlp_out."),
-            (".txt_mlp.net.0.proj.", ".txt_ff.mlp_in."),
-            (".txt_mlp.net.2.", ".txt_ff.mlp_out."),
-        ];
-        for (from, want) in cases {
-            let got = RENAMES
-                .iter()
-                .find(|(f, _)| from.contains(f))
-                .map(|(f, t)| from.replace(f, t))
-                .unwrap();
-            assert_eq!(got, want);
+
+        let mut w = Weights::empty();
+        for (from, _) in cases {
+            w.insert(from, mlx_rs::Array::from_slice(&[0f32], &[1]));
         }
+        remap_transformer_keys(&mut w);
+
+        let keys: std::collections::HashSet<&str> = w.keys().collect();
+        for (from, want) in cases {
+            assert!(keys.contains(want), "remap must alias {from} → {want}");
+        }
+        // A key that matches no rename family is left untouched.
+        let mut plain = Weights::empty();
+        plain.insert(
+            "transformer_blocks.0.attn.norm_q.weight",
+            mlx_rs::Array::from_slice(&[0f32], &[1]),
+        );
+        remap_transformer_keys(&mut plain);
+        assert_eq!(plain.keys().count(), 1, "unmatched key must not be aliased");
     }
 
     #[test]
