@@ -48,6 +48,7 @@ use mlx_gen::{
     WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
+use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{multiply, subtract};
 use mlx_rs::optimizers::clip_grad_norm;
 use mlx_rs::transforms::{eval, keyed_value_and_grad};
@@ -254,6 +255,18 @@ impl ZImageTurboTrainer {
         on_progress(TrainingProgress::Preparing);
         let edge = bucket_resolution(cfg.resolution);
 
+        // sc-4874 — fail-fast pre-flight memory guard. The dense (non-checkpointed) first step
+        // materializes the whole forward graph in one MLX `eval`; at high resolution that working set
+        // exceeds unified memory and the OS hard-kills the worker with an UNCATCHABLE SIGKILL (no
+        // in-process error, the run just appears to hang at the last cached latent). We cannot catch
+        // that kill, so we predict it and refuse up front with an actionable, catchable error —
+        // BEFORE the (~minutes-long) latent caching — when gradient checkpointing is not enabled.
+        let will_checkpoint =
+            matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
+        if !will_checkpoint {
+            preflight_memory_guard(edge)?;
+        }
+
         // --- prepare → load → cache: VAE-latents + prompt-embeds into memory before the loop ---
         on_progress(TrainingProgress::LoadingModel); // base model is already resident from load_trainer
         let total = req.items.len() as u32;
@@ -310,6 +323,38 @@ impl ZImageTurboTrainer {
             let lt = cfg.loss_type.to_ascii_lowercase();
             lt == "mae" || lt == "l1"
         };
+
+        // sc-4874 — gradient checkpointing. Collect, per MAIN block, the adapter-routable LOCAL paths
+        // trained on it (e.g. `"attention.to_q"`); the long unified main stack is where the
+        // first-step activation memory concentrates, so that is what we checkpoint. Refiner/embedder
+        // targets are not collected here — they train through ordinary autograd in the
+        // (non-checkpointed) pre-main forward.
+        let n_layers = self.transformer.cfg.n_layers;
+        let mut main_block_local_targets: Vec<Vec<String>> = vec![Vec::new(); n_layers];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("layers.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    if i < n_layers {
+                        main_block_local_targets[i].push(local.to_string());
+                    }
+                }
+            }
+        }
+        // Gradient checkpointing is an OPT-IN OPTION (the SceneWorks "Gradient Checkpointing"
+        // toggle), never auto-forced — a run that would OOM is caught instead by the fail-fast
+        // pre-flight guard below, which surfaces a catchable error and *recommends* this flag rather
+        // than silently changing the user's training dynamics. Only the LoRA path is checkpointed
+        // today — LoKr (a distinct Kronecker reconstruction) falls back to the dense path (follow-up).
+        let is_lora = matches!(adapter, TrainAdapter::Lora { .. });
+        let use_checkpoint = is_lora && cfg.gradient_checkpointing;
+        let checkpoint_main: Option<&[Vec<String>]> = if use_checkpoint {
+            Some(&main_block_local_targets)
+        } else {
+            None
+        };
         // AdamW with wd=0 is identical to Adam, so the one optimizer covers both choices.
         let weight_decay = if cfg.optimizer.eq_ignore_ascii_case("adam") {
             0.0
@@ -361,6 +406,7 @@ impl ZImageTurboTrainer {
                 sigma,
                 &noise,
                 mae,
+                checkpoint_main,
             )?;
             last_loss = loss;
             steps_run = step;
@@ -427,6 +473,40 @@ impl ZImageTurboTrainer {
             final_loss: last_loss,
         })
     }
+}
+
+/// Projected DENSE (non-checkpointed) first-step peak memory, in GB, as a function of the unified
+/// token count `s` — an empirical fit to measured peaks on the 128 GB target (sc-4874): edge
+/// 512/768/1024 → s≈1024/2304/4096 → 45/73.5/135 GB. The dominant cost is the forward `eval`
+/// materializing every block's retained activations at once (the LoRA backward adds only ~1 GB).
+fn projected_dense_peak_gb(s: f64) -> f64 {
+    31.5 + 0.0092 * s + 3.92e-6 * s * s
+}
+
+/// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
+/// SIGKILLed), returning a catchable, actionable error instead. `edge` is the bucketed training
+/// edge; the unified token count is ≈ `(edge/16)²` (latent /8, patch 2) plus the small padded
+/// caption block. The budget is MLX's own reported memory limit (≈ the device's recommended working
+/// set), scaled by 0.85 to leave headroom for the worker/host — exceeding it is the regime where the
+/// dense run was observed to die. Only consulted when gradient checkpointing is OFF.
+fn preflight_memory_guard(edge: u32) -> Result<()> {
+    let tokens_per_side = (edge as f64 / 16.0).ceil();
+    let s = tokens_per_side * tokens_per_side + 32.0; // + one padded caption block
+    let projected = projected_dense_peak_gb(s);
+    let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let safe = budget_gb * 0.85;
+    if projected > safe {
+        return Err(format!(
+            "z_image_turbo trainer: a dense first training step at resolution {edge} needs ~{projected:.0} GB \
+             (the forward working set materializes in one allocation), exceeding this machine's ~{safe:.0} GB \
+             safe budget ({budget_gb:.0} GB MLX limit × 0.85). Without mitigation the OS would hard-kill the \
+             worker (SIGKILL) at the first step with no recoverable error (sc-4874). Enable Gradient \
+             Checkpointing (recomputes activations in the backward; ~2.4× smaller working set) or reduce the \
+             training resolution."
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Resolve the config's target-module *suffixes* (default `to_q`/`to_k`/`to_v`/`to_out.0`) to full
@@ -502,6 +582,9 @@ fn sample_sigma(timestep_type: &str, timestep_bias: &str, seed: u64) -> Result<f
 /// One forward+backward over the trainable adapter factors: inject `params` (LoRA or LoKr), run the
 /// DiT, regress the (already-negated) `forward()` output toward the velocity `noise - x0`, return
 /// `(loss, grads)`.
+/// `checkpoint_main`, when `Some`, lists per-main-block LOCAL LoRA target paths and switches the
+/// forward to the gradient-checkpointed path (sc-4874) — each main block recomputes its activations
+/// in the backward instead of retaining them. `None` runs the dense (activation-retaining) forward.
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     transformer: &mut ZImageTransformer,
@@ -514,14 +597,29 @@ fn compute_loss_grads(
     sigma: f32,
     noise: &Array,
     mae: bool,
+    checkpoint_main: Option<&[Vec<String>]>,
 ) -> Result<(f32, LoraParams)> {
     let (x_t, target, timestep) = build_batch(x0, noise, sigma)?;
     let capf = cap.clone();
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+        // Install ALL targets: refiners/embedders train through this on the (non-checkpointed)
+        // pre-main forward; the main-block adapters installed here are simply replaced inside each
+        // checkpoint segment by the explicit-input factors, so they cost nothing on the ckpt path.
         adapter.install(transformer, &p, alpha, rank, LOKR_DTYPE)?;
-        let v = transformer
-            .forward(&x_t, timestep, &capf)
-            .map_err(|e| Exception::custom(e.to_string()))?;
+        let v = match checkpoint_main {
+            Some(locals) => {
+                let sh = x_t.shape();
+                let prep = transformer
+                    .prepare((sh[0], sh[1], sh[2], sh[3]), &capf)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                transformer
+                    .forward_with_main_checkpointed(&prep, &x_t, timestep, &p, locals, alpha)
+                    .map_err(|e| Exception::custom(e.to_string()))?
+            }
+            None => transformer
+                .forward(&x_t, timestep, &capf)
+                .map_err(|e| Exception::custom(e.to_string()))?,
+        };
         let diff = subtract(&v, &target)?;
         // MSE / MAE — `mean(None)` reduces to a 0-d scalar (grad requires a scalar cotangent).
         let loss = if mae {
@@ -534,6 +632,366 @@ fn compute_loss_grads(
     let mut vg = keyed_value_and_grad(loss_fn);
     let (val, grads) = vg(params.clone(), 0)?;
     Ok((val[0].item::<f32>(), grads))
+}
+
+// ===========================================================================================
+// sc-4874 — first-step signal-9 repro/instrumentation (weight-gated, run as its own process).
+//
+// The production run dies with SIGKILL the instant the first real training step begins, at the
+// default resolution 1024 (the e2e `trainer_e2e.rs` runs at 64 and never exercises this regime).
+// This harness drives the exact inner step (`compute_loss_grads` + the step-1 grad `eval` the real
+// loop forces at training.rs' optimizer step) directly, sweeping resolution with MLX peak-memory
+// probes around it, to pinpoint the working set at the death point and test whether a memory
+// ceiling converts the silent kill into a catchable error.
+//
+//   cargo test -p mlx-gen-z-image --release --lib first_step -- --ignored --nocapture
+// ===========================================================================================
+#[cfg(test)]
+mod first_step_repro {
+    use super::*;
+    use mlx_gen::media::Image;
+    use mlx_gen::train::lora::build_lora_targets;
+    use mlx_rs::memory::{
+        clear_cache, get_active_memory, get_peak_memory, reset_peak_memory, set_memory_limit,
+    };
+    use std::path::PathBuf;
+
+    fn snapshot() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("ZIMAGE_SNAPSHOT") {
+            return Some(PathBuf::from(p));
+        }
+        let home = std::env::var("HOME").ok()?;
+        let snaps = PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--Tongyi-MAI--Z-Image-Turbo/snapshots");
+        std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir())
+    }
+
+    /// A solid-colour `edge`×`edge` RGB source image (the latent magnitude is irrelevant; the graph
+    /// size — driven by resolution — is the variable under test).
+    fn swatch(edge: u32) -> Image {
+        let mut img = image::RgbImage::new(edge, edge);
+        for px in img.pixels_mut() {
+            *px = image::Rgb([180u8, 60, 90]);
+        }
+        Image {
+            width: edge,
+            height: edge,
+            pixels: img.into_raw(),
+        }
+    }
+
+    fn gb(bytes: usize) -> f64 {
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+    }
+
+    /// Run a single first training step at `edge` and report peak GPU memory across the
+    /// forward+backward. Forces the backward (grad eval) — the real step-1 kill point.
+    fn one_step(
+        trainer: &mut ZImageTurboTrainer,
+        adapter: &TrainAdapter,
+        params: &LoraParams,
+        cap: &Array,
+        edge: u32,
+        checkpoint_main: Option<&[Vec<String>]>,
+    ) -> Result<(f32, f64, [i32; 4])> {
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge)?;
+        eval([&x0])?;
+        let shape = {
+            let s = x0.shape();
+            [s[0], s[1], s[2], s[3]]
+        };
+        let noise = random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1)?))?;
+        eval([&noise])?;
+
+        reset_peak_memory();
+        let before = get_active_memory();
+        let (loss, grads) = compute_loss_grads(
+            &mut trainer.transformer,
+            params,
+            adapter,
+            16.0,
+            16.0,
+            &x0,
+            cap,
+            0.5,
+            &noise,
+            false,
+            checkpoint_main,
+        )?;
+        // `compute_loss_grads` only forces the loss (forward). The real trainer forces the backward
+        // at the step-1 optimizer `eval`; do the same here so the peak reflects the true working set.
+        eval(grads.values())?;
+        let peak = get_peak_memory();
+        let tag = if checkpoint_main.is_some() {
+            "ckpt"
+        } else {
+            "dense"
+        };
+        eprintln!(
+            "  [edge {edge:>4} {tag}] latent {shape:?}  loss {loss:.5}  active-before {:.2} GB  peak {:.2} GB",
+            gb(before),
+            gb(peak)
+        );
+        Ok((loss, gb(peak), shape))
+    }
+
+    /// Per-main-block LOCAL LoRA target paths (mirrors `train_impl`), for driving the checkpointed
+    /// path from the harness.
+    fn main_block_local_targets(trainer: &ZImageTurboTrainer) -> Vec<Vec<String>> {
+        let cfg = TrainingConfig {
+            rank: 16,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&trainer.transformer, &cfg);
+        let n_layers = trainer.transformer.cfg.n_layers;
+        let mut out: Vec<Vec<String>> = vec![Vec::new(); n_layers];
+        for path in &target_paths {
+            if let Some((idx, local)) = path
+                .strip_prefix("layers.")
+                .and_then(|rest| rest.split_once('.'))
+            {
+                if let Ok(i) = idx.parse::<usize>() {
+                    if i < n_layers {
+                        out[i].push(local.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn build_trainer_and_adapter() -> (ZImageTurboTrainer, TrainAdapter, LoraParams, Array) {
+        let root = snapshot().expect("Z-Image-Turbo snapshot (HF cache or ZIMAGE_SNAPSHOT)");
+        let mut trainer = ZImageTurboTrainer {
+            descriptor: trainer_descriptor(),
+            tokenizer: crate::loader::load_tokenizer(&root).unwrap(),
+            text_encoder: crate::loader::load_text_encoder(&root).unwrap(),
+            vae: crate::loader::load_vae(&root).unwrap(),
+            transformer: crate::loader::load_transformer(&root).unwrap(),
+        };
+        let cfg = TrainingConfig {
+            rank: 16,
+            ..Default::default()
+        };
+        let target_paths = resolve_target_paths(&trainer.transformer, &cfg);
+        let (targets, params) =
+            build_lora_targets(&mut trainer.transformer, &target_paths, 16, 7).unwrap();
+        let cap = crate::pipeline::encode_prompt(
+            &trainer.tokenizer,
+            &trainer.text_encoder,
+            "a solid colour swatch",
+            "sc-4874 repro",
+        )
+        .unwrap();
+        eval([&cap]).unwrap();
+        eprintln!(
+            "[sc-4874] loaded trainer; {} LoRA targets; cap {:?}",
+            targets.len(),
+            cap.shape()
+        );
+        (trainer, TrainAdapter::Lora { targets }, params, cap)
+    }
+
+    /// Attribute the first-step peak to the FORWARD eval vs the BACKWARD eval (sc-4874 root-cause:
+    /// is the "blip" the forward materializing, or the autograd backward retaining/recomputing?).
+    /// `compute_loss_grads` forces the forward (via `loss.item()`) and returns lazy grads; we then
+    /// force the backward. Run at SAFE resolutions (512/768) so it characterizes the split without
+    /// risking the OOM kill, and extrapolate.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn first_step_memory_attribution() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        for edge in [512u32, 768] {
+            let img = center_crop_square(&swatch(edge));
+            let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+            let noise =
+                random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap()))
+                    .unwrap();
+            eval([&x0, &noise]).unwrap();
+
+            clear_cache();
+            reset_peak_memory();
+            let build_active = get_active_memory();
+            let (_loss, grads) = compute_loss_grads(
+                &mut trainer.transformer,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                None,
+            )
+            .unwrap();
+            // `loss.item()` inside `compute_loss_grads` already forced the FORWARD graph.
+            let fwd_peak = get_peak_memory();
+            eval(grads.values()).unwrap(); // force the BACKWARD
+            let full_peak = get_peak_memory();
+            eprintln!(
+                "[sc-4874] edge {edge}: lazy-build active {:.2} GB | forward-eval peak {:.2} GB | +backward peak {:.2} GB (backward added {:.2} GB)",
+                gb(build_active),
+                gb(fwd_peak),
+                gb(full_peak),
+                gb(full_peak.saturating_sub(fwd_peak)),
+            );
+        }
+    }
+
+    /// Sweep resolution from tiny → production, printing the peak-memory curve. If the process dies
+    /// (SIGKILL) at some edge, the prints from the survived edges are already flushed (eprintln +
+    /// per-step completion), so the curve shows exactly where it falls over.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process (may SIGKILL)"]
+    fn first_step_memory_sweep() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        eprintln!("[sc-4874] sweeping first-step peak memory by resolution:");
+        for edge in [64u32, 256, 512, 768, 1024] {
+            eprintln!("[sc-4874] === edge {edge} ===");
+            match one_step(&mut trainer, &adapter, &params, &cap, edge, None) {
+                Ok((_, peak, shape)) => {
+                    eprintln!("[sc-4874] edge {edge} SURVIVED  latent {shape:?}  peak {peak:.2} GB")
+                }
+                Err(e) => eprintln!("[sc-4874] edge {edge} returned CATCHABLE error: {e}"),
+            }
+        }
+        eprintln!("[sc-4874] sweep complete (reached the end without SIGKILL)");
+    }
+
+    /// Production resolution (1024) with a low MLX memory ceiling: tests whether forcing MLX to
+    /// stay under a limit converts the silent SIGKILL into a catchable Rust error (story step 2).
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn first_step_1024_with_memory_limit() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        let limit_gb = std::env::var("SC4874_LIMIT_GB")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(24.0);
+        let prev = set_memory_limit((limit_gb * 1024.0 * 1024.0 * 1024.0) as usize);
+        eprintln!(
+            "[sc-4874] set memory limit to {limit_gb:.1} GB (prev {:.2} GB); running edge 1024…",
+            gb(prev)
+        );
+        match one_step(&mut trainer, &adapter, &params, &cap, 1024, None) {
+            Ok((loss, peak, shape)) => eprintln!(
+                "[sc-4874] edge 1024 SURVIVED under {limit_gb:.1} GB limit  latent {shape:?}  loss {loss:.5}  peak {peak:.2} GB"
+            ),
+            Err(e) => eprintln!("[sc-4874] edge 1024 returned CATCHABLE error under limit: {e}"),
+        }
+    }
+
+    /// The fix: at production resolution 1024, gradient checkpointing must drop the first-step peak
+    /// well under the dense path's ~135 GB (which exceeds the 128 GB unified memory). Runs the dense
+    /// step first (baseline), then the checkpointed step, and asserts a substantial reduction.
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn first_step_1024_checkpointed_vs_dense() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        let locals = main_block_local_targets(&trainer);
+        let n_main: usize = locals.iter().map(|v| v.len()).sum();
+        eprintln!("[sc-4874] checkpointing {n_main} LoRA targets across the main stack");
+
+        let (_, dense_peak, _) =
+            one_step(&mut trainer, &adapter, &params, &cap, 1024, None).expect("dense step");
+        let (_, ckpt_peak, _) =
+            one_step(&mut trainer, &adapter, &params, &cap, 1024, Some(&locals))
+                .expect("checkpointed step");
+        eprintln!(
+            "[sc-4874] edge 1024  dense {dense_peak:.2} GB  ckpt {ckpt_peak:.2} GB  ({:.0}% reduction)",
+            100.0 * (1.0 - ckpt_peak / dense_peak)
+        );
+        assert!(
+            ckpt_peak < dense_peak,
+            "checkpointing must reduce the first-step peak: dense {dense_peak:.2} GB vs ckpt {ckpt_peak:.2} GB"
+        );
+        // The whole point is fitting under 128 GB with production headroom — expect a large drop.
+        assert!(
+            ckpt_peak < 128.0,
+            "checkpointed peak must fit unified memory: {ckpt_peak:.2} GB"
+        );
+    }
+
+    /// Gradient checkpointing must not change the math: the checkpointed forward+grads must match the
+    /// dense path within fp tolerance (it reuses the same install + block forward, recompute-only).
+    #[test]
+    #[ignore = "needs real Z-Image weights; run as its own process"]
+    fn checkpointed_grads_match_dense() {
+        let (mut trainer, adapter, params, cap) = build_trainer_and_adapter();
+        let locals = main_block_local_targets(&trainer);
+        let edge = 256u32; // small enough that the dense path is cheap; math is resolution-agnostic
+        let img = center_crop_square(&swatch(edge));
+        let x0 = encode_init_latents(&trainer.vae, &img, edge, edge).unwrap();
+        let noise =
+            random::normal::<f32>(x0.shape(), None, None, Some(&random::key(1).unwrap())).unwrap();
+        eval([&x0, &noise]).unwrap();
+
+        let grads_of = |t: &mut ZImageTurboTrainer, ck: Option<&[Vec<String>]>| -> LoraParams {
+            let (_l, g) = compute_loss_grads(
+                &mut t.transformer,
+                &params,
+                &adapter,
+                16.0,
+                16.0,
+                &x0,
+                &cap,
+                0.5,
+                &noise,
+                false,
+                ck,
+            )
+            .unwrap();
+            eval(g.values()).unwrap();
+            g
+        };
+        let g_dense = grads_of(&mut trainer, None);
+        let g_ckpt = grads_of(&mut trainer, Some(&locals));
+
+        let mut max_rel = 0f32;
+        for (k, gd) in &g_dense {
+            let gc = g_ckpt.get(k).expect("same keys");
+            let num = gd.subtract(gc).unwrap().abs().unwrap().max(None).unwrap();
+            let den = gd.abs().unwrap().max(None).unwrap().item::<f32>().max(1e-6);
+            max_rel = max_rel.max(num.item::<f32>() / den);
+        }
+        eprintln!("[sc-4874] checkpointed-vs-dense grad max relative diff: {max_rel:.2e}");
+        assert!(
+            max_rel < 1e-3,
+            "checkpointed grads must match dense within tolerance: max rel {max_rel:.2e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::projected_dense_peak_gb;
+
+    // The empirical fit must reproduce the measured peaks (sc-4874) within a few GB and stay
+    // monotonic — it is the basis of the pre-flight OOM guard, so a regression here silently
+    // mis-sizes the guard. s ≈ (edge/16)²: edge 512→1024, 768→2304, 1024→4096 tokens.
+    #[test]
+    fn projection_matches_measured_curve() {
+        for (s, measured) in [(1024.0, 45.0), (2304.0, 73.5), (4096.0, 135.0)] {
+            let p = projected_dense_peak_gb(s);
+            assert!(
+                (p - measured).abs() < 5.0,
+                "projection at s={s} = {p:.1} GB, expected ≈{measured} GB"
+            );
+        }
+        // Monotonic increasing in token count.
+        assert!(projected_dense_peak_gb(1024.0) < projected_dense_peak_gb(2304.0));
+        assert!(projected_dense_peak_gb(2304.0) < projected_dense_peak_gb(4096.0));
+        // The 1024-edge dense step (~135 GB) must project above any sane single-machine budget×0.85
+        // (e.g. 128 GB → 103 GB), i.e. the guard would fire.
+        assert!(projected_dense_peak_gb(4096.0) > 103.0);
+    }
 }
 
 #[cfg(test)]

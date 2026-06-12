@@ -227,6 +227,7 @@ pub fn conv_lora_delta(
 
 /// One adapter's contribution WITHOUT the base, so a host can sum stacked adapters over
 /// a single base application.
+#[derive(Clone)]
 pub enum Adapter {
     /// LoRA: `residual = scale · x·A·B`.
     Lora { a: Array, b: Array, scale: f32 },
@@ -271,6 +272,7 @@ impl Adapter {
 
 /// A linear base — dense or quantized — evaluated through a shared reference. Mirrors the
 /// `forward` of mlx-rs's `nn::Linear` / `nn::QuantizedLinear` but without requiring `&mut`.
+#[derive(Clone)]
 pub enum LinearBase {
     Dense(Linear),
     Quantized(QuantizedLinear),
@@ -324,6 +326,7 @@ impl LinearBase {
 
 /// A linear base plus a stack of adapters, applied as `base(x) + Σ adapter.residual(x)`.
 /// Quantized-safe: the base weight is never mutated.
+#[derive(Clone)]
 pub struct AdaptableLinear {
     base: LinearBase,
     adapters: Vec<Adapter>,

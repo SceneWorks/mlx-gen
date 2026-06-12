@@ -59,6 +59,13 @@ pub struct TrainingConfig {
     pub steps: u32,
     pub batch_size: u32,
     pub gradient_accumulation: u32,
+    /// Gradient (activation) checkpointing: recompute each transformer block's activations during
+    /// the backward pass instead of retaining them, bounding the first-step working set (sc-4874 —
+    /// without it a production-resolution run can exceed unified memory and the OS hard-kills the
+    /// worker). This is the engine-side home of the SceneWorks "Gradient Checkpointing" toggle (which
+    /// was previously a no-op on the Rust path). The family trainer may additionally auto-enable it
+    /// when the projected working set would exceed the memory budget, regardless of this flag.
+    pub gradient_checkpointing: bool,
     /// Square training resolution edge in pixels; bucketed down to a multiple of 32.
     pub resolution: u32,
     /// Adapter-checkpoint cadence, in micro-steps (`0` = no intermediate checkpoints).
@@ -96,6 +103,7 @@ impl Default for TrainingConfig {
             steps: 1000,
             batch_size: 1,
             gradient_accumulation: 1,
+            gradient_checkpointing: false,
             resolution: 1024,
             save_every: 250,
             seed: 0,
