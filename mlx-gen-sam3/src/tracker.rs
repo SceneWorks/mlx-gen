@@ -51,6 +51,7 @@ const INPUT_SIZE: f32 = 1008.0; // image_size
 const STABILITY_DELTA: f32 = 0.05; // dynamic_multimask_stability_delta
 const STABILITY_THRESH: f32 = 0.98; // dynamic_multimask_stability_thresh
 const NO_OBJ_SCORE: f32 = -1024.0; // logit for "object absent" frames
+const MASK_INPUT_SIZE: i32 = 288; // prompt encoder mask_input_size (4·1008/14)
 
 fn join(prefix: &str, leaf: &str) -> String {
     format!("{prefix}.{leaf}")
@@ -324,10 +325,22 @@ struct PromptEncoder {
     point_embed: Array,   // [4, 256]
     not_a_point: Array,   // [1, 256]
     no_mask_embed: Array, // [1, 256]
+    /// `mask_embed` dense-mask path (`Sam3TrackerVideoMaskEmbedding`): conv1 1→4 k2s2, LN, gelu,
+    /// conv2 4→16 k2s2, LN, gelu, conv3 16→256 k1 → dense `[1, 72, 72, 256]`. Convs are OHWI; the
+    /// channels-first LayerNorms are a plain LN over the (last, NHWC) channel axis.
+    mask_conv1: (Array, Array),
+    mask_ln1: (Array, Array),
+    mask_conv2: (Array, Array),
+    mask_ln2: (Array, Array),
+    mask_conv3: (Array, Array),
 }
 
 impl PromptEncoder {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let me = join(prefix, "mask_embed");
+        let (c1, c1b) = weight_bias(w, &join(&me, "conv1"))?;
+        let (c2, c2b) = weight_bias(w, &join(&me, "conv2"))?;
+        let (c3, c3b) = weight_bias(w, &join(&me, "conv3"))?;
         Ok(Self {
             pe: PositionEmbeddingRandom {
                 gaussian: w
@@ -339,7 +352,26 @@ impl PromptEncoder {
                 .require(&join(prefix, "not_a_point_embed.weight"))?
                 .clone(),
             no_mask_embed: w.require(&join(prefix, "no_mask_embed.weight"))?.clone(),
+            mask_conv1: (conv_w_ohwi(&c1)?, c1b),
+            mask_ln1: weight_bias(w, &join(&me, "layer_norm1"))?,
+            mask_conv2: (conv_w_ohwi(&c2)?, c2b),
+            mask_ln2: weight_bias(w, &join(&me, "layer_norm2"))?,
+            mask_conv3: (conv_w_ohwi(&c3)?, c3b),
         })
+    }
+
+    /// `mask_embed` forward + empty-point sparse, for a mask-conditioned (detection-seeded) frame.
+    /// `mask_288`: NHWC `[1, 288, 288, 1]` (the prompt-encoder `mask_input_size`). Returns
+    /// `(sparse [1, 1, 2, 256] (2× not_a_point), dense [1, 72, 72, 256])`.
+    fn encode_mask_prompt(&self, mask_288: &Array) -> Result<(Array, Array)> {
+        let h = conv2d(mask_288, &self.mask_conv1.0, Some(&self.mask_conv1.1), 2, 0)?;
+        let h = gelu_exact(&ln(&h, &self.mask_ln1)?)?;
+        let h = conv2d(&h, &self.mask_conv2.0, Some(&self.mask_conv2.1), 2, 0)?;
+        let h = gelu_exact(&ln(&h, &self.mask_ln2)?)?;
+        let dense = conv2d(&h, &self.mask_conv3.0, Some(&self.mask_conv3.1), 1, 0)?;
+        let nap = self.not_a_point.reshape(&[1, 1, 1, HIDDEN])?;
+        let sparse = concatenate_axis(&[&nap, &nap], 2)?;
+        Ok((sparse, dense))
     }
 
     /// `box_xyxy` in **1008-input** pixel space → `(sparse [1, 1, 3, 256], dense [1, g, g, 256])`.
@@ -1107,6 +1139,9 @@ pub struct Sam3Tracker {
     /// `tracker_model.temporal_positional_encoding_projection_layer` — Linear 256→64 projecting an
     /// object pointer's 1-D sine temporal encoding down to the memory dimension (F2.4).
     tpos_proj: (Array, Array),
+    /// `tracker_model.mask_downsample` — a single conv (1→1, k4s4) shrinking the input mask before the
+    /// prompt encoder's `mask_embed` on the `_use_mask_as_output` object-pointer path (F2.5a-ii).
+    mask_downsample: (Array, Array),
 }
 
 /// A frame's encoded memory: the 64-channel spatial feature map + its sine position encoding, both
@@ -1180,6 +1215,10 @@ impl Sam3Tracker {
                 w,
                 "tracker_model.temporal_positional_encoding_projection_layer",
             )?,
+            mask_downsample: {
+                let (mw, mb) = weight_bias(w, "tracker_model.mask_downsample")?;
+                (conv_w_ohwi(&mw)?, mb)
+            },
         })
     }
 
@@ -1481,6 +1520,102 @@ impl Sam3Tracker {
         // the full set, since the multimask slice drops token 0).
         let token = take1(&mask_tokens, best + 1, 1)?;
         let object_pointer = self.compute_object_pointer(&token, object_score)?;
+        Ok(TrackerFrameOutput {
+            low_res,
+            high_res: high,
+            object_pointer,
+            object_score,
+        })
+    }
+
+    /// Decode a mask-conditioned (detection-seeded) frame — `_use_mask_as_output` — producing the
+    /// high-res mask logits (for the memory encoder) + the object pointer (for the bank). `raw_embedding`:
+    /// NHWC `[1, 72, 72, 256]` — the **raw** frame image embedding ([`Self::encode_frame`] first output;
+    /// the mask-as-output path does **not** add `no_memory_embedding` and does **not** memory-condition).
+    /// `mask_det`: NHWC `[1, 288, 288, 1]` binary detection mask (`det ≥ 0.5`). The detector mask is
+    /// upsampled to 1008² and turned into `±` logits (`·20 −10`); the object pointer comes from the SAM
+    /// decoder prompted with `mask_embed(mask_downsample(mask))` (multimask ⇒ best-IoU token), gated by
+    /// the decoder's object score and then by mask presence (`any(mask > 0)`).
+    ///
+    /// `low_res` here is the simple 288² detection-mask logits (the reference's antialiased
+    /// 1008→288 downsample is not bit-reproduced — it is unused for output/memory on this path; the
+    /// memory encoder consumes `high_res`).
+    pub fn decode_mask_conditioning_frame(
+        &self,
+        raw_embedding: &Array,
+        high_res: &[Array; 2],
+        mask_det: &Array,
+    ) -> Result<TrackerFrameOutput> {
+        let g = raw_embedding.shape()[1];
+        let in_sz = mask_det.shape()[1];
+        let big = INPUT_SIZE as i32;
+        // detection mask presence (drives the object score + outer pointer gate).
+        let is_appearing = mask_det
+            .reshape(&[-1])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()
+            .iter()
+            .any(|&v| v > 0.0);
+        // upsample the binary mask to 1008² and turn it into ± logits.
+        let md = mask_det.reshape(&[in_sz, in_sz])?;
+        let up = bilinear_resize_matrix(in_sz, big);
+        let mask_big = up.matmul(&md)?.matmul(&up.transpose_axes(&[1, 0])?)?; // [1008,1008]
+        let high = add(
+            &mask_big.multiply(Array::from_f32(SIGMOID_SCALE_FOR_MEM))?,
+            Array::from_f32(SIGMOID_BIAS_FOR_MEM),
+        )?
+        .reshape(&[1, 1, big, big])?;
+        // mask prompt: mask_downsample (k4s4 → 252²) then bilinear up to mask_input_size 288².
+        let mask_big_nhwc = mask_big.reshape(&[1, big, big, 1])?;
+        let mds = conv2d(
+            &mask_big_nhwc,
+            &self.mask_downsample.0,
+            Some(&self.mask_downsample.1),
+            4,
+            0,
+        )?; // [1,252,252,1]
+        let ds = mds.shape()[1];
+        let mds2 = mds.reshape(&[ds, ds])?;
+        let up2 = bilinear_resize_matrix(ds, MASK_INPUT_SIZE);
+        let mask_288 = up2
+            .matmul(&mds2)?
+            .matmul(&up2.transpose_axes(&[1, 0])?)?
+            .reshape(&[1, MASK_INPUT_SIZE, MASK_INPUT_SIZE, 1])?;
+        let (sparse, dense) = self.prompt.encode_mask_prompt(&mask_288)?;
+        // decoder on the RAW image embedding (no no_memory_embedding), multimask=true.
+        let image_pe = self.image_pe_embed.dense_pe(g)?;
+        let (masks, ious, obj_score, mask_tokens) =
+            self.decoder
+                .forward(raw_embedding, &image_pe, &sparse, &dense, high_res, true)?;
+        let decoder_score = obj_score
+            .reshape(&[-1])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()[0];
+        let iv = ious
+            .reshape(&[-1])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()
+            .to_vec();
+        let best = argmax(&iv) as i32;
+        // object pointer: best-IoU token, inner-gated by the decoder score, outer-gated by mask presence.
+        let token = take1(&mask_tokens, best + 1, 1)?;
+        let inner = self.compute_object_pointer(&token, decoder_score)?;
+        let object_pointer = if is_appearing {
+            inner
+        } else {
+            self.no_object_pointer.reshape(&[1, HIDDEN])?
+        };
+        let object_score = if is_appearing {
+            SIGMOID_SCALE_FOR_MEM + SIGMOID_BIAS_FOR_MEM // 20 − 10 = 10
+        } else {
+            SIGMOID_BIAS_FOR_MEM // −10
+        };
+        let _ = masks; // mask output on this path comes from the detection, not the decoder.
+        let low_res = add(
+            &md.multiply(Array::from_f32(SIGMOID_SCALE_FOR_MEM))?,
+            Array::from_f32(SIGMOID_BIAS_FOR_MEM),
+        )?
+        .reshape(&[1, 1, in_sz, in_sz])?;
         Ok(TrackerFrameOutput {
             low_res,
             high_res: high,

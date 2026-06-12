@@ -1,0 +1,88 @@
+{
+  "model": "facebook/sam3",
+  "image_url": "https://raw.githubusercontent.com/ultralytics/ultralytics/main/ultralytics/assets/zidane.jpg",
+  "stages": {
+    "pix_feat": {
+      "shape": [
+        1,
+        256,
+        72,
+        72
+      ],
+      "min": -2.2623727321624756,
+      "max": 2.446113109588623,
+      "mean": -0.003101648995652795,
+      "sha1_5dp": "65b38394b2b25930"
+    },
+    "feat_s0": {
+      "shape": [
+        1,
+        32,
+        288,
+        288
+      ],
+      "min": -1.134371280670166,
+      "max": 1.255040168762207,
+      "mean": 0.03821501135826111,
+      "sha1_5dp": "5d34841905b345b4"
+    },
+    "feat_s1": {
+      "shape": [
+        1,
+        64,
+        144,
+        144
+      ],
+      "min": -1.9107240438461304,
+      "max": 2.254561185836792,
+      "mean": 0.017334625124931335,
+      "sha1_5dp": "aba8068d4369bc4a"
+    },
+    "mask_inputs": {
+      "shape": [
+        1,
+        1,
+        288,
+        288
+      ],
+      "min": 0.0,
+      "max": 1.0,
+      "mean": 0.15524932742118835,
+      "sha1_5dp": "d6c7562964c62a74"
+    },
+    "high_res_masks": {
+      "shape": [
+        1,
+        1,
+        1008,
+        1008
+      ],
+      "min": -10.0,
+      "max": 10.0,
+      "mean": -6.895013332366943,
+      "sha1_5dp": "3fdf799f347db50f"
+    },
+    "object_pointer": {
+      "shape": [
+        1,
+        1,
+        256
+      ],
+      "min": -1.2908527851104736,
+      "max": 0.9863244891166687,
+      "mean": -0.10737404972314835,
+      "sha1_5dp": "11c3237080bef1d2"
+    },
+    "object_score_logits": {
+      "shape": [
+        1,
+        1,
+        1
+      ],
+      "min": 10.0,
+      "max": 10.0,
+      "mean": 10.0,
+      "sha1_5dp": "400bec6bce4c38ad"
+    }
+  }
+}
