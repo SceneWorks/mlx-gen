@@ -14,3 +14,8 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's captioner registry.
 inventory = { workspace = true }
+
+[dev-dependencies]
+# Backend-neutral contract conformance suite (sc-4895): the macos-mlx lane runs joy_caption through
+# it as the "one real captioner" the testkit AC requires. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }
