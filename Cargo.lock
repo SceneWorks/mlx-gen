@@ -631,6 +631,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-lens"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-ltx"
 version = "0.0.0"
 dependencies = [
