@@ -16,9 +16,11 @@
 //! exposes a plain API rather than self-registering into the model registry.
 
 pub mod config;
+pub mod detr;
 pub mod text;
 pub mod vision;
 
-pub use config::{Sam3TextConfig, Sam3VisionConfig};
+pub use config::{Sam3DetrConfig, Sam3TextConfig, Sam3VisionConfig};
+pub use detr::{DetectorOutput, Sam3Detector};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use vision::Sam3VisionEncoder;

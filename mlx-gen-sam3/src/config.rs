@@ -83,6 +83,58 @@ impl Sam3VisionConfig {
     }
 }
 
+/// DETR detector configuration (encoder + decoder + presence + scoring). The shared working width
+/// is `hidden_size` (256); the vision/text features are already projected to it upstream.
+#[derive(Clone, Debug)]
+pub struct Sam3DetrConfig {
+    /// Working width of the DETR stack (256).
+    pub hidden_size: i32,
+    /// FFN intermediate dim (2048).
+    pub intermediate_size: i32,
+    /// Attention heads (8); `head_dim = hidden_size / num_attention_heads` (32).
+    pub num_attention_heads: i32,
+    /// Encoder layers (6).
+    pub num_encoder_layers: i32,
+    /// Decoder layers (6).
+    pub num_decoder_layers: i32,
+    /// Object queries (200).
+    pub num_queries: i32,
+    /// LayerNorm epsilon (1e-5).
+    pub layer_norm_eps: f32,
+    /// Presence-logit clamp magnitude (10.0).
+    pub presence_clamp: f32,
+    /// Dot-product scoring clamp magnitude (12.0).
+    pub score_clamp: f32,
+}
+
+impl Default for Sam3DetrConfig {
+    fn default() -> Self {
+        Self::sam3()
+    }
+}
+
+impl Sam3DetrConfig {
+    /// The shipped `facebook/sam3` DETR configuration.
+    pub fn sam3() -> Self {
+        Self {
+            hidden_size: 256,
+            intermediate_size: 2048,
+            num_attention_heads: 8,
+            num_encoder_layers: 6,
+            num_decoder_layers: 6,
+            num_queries: 200,
+            layer_norm_eps: 1e-5,
+            presence_clamp: 10.0,
+            score_clamp: 12.0,
+        }
+    }
+
+    /// `head_dim = hidden_size / num_attention_heads`.
+    pub fn head_dim(&self) -> i32 {
+        self.hidden_size / self.num_attention_heads
+    }
+}
+
 /// CLIP text-encoder configuration (the `Sam3Config.text_config`, a CLIP-H text tower) + the SAM3
 /// `text_projection` output dim. Defaults are the shipped `facebook/sam3` values.
 #[derive(Clone, Debug)]
