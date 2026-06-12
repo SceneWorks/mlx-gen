@@ -670,6 +670,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-sam3"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-sdxl"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,5 @@
+# Regenerable oracle fixtures — produced from the cached facebook/sam3 weights by the dumper
+# scripts in seconds; kept out of git. The dumpers + manifests + README are tracked.
+*.safetensors
+*.npz
+overlay_*.png
