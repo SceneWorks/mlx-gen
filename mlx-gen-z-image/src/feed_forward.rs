@@ -12,6 +12,7 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+#[derive(Clone)]
 pub struct FeedForward {
     pub w1: AdaptableLinear,
     pub w2: AdaptableLinear,

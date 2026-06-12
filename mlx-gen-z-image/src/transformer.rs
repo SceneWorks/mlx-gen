@@ -10,8 +10,10 @@
 //! trained checkpoint's pad tokens are non-zero. Position ids / coord grids are computed in plain
 //! Rust and asserted exact in the parity test.
 
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::Array;
 
 use super::context_block::ZImageContextBlock;
@@ -19,7 +21,8 @@ use super::final_layer::FinalLayer;
 use super::rope_embedder::RopeEmbedder;
 use super::timestep_embedder::TimestepEmbedder;
 use super::transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
-use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -264,6 +267,117 @@ impl ZImageTransformer {
         let head = unified
             .reshape(&[unified.shape()[1], embed_dim])? // drop batch dim (size 1)
             .take_axis(row_indices(x_len), 0)?; // (x_len, embed_dim)
+        let out = self.unpatchify(&head, prep.x_size)?;
+        Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
+    }
+
+    /// Training forward with **per-main-block gradient checkpointing** (sc-4874). Identical compute
+    /// to [`forward_with`](Self::forward_with), but each of the main `layers` runs inside an
+    /// `mlx::checkpoint` segment whose explicit inputs are the block hidden state plus that block's
+    /// trainable LoRA factors — so the reverse pass recomputes the block instead of retaining its
+    /// activations (bounding the first-step working set), while gradients still flow to the LoRA
+    /// params. The pre-main embedders/refiners and the final layer run normally (their LoRA, if any,
+    /// is installed on `self` by the caller and trains through ordinary autograd); the long unified
+    /// stack is where the activation memory concentrates, so that is what is checkpointed.
+    ///
+    /// `params` is the live trainable factor map; `main_block_local_targets[i]` lists the
+    /// adapter-routable LOCAL paths (e.g. `"attention.to_q"`) trained on main block `i`, in the order
+    /// their factors are threaded as checkpoint inputs. Blocks with no trained targets still run
+    /// checkpointed (hidden-only input) so the whole stack is uniformly recompute-on-backward.
+    pub(crate) fn forward_with_main_checkpointed(
+        &self,
+        prep: &Prepared,
+        x: &Array,
+        timestep: f32,
+        params: &LoraParams,
+        main_block_local_targets: &[Vec<String>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let t = Array::from_slice(&[timestep * self.cfg.t_scale], &[1]);
+        let t_emb = self.t_embedder.forward(&t)?;
+
+        // Image + caption streams + refiners — identical to `forward_with` (not checkpointed).
+        let x_tokens = self.patchify_image_tokens(x, prep.img_pad)?;
+        let mut x_emb = self.x_embedder.forward(&x_tokens)?;
+        x_emb = apply_pad(&x_emb, &prep.x_keep, &self.x_pad_token)?;
+        let mut x_emb = x_emb.expand_dims(0)?;
+        for layer in &self.noise_refiner {
+            x_emb = layer.forward(&x_emb, &prep.x_freqs, &t_emb)?;
+        }
+        let cap_normed = rms_norm(&prep.cap_tokens, &self.cap_norm_w, self.cfg.norm_eps)?;
+        let mut cap_emb = self.cap_linear.forward(&cap_normed)?;
+        cap_emb = apply_pad(&cap_emb, &prep.cap_keep, &self.cap_pad_token)?;
+        let mut cap_emb = cap_emb.expand_dims(0)?;
+        for layer in &self.context_refiner {
+            cap_emb = layer.forward(&cap_emb, &prep.cap_freqs)?;
+        }
+
+        let x_len = x_emb.shape()[1];
+        let mut unified = concatenate_axis(&[&x_emb, &cap_emb], 1)?;
+
+        // Main stack — each block checkpointed with its LoRA factors as explicit inputs.
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the
+            // backward recompute runs after this method's frame is gone; a borrow of `self` would
+            // dangle. `set_adapters` inside the closure replaces whatever the clone carried with the
+            // explicit-input LoRA, so any adapters the caller installed on `self.layers` are moot.
+            let mut blk = layer.clone();
+            let locals = main_block_local_targets.get(i).cloned().unwrap_or_default();
+            let freqs = prep.unified_freqs.clone();
+            let te = t_emb.clone();
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, ...] (raw `[r,in]`/`[out,r]` factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * locals.len());
+            inputs.push(unified.clone());
+            for local in &locals {
+                let ak = format!("layers.{i}.{local}.lora_a");
+                let bk = format!("layers.{i}.{local}.lora_b");
+                inputs.push(
+                    params
+                        .get(ak.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {ak}")))?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(bk.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {bk}")))?
+                        .clone(),
+                );
+            }
+
+            let alpha_c = alpha;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
+                // scale=1)` `install_training_lora` applies — so the checkpointed block forward is
+                // numerically identical to the installed-adapter path, and grads route to `inp`.
+                for (j, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * j].t(); // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let b = inp[2 + 2 * j]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?;
+                    let segs: Vec<&str> = local.split('.').collect();
+                    blk.adaptable_mut(&segs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!("checkpoint LoRA target not found: {local}"))
+                        })?
+                        .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+                }
+                let out = blk
+                    .forward(&inp[0], &freqs, &te)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            unified = seg(&inputs)?.into_iter().next().expect("one block output");
+        }
+
+        // Final layer + unpatchify — identical to `forward_with`.
+        let unified = self.final_layer.forward(&unified, &t_emb)?;
+        let embed_dim = unified.shape()[2];
+        let head = unified
+            .reshape(&[unified.shape()[1], embed_dim])?
+            .take_axis(row_indices(x_len), 0)?;
         let out = self.unpatchify(&head, prep.x_size)?;
         Ok(out.multiply(Array::from_slice(&[-1.0f32], &[1]))?)
     }

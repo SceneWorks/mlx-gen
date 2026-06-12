@@ -20,6 +20,7 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+#[derive(Clone)]
 pub struct ZImageAttention {
     pub to_q: AdaptableLinear,
     pub to_k: AdaptableLinear,

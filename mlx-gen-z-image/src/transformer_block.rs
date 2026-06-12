@@ -40,6 +40,7 @@ pub struct ZImageBlockConfig {
     pub norm_eps: f32,
 }
 
+#[derive(Clone)]
 pub struct ZImageTransformerBlock {
     pub attention: ZImageAttention,
     pub feed_forward: FeedForward,
