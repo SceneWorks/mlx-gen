@@ -15,9 +15,9 @@ use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Image, Progress, Result
 
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_ip,
-    encode_init_latents, load_unet_kolors_dtype, load_vae, preprocess_control_image, Autoencoder,
-    ControlContext, ControlNet, Denoiser, IpImageEncoder, LoraCoverage, SdxlLoraReport,
-    UNet2DConditionModel,
+    denoise_ip_control, encode_init_latents, load_unet_kolors_dtype, load_vae,
+    preprocess_control_image, Autoencoder, ControlContext, ControlNet, Denoiser, IpImageEncoder,
+    LoraCoverage, SdxlLoraReport, UNet2DConditionModel,
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -446,6 +446,149 @@ impl Kolors {
             &tokens,
             ip_scale,
         )
+    }
+
+    /// Run the CFG denoise loop combining the Kolors **ControlNet** pose branch AND the
+    /// **IP-Adapter** image tokens on an **img2img** init (sc-5012) — the SceneWorks strict-pose tier
+    /// (Character Studio pose-locked character variations). One pose ControlNet (the rasterized
+    /// skeleton) locks the pose, the IP-Adapter reference drives identity, and the **same** reference
+    /// seeds the img2img init. Mirrors the vendored `StableDiffusionXLControlNetImg2ImgPipeline` with
+    /// `ip_adapter_image` (the torch `KolorsDiffusersAdapter._run_pose`).
+    ///
+    /// Reuses the SDXL [`denoise_ip_control`] primitive (built for InstantID, sc-3113/3114) — it runs
+    /// the ControlNet branch and injects the IP tokens in the same step. The crucial Kolors-specific
+    /// wiring: the ControlNet cross-attends to the **text** `conditioning` (`control_encoder =
+    /// conditioning`), NOT the IP tokens — the Kolors ControlNet projects the ChatGLM3 context with
+    /// its own `encoder_hid_proj`, unlike InstantID's IdentityNet which cross-attends to face tokens.
+    ///
+    /// `control_scale` (torch `controlnet_conditioning_scale` ≈ 0.7) and `ip_scale` (torch
+    /// `ip_adapter_scale` ≈ 0.6) are independent; `strength` is the img2img init strength (torch
+    /// default 1.0 — at full strength the init only seeds latent dimensions, identity comes from the
+    /// IP-Adapter). `control_scale = 0` + `ip_scale = 0` ⇒ identical to plain img2img. `init_latents`
+    /// is the VAE mean of the reference (`[1, h, w, 4]`); `ip_tokens` is `[1, N, 2048]`. The ControlNet
+    /// must be loaded and the IP-Adapter pairs installed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_ip_latents(
+        &self,
+        controlnet: &ControlNet,
+        ip_tokens: &Array,
+        init_latents: &Array,
+        noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: &(Array, Array),
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        control_scale: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        use mlx_rs::ops::{concatenate_axis, zeros};
+        let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        let time_ids = kolors_time_ids(2, height, width);
+        // Seed the img2img init (raw `x₀ + noise·σ_start`), as in `denoise_img2img_latents`.
+        let latents = sampler.add_noise(init_latents, noise)?;
+
+        // The ControlNet sees the same CFG-batched control image as the U-Net (cfg>1 ⇒ [cond, uncond]).
+        let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
+        let cimg = if cfg > 1.0 {
+            concatenate_axis(&[&cimg, &cimg], 0)?
+        } else {
+            cimg
+        };
+        let cc = ControlContext {
+            cond_embed: controlnet.embed_cond(&cimg)?,
+            controlnet,
+            scale: control_scale,
+        };
+
+        // CFG batch the IP tokens with a zeros uncond row (the uncond gets no image conditioning), as
+        // in `denoise_ip_latents`.
+        let sh = ip_tokens.shape();
+        let zero = zeros::<f32>(sh)?.as_dtype(ip_tokens.dtype())?;
+        let tokens = concatenate_axis(&[ip_tokens, &zero], 0)?;
+
+        let d = Denoiser {
+            unet: &self.unet,
+            sampler: &sampler,
+        };
+        // `control_encoder = conditioning`: the Kolors ControlNet cross-attends to the ChatGLM3 text
+        // context (its own `encoder_hid_proj`), NOT the IP tokens. `cn_enc = control_encoder
+        // .unwrap_or(conditioning)` in `denoise_core`, so passing the text conditioning here is the
+        // Kolors-correct override (the InstantID default would feed face tokens).
+        denoise_ip_control(
+            &d,
+            latents,
+            &conditioning,
+            &pooled,
+            &time_ids,
+            cfg,
+            cancel,
+            on_progress,
+            &cc,
+            &conditioning,
+            &tokens,
+            ip_scale,
+        )
+    }
+
+    /// Full combined ControlNet-pose + IP-Adapter img2img (sc-5012): encode the `reference_image` →
+    /// IP image tokens + VAE init, seed the noise, encode the prompts, run the combined denoise, and
+    /// VAE-decode. The `reference_image` drives **both** the IP-Adapter identity and the img2img init;
+    /// `control_image` is the pose skeleton. The ControlNet must be loaded and the IP-Adapter pairs
+    /// installed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_controlnet_ip(
+        &self,
+        controlnet: &ControlNet,
+        ip_encoder: &IpImageEncoder,
+        control_image: &Image,
+        reference_image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        control_scale: f32,
+        ip_scale: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        let ip_tokens = ip_encoder.tokens(reference_image)?;
+        // VAE-encode the init (no RNG: mean) so the first global-RNG draw is the add_noise noise.
+        let init_latents =
+            encode_init_latents(&self.vae, reference_image, width as u32, height as u32)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = self.encode(negative)?;
+        let latents = self.denoise_controlnet_ip_latents(
+            controlnet,
+            &ip_tokens,
+            &init_latents,
+            &noise,
+            control_image,
+            &pos,
+            &neg,
+            num_steps,
+            strength,
+            cfg,
+            control_scale,
+            ip_scale,
+            height,
+            width,
+            &CancelFlag::new(),
+            &mut |_p| {},
+        )?;
+        self.decode(&latents)
     }
 
     /// Full IP-Adapter T2I: encode the `reference_image` → image tokens, seed the noise, encode the

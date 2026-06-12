@@ -39,6 +39,10 @@ const DEFAULT_GUIDANCE: f32 = 5.0;
 /// Default IP-Adapter scale when a request doesn't override it (carried on the `Reference` strength
 /// field in IP mode, mirroring the SDXL IP-Adapter convention).
 const IP_DEFAULT_SCALE: f32 = 0.6;
+/// Default img2img init strength for the combined strict-pose tier (sc-5012) when `req.strength` is
+/// unset — the torch `_run_pose` default 1.0 (at full strength the init only seeds latent
+/// dimensions; identity comes from the IP-Adapter, structure from the ControlNet).
+const POSE_IMG2IMG_STRENGTH: f32 = 1.0;
 /// The single Kolors sampler — diffusers `EulerDiscreteScheduler` (leading), see [`KolorsEulerSampler`].
 const SAMPLER: &str = "euler_discrete";
 
@@ -178,7 +182,10 @@ impl KolorsGenerator {
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         validate_request(&self.descriptor.capabilities, req)?;
-        // Mode-combination guards (the Kolors paths are mutually exclusive in this build).
+        // Mode-combination guards. The Kolors conditioning paths are mutually exclusive EXCEPT the
+        // combined strict-pose tier (sc-5012): Control (the pose skeleton) + a Reference (the
+        // IP-Adapter identity, which also seeds the img2img init), which is supported when BOTH a
+        // ControlNet and an IP-Adapter are loaded.
         let has_ref = req
             .conditioning
             .iter()
@@ -194,16 +201,24 @@ impl KolorsGenerator {
                     .into(),
             ));
         }
-        if has_ctrl && has_ref {
+        // Control + Reference is the combined pose tier — allowed ONLY when an IP-Adapter is also
+        // loaded (the Reference is the IP identity + img2img init). Plain Control + img2img (a
+        // Reference with no IP-Adapter) is not a wired Kolors path.
+        if has_ctrl && has_ref && self.ip_encoder.is_none() {
             return Err(Error::Msg(
-                "kolors: combining ControlNet (Control) with a Reference (img2img / IP) is not \
+                "kolors: combining ControlNet (Control) with a Reference requires an IP-Adapter (the \
+                 combined pose tier — load LoadSpec::ip_adapter); plain Control + img2img is not \
                  supported in this build"
                     .into(),
             ));
         }
-        if self.ip_encoder.is_some() && has_ctrl {
+        // A loaded IP-Adapter + Control with no Reference can't run: the combined pass needs the
+        // reference as the IP identity (and the IP image prompt is required in IP mode anyway).
+        if has_ctrl && self.ip_encoder.is_some() && !has_ref {
             return Err(Error::Msg(
-                "kolors: IP-Adapter + ControlNet in one pass is not supported in this build".into(),
+                "kolors: the combined ControlNet + IP-Adapter pass requires a Reference image (the \
+                 IP-Adapter identity)"
+                    .into(),
             ));
         }
         Ok(())
@@ -273,7 +288,35 @@ impl KolorsGenerator {
             // one global-RNG draw happens per image (the noise); the img2img VAE-encode below draws
             // none, so the per-image output stays byte-identical to the struct API's RNG order.
             let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-            let latents = if let Some((image, scale)) = control {
+            let latents = if let (Some((skeleton, control_scale)), Some((tokens, ip_scale))) =
+                (control, &ip)
+            {
+                // Combined strict-pose tier (sc-5012): the pose ControlNet (skeleton) + the
+                // IP-Adapter identity, on an img2img init from the SAME reference. `ip_mode` ⇒ a
+                // Reference is present (validated), and it is both the IP image prompt and the init.
+                let (reference_image, _) = reference.expect("ip mode requires a reference");
+                let init_latents =
+                    encode_init_latents(self.kolors.vae(), reference_image, w as u32, h as u32)?;
+                let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
+                self.kolors.denoise_controlnet_ip_latents(
+                    self.control.as_ref().expect("validated above"),
+                    tokens,
+                    &init_latents,
+                    &noise,
+                    skeleton,
+                    &pos,
+                    &neg,
+                    steps,
+                    strength,
+                    cfg,
+                    control_scale,
+                    *ip_scale,
+                    h,
+                    w,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else if let Some((image, scale)) = control {
                 self.kolors.denoise_controlnet_latents(
                     self.control.as_ref().expect("validated above"),
                     &noise,
