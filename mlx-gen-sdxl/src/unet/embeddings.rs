@@ -122,6 +122,14 @@ impl TimestepEmbedding {
         Ok(())
     }
 
+    /// Cast both MLP Linears to `dtype` (sc-4941 bf16 training). The sinusoidal `sigmas` tables stay
+    /// f32 (computed once, cast to the model dtype at the `text_time_temb` call site).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.linear1.cast_weights(dtype)?;
+        self.linear2.cast_weights(dtype)?;
+        Ok(())
+    }
+
     pub fn forward(&self, x: &Array) -> Result<Array> {
         let x = self.linear1.forward(x)?;
         let x = silu_glue(&x)?;

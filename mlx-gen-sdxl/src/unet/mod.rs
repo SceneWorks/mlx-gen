@@ -9,11 +9,14 @@ mod embeddings;
 mod resnet;
 mod transformer;
 
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::add;
-use mlx_rs::Array;
+use mlx_rs::transforms::checkpoint;
+use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
+use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::nn::{conv2d, group_norm};
+use mlx_gen::train::lora::LoraParams;
 
 use crate::silu_glue;
 use mlx_gen::weights::Weights;
@@ -35,6 +38,17 @@ const GN_EPS: f32 = 1e-5;
 /// Transpose a stored NCHW conv weight `[out, in, kH, kW]` to mlx's NHWC `[out, kH, kW, in]`.
 pub(crate) fn nchw_to_nhwc(w: &Array) -> Result<Array> {
     Ok(w.transpose_axes(&[0, 2, 3, 1])?)
+}
+
+/// Cast a raw parameter array (GroupNorm/LayerNorm weight or bias) to `dtype` in place if it differs
+/// — the building block of the U-Net's `cast_weights` traversal for bf16 mixed-precision training
+/// (sc-4941). `AdaptableLinear`/`AdaptableConv2d` carry their own `cast_weights`; this covers the
+/// bare `Array`s that the norm ops consume directly.
+pub(crate) fn cast_array(a: &mut Array, dtype: mlx_rs::Dtype) -> Result<()> {
+    if a.dtype() != dtype {
+        *a = a.as_dtype(dtype)?;
+    }
+    Ok(())
 }
 
 /// The SDXL conditional U-Net.
@@ -170,6 +184,59 @@ impl UNet2DConditionModel {
             b.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing across every cross-attention transformer (sc-4941):
+    /// down/up blocks + the mid transformer. Training-only; opt-in (the SDXL first-step working set
+    /// fits unified memory without it, so the trainer gates this on `gradient_checkpointing` rather
+    /// than forcing it always-on). Grads are bit-identical to the retained backward.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.down_blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+        self.mid_transformer.set_sdpa_checkpoint(on);
+        for b in &mut self.up_blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
+    /// Cast every frozen base weight to `dtype` (sc-4941 bf16 mixed-precision training): the conv
+    /// stem/head, the time + add embeddings, every down/mid/up block (resnets, attention transformers,
+    /// samplers), the output GroupNorm, and the Kolors `encoder_hid_proj`. The trainable LoRA factors,
+    /// loss, gradients, and optimizer state stay f32 (master-weights); only the base + the activation
+    /// stream this casts become bf16. Destructive (f32→bf16 drops mantissa) — reload for f32.
+    pub fn cast_weights(&mut self, dtype: mlx_rs::Dtype) -> Result<()> {
+        self.conv_in.cast_weights(dtype)?;
+        self.time_embedding.cast_weights(dtype)?;
+        self.add_embedding.cast_weights(dtype)?;
+        for b in &mut self.down_blocks {
+            b.cast_weights(dtype)?;
+        }
+        self.mid_resnet0.cast_weights(dtype)?;
+        self.mid_transformer.cast_weights(dtype)?;
+        self.mid_resnet1.cast_weights(dtype)?;
+        for b in &mut self.up_blocks {
+            b.cast_weights(dtype)?;
+        }
+        cast_array(&mut self.conv_norm_out_w, dtype)?;
+        cast_array(&mut self.conv_norm_out_b, dtype)?;
+        self.conv_out.cast_weights(dtype)?;
+        // The Kolors `encoder_hid_proj` (ChatGLM3 4096→2048 context projection) casts with the rest.
+        // sc-4941 carve-out audit: an f32 carve-out on this conditioning entry (with f32
+        // cross-attention) was MEASURED to make the bf16 grad direction WORSE, not better (global
+        // cosine 0.9946→0.9933, min-large 0.971→0.924), so it is deliberately NOT applied — full bf16
+        // is the better config for Kolors (see the Kolors trainer's `bf16_grads_direction` gate).
+        if let Some(proj) = &mut self.encoder_hid_proj {
+            proj.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// The model's current compute dtype (read off the conv stem weight), or `None` if quantized.
+    /// Lets the trainer detect a prior [`cast_weights`](Self::cast_weights) (the cast is destructive,
+    /// so a trainer reused across runs must not silently re-cast a bf16 base for an f32 request).
+    pub fn compute_dtype(&self) -> Option<mlx_rs::Dtype> {
+        Some(self.conv_in.weight_dtype())
     }
 
     /// Install IP-Adapter decoupled K/V projections (sc-3059) into the cross-attention modules, in
@@ -370,6 +437,138 @@ impl UNet2DConditionModel {
         conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
     }
 
+    /// Training forward with **per-block gradient checkpointing** (sc-4941 — the `gradient_checkpointing`
+    /// behavior for LoRA training): identical compute to [`forward`](Self::forward), but each down/up
+    /// macro-block runs inside an `mlx::checkpoint` segment whose explicit inputs are the block hidden
+    /// state, its up-path skip residuals, and its trainable LoRA factors — so the reverse pass
+    /// recomputes the block (recovering the conv-resnet activation memory that dominates the SDXL
+    /// first-step peak) instead of retaining it, while gradients still flow to the LoRA params (a
+    /// captured param gets no grad through `checkpoint`, hence the explicit-input threading). The conv
+    /// stem/head, the timestep + add embeddings, and the **mid block** (low resolution, cheap) run
+    /// normally — their LoRA, if any, is installed on `self` by the caller and trains through ordinary
+    /// autograd. LoRA-only (the caller falls LoKr back to the dense path, guarded). `target_paths` is
+    /// the resolved LoRA target set; `params` the live factor map; `alpha` the LoRA alpha. The compute
+    /// dtype is read off the input `x` (the U-Net was cast in `train_impl`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_block_checkpointed(
+        &self,
+        x: &Array,
+        timestep: f32,
+        encoder_x: &Array,
+        text_emb: &Array,
+        time_ids: &Array,
+        target_paths: &[String],
+        params: &LoraParams,
+        alpha: f32,
+    ) -> Result<Array> {
+        let batch = x.shape()[0];
+        let dtype = x.dtype();
+
+        // Kolors context projection + temb + conv stem — not checkpointed (identical to `forward_core`).
+        let projected;
+        let encoder_x = match &self.encoder_hid_proj {
+            Some(proj) => {
+                projected = proj.forward(encoder_x)?;
+                &projected
+            }
+            None => encoder_x,
+        };
+        let temb = text_time_temb(
+            &self.timesteps,
+            &self.time_embedding,
+            &self.add_time_proj,
+            &self.add_embedding,
+            timestep,
+            text_emb,
+            time_ids,
+            batch,
+            dtype,
+        )?;
+        let mut x = conv2d(x, self.conv_in.weight(), self.conv_in.bias(), 1, 1)?;
+
+        // Down path — each block checkpointed; its output states (skip residuals) are checkpoint
+        // OUTPUTS, collected onto the residual stack for the up path.
+        let mut residuals: Vec<Array> = vec![x.clone()];
+        for (i, block) in self.down_blocks.iter().enumerate() {
+            let (locals, factors) =
+                collect_block_lora(&format!("down_blocks.{i}"), target_paths, params)?;
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + factors.len());
+            inputs.push(x.clone());
+            inputs.extend(factors);
+            // The closure must OWN its block (the backward recompute runs after this frame is gone);
+            // Arrays are refcounted, so the clone is cheap. `install_threaded_lora` replaces whatever
+            // adapters the clone carried with the explicit-input factors, routing grads to `inp`.
+            let mut blk = block.clone();
+            let ex = encoder_x.clone();
+            let tb = temb.clone();
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                install_threaded_lora(&mut blk, &locals, &inp[1..], alpha, dtype)?;
+                // The block's final output IS its last skip state (`out == output_states.last()`), so
+                // return only the output states — emitting `out` separately would put the SAME array
+                // twice in the checkpoint's output list and corrupt the multi-output VJP (the skip
+                // path's cotangent would be dropped, scrambling the down-block grads). The next block
+                // takes `x` from the last state.
+                let (_out, res) = blk
+                    .forward_ip(&inp[0], &ex, &tb, None, None)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(res)
+            });
+            let outs = seg(&inputs)?;
+            x = outs
+                .last()
+                .ok_or_else(|| mlx_gen::Error::Msg("down block produced no output states".into()))?
+                .clone();
+            residuals.extend(outs);
+        }
+
+        // Mid — dense (lowest-resolution block, cheap to retain; its LoRA trains via the adapters the
+        // caller installed on `self`).
+        x = self.mid_resnet0.forward(&x, Some(&temb))?;
+        x = self.mid_transformer.forward_ip(&x, encoder_x, None)?;
+        x = self.mid_resnet1.forward(&x, Some(&temb))?;
+
+        // Up path — each block checkpointed; its skip residuals are peeled off the stack (in push
+        // order) and threaded as explicit inputs so the block's recompute consumes them.
+        for (k, block) in self.up_blocks.iter().enumerate() {
+            let (locals, factors) =
+                collect_block_lora(&format!("up_blocks.{k}"), target_paths, params)?;
+            let kskip = block.num_skip_inputs();
+            let skips = residuals.split_off(residuals.len() - kskip); // push order
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + kskip + factors.len());
+            inputs.push(x.clone());
+            inputs.extend(skips);
+            inputs.extend(factors);
+            let mut blk = block.clone();
+            let ex = encoder_x.clone();
+            let tb = temb.clone();
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // `forward_ip` pops one skip per resnet from the END — so a push-order Vec yields the
+                // last-pushed skip first, matching the dense path.
+                let mut skips_v: Vec<Array> = inp[1..1 + kskip].to_vec();
+                install_threaded_lora(&mut blk, &locals, &inp[1 + kskip..], alpha, dtype)?;
+                let (out, _) = blk
+                    .forward_ip(&inp[0], &ex, &tb, Some(&mut skips_v), None)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            x = seg(&inputs)?
+                .into_iter()
+                .next()
+                .expect("one up-block output");
+        }
+
+        // Conv head — not checkpointed.
+        let x = group_norm(
+            &x,
+            &self.conv_norm_out_w,
+            &self.conv_norm_out_b,
+            GN_GROUPS,
+            GN_EPS,
+        )?;
+        let x = silu_glue(&x)?;
+        conv2d(&x, self.conv_out.weight(), self.conv_out.bias(), 1, 1)
+    }
+
     /// Every LoRA-targetable Linear's diffusers dotted path, matching the vendored `lora.py`
     /// reachable surface (sc-2639): down/up attention (`to_q/k/v`, `to_out.0`), the `proj_in`/`proj_out`
     /// projections, and each resnet's `time_emb_proj`. **`mid_block` is intentionally omitted** — the
@@ -441,6 +640,67 @@ impl UNet2DConditionModel {
         }
         out
     }
+}
+
+/// Collect the per-block LoRA factor inputs for [`UNet2DConditionModel::forward_block_checkpointed`]
+/// (sc-4941): for every trained `target_paths` entry under `prefix` (e.g. `down_blocks.0`), return its
+/// LOCAL path (after the prefix) plus its raw `[r,in]`/`[out,r]` factors looked up in `params`,
+/// interleaved `[a_0, b_0, a_1, b_1, …]` in `locals` order. Threading these as explicit checkpoint
+/// inputs is what lets gradients reach them (a captured param gets no grad through `checkpoint`).
+fn collect_block_lora(
+    prefix: &str,
+    target_paths: &[String],
+    params: &LoraParams,
+) -> Result<(Vec<String>, Vec<Array>)> {
+    let dot = format!("{prefix}.");
+    let mut locals = Vec::new();
+    let mut factors = Vec::new();
+    for path in target_paths {
+        let Some(local) = path.strip_prefix(&dot) else {
+            continue;
+        };
+        let ak = format!("{path}.lora_a");
+        let bk = format!("{path}.lora_b");
+        let a = params
+            .get(ak.as_str())
+            .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {ak}")))?;
+        let b = params
+            .get(bk.as_str())
+            .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {bk}")))?;
+        locals.push(local.to_string());
+        factors.push(a.clone());
+        factors.push(b.clone());
+    }
+    Ok((locals, factors))
+}
+
+/// Reinstall threaded LoRA factors onto a freshly-cloned block inside a checkpoint segment — the SAME
+/// `(transpose, alpha/rank fold, scale=1)` `install_training_lora` applies, so the checkpointed block
+/// forward is numerically identical to the installed-adapter path, plus the dtype-follow on the block
+/// hidden state (under the bf16 training cast the f32 factors must join the bf16 stream or every
+/// adapted Linear re-promotes the block to f32). `factors` is `[a_0, b_0, a_1, b_1, …]` matching
+/// `locals`. Grads flow back to the factors (f32) through the `astype` VJP (master-weights).
+fn install_threaded_lora<H: AdaptableHost>(
+    block: &mut H,
+    locals: &[String],
+    factors: &[Array],
+    alpha: f32,
+    dtype: Dtype,
+) -> MlxResult<()> {
+    for (j, local) in locals.iter().enumerate() {
+        let a = factors[2 * j].t().as_dtype(dtype)?; // [r,in] -> [in,r]
+        let rank = a.shape()[1] as f32;
+        let b = factors[2 * j + 1]
+            .t() // [out,r] -> [r,out]
+            .multiply(Array::from_slice(&[alpha / rank], &[1]))?
+            .as_dtype(dtype)?;
+        let segs: Vec<&str> = local.split('.').collect();
+        block
+            .adaptable_mut(&segs)
+            .ok_or_else(|| Exception::custom(format!("checkpoint LoRA target not found: {local}")))?
+            .set_adapters(vec![Adapter::Lora { a, b, scale: 1.0 }]);
+    }
+    Ok(())
 }
 
 impl AdaptableHost for UNet2DConditionModel {

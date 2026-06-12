@@ -5,7 +5,8 @@
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, multiply};
-use mlx_rs::Array;
+use mlx_rs::transforms::checkpoint;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
@@ -20,6 +21,7 @@ const LN_EPS: f32 = 1e-5;
 /// Multi-head attention as the vendored `nn.MultiHeadAttention`: q/k/v projections without bias,
 /// output projection with bias, no mask. Used for both self-attention (context = `x`) and
 /// cross-attention (context = the text `memory`).
+#[derive(Clone)]
 struct AttentionMHA {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -35,6 +37,12 @@ struct AttentionMHA {
     /// here; an ArcFace Resampler for InstantID sc-3113) — this is just the injection primitive.
     to_k_ip: Option<AdaptableLinear>,
     to_v_ip: Option<AdaptableLinear>,
+    /// sc-4941 — run the SDPA segment inside an `mlx::checkpoint` so its backward recomputes the
+    /// decomposed attention (MLX has no fused SDPA backward) instead of retaining the `[heads,s,s]`
+    /// probability matrix. Training-only knob (opt-in via the U-Net's `set_sdpa_checkpoint`); for
+    /// SDXL the seq² term is small (64²/32² grids), so this is gated behind `gradient_checkpointing`
+    /// rather than always-on. Grads are bit-identical. Default off (inference unaffected).
+    ckpt_sdpa: bool,
 }
 
 impl AttentionMHA {
@@ -59,7 +67,24 @@ impl AttentionMHA {
             scale: (head_dim as f32).powf(-0.5),
             to_k_ip: None,
             to_v_ip: None,
+            ckpt_sdpa: false,
         })
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-4941). Training-only — see `ckpt_sdpa`.
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.ckpt_sdpa = on;
+    }
+
+    /// Cast the attention projections (and any IP K/V) to `dtype` (sc-4941 bf16 training).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for lin in [&mut self.q, &mut self.k, &mut self.v, &mut self.out] {
+            lin.cast_weights(dtype)?;
+        }
+        for lin in [&mut self.to_k_ip, &mut self.to_v_ip].into_iter().flatten() {
+            lin.cast_weights(dtype)?;
+        }
+        Ok(())
     }
 
     /// Install the IP-Adapter decoupled K/V projections (sc-3059). `k_ip`/`v_ip` are the
@@ -107,7 +132,23 @@ impl AttentionMHA {
         let q = to_heads(self.q.forward(x)?, l)?;
         let k = to_heads(self.k.forward(context)?, s)?;
         let v = to_heads(self.v.forward(context)?, s)?;
-        let mut o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        // 6th arg is `sinks`; `None` = standard attention. sc-4941: optionally checkpoint just the
+        // SDPA so its backward recomputes the decomposed attention (q/k/v threaded as inputs, scale
+        // captured) rather than retaining the seq² probability matrix. Grads stay bit-identical.
+        let mut o = if self.ckpt_sdpa {
+            let scale = self.scale;
+            let mut seg = checkpoint(move |inp: &[Array]| -> mlx_rs::error::Result<Vec<Array>> {
+                Ok(vec![scaled_dot_product_attention(
+                    &inp[0], &inp[1], &inp[2], scale, None, None,
+                )?])
+            });
+            seg(&[q.clone(), k.clone(), v.clone()])?
+                .into_iter()
+                .next()
+                .expect("one sdpa output")
+        } else {
+            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+        };
 
         // IP-Adapter decoupled cross-attention (shares the query `q`).
         if let (Some(k_ip), Some(v_ip), Some((tokens, scale))) = (&self.to_k_ip, &self.to_v_ip, ip)
@@ -131,6 +172,7 @@ impl AttentionMHA {
 
 /// One spatial-transformer block: pre-norm self-attn, pre-norm cross-attn to the text memory, and a
 /// pre-norm GEGLU FFN (`linear1(y) * gelu(linear2(y)) → linear3`). All residual.
+#[derive(Clone)]
 struct TransformerBlock {
     norm1_w: Array,
     norm1_b: Array,
@@ -208,6 +250,32 @@ impl TransformerBlock {
         self.attn2.install_ip(k_ip, v_ip);
     }
 
+    /// Toggle SDPA-segment checkpointing on both attentions (sc-4941).
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn1.set_sdpa_checkpoint(on);
+        self.attn2.set_sdpa_checkpoint(on);
+    }
+
+    /// Cast all dtype-bearing leaves (norms, attentions, GEGLU FFN) to `dtype` (sc-4941 bf16).
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for a in [
+            &mut self.norm1_w,
+            &mut self.norm1_b,
+            &mut self.norm2_w,
+            &mut self.norm2_b,
+            &mut self.norm3_w,
+            &mut self.norm3_b,
+        ] {
+            super::cast_array(a, dtype)?;
+        }
+        self.attn1.cast_weights(dtype)?;
+        self.attn2.cast_weights(dtype)?;
+        self.linear1.cast_weights(dtype)?;
+        self.linear2.cast_weights(dtype)?;
+        self.linear3.cast_weights(dtype)?;
+        Ok(())
+    }
+
     /// Run the block. The cross-attention (`attn2`) also injects the IP-Adapter branch when `ip` is
     /// supplied (sc-3059); self-attention never gets IP. (No no-IP wrapper — callers always thread
     /// the `Option`, passing `None` when there's no IP-Adapter.)
@@ -230,6 +298,7 @@ impl TransformerBlock {
 }
 
 /// A 2-D spatial transformer over NHWC features, cross-attending to the text `encoder_x`.
+#[derive(Clone)]
 pub struct Transformer2D {
     norm_w: Array,
     norm_b: Array,
@@ -277,6 +346,25 @@ impl Transformer2D {
         self.proj_out.quantize(bits, None)?;
         for b in &mut self.blocks {
             b.quantize(bits)?;
+        }
+        Ok(())
+    }
+
+    /// Toggle SDPA-segment checkpointing across every transformer block (sc-4941).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
+    /// Cast the GroupNorm, `proj_in`/`proj_out`, and every block to `dtype` (sc-4941 bf16).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        super::cast_array(&mut self.norm_w, dtype)?;
+        super::cast_array(&mut self.norm_b, dtype)?;
+        self.proj_in.cast_weights(dtype)?;
+        self.proj_out.cast_weights(dtype)?;
+        for b in &mut self.blocks {
+            b.cast_weights(dtype)?;
         }
         Ok(())
     }

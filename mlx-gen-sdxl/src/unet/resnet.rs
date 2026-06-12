@@ -5,7 +5,7 @@
 //! load (NCHW→NHWC).
 
 use mlx_rs::ops::add;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, group_norm};
@@ -20,6 +20,7 @@ use super::nchw_to_nhwc;
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
 
+#[derive(Clone)]
 pub struct ResnetBlock2D {
     norm1_w: Array,
     norm1_b: Array,
@@ -86,6 +87,24 @@ impl ResnetBlock2D {
         // missed it. The `mlx_sd` reference also stores `conv_shortcut` as `nn.Linear` and quantizes
         // it, so leaving it dense is a deliberate, correct divergence from a reference that shares the
         // bug. (LoRA still merges into `shortcut` as a reshaped conv delta — that path is unaffected.)
+        Ok(())
+    }
+
+    /// Cast every dtype-bearing leaf to `dtype` (sc-4941 bf16 training): the GroupNorm weights/biases,
+    /// both convs, the time-embedding projection, and the 1×1 shortcut.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        super::cast_array(&mut self.norm1_w, dtype)?;
+        super::cast_array(&mut self.norm1_b, dtype)?;
+        super::cast_array(&mut self.norm2_w, dtype)?;
+        super::cast_array(&mut self.norm2_b, dtype)?;
+        self.conv1.cast_weights(dtype)?;
+        self.conv2.cast_weights(dtype)?;
+        if let Some(t) = &mut self.time_emb_proj {
+            t.cast_weights(dtype)?;
+        }
+        if let Some(sc) = &mut self.shortcut {
+            sc.cast_weights(dtype)?;
+        }
         Ok(())
     }
 

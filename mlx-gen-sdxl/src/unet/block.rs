@@ -5,7 +5,7 @@
 //! already carry the post-concat channel counts, so no channel math is needed here.
 
 use mlx_rs::ops::concatenate_axis;
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::adapters::{AdaptableConv2d, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::{conv2d, upsample_nearest};
@@ -16,6 +16,7 @@ use super::nchw_to_nhwc;
 use super::resnet::ResnetBlock2D;
 use super::transformer::Transformer2D;
 
+#[derive(Clone)]
 pub struct UNetBlock2D {
     resnets: Vec<ResnetBlock2D>,
     attentions: Option<Vec<Transformer2D>>,
@@ -98,6 +99,41 @@ impl UNetBlock2D {
             for a in attns {
                 a.quantize(bits)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Number of skip tensors this block pops on the up path (one per resnet) — the count
+    /// `forward_block_checkpointed` (sc-4941) peels off the residual stack to thread into the block's
+    /// checkpoint segment as explicit inputs.
+    pub fn num_skip_inputs(&self) -> usize {
+        self.resnets.len()
+    }
+
+    /// Toggle SDPA-segment checkpointing on every cross-attention transformer in this block (sc-4941).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        if let Some(attns) = &mut self.attentions {
+            for a in attns {
+                a.set_sdpa_checkpoint(on);
+            }
+        }
+    }
+
+    /// Cast every dtype-bearing leaf (resnets, attention transformers, samplers) to `dtype` (sc-4941).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for r in &mut self.resnets {
+            r.cast_weights(dtype)?;
+        }
+        if let Some(attns) = &mut self.attentions {
+            for a in attns {
+                a.cast_weights(dtype)?;
+            }
+        }
+        if let Some(c) = &mut self.downsample {
+            c.cast_weights(dtype)?;
+        }
+        if let Some(c) = &mut self.upsample {
+            c.cast_weights(dtype)?;
         }
         Ok(())
     }

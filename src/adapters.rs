@@ -552,6 +552,7 @@ impl AdaptableLinear {
 /// is no adapter stack or quantized variant — just the mergeable weight and the accessors a forward
 /// pass needs. The merge takes a delta in the trained-file NCHW layout and folds it in chaos-safely
 /// (`W += δ`), the conv analog of [`AdaptableLinear::merge_dense_delta`].
+#[derive(Clone)]
 pub struct AdaptableConv2d {
     /// NHWC `[out, kH, kW, in]` — the layout `mlx_gen::nn::conv2d` expects.
     weight: Array,
@@ -587,6 +588,27 @@ impl AdaptableConv2d {
         let delta_nhwc = delta_nchw.transpose_axes(&[0, 2, 3, 1])?;
         self.weight = add(&self.weight, &delta_nhwc.as_dtype(self.weight.dtype())?)?;
         Ok(())
+    }
+
+    /// Cast the conv weight (and bias) to `dtype` in place — the conv analog of
+    /// [`AdaptableLinear::cast_weights`], for bf16 mixed-precision training (sc-4878/sc-4941). Convs
+    /// are never quantized, so this always applies. Destructive for a narrowing cast (reload to get
+    /// the f32 weights back).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        if self.weight.dtype() != dtype {
+            self.weight = self.weight.as_dtype(dtype)?;
+        }
+        if let Some(b) = &self.bias {
+            if b.dtype() != dtype {
+                self.bias = Some(b.as_dtype(dtype)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// The conv weight's dtype — lets a forward stay dtype-following without assuming f32.
+    pub fn weight_dtype(&self) -> Dtype {
+        self.weight.dtype()
     }
 }
 
