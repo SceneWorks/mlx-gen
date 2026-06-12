@@ -11,6 +11,12 @@ uv venv --python 3.12 /tmp/sam3ref/.venv
 /tmp/sam3ref/.venv/bin/python run_oracle.py
 ```
 
+## Component dumpers (Phase A–F)
+Each `dump_*.py` runs one real model component and writes a `*_fixture.safetensors` (gitignored) + a tracked `*_manifest.json`; a matching `#[ignore]` Rust test in `mlx-gen-sam3/tests/` gates parity (cosine):
+- `dump_vision_fixture.py` / `dump_text_fixture.py` / `dump_detr_fixture.py` / `dump_e2e_fixture.py` — detector (Phase A–D).
+- `dump_tracker_fixture.py` — **F1** single-frame box-prompt tracker (neck → prompt → mask decoder).
+- `dump_memory_fixture.py` — **F2** memory encoder: `_encode_new_memory` (1008→1152 bilinear mask prep, sigmoid/binarize ·20−10, mask_downsampler → feature_projection → memory_fuser → projection, sine pos-enc, occlusion add). Gated by `tests/memory_parity.rs`.
+
 ## Artifacts
 - `oracle_manifest.json` — per-case shapes/stats/sha1 (rounded 5dp) for staged parity.
 - `fixture_{car,zidane,bus}.npz` — full tensors: `pixel_values`, `input_ids`, `pred_logits`, `pred_boxes`, `presence_logits`, `semantic_seg`, `instance_masks`.

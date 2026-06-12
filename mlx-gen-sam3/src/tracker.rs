@@ -18,7 +18,9 @@ use std::f32::consts::PI;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::nn::relu;
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, conv_transpose2d, sigmoid, stack_axis};
+use mlx_rs::ops::{
+    add, broadcast_to, concatenate_axis, conv_transpose2d, multiply, sigmoid, stack_axis,
+};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
@@ -548,6 +550,201 @@ impl TrackerNeck {
     }
 }
 
+// --- memory encoder (Sam3TrackerVideoMemoryEncoder, F2) ------------------------------------------
+//
+// Encodes a frame's image features + its predicted mask into a 64-channel spatial memory + sine
+// position encoding, stored in the memory bank for later frames. Mirrors `_encode_new_memory`
+// (modeling_sam3_tracker_video.py ~2658) and the encoder forward (~1136). NHWC throughout; the
+// reference is NCHW (channels-first `LayerNorm` ⇒ a plain LayerNorm over the channel axis here).
+
+const SIGMOID_SCALE_FOR_MEM: f32 = 20.0;
+const SIGMOID_BIAS_FOR_MEM: f32 = -10.0;
+const MEM_OUT_CHANNELS: i32 = 64; // memory_encoder_output_channels
+const MEM_POS_FEATS: i32 = MEM_OUT_CHANNELS / 2; // PositionEmbeddingSine num_position_features (32)
+const MEM_SINE_TEMPERATURE: f32 = 10000.0;
+
+/// Grouped 2-D conv on an **NHWC** input with an OHWI weight (+ channel bias). `groups == channels`
+/// is the depthwise case (`memory_fuser` 7×7); everything else is `groups = 1`.
+fn conv2d_g(
+    x: &Array,
+    w_ohwi: &Array,
+    b: &Array,
+    stride: i32,
+    pad: i32,
+    groups: i32,
+) -> Result<Array> {
+    let y = mlx_rs::ops::conv2d(x, w_ohwi, (stride, stride), (pad, pad), (1, 1), groups)?;
+    Ok(add(&y, b)?)
+}
+
+/// Separable bilinear-resize weight matrix `W` `[out, in]` for `align_corners=False`
+/// (`out = W @ in @ Wᵀ`). Matches `torch.nn.functional.interpolate(mode="bilinear")`; the SAM3 mask
+/// prep is 1008²→1152² (**upsampling**, so the reference `antialias=True` is a documented no-op).
+fn bilinear_resize_matrix(in_size: i32, out_size: i32) -> Array {
+    let mut data = vec![0f32; (out_size * in_size) as usize];
+    let scale = in_size as f32 / out_size as f32;
+    for o in 0..out_size {
+        // area_pixel source index (align_corners=False), clamped to [0, in-1].
+        let src = ((o as f32 + 0.5) * scale - 0.5).clamp(0.0, (in_size - 1) as f32);
+        let x0 = src.floor() as i32;
+        let x1 = (x0 + 1).min(in_size - 1);
+        let frac = src - x0 as f32;
+        data[(o * in_size + x0) as usize] += 1.0 - frac;
+        data[(o * in_size + x1) as usize] += frac;
+    }
+    Array::from_slice(&data, &[out_size, in_size])
+}
+
+/// `Sam3TrackerVideoPositionEmbeddingSine(num_position_features=32, normalize=True)` over a `g×g`
+/// grid → NHWC `[1, g, g, 64]`. Channel layout is `cat(pos_y[32], pos_x[32])`; within each half the
+/// `2k`/`2k+1` pair is `(sin, cos)` at frequency `10000^(k/16)`. Host-computed (weight-free).
+fn position_embedding_sine(g: i32) -> Array {
+    let num_pos = MEM_POS_FEATS; // 32
+    let half = (num_pos / 2) as usize; // 16 frequencies
+    let scale = 2.0 * PI;
+    let eps = 1e-6f32;
+    let denom = g as f32 + eps;
+    let freqs: Vec<f32> = (0..half)
+        .map(|k| MEM_SINE_TEMPERATURE.powf((2.0 * k as f32) / num_pos as f32))
+        .collect();
+    let ch = (2 * num_pos) as usize; // 64
+    let mut data = vec![0f32; (g * g) as usize * ch];
+    for y in 0..g {
+        let ye = (y as f32 + 1.0) / denom * scale;
+        for x in 0..g {
+            let xe = (x as f32 + 1.0) / denom * scale;
+            let base = ((y * g + x) as usize) * ch;
+            for k in 0..half {
+                let (py, px) = (ye / freqs[k], xe / freqs[k]);
+                data[base + 2 * k] = py.sin();
+                data[base + 2 * k + 1] = py.cos();
+                data[base + num_pos as usize + 2 * k] = px.sin();
+                data[base + num_pos as usize + 2 * k + 1] = px.cos();
+            }
+        }
+    }
+    Array::from_slice(&data, &[1, g, g, ch as i32])
+}
+
+/// `MaskDownSampler`: 4× (k3/s2/p1 conv → channels-first LayerNorm → GELU), channels 1→4→16→64→256,
+/// then a 1×1 `final_conv` (256→256). Shrinks `[1,1152,1152,1]` → `[1,72,72,256]`. NHWC.
+struct MaskDownSampler {
+    layers: Vec<((Array, Array), (Array, Array))>, // (conv (OHWI,bias), layer_norm (w,b))
+    final_conv: (Array, Array),
+}
+
+impl MaskDownSampler {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let layers = (0..4)
+            .map(|i| -> Result<((Array, Array), (Array, Array))> {
+                let lp = join(prefix, &format!("layers.{i}"));
+                let (cw, cb) = weight_bias(w, &join(&lp, "conv"))?;
+                Ok((
+                    (conv_w_ohwi(&cw)?, cb),
+                    weight_bias(w, &join(&lp, "layer_norm"))?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (fw, fb) = weight_bias(w, &join(prefix, "final_conv"))?;
+        Ok(Self {
+            layers,
+            final_conv: (conv_w_ohwi(&fw)?, fb),
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let mut x = x.clone();
+        for ((cw, cb), norm) in &self.layers {
+            x = conv2d_g(&x, cw, cb, 2, 1, 1)?;
+            x = gelu_exact(&ln(&x, norm)?)?;
+        }
+        conv2d_g(&x, &self.final_conv.0, &self.final_conv.1, 1, 0, 1)
+    }
+}
+
+/// `MemoryFuserCXBlock`: ConvNeXt-style residual — 7×7 depthwise conv → channels-first LayerNorm →
+/// 1×1 expand (256→1024) → GELU → 1×1 project (1024→256) → per-channel `scale` → +input. NHWC, so
+/// the pointwise convs are last-axis linears with no permute.
+struct CxBlock {
+    depthwise: (Array, Array), // OHWI [256,7,7,1], depthwise (groups=256)
+    norm: (Array, Array),
+    pw1: (Array, Array),
+    pw2: (Array, Array),
+    scale: Array, // [256]
+}
+
+impl CxBlock {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let (dw, db) = weight_bias(w, &join(prefix, "depthwise_conv"))?;
+        Ok(Self {
+            depthwise: (conv_w_ohwi(&dw)?, db),
+            norm: weight_bias(w, &join(prefix, "layer_norm"))?,
+            pw1: weight_bias(w, &join(prefix, "pointwise_conv1"))?,
+            pw2: weight_bias(w, &join(prefix, "pointwise_conv2"))?,
+            scale: w.require(&join(prefix, "scale"))?.clone(),
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let h = conv2d_g(x, &self.depthwise.0, &self.depthwise.1, 1, 3, HIDDEN)?; // groups == channels
+        let h = ln(&h, &self.norm)?;
+        let h = linear(
+            &gelu_exact(&linear(&h, &self.pw1.0, &self.pw1.1)?)?,
+            &self.pw2.0,
+            &self.pw2.1,
+        )?;
+        let h = multiply(&self.scale, &h)?;
+        Ok(add(x, &h)?)
+    }
+}
+
+/// `Sam3TrackerVideoMemoryEncoder`: `mask_downsampler` + `feature_projection` (1×1 256→256) +
+/// `memory_fuser` (2 CXBlocks) + `projection` (1×1 256→64), returning the 64-channel memory map +
+/// its sine position encoding.
+struct MemoryEncoder {
+    mask_downsampler: MaskDownSampler,
+    feature_projection: (Array, Array), // 1×1 256→256
+    fuser: Vec<CxBlock>,
+    projection: (Array, Array), // 1×1 256→64
+}
+
+impl MemoryEncoder {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        let (fpw, fpb) = weight_bias(w, &join(prefix, "feature_projection"))?;
+        let (pw, pb) = weight_bias(w, &join(prefix, "projection"))?;
+        Ok(Self {
+            mask_downsampler: MaskDownSampler::from_weights(w, &join(prefix, "mask_downsampler"))?,
+            feature_projection: (conv_w_ohwi(&fpw)?, fpb),
+            fuser: vec![
+                CxBlock::from_weights(w, &join(prefix, "memory_fuser.layers.0"))?,
+                CxBlock::from_weights(w, &join(prefix, "memory_fuser.layers.1"))?,
+            ],
+            projection: (conv_w_ohwi(&pw)?, pb),
+        })
+    }
+
+    /// `pix_feat`: NHWC `[1,72,72,256]` raw image embedding; `mask_for_mem`: NHWC `[1,1152,1152,1]`
+    /// scaled mask. Returns `(features [1,72,72,64], pos_enc [1,72,72,64])`.
+    fn forward(&self, pix_feat: &Array, mask_for_mem: &Array) -> Result<(Array, Array)> {
+        let masks = self.mask_downsampler.forward(mask_for_mem)?; // [1,72,72,256]
+        let mut x = conv2d_g(
+            pix_feat,
+            &self.feature_projection.0,
+            &self.feature_projection.1,
+            1,
+            0,
+            1,
+        )?;
+        x = add(&x, &masks)?;
+        for layer in &self.fuser {
+            x = layer.forward(&x)?;
+        }
+        let features = conv2d_g(&x, &self.projection.0, &self.projection.1, 1, 0, 1)?; // [1,72,72,64]
+        let pos = position_embedding_sine(features.shape()[1]);
+        Ok((features, pos))
+    }
+}
+
 // --- single-frame tracker -----------------------------------------------------------------------
 
 /// SAM3 single-frame box-prompt tracker (PVS path). Reuses the shared PE [`Backbone`]; loads the
@@ -565,7 +762,23 @@ pub struct Sam3Tracker {
     /// the image embedding on a frame with no memory conditioning (the single-frame / init path).
     /// On a memory-conditioned video frame this is replaced by memory attention (F2).
     no_memory_embedding: Array,
+    /// `tracker_model.memory_encoder` — encodes a frame's image features + predicted mask into the
+    /// 64-channel spatial memory stored in the memory bank (F2).
+    memory_encoder: MemoryEncoder,
+    /// `tracker_model.occlusion_spatial_embedding_parameter` `[1, 64]` — added to the spatial memory
+    /// when the object is predicted absent (`object_score_logits ≤ 0`).
+    occlusion: Array,
 }
+
+/// A frame's encoded memory: the 64-channel spatial feature map + its sine position encoding, both
+/// NHWC `[1, 72, 72, 64]` (f32). The reference casts the features to bf16 for storage; that cast is
+/// applied by the memory-bank layer, not here.
+pub struct MemoryFeatures {
+    pub features: Array,
+    pub pos: Array,
+}
+
+const MASK_MEM_SIZE: i32 = 1152; // mask_input_size (4·72) · 4
 
 /// A single-frame tracker prediction: the best (argmax-IoU) low-res mask logits + its IoU + the
 /// object-score logit.
@@ -591,7 +804,65 @@ impl Sam3Tracker {
                     .clone(),
             },
             no_memory_embedding: w.require("tracker_model.no_memory_embedding")?.clone(),
+            memory_encoder: MemoryEncoder::from_weights(w, "tracker_model.memory_encoder")?,
+            occlusion: w
+                .require("tracker_model.occlusion_spatial_embedding_parameter")?
+                .clone(),
         })
+    }
+
+    /// Mask prep for `_encode_new_memory`: resize the image-resolution mask logits to the 1152² mask
+    /// memory size (separable bilinear, `align_corners=False`), then `sigmoid` (or `>0` binarize for
+    /// point/box-prompted frames), then `·20 −10`. Returns NHWC `[1, 1152, 1152, 1]`.
+    pub fn prepare_mask_for_mem(
+        &self,
+        pred_high_res: &Array,
+        is_mask_from_pts: bool,
+    ) -> Result<Array> {
+        let sh = pred_high_res.shape();
+        let (in_h, in_w) = (sh[sh.len() - 2], sh[sh.len() - 1]);
+        let m = pred_high_res.reshape(&[in_h, in_w])?;
+        let resized = if in_h == MASK_MEM_SIZE && in_w == MASK_MEM_SIZE {
+            m
+        } else {
+            let wh = bilinear_resize_matrix(in_h, MASK_MEM_SIZE);
+            let ww = bilinear_resize_matrix(in_w, MASK_MEM_SIZE);
+            wh.matmul(&m)?.matmul(&ww.transpose_axes(&[1, 0])?)?
+        };
+        let prob = if is_mask_from_pts {
+            resized.gt(Array::from_f32(0.0))?.as_dtype(Dtype::Float32)?
+        } else {
+            sigmoid(&resized)?
+        };
+        let scaled = add(
+            &prob.multiply(Array::from_f32(SIGMOID_SCALE_FOR_MEM))?,
+            Array::from_f32(SIGMOID_BIAS_FOR_MEM),
+        )?;
+        Ok(scaled.reshape(&[1, MASK_MEM_SIZE, MASK_MEM_SIZE, 1])?)
+    }
+
+    /// `_encode_new_memory`: encode a frame's raw image embedding + its predicted mask into spatial
+    /// memory. `pix_feat`: NHWC `[1, 72, 72, 256]` raw image embedding (the [`Self::encode_frame`]
+    /// first output — **no** `no_memory_embedding` bias). `pred_high_res`: `[1, 1, 1008, 1008]`
+    /// image-resolution mask logits. `object_score`: the decoder object-score logit (drives the
+    /// occlusion add). `is_mask_from_pts`: binarize vs sigmoid the mask (true for point/box frames).
+    pub fn encode_new_memory(
+        &self,
+        pix_feat: &Array,
+        pred_high_res: &Array,
+        object_score: f32,
+        is_mask_from_pts: bool,
+    ) -> Result<MemoryFeatures> {
+        let mask_for_mem = self.prepare_mask_for_mem(pred_high_res, is_mask_from_pts)?;
+        let (mut features, pos) = self.memory_encoder.forward(pix_feat, &mask_for_mem)?;
+        if object_score <= 0.0 {
+            // object predicted absent → add the occlusion spatial embedding over the grid.
+            features = add(
+                &features,
+                &self.occlusion.reshape(&[1, 1, 1, MEM_OUT_CHANNELS])?,
+            )?;
+        }
+        Ok(MemoryFeatures { features, pos })
     }
 
     /// Encode a frame's pixels `[1, 3, 1008, 1008]` → `(image_embedding, high_res)`. Runs the shared
