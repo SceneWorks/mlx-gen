@@ -27,10 +27,13 @@
 //!   clamped-SwiGLU experts) + full **decoder-layer** assembly
 //!   ([`text_encoder::gpt_oss::GptOssDecoderLayer`]), with MXFP4 expert dequant
 //!   ([`text_encoder::mxfp4`]). Validated single-layer against `transformers.GptOssDecoderLayer`.
+//! - **sc-3167** — the **harmony tokenizer + Lens chat-template** ([`text::LensTokenizer`]):
+//!   byte-exact `input_ids` vs `LensPipeline._build_chat_inputs` (`txt_offset = 97`).
 //!
 //! Still to come: the multi-layer hidden capture (sc-3171), the memory-efficient weight conversion /
 //! Q4-Q8 re-quant (sc-3172), the DiT (sc-3168), VAE shim (sc-3169), scheduler (sc-3170), and the
 //! generate/e2e integration (sc-3173).
 
 pub mod config;
+pub mod text;
 pub mod text_encoder;
