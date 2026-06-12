@@ -277,7 +277,13 @@ impl LtxTrainer {
             }
         }
         if cache.is_empty() {
-            return Err("ltx_2_3 trainer: no usable dataset items (all cancelled?)".into());
+            // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
+            // `Error::Canceled` (bridged 1:1 to `gen_core::Error::Canceled`); an empty cache with no
+            // cancel is a real "no usable dataset items" error.
+            if req.cancel.is_cancelled() {
+                return Err(mlx_gen::Error::Canceled);
+            }
+            return Err("ltx_2_3 trainer: no usable dataset items".into());
         }
         // Free the Gemma text encoder + tokenizer (~24 GB) before training — they are only needed for
         // the one-time embed cache (mirrors the reference `prepare_dataset` release).
@@ -405,6 +411,15 @@ impl LtxTrainer {
                 save_lora(&params, &targets, alpha, cfg.rank, &ckpt)?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
+        }
+
+        // Cancelled before completing a single step (`steps == 0` is rejected upstream by
+        // `validate`): the LoRA factors are still freshly initialized with `B = 0`, a no-op adapter.
+        // Surface the typed `Error::Canceled` (sc-4895, bridged 1:1 to `gen_core::Error::Canceled`)
+        // rather than writing a valid-looking `.safetensors` and returning `Ok` — downstream tooling
+        // would otherwise ship an identity LoRA as a trained artifact (F-040).
+        if steps_run == 0 {
+            return Err(mlx_gen::Error::Canceled);
         }
 
         // --- save final adapter ---

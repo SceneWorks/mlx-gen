@@ -616,6 +616,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]

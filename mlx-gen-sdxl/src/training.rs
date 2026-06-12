@@ -219,7 +219,13 @@ impl SdxlTrainer {
             cache.push((x0, cond, pooled));
         }
         if cache.is_empty() {
-            return Err("sdxl trainer: no usable dataset items (all cancelled?)".into());
+            // sc-4895 — a cancel tripped during caching is a genuine cancellation → typed
+            // `Error::Canceled` (bridged 1:1 to `gen_core::Error::Canceled`); an empty cache with no
+            // cancel is a real "no usable dataset items" error.
+            if req.cancel.is_cancelled() {
+                return Err(mlx_gen::Error::Canceled);
+            }
+            return Err("sdxl trainer: no usable dataset items".into());
         }
 
         // SDXL micro-conditioning `time_ids`, built once and shared (B=1). Matches the inference
@@ -350,6 +356,15 @@ impl SdxlTrainer {
                 )?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
+        }
+
+        // Cancelled before completing a single step (`steps == 0` is rejected upstream by
+        // `validate`): the LoRA factors are still freshly initialized with `B = 0`, a no-op adapter.
+        // Surface the typed `Error::Canceled` (sc-4895, bridged 1:1 to `gen_core::Error::Canceled`)
+        // rather than writing a valid-looking `.safetensors` and returning `Ok` — downstream tooling
+        // would otherwise ship an identity LoRA as a trained artifact (F-040).
+        if steps_run == 0 {
+            return Err(mlx_gen::Error::Canceled);
         }
 
         // --- save final adapter ---

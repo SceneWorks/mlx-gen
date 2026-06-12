@@ -1,11 +1,12 @@
 //! # gen-core-testkit
 //!
-//! A **contract conformance suite** for [`gen_core::Generator`] providers. Given any
-//! `Box<dyn Generator>` — an MLX family from `mlx-gen` or a future candle-gen provider — it
-//! exercises the behavioral guarantees the contract *promises but cannot express in the type
-//! system*: cancellation, progress monotonicity, seed determinism, and capability honesty. Both
-//! backends run it in CI, so a provider that silently ignores `CancelFlag` or reports no progress
-//! (the sc-4380 class of bug) becomes a CI failure instead of a field report (epic 3720, sc-4481).
+//! A **contract conformance suite** for gen-core providers — [`gen_core::Generator`] (this module),
+//! [`gen_core::Trainer`](crate::trainer), and [`gen_core::Captioner`](crate::captioner). Given any
+//! boxed provider — an MLX family from `mlx-gen` or a future candle-gen provider — it exercises the
+//! behavioral guarantees the contract *promises but cannot express in the type system*: typed
+//! cancellation, progress monotonicity, seed determinism, and capability honesty. Both backends run
+//! it in CI, so a provider that silently ignores `CancelFlag` or reports no progress (the sc-4380
+//! class of bug) becomes a CI failure instead of a field report (epic 3720, sc-4481/sc-4895).
 //!
 //! The testkit has **zero tensor dependencies** — it depends only on `gen-core` and drives the
 //! provider purely through the public contract, so it builds and runs on the Linux gen-core lane
@@ -14,15 +15,35 @@
 //! ## Usage
 //!
 //! ```ignore
-//! // macOS lane, real family:
+//! // macOS lane, real family — generator, trainer, captioner:
 //! gen_core_testkit::conformance(
 //!     || mlx_gen::load("z_image_turbo", &spec).unwrap(),
 //!     &gen_core_testkit::Profile::cheap(),
 //! );
+//! gen_core_testkit::trainer_conformance(
+//!     || mlx_gen::load_trainer("z_image_turbo", &spec).unwrap(),
+//!     &gen_core_testkit::TrainerProfile::cheap(items, out_dir),
+//! );
+//! gen_core_testkit::captioner_conformance(
+//!     || mlx_gen::load_captioner("joy_caption", &spec).unwrap(),
+//!     &gen_core_testkit::CaptionerProfile::cheap(),
+//! );
 //! ```
 //!
 //! The individual `check_*` functions are public so a provider's own tests can target one guarantee
-//! at a time; [`conformance`] runs them all and panics with the aggregated failures.
+//! at a time; the `*_conformance` entry points run them all and panic with the aggregated failures.
+
+pub mod captioner;
+pub mod trainer;
+
+pub use captioner::{
+    captioner_conformance, check_captioner_cancellation, check_captioner_progress,
+    check_captioner_registry, check_captioner_validate, CaptionerProfile,
+};
+pub use trainer::{
+    check_trainer_cancellation, check_trainer_progress, check_trainer_registry,
+    check_trainer_validate, trainer_conformance, TrainerProfile,
+};
 
 use gen_core::{
     Capabilities, Conditioning, Error, GenerationOutput, GenerationRequest, Generator, Image,
