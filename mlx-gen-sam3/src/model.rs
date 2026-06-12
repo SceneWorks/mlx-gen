@@ -66,6 +66,19 @@ impl Sam3ImageSegmenter {
         })
     }
 
+    /// Affine-quantize the segmenter's linear projections to `bits` (`8` = Q8 near-lossless, `4` =
+    /// Q4) — the PE ViT backbone, CLIP text tower + projection, DETR encoder/decoder + scoring, the
+    /// geometry encoder, and the mask head's prompt attention + embedder. Convs, GroupNorms,
+    /// embeddings, and the small/odd projections stay dense (see [`crate::quantize_linear`]).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.vision.quantize(bits)?;
+        self.text.quantize(bits)?;
+        self.geometry.quantize(bits)?;
+        self.detector.quantize(bits)?;
+        self.mask_head.quantize(bits)?;
+        Ok(())
+    }
+
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`; `input_ids`: `[1, 32]`; `text_mask`: per-token
     /// validity (`1`/`0`). Text-only PCS — runs the full detector + mask head.
     pub fn forward(

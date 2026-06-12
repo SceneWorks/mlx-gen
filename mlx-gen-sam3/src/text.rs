@@ -11,7 +11,8 @@ use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
-use mlx_gen::nn::{gelu_exact, linear};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::gelu_exact;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -31,18 +32,12 @@ struct ClipLayer {
     ln1_b: Array,
     ln2_w: Array,
     ln2_b: Array,
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    o_w: Array,
-    o_b: Array,
-    fc1_w: Array,
-    fc1_b: Array,
-    fc2_w: Array,
-    fc2_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
+    fc1: AdaptableLinear,
+    fc2: AdaptableLinear,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -52,24 +47,19 @@ struct ClipLayer {
 impl ClipLayer {
     fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3TextConfig) -> Result<Self> {
         let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         let head_dim = cfg.head_dim();
         Ok(Self {
             ln1_w: g("layer_norm1.weight")?,
             ln1_b: g("layer_norm1.bias")?,
             ln2_w: g("layer_norm2.weight")?,
             ln2_b: g("layer_norm2.bias")?,
-            q_w: g("self_attn.q_proj.weight")?,
-            q_b: g("self_attn.q_proj.bias")?,
-            k_w: g("self_attn.k_proj.weight")?,
-            k_b: g("self_attn.k_proj.bias")?,
-            v_w: g("self_attn.v_proj.weight")?,
-            v_b: g("self_attn.v_proj.bias")?,
-            o_w: g("self_attn.out_proj.weight")?,
-            o_b: g("self_attn.out_proj.bias")?,
-            fc1_w: g("mlp.fc1.weight")?,
-            fc1_b: g("mlp.fc1.bias")?,
-            fc2_w: g("mlp.fc2.weight")?,
-            fc2_b: g("mlp.fc2.bias")?,
+            q: l("self_attn.q_proj")?,
+            k: l("self_attn.k_proj")?,
+            v: l("self_attn.v_proj")?,
+            o: l("self_attn.out_proj")?,
+            fc1: l("mlp.fc1")?,
+            fc2: l("mlp.fc2")?,
             num_heads: cfg.num_attention_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -77,13 +67,27 @@ impl ClipLayer {
         })
     }
 
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for l in [
+            &mut self.q,
+            &mut self.k,
+            &mut self.v,
+            &mut self.o,
+            &mut self.fc1,
+            &mut self.fc2,
+        ] {
+            crate::quantize_linear(l, bits)?;
+        }
+        Ok(())
+    }
+
     fn forward(&self, x: &Array, mask: &Array) -> Result<Array> {
         let y = layer_norm(x, Some(&self.ln1_w), Some(&self.ln1_b), self.eps)?;
         let y = self.attention(&y, mask)?;
         let x = add(x, &y)?;
         let y = layer_norm(&x, Some(&self.ln2_w), Some(&self.ln2_b), self.eps)?;
-        let y = gelu_exact(&linear(&y, &self.fc1_w, &self.fc1_b)?)?;
-        let y = linear(&y, &self.fc2_w, &self.fc2_b)?;
+        let y = gelu_exact(&self.fc1.forward(&y)?)?;
+        let y = self.fc2.forward(&y)?;
         Ok(add(&x, &y)?)
     }
 
@@ -94,14 +98,14 @@ impl ClipLayer {
             Ok(a.reshape(&[b, n, self.num_heads, self.head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = to_heads(linear(x, &self.q_w, &self.q_b)?)?;
-        let k = to_heads(linear(x, &self.k_w, &self.k_b)?)?;
-        let v = to_heads(linear(x, &self.v_w, &self.v_b)?)?;
+        let q = to_heads(self.q.forward(x)?)?;
+        let k = to_heads(self.k.forward(x)?)?;
+        let v = to_heads(self.v.forward(x)?)?;
         let o = scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, n, self.num_heads * self.head_dim])?;
-        linear(&o, &self.o_w, &self.o_b)
+        self.o.forward(&o)
     }
 }
 
@@ -112,8 +116,7 @@ pub struct Sam3TextEncoder {
     layers: Vec<ClipLayer>,
     final_ln_w: Array,
     final_ln_b: Array,
-    proj_w: Array,
-    proj_b: Array,
+    proj: AdaptableLinear,
     eps: f32,
 }
 
@@ -145,10 +148,18 @@ impl Sam3TextEncoder {
             final_ln_b: w
                 .require(&join(clip_prefix, "final_layer_norm.bias"))?
                 .clone(),
-            proj_w: w.require(&join(proj_prefix, "weight"))?.clone(),
-            proj_b: w.require(&join(proj_prefix, "bias"))?.clone(),
+            proj: crate::load_linear(w, proj_prefix)?,
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    /// Quantize the CLIP attention/MLP projections + the 1024→256 text projection (Q8/Q4). Token
+    /// and position embeddings stay dense (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        crate::quantize_linear(&mut self.proj, bits)
     }
 
     /// Encode `input_ids` `[1, N]` (int32) with a key-padding `attention_mask` (`1` = real token).
@@ -175,7 +186,7 @@ impl Sam3TextEncoder {
         let last_hidden_state =
             layer_norm(&x, Some(&self.final_ln_w), Some(&self.final_ln_b), self.eps)?;
         // SAM3 projection: every token 1024 → 256.
-        linear(&last_hidden_state, &self.proj_w, &self.proj_b)
+        self.proj.forward(&last_hidden_state)
     }
 }
 

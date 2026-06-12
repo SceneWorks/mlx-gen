@@ -21,7 +21,8 @@ use mlx_rs::nn::MaxPool2d;
 use mlx_rs::ops::{add, concatenate_axis, conv_transpose2d, negative, pad, stack_axis};
 use mlx_rs::Array;
 
-use mlx_gen::nn::{conv2d, gelu_exact, linear};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::{conv2d, gelu_exact};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -157,58 +158,60 @@ fn apply_rope(q: &Array, table: &RopeTable) -> Result<Array> {
 
 /// Two-layer GELU MLP (`mlp.fc1` → exact-gelu → `mlp.fc2`).
 struct Mlp {
-    fc1_w: Array,
-    fc1_b: Array,
-    fc2_w: Array,
-    fc2_b: Array,
+    fc1: AdaptableLinear,
+    fc2: AdaptableLinear,
 }
 
 impl Mlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            fc1_w: w.require(&join(prefix, "fc1.weight"))?.clone(),
-            fc1_b: w.require(&join(prefix, "fc1.bias"))?.clone(),
-            fc2_w: w.require(&join(prefix, "fc2.weight"))?.clone(),
-            fc2_b: w.require(&join(prefix, "fc2.bias"))?.clone(),
+            fc1: crate::load_linear(w, &join(prefix, "fc1"))?,
+            fc2: crate::load_linear(w, &join(prefix, "fc2"))?,
         })
     }
 
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.fc1, bits)?;
+        crate::quantize_linear(&mut self.fc2, bits)?;
+        Ok(())
+    }
+
     fn forward(&self, x: &Array) -> Result<Array> {
-        let h = gelu_exact(&linear(x, &self.fc1_w, &self.fc1_b)?)?;
-        linear(&h, &self.fc2_w, &self.fc2_b)
+        let h = gelu_exact(&self.fc1.forward(x)?)?;
+        self.fc2.forward(&h)
     }
 }
 
 /// RoPE self-attention (separate q/k/v/o projections). Operates on NHWC `[b, H, W, C]`
 /// (`b = batch·num_windows` for windowed layers).
 struct Attention {
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    o_w: Array,
-    o_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     num_heads: i32,
     head_dim: i32,
 }
 
 impl Attention {
     fn from_weights(w: &Weights, prefix: &str, num_heads: i32, head_dim: i32) -> Result<Self> {
-        let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         Ok(Self {
-            q_w: g("q_proj.weight")?,
-            q_b: g("q_proj.bias")?,
-            k_w: g("k_proj.weight")?,
-            k_b: g("k_proj.bias")?,
-            v_w: g("v_proj.weight")?,
-            v_b: g("v_proj.bias")?,
-            o_w: g("o_proj.weight")?,
-            o_b: g("o_proj.bias")?,
+            q: l("q_proj")?,
+            k: l("k_proj")?,
+            v: l("v_proj")?,
+            o: l("o_proj")?,
             num_heads,
             head_dim,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.q, bits)?;
+        crate::quantize_linear(&mut self.k, bits)?;
+        crate::quantize_linear(&mut self.v, bits)?;
+        crate::quantize_linear(&mut self.o, bits)?;
+        Ok(())
     }
 
     fn forward(&self, x: &Array, rope: &RopeTable) -> Result<Array> {
@@ -221,16 +224,16 @@ impl Attention {
             Ok(t.reshape(&[b, seq, nh, hd])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = apply_rope(&to_heads(linear(x, &self.q_w, &self.q_b)?)?, rope)?;
-        let k = apply_rope(&to_heads(linear(x, &self.k_w, &self.k_b)?)?, rope)?;
-        let v = to_heads(linear(x, &self.v_w, &self.v_b)?)?;
+        let q = apply_rope(&to_heads(self.q.forward(x)?)?, rope)?;
+        let k = apply_rope(&to_heads(self.k.forward(x)?)?, rope)?;
+        let v = to_heads(self.v.forward(x)?)?;
 
         let scale = 1.0 / (hd as f32).sqrt();
         let attn = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
         let out = attn
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, h, w, nh * hd])?;
-        linear(&out, &self.o_w, &self.o_b)
+        self.o.forward(&out)
     }
 }
 
@@ -279,6 +282,12 @@ impl ViTLayer {
             window: if global { 0 } else { cfg.window_size },
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.attn.quantize(bits)?;
+        self.mlp.quantize(bits)?;
+        Ok(())
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
@@ -334,6 +343,13 @@ impl Backbone {
             pretrain_grid: cfg.pretrain_grid(),
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// Tile the `[1, pg², C]` position embedding to `[1, grid, grid, C]`. The shipped config has
@@ -464,6 +480,12 @@ impl Sam3VisionEncoder {
             backbone,
             fpn_layers,
         })
+    }
+
+    /// Quantize the ViT backbone's attention + MLP projections (Q8/Q4). The patch-embed conv, the
+    /// position embedding, and the conv-only FPN neck stay dense (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.backbone.quantize(bits)
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`. Returns the FPN feature maps as **NHWC**

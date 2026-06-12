@@ -21,7 +21,7 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::{add, concatenate_axis, matmul_device};
 use mlx_rs::{Array, Dtype, StreamOrDevice};
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -71,6 +71,13 @@ impl GeometryLayer {
         })
     }
 
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.self_attn.quantize(bits)?;
+        self.cross_attn.quantize(bits)?;
+        self.ffn.quantize(bits)?;
+        Ok(())
+    }
+
     /// `prompt`: `[1, P, C]`; `vision`: `[1, H·W, C]` (raw 72² feature, flattened); `vision_pos`:
     /// `[1, H·W, C]`. All prompt tokens are valid (PVS path), so attention runs unmasked.
     fn forward(&self, prompt: &Array, vision: &Array, vision_pos: &Array) -> Result<Array> {
@@ -91,18 +98,15 @@ impl GeometryLayer {
 
 /// SAM3 geometry/exemplar prompt encoder (`Sam3GeometryEncoder`).
 pub struct Sam3GeometryEncoder {
-    label_embed: Array, // [2, C]
-    cls_embed: Array,   // [1, C]
-    boxes_direct_w: Array,
-    boxes_direct_b: Array, // Linear(4, C)
-    boxes_pool_w: Array,   // Conv2d(C, C, roi_size) weight [C, C, R, R]
-    boxes_pool_b: Array,   // [C]
-    boxes_pos_w: Array,
-    boxes_pos_b: Array, // Linear(C + 2, C)
+    label_embed: Array,            // [2, C]
+    cls_embed: Array,              // [1, C]
+    boxes_direct: AdaptableLinear, // Linear(4, C) — stays dense (in=4)
+    boxes_pool_w: Array,           // Conv2d(C, C, roi_size) weight [C, C, R, R]
+    boxes_pool_b: Array,           // [C]
+    boxes_pos: AdaptableLinear,    // Linear(C + 2, C) — stays dense (in=258)
     vision_ln_w: Array,
     vision_ln_b: Array,
-    final_proj_w: Array,
-    final_proj_b: Array,
+    final_proj: AdaptableLinear,
     prompt_ln_w: Array,
     prompt_ln_b: Array,
     layers: Vec<GeometryLayer>,
@@ -120,16 +124,13 @@ impl Sam3GeometryEncoder {
         Ok(Self {
             label_embed: g("label_embed.weight")?,
             cls_embed: g("cls_embed.weight")?,
-            boxes_direct_w: g("boxes_direct_project.weight")?,
-            boxes_direct_b: g("boxes_direct_project.bias")?,
+            boxes_direct: crate::load_linear(w, &join(prefix, "boxes_direct_project"))?,
             boxes_pool_w: g("boxes_pool_project.weight")?,
             boxes_pool_b: g("boxes_pool_project.bias")?,
-            boxes_pos_w: g("boxes_pos_enc_project.weight")?,
-            boxes_pos_b: g("boxes_pos_enc_project.bias")?,
+            boxes_pos: crate::load_linear(w, &join(prefix, "boxes_pos_enc_project"))?,
             vision_ln_w: g("vision_layer_norm.weight")?,
             vision_ln_b: g("vision_layer_norm.bias")?,
-            final_proj_w: g("final_proj.weight")?,
-            final_proj_b: g("final_proj.bias")?,
+            final_proj: crate::load_linear(w, &join(prefix, "final_proj"))?,
             prompt_ln_w: g("prompt_layer_norm.weight")?,
             prompt_ln_b: g("prompt_layer_norm.bias")?,
             layers,
@@ -137,6 +138,20 @@ impl Sam3GeometryEncoder {
             output_ln_b: g("output_layer_norm.bias")?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Quantize the geometry encoder's transformer-layer attention + FFN and the `final_proj`
+    /// (Q8/Q4). The `boxes_direct_project` (4→C), `boxes_pos_enc_project` (258→C), the ROI-pool conv,
+    /// embeddings, and norms stay dense (the small/odd projections aren't group-quantizable; see
+    /// [`crate::quantize_linear`]) (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        crate::quantize_linear(&mut self.boxes_direct, bits)?; // no-op (in=4)
+        crate::quantize_linear(&mut self.boxes_pos, bits)?; // no-op (in=258)
+        crate::quantize_linear(&mut self.final_proj, bits)?;
+        Ok(())
     }
 
     /// Encode box prompts into prompt tokens.
@@ -161,7 +176,7 @@ impl Sam3GeometryEncoder {
         let n = boxes.shape()[1];
 
         // (1) direct projection of the box coordinates
-        let direct = linear(boxes, &self.boxes_direct_w, &self.boxes_direct_b)?; // [1, N, C]
+        let direct = self.boxes_direct.forward(boxes)?; // [1, N, C]
 
         // (2) ROI-align pooling of the channel-normalized 72² feature, then the 7×7 conv
         let norm_feat = ln(
@@ -175,7 +190,7 @@ impl Sam3GeometryEncoder {
 
         // (3) sine position encoding of the box center (+ raw h/w), projected to C
         let pos_enc = box_pos_encoding(&boxes_host, n, c); // [1, N, C+2]
-        let pos = linear(&pos_enc, &self.boxes_pos_w, &self.boxes_pos_b)?; // [1, N, C]
+        let pos = self.boxes_pos.forward(&pos_enc)?; // [1, N, C]
 
         // label (positive/negative) embedding + the three box encodings
         let lbl_idx = Array::from_slice(box_labels, &[n]);
@@ -189,7 +204,7 @@ impl Sam3GeometryEncoder {
         let cls = self.cls_embed.reshape(&[1, 1, c])?;
         let prompt = concatenate_axis(&[&boxes_embed, &cls], 1)?; // [1, N+1, C]
         let prompt = ln(
-            &linear(&prompt, &self.final_proj_w, &self.final_proj_b)?,
+            &self.final_proj.forward(&prompt)?,
             &self.prompt_ln_w,
             &self.prompt_ln_b,
             self.cfg.layer_norm_eps,

@@ -12,7 +12,8 @@ use mlx_rs::nn::relu;
 use mlx_rs::ops::{add, matmul, sigmoid};
 use mlx_rs::Array;
 
-use mlx_gen::nn::{conv2d, group_norm, linear, upsample_nearest};
+use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::{conv2d, group_norm, upsample_nearest};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -32,14 +33,10 @@ fn conv_w(w: &Array) -> Result<Array> {
 
 /// Prompt cross-attention (text-conditioned), `[B, Nq, D]` query over `[B, Nk, D]` key/value.
 struct PromptAttn {
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    o_w: Array,
-    o_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -47,21 +44,25 @@ struct PromptAttn {
 
 impl PromptAttn {
     fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3DetrConfig) -> Result<Self> {
-        let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         let head_dim = cfg.head_dim();
         Ok(Self {
-            q_w: g("q_proj.weight")?,
-            q_b: g("q_proj.bias")?,
-            k_w: g("k_proj.weight")?,
-            k_b: g("k_proj.bias")?,
-            v_w: g("v_proj.weight")?,
-            v_b: g("v_proj.bias")?,
-            o_w: g("o_proj.weight")?,
-            o_b: g("o_proj.bias")?,
+            q: l("q_proj")?,
+            k: l("k_proj")?,
+            v: l("v_proj")?,
+            o: l("o_proj")?,
             num_heads: cfg.num_attention_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.q, bits)?;
+        crate::quantize_linear(&mut self.k, bits)?;
+        crate::quantize_linear(&mut self.v, bits)?;
+        crate::quantize_linear(&mut self.o, bits)?;
+        Ok(())
     }
 
     fn forward(&self, query: &Array, kv: &Array, mask: &Array) -> Result<Array> {
@@ -71,40 +72,39 @@ impl PromptAttn {
         let heads = |t: Array, n: i32| -> Result<Array> {
             Ok(t.reshape(&[b, n, nh, hd])?.transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = heads(linear(query, &self.q_w, &self.q_b)?, nq)?;
-        let k = heads(linear(kv, &self.k_w, &self.k_b)?, nk)?;
-        let v = heads(linear(kv, &self.v_w, &self.v_b)?, nk)?;
+        let q = heads(self.q.forward(query)?, nq)?;
+        let k = heads(self.k.forward(kv)?, nk)?;
+        let v = heads(self.v.forward(kv)?, nk)?;
         let o = scaled_dot_product_attention(&q, &k, &v, self.scale, mask, None)?;
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, nq, nh * hd])?;
-        linear(&o, &self.o_w, &self.o_b)
+        self.o.forward(&o)
     }
 }
 
 /// 3-layer ReLU MLP embedding the queries for mask prediction (`Sam3MaskEmbedder`).
 struct MaskEmbedder {
-    layers: Vec<(Array, Array)>,
+    layers: Vec<AdaptableLinear>,
 }
 
 impl MaskEmbedder {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let layers = (0..3)
-            .map(|i| -> Result<(Array, Array)> {
-                Ok((
-                    w.require(&join(prefix, &format!("layers.{i}.weight")))?
-                        .clone(),
-                    w.require(&join(prefix, &format!("layers.{i}.bias")))?
-                        .clone(),
-                ))
-            })
+            .map(|i| crate::load_linear(w, &join(prefix, &format!("layers.{i}"))))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { layers })
     }
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for l in &mut self.layers {
+            crate::quantize_linear(l, bits)?;
+        }
+        Ok(())
+    }
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = x.clone();
-        for (i, (w, b)) in self.layers.iter().enumerate() {
-            h = linear(&h, w, b)?;
+        for (i, l) in self.layers.iter().enumerate() {
+            h = l.forward(&h)?;
             if i < 2 {
                 h = relu(&h)?;
             }
@@ -197,6 +197,14 @@ impl Sam3MaskHead {
                 .clone(),
             prompt_norm_b: w.require(&join(&p, "prompt_cross_attn_norm.bias"))?.clone(),
         })
+    }
+
+    /// Quantize the prompt cross-attention + the mask-embedder MLP (Q8/Q4). The pixel-decoder convs,
+    /// GroupNorms, and the 1×1 instance/semantic projection convs stay dense (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.prompt_attn.quantize(bits)?;
+        self.mask_embedder.quantize(bits)?;
+        Ok(())
     }
 
     /// `query_hidden`: `[1, Q, D]`; `backbone_features`: NHWC fine→coarse `[288²,144²,72²]`;

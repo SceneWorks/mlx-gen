@@ -18,7 +18,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -65,14 +65,10 @@ fn attend(q: &Array, k: &Array, v: &Array, scale: f32, mask: Option<&Array>) -> 
 /// Generic multi-head attention (`Sam3Attention`): separate q/k/v/o, optional additive mask.
 /// Shared by the DETR stack (sc-4921) and the geometry encoder (sc-4923).
 pub(crate) struct Attn {
-    q_w: Array,
-    q_b: Array,
-    k_w: Array,
-    k_b: Array,
-    v_w: Array,
-    v_b: Array,
-    o_w: Array,
-    o_b: Array,
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     num_heads: i32,
     head_dim: i32,
     scale: f32,
@@ -91,20 +87,24 @@ impl Attn {
         num_heads: i32,
         head_dim: i32,
     ) -> Result<Self> {
-        let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         Ok(Self {
-            q_w: g("q_proj.weight")?,
-            q_b: g("q_proj.bias")?,
-            k_w: g("k_proj.weight")?,
-            k_b: g("k_proj.bias")?,
-            v_w: g("v_proj.weight")?,
-            v_b: g("v_proj.bias")?,
-            o_w: g("o_proj.weight")?,
-            o_b: g("o_proj.bias")?,
+            q: l("q_proj")?,
+            k: l("k_proj")?,
+            v: l("v_proj")?,
+            o: l("o_proj")?,
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
         })
+    }
+
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.q, bits)?;
+        crate::quantize_linear(&mut self.k, bits)?;
+        crate::quantize_linear(&mut self.v, bits)?;
+        crate::quantize_linear(&mut self.o, bits)?;
+        Ok(())
     }
 
     pub(crate) fn forward(
@@ -121,65 +121,65 @@ impl Attn {
         let heads = |t: Array, n: i32| -> Result<Array> {
             Ok(t.reshape(&[b, n, nh, hd])?.transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = heads(linear(query, &self.q_w, &self.q_b)?, ql)?;
-        let k = heads(linear(key, &self.k_w, &self.k_b)?, kl)?;
-        let v = heads(linear(value, &self.v_w, &self.v_b)?, kl)?;
+        let q = heads(self.q.forward(query)?, ql)?;
+        let k = heads(self.k.forward(key)?, kl)?;
+        let v = heads(self.v.forward(value)?, kl)?;
         let o = attend(&q, &k, &v, self.scale, mask)?;
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, ql, nh * hd])?;
-        linear(&o, &self.o_w, &self.o_b)
+        self.o.forward(&o)
     }
 }
 
 /// `Sam3MLP` (DETR enc/dec FFN): `fc1` → **ReLU** → `fc2` (`hidden_act = "relu"`).
 /// Shared with the geometry encoder (sc-4923).
 pub(crate) struct Ffn {
-    fc1_w: Array,
-    fc1_b: Array,
-    fc2_w: Array,
-    fc2_b: Array,
+    fc1: AdaptableLinear,
+    fc2: AdaptableLinear,
 }
 
 impl Ffn {
     pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let g = |n: &str| -> Result<Array> { Ok(w.require(&join(prefix, n))?.clone()) };
         Ok(Self {
-            fc1_w: g("fc1.weight")?,
-            fc1_b: g("fc1.bias")?,
-            fc2_w: g("fc2.weight")?,
-            fc2_b: g("fc2.bias")?,
+            fc1: crate::load_linear(w, &join(prefix, "fc1"))?,
+            fc2: crate::load_linear(w, &join(prefix, "fc2"))?,
         })
     }
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.fc1, bits)?;
+        crate::quantize_linear(&mut self.fc2, bits)?;
+        Ok(())
+    }
     pub(crate) fn forward(&self, x: &Array) -> Result<Array> {
-        let h = relu(&linear(x, &self.fc1_w, &self.fc1_b)?)?;
-        linear(&h, &self.fc2_w, &self.fc2_b)
+        let h = relu(&self.fc1.forward(x)?)?;
+        self.fc2.forward(&h)
     }
 }
 
 /// `Sam3DecoderMLP`: a 2- or 3-layer ReLU MLP (relu between layers, no final activation).
 struct DecoderMlp {
-    layers: Vec<(Array, Array)>,
+    layers: Vec<AdaptableLinear>,
 }
 
 impl DecoderMlp {
     fn from_weights(w: &Weights, prefix: &str, num_layers: usize) -> Result<Self> {
         let layers = (1..=num_layers)
-            .map(|i| -> Result<(Array, Array)> {
-                Ok((
-                    w.require(&join(prefix, &format!("layer{i}.weight")))?
-                        .clone(),
-                    w.require(&join(prefix, &format!("layer{i}.bias")))?.clone(),
-                ))
-            })
+            .map(|i| crate::load_linear(w, &join(prefix, &format!("layer{i}"))))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { layers })
+    }
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for l in &mut self.layers {
+            crate::quantize_linear(l, bits)?;
+        }
+        Ok(())
     }
     fn forward(&self, x: &Array) -> Result<Array> {
         let mut h = x.clone();
         let n = self.layers.len();
-        for (i, (w, b)) in self.layers.iter().enumerate() {
-            h = linear(&h, w, b)?;
+        for (i, l) in self.layers.iter().enumerate() {
+            h = l.forward(&h)?;
             if i + 1 < n {
                 h = relu(&h)?;
             }
@@ -227,10 +227,8 @@ struct DotScoring {
     text_mlp: DecoderMlp,
     text_mlp_out_w: Array,
     text_mlp_out_b: Array,
-    text_proj_w: Array,
-    text_proj_b: Array,
-    query_proj_w: Array,
-    query_proj_b: Array,
+    text_proj: AdaptableLinear,
+    query_proj: AdaptableLinear,
     scale: f32,
     clamp: f32,
     eps: f32,
@@ -243,14 +241,19 @@ impl DotScoring {
             text_mlp: DecoderMlp::from_weights(w, &join(prefix, "text_mlp"), 2)?,
             text_mlp_out_w: g("text_mlp_out_norm.weight")?,
             text_mlp_out_b: g("text_mlp_out_norm.bias")?,
-            text_proj_w: g("text_proj.weight")?,
-            text_proj_b: g("text_proj.bias")?,
-            query_proj_w: g("query_proj.weight")?,
-            query_proj_b: g("query_proj.bias")?,
+            text_proj: crate::load_linear(w, &join(prefix, "text_proj"))?,
+            query_proj: crate::load_linear(w, &join(prefix, "query_proj"))?,
             scale: 1.0 / (cfg.hidden_size as f32).sqrt(),
             clamp: cfg.score_clamp,
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.text_mlp.quantize(bits)?;
+        crate::quantize_linear(&mut self.text_proj, bits)?;
+        crate::quantize_linear(&mut self.query_proj, bits)?;
+        Ok(())
     }
 
     /// `queries`: `[1, Q, D]`; `text`: `[1, L, D]`; `text_mask`: per-token validity.
@@ -275,9 +278,9 @@ impl DotScoring {
             &multiply(&t, &is_valid)?.sum_axis(1, false)?,
             Array::from_f32(n_valid),
         )?; // [1, D]
-        let proj_text = linear(&pooled, &self.text_proj_w, &self.text_proj_b)?; // [1, D]
-        let proj_q = linear(queries, &self.query_proj_w, &self.query_proj_b)?; // [1, Q, D]
-                                                                               // ⟨q, text⟩ over D → [1, Q]
+        let proj_text = self.text_proj.forward(&pooled)?; // [1, D]
+        let proj_q = self.query_proj.forward(queries)?; // [1, Q, D]
+                                                        // ⟨q, text⟩ over D → [1, Q]
         let scores = multiply(&proj_q, &proj_text.reshape(&[1, 1, -1])?)?.sum_axis(-1, false)?;
         let scores = multiply(&scores, Array::from_f32(self.scale))?;
         clamp(&scores, -self.clamp, self.clamp)
@@ -313,6 +316,13 @@ impl EncoderLayer {
             ffn: Ffn::from_weights(w, &join(prefix, "mlp"))?,
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.self_attn.quantize(bits)?;
+        self.cross_attn.quantize(bits)?;
+        self.ffn.quantize(bits)?;
+        Ok(())
     }
 
     fn forward(
@@ -374,6 +384,14 @@ impl DecoderLayer {
             mlp_ln_b: g("mlp_layer_norm.bias")?,
             eps: cfg.layer_norm_eps,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.self_attn.quantize(bits)?;
+        self.text_attn.quantize(bits)?;
+        self.vis_attn.quantize(bits)?;
+        self.ffn.quantize(bits)?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -476,6 +494,25 @@ impl Sam3Detector {
             scoring: DotScoring::from_weights(w, &join(prefix, "dot_product_scoring"), cfg)?,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Quantize the DETR encoder/decoder attention + FFN, the box/presence/ref-point heads, and the
+    /// dot-product scoring (Q8/Q4). The BoxRPB `2→256` embedders, embeddings, and norms stay dense
+    /// (the `2→256` projections are not group-quantizable; see [`crate::quantize_linear`]) (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.enc_layers {
+            layer.quantize(bits)?;
+        }
+        for layer in &mut self.dec_layers {
+            layer.quantize(bits)?;
+        }
+        self.box_head.quantize(bits)?;
+        self.presence_head.quantize(bits)?;
+        self.ref_point_head.quantize(bits)?;
+        self.box_rpb_x.quantize(bits)?; // no-ops on the 2→256 layer1 (guarded)
+        self.box_rpb_y.quantize(bits)?;
+        self.scoring.quantize(bits)?;
+        Ok(())
     }
 
     /// `vision_feature`: the 72² FPN feature **NHWC** `[1, H, W, 256]`; `text`: `[1, L, 256]`.

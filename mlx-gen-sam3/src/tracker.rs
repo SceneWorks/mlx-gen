@@ -23,6 +23,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -82,9 +83,9 @@ fn ln(x: &Array, p: &(Array, Array)) -> Result<Array> {
 
 /// `proj_in → act → (layers.i → act)* → proj_out → [sigmoid]`. `act` is ReLU throughout the tracker.
 struct FeedForward {
-    proj_in: (Array, Array),
-    layers: Vec<(Array, Array)>,
-    proj_out: (Array, Array),
+    proj_in: AdaptableLinear,
+    layers: Vec<AdaptableLinear>,
+    proj_out: AdaptableLinear,
     sigmoid_output: bool,
 }
 
@@ -96,22 +97,31 @@ impl FeedForward {
         sigmoid_output: bool,
     ) -> Result<Self> {
         let layers = (0..num_layers - 2)
-            .map(|i| weight_bias(w, &join(prefix, &format!("layers.{i}"))))
+            .map(|i| crate::load_linear(w, &join(prefix, &format!("layers.{i}"))))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            proj_in: weight_bias(w, &join(prefix, "proj_in"))?,
+            proj_in: crate::load_linear(w, &join(prefix, "proj_in"))?,
             layers,
-            proj_out: weight_bias(w, &join(prefix, "proj_out"))?,
+            proj_out: crate::load_linear(w, &join(prefix, "proj_out"))?,
             sigmoid_output,
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let mut h = relu(&linear(x, &self.proj_in.0, &self.proj_in.1)?)?;
-        for l in &self.layers {
-            h = relu(&linear(&h, &l.0, &l.1)?)?;
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.proj_in, bits)?;
+        for l in &mut self.layers {
+            crate::quantize_linear(l, bits)?;
         }
-        h = linear(&h, &self.proj_out.0, &self.proj_out.1)?;
+        crate::quantize_linear(&mut self.proj_out, bits)?;
+        Ok(())
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let mut h = relu(&self.proj_in.forward(x)?)?;
+        for l in &self.layers {
+            h = relu(&l.forward(&h)?)?;
+        }
+        h = self.proj_out.forward(&h)?;
         if self.sigmoid_output {
             h = sigmoid(&h)?;
         }
@@ -124,23 +134,32 @@ impl FeedForward {
 /// MHA on `[b, n, hidden]` tokens; q/k/v project to `internal = hidden / downsample`, split into
 /// `NUM_HEADS`, SDPA, then `o_proj` back to `hidden`.
 struct Attention {
-    q: (Array, Array),
-    k: (Array, Array),
-    v: (Array, Array),
-    o: (Array, Array),
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     num_heads: i32,
 }
 
 impl Attention {
     fn from_weights(w: &Weights, prefix: &str, downsample: i32) -> Result<Self> {
         let _ = downsample; // head split is derived from the loaded projection width at forward time
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         Ok(Self {
-            q: weight_bias(w, &join(prefix, "q_proj"))?,
-            k: weight_bias(w, &join(prefix, "k_proj"))?,
-            v: weight_bias(w, &join(prefix, "v_proj"))?,
-            o: weight_bias(w, &join(prefix, "o_proj"))?,
+            q: l("q_proj")?,
+            k: l("k_proj")?,
+            v: l("v_proj")?,
+            o: l("o_proj")?,
             num_heads: NUM_HEADS,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.q, bits)?;
+        crate::quantize_linear(&mut self.k, bits)?;
+        crate::quantize_linear(&mut self.v, bits)?;
+        crate::quantize_linear(&mut self.o, bits)?;
+        Ok(())
     }
 
     fn forward(&self, q: &Array, k: &Array, v: &Array) -> Result<Array> {
@@ -150,15 +169,15 @@ impl Attention {
             Ok(x.reshape(&[b, n, self.num_heads, c / self.num_heads])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = sep(&linear(q, &self.q.0, &self.q.1)?)?;
-        let k = sep(&linear(k, &self.k.0, &self.k.1)?)?;
-        let v = sep(&linear(v, &self.v.0, &self.v.1)?)?;
+        let q = sep(&self.q.forward(q)?)?;
+        let k = sep(&self.k.forward(k)?)?;
+        let v = sep(&self.v.forward(v)?)?;
         let scale = 1.0 / (q.shape()[3] as f32).sqrt();
         let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
         let sh = out.shape();
         let (b, h, n, c) = (sh[0], sh[1], sh[2], sh[3]);
         let out = out.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, n, h * c])?;
-        linear(&out, &self.o.0, &self.o.1)
+        self.o.forward(&out)
     }
 }
 
@@ -197,6 +216,14 @@ impl TwoWayBlock {
             norm4: weight_bias(w, &join(prefix, "layer_norm4"))?,
             skip_first_layer_pe,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.self_attn.quantize(bits)?;
+        self.cross_t2i.quantize(bits)?;
+        self.mlp.quantize(bits)?;
+        self.cross_i2t.quantize(bits)?;
+        Ok(())
     }
 
     /// `queries`/`keys`: `[b, nq, D]` / `[b, nk, D]`; `query_pe`/`key_pe`: same shapes.
@@ -253,6 +280,14 @@ impl TwoWayTransformer {
             )?,
             norm_final: weight_bias(w, &join(prefix, "layer_norm_final_attn"))?,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        self.final_attn.quantize(bits)?;
+        Ok(())
     }
 
     /// `image_embedding`/`image_pe`: token-flattened `[b, hw, D]`; `point_embedding`: `[b, n, D]`.
@@ -501,6 +536,16 @@ impl MaskDecoder {
                 false,
             )?,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.transformer.quantize(bits)?;
+        for h in &mut self.hypernet {
+            h.quantize(bits)?;
+        }
+        self.iou_head.quantize(bits)?;
+        self.obj_score_head.quantize(bits)?;
+        Ok(())
     }
 
     /// `image_embedding`: NHWC `[1, g, g, 256]`; `image_pe`: NHWC `[1, g, g, 256]`; `sparse`:
@@ -933,22 +978,31 @@ fn apply_rope_2d(
 /// axial RoPE on q + the rotated keys, SDPA, then `o_proj`. `kv_in_dim` is 256 (self-attn) or 64
 /// (cross-attn over the memory bank).
 struct RoPEAttention {
-    q: (Array, Array),
-    k: (Array, Array),
-    v: (Array, Array),
-    o: (Array, Array),
+    q: AdaptableLinear,
+    k: AdaptableLinear,
+    v: AdaptableLinear,
+    o: AdaptableLinear,
     rope_k_repeat: bool,
 }
 
 impl RoPEAttention {
     fn from_weights(w: &Weights, prefix: &str, rope_k_repeat: bool) -> Result<Self> {
+        let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         Ok(Self {
-            q: weight_bias(w, &join(prefix, "q_proj"))?,
-            k: weight_bias(w, &join(prefix, "k_proj"))?,
-            v: weight_bias(w, &join(prefix, "v_proj"))?,
-            o: weight_bias(w, &join(prefix, "o_proj"))?,
+            q: l("q_proj")?,
+            k: l("k_proj")?,
+            v: l("v_proj")?,
+            o: l("o_proj")?,
             rope_k_repeat,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        crate::quantize_linear(&mut self.q, bits)?;
+        crate::quantize_linear(&mut self.k, bits)?;
+        crate::quantize_linear(&mut self.v, bits)?;
+        crate::quantize_linear(&mut self.o, bits)?;
+        Ok(())
     }
 
     /// `query`: `[1, seq, 256]`; `key`/`value`: `[1, seq_k, kv_in]`. Returns `[1, seq, 256]`.
@@ -968,9 +1022,9 @@ impl RoPEAttention {
                     .transpose_axes(&[0, 2, 1, 3])?,
             ) // [1, heads, seq, head_dim]
         };
-        let q = to_heads(&linear(query, &self.q.0, &self.q.1)?)?;
-        let k = to_heads(&linear(key, &self.k.0, &self.k.1)?)?;
-        let v = to_heads(&linear(value, &self.v.0, &self.v.1)?)?;
+        let q = to_heads(&self.q.forward(query)?)?;
+        let k = to_heads(&self.k.forward(key)?)?;
+        let v = to_heads(&self.v.forward(value)?)?;
         let (q, k) = apply_rope_2d(&q, &k, cos, sin, num_k_exclude, self.rope_k_repeat)?;
         let scale = 1.0 / (MEM_ATTN_HEAD_DIM as f32).sqrt();
         let out = scaled_dot_product_attention(&q, &k, &v, scale, None, None)?;
@@ -980,7 +1034,7 @@ impl RoPEAttention {
             sh[2],
             MEM_ATTN_HEADS * MEM_ATTN_HEAD_DIM,
         ])?;
-        linear(&out, &self.o.0, &self.o.1)
+        self.o.forward(&out)
     }
 }
 
@@ -992,8 +1046,8 @@ struct MemAttnLayer {
     norm1: (Array, Array),
     norm2: (Array, Array),
     norm3: (Array, Array),
-    linear1: (Array, Array),
-    linear2: (Array, Array),
+    linear1: AdaptableLinear,
+    linear2: AdaptableLinear,
 }
 
 impl MemAttnLayer {
@@ -1004,9 +1058,17 @@ impl MemAttnLayer {
             norm1: weight_bias(w, &join(prefix, "layer_norm1"))?,
             norm2: weight_bias(w, &join(prefix, "layer_norm2"))?,
             norm3: weight_bias(w, &join(prefix, "layer_norm3"))?,
-            linear1: weight_bias(w, &join(prefix, "linear1"))?,
-            linear2: weight_bias(w, &join(prefix, "linear2"))?,
+            linear1: crate::load_linear(w, &join(prefix, "linear1"))?,
+            linear2: crate::load_linear(w, &join(prefix, "linear2"))?,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.self_attn.quantize(bits)?;
+        self.cross_attn.quantize(bits)?;
+        crate::quantize_linear(&mut self.linear1, bits)?;
+        crate::quantize_linear(&mut self.linear2, bits)?;
+        Ok(())
     }
 
     /// `queries`: `[1, seq, 256]`; `keys`/`key_pos`: `[1, seq_k, 64]`. `num_k_exclude` = object-pointer
@@ -1033,11 +1095,7 @@ impl MemAttnLayer {
         let queries = add(&queries, &q)?;
         // FFN.
         let q = ln(&queries, &self.norm3)?;
-        let q = linear(
-            &relu(&linear(&q, &self.linear1.0, &self.linear1.1)?)?,
-            &self.linear2.0,
-            &self.linear2.1,
-        )?;
+        let q = self.linear2.forward(&relu(&self.linear1.forward(&q)?)?)?;
         Ok(add(&queries, &q)?)
     }
 }
@@ -1063,6 +1121,13 @@ impl MemoryAttention {
             rope_cos,
             rope_sin,
         })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.quantize(bits)?;
+        }
+        Ok(())
     }
 
     /// `current_vision_features`/`current_vision_pos`: seq-first `[seq, 1, 256]`; `memory`/`memory_pos`:
@@ -1138,7 +1203,7 @@ pub struct Sam3Tracker {
     mem_temporal_pos_enc: Array,
     /// `tracker_model.temporal_positional_encoding_projection_layer` — Linear 256→64 projecting an
     /// object pointer's 1-D sine temporal encoding down to the memory dimension (F2.4).
-    tpos_proj: (Array, Array),
+    tpos_proj: AdaptableLinear,
     /// `tracker_model.mask_downsample` — a single conv (1→1, k4s4) shrinking the input mask before the
     /// prompt encoder's `mask_embed` on the `_use_mask_as_output` object-pointer path (F2.5a-ii).
     mask_downsample: (Array, Array),
@@ -1211,7 +1276,7 @@ impl Sam3Tracker {
             mem_temporal_pos_enc: w
                 .require("tracker_model.memory_temporal_positional_encoding")?
                 .clone(),
-            tpos_proj: weight_bias(
+            tpos_proj: crate::load_linear(
                 w,
                 "tracker_model.temporal_positional_encoding_projection_layer",
             )?,
@@ -1220,6 +1285,20 @@ impl Sam3Tracker {
                 (conv_w_ohwi(&mw)?, mb)
             },
         })
+    }
+
+    /// Quantize the tracker's linear projections (Q8/Q4): the shared PE backbone, the mask decoder's
+    /// two-way transformer + hypernet/IoU/obj-score MLPs, the memory-attention RoPE attention + FFN,
+    /// the object-pointer projection, and the temporal-pos projection. Convs (tracker neck, memory
+    /// encoder, ConvNeXt pointwise convs, upscale/mask-downsample), GroupNorms, the prompt encoder's
+    /// embeddings, and the random-Gaussian position tables stay dense (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.backbone.quantize(bits)?;
+        self.decoder.quantize(bits)?;
+        self.memory_attention.quantize(bits)?;
+        self.object_pointer_proj.quantize(bits)?;
+        crate::quantize_linear(&mut self.tpos_proj, bits)?;
+        Ok(())
     }
 
     /// The axial 2-D RoPE `(cos, sin)` tables `[72², 256]` the memory attention uses (exposed for
@@ -1312,7 +1391,7 @@ impl Sam3Tracker {
                 .map(|(o, _)| *o as f32 / max_temporal_diff)
                 .collect();
             let sine_pe = sine_pe_1d(&offsets, HIDDEN as usize, MEM_SINE_TEMPERATURE); // [P, 256]
-            let proj = linear(&sine_pe, &self.tpos_proj.0, &self.tpos_proj.1)?; // [P, 64]
+            let proj = self.tpos_proj.forward(&sine_pe)?; // [P, 64]
             let p = object_pointers.len() as i32;
             // pointer tokens stacked [P, 256] → split each into 4×64 contiguous → [P·4, 1, 64].
             let mut rows: Vec<Array> = Vec::with_capacity(object_pointers.len());

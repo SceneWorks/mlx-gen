@@ -115,6 +115,15 @@ impl Sam3VideoModel {
         })
     }
 
+    /// Affine-quantize the whole video model to `bits` (Q8/Q4): both the detector segmenter and the
+    /// tracker (each carries its own copy of the PE backbone + heads). Convs/norms/embeddings stay
+    /// dense (sc-4925).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.segmenter.quantize(bits)?;
+        self.tracker.quantize(bits)?;
+        Ok(())
+    }
+
     /// Process a whole video (forward, non-streaming): `frames[f]` = NCHW `[1,3,1008,1008]`; one text
     /// prompt (`input_ids[1,32]` + `text_mask`). Returns per-frame `obj_id → 288² mask logits`.
     pub fn propagate(
