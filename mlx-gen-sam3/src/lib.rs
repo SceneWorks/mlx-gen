@@ -17,10 +17,14 @@
 
 pub mod config;
 pub mod detr;
+pub mod mask;
+pub mod model;
 pub mod text;
 pub mod vision;
 
 pub use config::{Sam3DetrConfig, Sam3TextConfig, Sam3VisionConfig};
 pub use detr::{DetectorOutput, Sam3Detector};
+pub use mask::{post_process_instances, Instance, Sam3MaskHead};
+pub use model::{Sam3ImageSegmenter, SegmentationOutput};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use vision::Sam3VisionEncoder;

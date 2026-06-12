@@ -419,6 +419,8 @@ pub struct DetectorOutput {
     pub presence_logits: Array,
     /// `[1, Q, D]` final decoder query hidden states (output-LN'd) — the mask head consumes these.
     pub query_hidden: Array,
+    /// `[1, H·W, D]` DETR encoder output (the encoded 72² level) — the mask head consumes this.
+    pub encoder_hidden_states: Array,
 }
 
 impl Sam3Detector {
@@ -560,6 +562,7 @@ impl Sam3Detector {
             pred_boxes,
             presence_logits,
             query_hidden,
+            encoder_hidden_states: enc,
         })
     }
 
