@@ -1206,8 +1206,7 @@ mod tests {
         let empty = Array::from_slice(&[] as &[f32], &[0]);
         assert_eq!(empty.size(), 0);
         let err = scalar_alpha(&empty)
-            .err()
-            .expect("size-0 alpha must be a typed error, not Ok")
+            .expect_err("size-0 alpha must be a typed error, not Ok")
             .to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
