@@ -583,6 +583,246 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The Bernini renderer inference knobs preserved beside the converted snapshot (consumed by the
+/// sc-4706 provider; the loadable `config.json` carries only the Wan2.2 architecture).
+const BERNINI_RENDERER_SIDECAR: &str = "bernini_renderer.json";
+
+/// Diffusers `WanTransformer3DModel` keys → mlx-gen **internal** `WanTransformer` keys (sc-4705).
+///
+/// This is the inverse of [`crate::adapters`]'s internal→diffusers `normalize`, composed with the
+/// `patch_embedding` conv→Linear reshape that [`sanitize_wan_transformer`] already applies. It lets a
+/// diffusers-layout Wan2.2 transformer (here: a Bernini renderer DiT, shipped diffusers-named in the
+/// combined `bernini/` index) load through the validated dual-expert [`crate::pipeline`] /
+/// [`WanTransformer::from_weights`] path — the same path the native `convert_t2v_14b` output uses.
+///
+/// The map is a verified 1:1 bijection (1095 tensors / 42 key patterns) against a native-converted
+/// `wan2_2_t2v_a14b` expert:
+///   - `attn1.{to_q,to_k,to_v,to_out.0,norm_q,norm_k}` → `self_attn.{q,k,v,o,norm_q,norm_k}`;
+///     `attn2.*` → `cross_attn.*`
+///   - `ffn.net.0.proj` → `ffn.fc1`, `ffn.net.2` → `ffn.fc2`, `norm2` → `norm3`,
+///     per-block `scale_shift_table` → `modulation`
+///   - `condition_embedder.{text,time}_embedder.linear_{1,2}` → `{text,time}_embedding_{0,1}`,
+///     `condition_embedder.time_proj` → `time_projection`
+///   - `patch_embedding.weight` `[dim,16,1,2,2]` → reshape → `patch_embedding_proj.weight` `[dim,64]`;
+///     `proj_out` → `head.head`; top-level `scale_shift_table` → `head.modulation`
+pub fn sanitize_wan_transformer_diffusers(
+    raw: &HashMap<String, Array>,
+) -> Result<HashMap<String, Array>> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (key, value) in raw {
+        // Conv3d patch embed [dim, in, 1, 2, 2] → Linear [dim, in·4] (same as the native path).
+        if key == "patch_embedding.weight" {
+            let s = value.shape();
+            let cols: i32 = s[1..].iter().product();
+            out.insert(
+                "patch_embedding_proj.weight".into(),
+                value.reshape(&[s[0], cols])?,
+            );
+            continue;
+        }
+        if key == "patch_embedding.bias" {
+            out.insert("patch_embedding_proj.bias".into(), value.clone());
+            continue;
+        }
+        // Final-norm modulation table + output projection (top-level, not per-block).
+        if key == "scale_shift_table" {
+            out.insert("head.modulation".into(), value.clone());
+            continue;
+        }
+        if let Some(rest) = key.strip_prefix("proj_out.") {
+            out.insert(format!("head.head.{rest}"), value.clone());
+            continue;
+        }
+        // Global condition embedder → text/time embeddings + time projection.
+        let mut t = key
+            .replace(
+                "condition_embedder.text_embedder.linear_1",
+                "text_embedding_0",
+            )
+            .replace(
+                "condition_embedder.text_embedder.linear_2",
+                "text_embedding_1",
+            )
+            .replace(
+                "condition_embedder.time_embedder.linear_1",
+                "time_embedding_0",
+            )
+            .replace(
+                "condition_embedder.time_embedder.linear_2",
+                "time_embedding_1",
+            )
+            .replace("condition_embedder.time_proj", "time_projection");
+        // Per-block attention / FFN / norms / modulation.
+        if t.starts_with("blocks.") {
+            t = t
+                .replace(".attn1.to_out.0", ".self_attn.o")
+                .replace(".attn1.to_q", ".self_attn.q")
+                .replace(".attn1.to_k", ".self_attn.k")
+                .replace(".attn1.to_v", ".self_attn.v")
+                .replace(".attn1.norm_q", ".self_attn.norm_q")
+                .replace(".attn1.norm_k", ".self_attn.norm_k")
+                .replace(".attn2.to_out.0", ".cross_attn.o")
+                .replace(".attn2.to_q", ".cross_attn.q")
+                .replace(".attn2.to_k", ".cross_attn.k")
+                .replace(".attn2.to_v", ".cross_attn.v")
+                .replace(".attn2.norm_q", ".cross_attn.norm_q")
+                .replace(".attn2.norm_k", ".cross_attn.norm_k")
+                .replace(".ffn.net.0.proj", ".ffn.fc1")
+                .replace(".ffn.net.2", ".ffn.fc2")
+                .replace(".norm2.", ".norm3.")
+                .replace(".scale_shift_table", ".modulation");
+        }
+        out.insert(t, value.clone());
+    }
+    Ok(out)
+}
+
+/// Pull one renderer expert out of the combined Bernini `bernini/` index: every tensor whose key
+/// starts with `prefix` (`diff_dec.transformer.` = high-noise / `diff_dec_low.transformer_2.` = low),
+/// the prefix stripped. Reads shard-by-shard and keeps only the matching (lazy, mmap-backed) arrays,
+/// so the ~168 GB of non-renderer weights (MLLM / T5 / VAE / connector / vit_decoder) packed in the
+/// same shards are never materialized.
+fn extract_bernini_expert(bernini_dir: &Path, prefix: &str) -> Result<HashMap<String, Array>> {
+    let mut shards: Vec<PathBuf> = std::fs::read_dir(bernini_dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .collect();
+    shards.sort();
+    if shards.is_empty() {
+        return Err(Error::Msg(format!(
+            "assemble_bernini_renderer_snapshot: no .safetensors shards under {}",
+            bernini_dir.display()
+        )));
+    }
+    let mut out = HashMap::new();
+    for shard in &shards {
+        let w = Weights::from_file(shard)?;
+        for k in w.keys() {
+            if let Some(rest) = k.strip_prefix(prefix) {
+                out.insert(rest.to_string(), w.require(k)?.clone());
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::Msg(format!(
+            "assemble_bernini_renderer_snapshot: no keys with prefix '{prefix}' under {} \
+             (expected a ByteDance/Bernini-Diffusers `bernini/` index)",
+            bernini_dir.display()
+        )));
+    }
+    Ok(out)
+}
+
+/// The Bernini renderer knobs, read from the package `config.json` where present, else the upstream
+/// `BerniniRendererConfig` defaults. The provider (sc-4706) reads these for the source-id rotary,
+/// expert-switch boundary, and flow shift.
+fn bernini_renderer_knobs(pkg: &Path) -> serde_json::Value {
+    use serde_json::json;
+    let cfg: serde_json::Value = std::fs::read(pkg.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({}));
+    let f = |k: &str, d: f64| cfg.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
+    let b = |k: &str, d: bool| cfg.get(k).and_then(serde_json::Value::as_bool).unwrap_or(d);
+    let i = |k: &str, d: i64| cfg.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
+    json!({
+        "switch_dit_boundary": f("switch_dit_boundary", 0.875),
+        "shift": f("shift", 3.0),
+        "use_src_id_rotary_emb": b("use_src_id_rotary_emb", true),
+        "interpolate_src_id": b("interpolate_src_id", true),
+        "max_trained_src_id": i("max_trained_src_id", 5),
+        "max_sequence_length": i("max_sequence_length", 512),
+        "flow_shift": f("flow_shift", 5.0),
+    })
+}
+
+/// Assemble a native MLX **Bernini renderer** snapshot from a `ByteDance/Bernini-Diffusers` package
+/// (sc-4705). The renderer is Wan2.2-T2V-A14B verbatim, finetuned; the only Bernini-specific weights
+/// are the two dual-expert DiTs, which the full package bundles into one combined `bernini/` index
+/// (38 F32 shards) under the `diff_dec.transformer.` (high-noise) and `diff_dec_low.transformer_2.`
+/// (low-noise) prefixes. The stock Wan2.2 UMT5 / z16 VAE / tokenizer — which the reference
+/// `BerniniRendererModel` itself loads from its `wan22_base` — are reused from a converted base-Wan
+/// snapshot (`base_wan_snapshot`, a [`convert_t2v_14b`] output) rather than re-derived.
+///
+/// Emits the dual-expert layout the existing `wan2_2_t2v_14b` provider loads:
+///   - `high_noise_model.safetensors` ← `diff_dec.transformer.*` → internal → bf16 (+ optional Q4/Q8)
+///   - `low_noise_model.safetensors`  ← `diff_dec_low.transformer_2.*` → internal → bf16 (+ Q4/Q8)
+///   - `t5_encoder.safetensors`, `vae.safetensors`, `tokenizer.json` ← `base_wan_snapshot` (link or copy)
+///   - `config.json` (the loadable `wan22_t2v_14b` preset) + `bernini_renderer.json` (Bernini knobs)
+///
+/// `link == true` symlinks the shared components (zero-copy; the engine resolves symlinks); `false`
+/// copies them (a portable, self-contained snapshot). The extracted DiTs are always written fresh
+/// (they are F32 in the package and re-saved bf16, halving them). Idempotent: existing targets are
+/// replaced.
+pub fn assemble_bernini_renderer_snapshot(
+    out_dir: impl AsRef<Path>,
+    bernini_diffusers_dir: impl AsRef<Path>,
+    base_wan_snapshot: impl AsRef<Path>,
+    quantize: Option<(i32, i32)>,
+    link: bool,
+) -> Result<PathBuf> {
+    let out_dir = out_dir.as_ref();
+    let pkg = bernini_diffusers_dir.as_ref();
+    let base = base_wan_snapshot.as_ref();
+
+    let bernini_dir = pkg.join("bernini");
+    if !bernini_dir.is_dir() {
+        return Err(Error::Msg(format!(
+            "assemble_bernini_renderer_snapshot: no `bernini/` dir under {} (point at a \
+             ByteDance/Bernini-Diffusers snapshot root)",
+            pkg.display()
+        )));
+    }
+    // The stock Wan2.2 components Bernini-R reuses (the reference loads T5/VAE from `wan22_base`).
+    const SHARED: [&str; 3] = [
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+        "tokenizer.json",
+    ];
+    for name in SHARED {
+        if !base.join(name).is_file() {
+            return Err(Error::Msg(format!(
+                "assemble_bernini_renderer_snapshot: base snapshot {} is missing {name} (point at a \
+                 convert_t2v_14b output — Bernini-R reuses the stock Wan2.2 T5/VAE/tokenizer)",
+                base.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(out_dir)?;
+
+    // 1. The two renderer experts: diffusers → internal → bf16 (+ optional Q4/Q8). Done one at a
+    //    time so only one expert's tensors are materialized at the save eval.
+    for (prefix, out_name) in [
+        ("diff_dec.transformer.", "high_noise_model.safetensors"),
+        ("diff_dec_low.transformer_2.", "low_noise_model.safetensors"),
+    ] {
+        let raw = extract_bernini_expert(&bernini_dir, prefix)?;
+        let mut expert = sanitize_wan_transformer_diffusers(&raw)?;
+        drop(raw);
+        cast_map(&mut expert, Dtype::Bfloat16)?;
+        let expert = match quantize {
+            Some((bits, group)) => quantize_wan_transformer(expert, bits, group)?,
+            None => expert,
+        };
+        save_map(out_dir.join(out_name), &expert)?;
+    }
+
+    // 2. Loadable Wan2.2 config + preserved Bernini renderer knobs.
+    write_json(out_dir.join("config.json"), &wan22_t2v_14b_config(quantize))?;
+    write_json(
+        out_dir.join(BERNINI_RENDERER_SIDECAR),
+        &bernini_renderer_knobs(pkg),
+    )?;
+
+    // 3. Shared stock-Wan2.2 components (link or copy).
+    for name in SHARED {
+        place_component(&out_dir.join(name), &base.join(name), link)?;
+    }
+
+    Ok(out_dir.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +837,80 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), v.clone()))
             .collect()
+    }
+
+    /// sc-4705: diffusers `WanTransformer3DModel` keys → internal `WanTransformer` keys is a faithful
+    /// bijection (one representative tensor per pattern), and the patch-embed conv flattens to a Linear.
+    #[test]
+    fn bernini_diffusers_key_map() {
+        let lin = |o: i32, i: i32| Array::ones::<f32>(&[o, i]).unwrap();
+        let vec = |n: i32| Array::ones::<f32>(&[n]).unwrap();
+        let raw = m(&[
+            (
+                "patch_embedding.weight",
+                Array::ones::<f32>(&[8, 16, 1, 2, 2]).unwrap(),
+            ),
+            ("patch_embedding.bias", vec(8)),
+            ("scale_shift_table", Array::ones::<f32>(&[1, 2, 8]).unwrap()),
+            ("proj_out.weight", lin(64, 8)),
+            ("proj_out.bias", vec(64)),
+            (
+                "condition_embedder.text_embedder.linear_1.weight",
+                lin(8, 4096),
+            ),
+            (
+                "condition_embedder.text_embedder.linear_2.weight",
+                lin(8, 8),
+            ),
+            (
+                "condition_embedder.time_embedder.linear_1.weight",
+                lin(8, 256),
+            ),
+            (
+                "condition_embedder.time_embedder.linear_2.weight",
+                lin(8, 8),
+            ),
+            ("condition_embedder.time_proj.weight", lin(48, 8)),
+            ("blocks.0.attn1.to_q.weight", lin(8, 8)),
+            ("blocks.0.attn1.to_out.0.weight", lin(8, 8)),
+            ("blocks.0.attn1.norm_q.weight", vec(8)),
+            ("blocks.0.attn2.to_k.weight", lin(8, 8)),
+            ("blocks.0.ffn.net.0.proj.weight", lin(32, 8)),
+            ("blocks.0.ffn.net.2.weight", lin(8, 32)),
+            ("blocks.0.norm2.weight", vec(8)),
+            (
+                "blocks.0.scale_shift_table",
+                Array::ones::<f32>(&[1, 6, 8]).unwrap(),
+            ),
+        ]);
+        let out = sanitize_wan_transformer_diffusers(&raw).unwrap();
+        let mut keys: Vec<&str> = out.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "blocks.0.cross_attn.k.weight",
+                "blocks.0.ffn.fc1.weight",
+                "blocks.0.ffn.fc2.weight",
+                "blocks.0.modulation",
+                "blocks.0.norm3.weight",
+                "blocks.0.self_attn.norm_q.weight",
+                "blocks.0.self_attn.o.weight",
+                "blocks.0.self_attn.q.weight",
+                "head.head.bias",
+                "head.head.weight",
+                "head.modulation",
+                "patch_embedding_proj.bias",
+                "patch_embedding_proj.weight",
+                "text_embedding_0.weight",
+                "text_embedding_1.weight",
+                "time_embedding_0.weight",
+                "time_embedding_1.weight",
+                "time_projection.weight",
+            ]
+        );
+        // Conv patch embed [8, 16, 1, 2, 2] flattens to the Linear [8, 16·1·2·2 = 64].
+        assert_eq!(out["patch_embedding_proj.weight"].shape(), [8, 64]);
     }
 
     /// Key renames: Sequential index → layer_N, resample/to_qkv/proj conv renames.
