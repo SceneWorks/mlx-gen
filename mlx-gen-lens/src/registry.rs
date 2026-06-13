@@ -10,7 +10,7 @@
 //!
 //! **Surface.** This is a pure **T2I** generator: no img2img / ControlNet / IP conditioning (none
 //! exists in the Lens port). **LoRA + LoKr** merge into the DiT's joint-attention projections at load
-//! (sc-3174 — inference consumption; training stays Python). The dense path is bf16; the `Fp32`
+//! (sc-3174 — inference consumption; native-MLX *training* is [`crate::training`], sc-5148). The dense path is bf16; the `Fp32`
 //! precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE experts (sc-3172 —
 //! the ~38 GB / 20 B-param bulk → ~12 GB) **and** the DiT's linears (sc-3175) at load.
 //!

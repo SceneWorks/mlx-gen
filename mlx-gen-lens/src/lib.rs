@@ -79,6 +79,12 @@
 //!   the prompt before encoding. **Off by default** ([`pipeline::GenerateOptions::enable_reasoner`] +
 //!   [`pipeline::LensPipeline::attach_reasoner`]); the API-based path needs no MLX. Validated vs torch
 //!   `generate` (template byte-exact, greedy prefix match, cache-equivalence bit-exact).
+//! - **sc-5148** — native-MLX LoRA/LoKr **training** ([`training::LensTrainer`]): the core
+//!   [`Trainer`](mlx_gen::Trainer) contract on the base `microsoft/Lens` DiT (functional autograd over
+//!   the joint-attention adapter factors; flow-match target `noise − x0`, timestep `t`; latents via the
+//!   Flux.2 `encode_init_latents` chain; Q8 caption encoder, dropped post-cache). Writes the
+//!   diffusers/PEFT `.safetensors` the [`adapters`] inference path reloads — retiring the Python
+//!   `lens_train_runner.py`, the last Lens Python holdout (epic 3482).
 //!
 //! The Lens-Turbo engine is complete; only the SceneWorks worker cutover (separate repo) remains.
 
@@ -92,4 +98,5 @@ pub mod resolution;
 pub mod schedule;
 pub mod text;
 pub mod text_encoder;
+pub mod training;
 pub mod vae;
