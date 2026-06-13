@@ -182,6 +182,7 @@ impl PackedForward {
 
 /// All the per-step guidance knobs (the omegas are already `omega_scale`-rescaled when the low-noise
 /// expert is active — done by the caller).
+#[derive(Clone)]
 pub struct GuidanceParams {
     pub omega_vid: f32,
     pub omega_img: f32,
