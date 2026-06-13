@@ -565,6 +565,7 @@ dependencies = [
  "mlx-gen-wan",
  "pmetal-mlx-rs",
  "serde_json",
+ "tokenizers",
 ]
 
 [[package]]
