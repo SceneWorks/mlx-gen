@@ -23,7 +23,7 @@
 //! Sequence-axis gather is `take_axis`; scatter (write a few rows back into the buffer) is the
 //! one-hot-selection matmul idiom (no in-place index assignment), matching the sensenova port.
 
-use mlx_rs::ops::{add, concatenate_axis, matmul, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::Result;
@@ -163,29 +163,27 @@ pub fn mar_schedule(n_query: i32, planning_step: usize, order: &[i32]) -> Vec<Ve
 }
 
 // ---------------------------------------------------------------------------
-// Sequence-axis scatter (one-hot matmul; no in-place index assignment).
+// Sequence-axis scatter (row gather; bit-exact, no matmul reduction).
 // ---------------------------------------------------------------------------
 
 /// Overwrite the rows of `base` `[1, L, H]` at positions `idx` with `src` `[1, n, H]` (row `j` ←
-/// `src[0, j]`), leaving the other rows untouched. `idx.len() == n`. Done with a one-hot selection
-/// matmul `P[L, n]` (P[idx[j], j] = 1): `keep = base·(1−sel) + reshape(P · src[0])`.
-fn scatter_rows(base: &Array, idx: &[i32], src: &Array) -> Result<Array> {
+/// `src[0, j]`), leaving the other rows untouched. `idx.len() == n`. Implemented as a pure row gather
+/// over `concat([base; src])` — `out[l] = base[l]` for un-touched rows, `src[j]` where `idx[j] == l` —
+/// so it is **bit-exact** (a one-hot matmul would pick up the Metal f32 matmul floor instead). Also the
+/// `masked_scatter` primitive for [`crate::assembly::format_mllm_inputs_embeds`].
+pub(crate) fn scatter_rows(base: &Array, idx: &[i32], src: &Array) -> Result<Array> {
     let sh = base.shape();
     let (l, h) = (sh[1], sh[2]);
     let n = idx.len() as i32;
-    let dt = base.dtype();
+    let stacked = concatenate_axis(&[&base.reshape(&[l, h])?, &src.reshape(&[n, h])?], 0)?; // [L+n, H]
 
-    let mut p = vec![0f32; (l * n) as usize];
-    let mut sel = vec![0f32; l as usize];
+    let mut gi: Vec<i32> = (0..l).collect(); // un-touched rows keep their own index
     for (j, &pos) in idx.iter().enumerate() {
-        p[pos as usize * n as usize + j] = 1.0;
-        sel[pos as usize] = 1.0;
+        gi[pos as usize] = l + j as i32; // touched rows point into the src block
     }
-    let p_arr = Array::from_slice(&p, &[l, n]).as_dtype(dt)?;
-    let scattered = matmul(&p_arr, &src.reshape(&[n, h])?)?.reshape(&[1, l, h])?; // [1,L,H], 0 off-idx
-    let sel_col = Array::from_slice(&sel, &[1, l, 1]).as_dtype(dt)?;
-    let keep = multiply(base, &subtract(Array::from_f32(1.0), &sel_col)?)?;
-    Ok(add(&keep, &scattered)?)
+    Ok(stacked
+        .take_axis(Array::from_slice(&gi, &[l]), 0)?
+        .reshape(&[1, l, h])?)
 }
 
 // ---------------------------------------------------------------------------

@@ -586,9 +586,10 @@ impl WanVae {
         })
     }
 
-    /// Encode a video `[B, 3, T, H, W]` (T = 1 + 4·k, values in `[-1, 1]`) → normalized latent
-    /// `[B, z, T_lat, H/8, W/8]` via chunked causal encoding. Requires encoder weights.
-    pub fn encode(&self, video: &Array) -> Result<Array> {
+    /// Run the chunked causal encoder + the post-encoder conv → the raw Gaussian moments
+    /// `(mean, logvar)`, each `[B, z, T_lat, H/8, W/8]` (the `post_conv1` output split on the channel
+    /// axis), **before** latent normalization — the reference `DiagonalGaussianDistribution.parameters`.
+    fn encode_moments(&self, video: &Array) -> Result<(Array, Array)> {
         let (post_conv1, encoder) = self
             .encoder
             .as_ref()
@@ -611,10 +612,40 @@ impl WanVae {
                 Some(o) => concatenate_axis(&[&o, &chunk_out], 2)?,
             });
         }
-
-        let mu = &split(&post_conv1.forward(&out.unwrap(), None)?, 2, 1)?[0];
-        contiguous(&multiply(&subtract(mu, &self.mean)?, &self.inv_std)?)
+        let parts = split(&post_conv1.forward(&out.unwrap(), None)?, 2, 1)?; // [mean, logvar]
+        Ok((parts[0].clone(), parts[1].clone()))
     }
+
+    /// Latent normalization by the z16 stats: `(x − mean)·inv_std`.
+    fn normalize_latent(&self, x: &Array) -> Result<Array> {
+        contiguous(&multiply(&subtract(x, &self.mean)?, &self.inv_std)?)
+    }
+
+    /// Encode a video `[B, 3, T, H, W]` (T = 1 + 4·k, values in `[-1, 1]`) → normalized latent
+    /// `[B, z, T_lat, H/8, W/8]` via chunked causal encoding (`DiagonalGaussianDistribution.mode()` =
+    /// the Gaussian mean). Requires encoder weights.
+    pub fn encode(&self, video: &Array) -> Result<Array> {
+        let (mean, _logvar) = self.encode_moments(video)?;
+        self.normalize_latent(&mean)
+    }
+
+    /// Encode + **sample** the Gaussian (`DiagonalGaussianDistribution.sample()`): `mean +
+    /// exp(0.5·clamp(logvar, −30, 20))·eps`, then latent-normalize. `eps` is standard-normal noise of
+    /// the latent shape `[B, z, T_lat, H/8, W/8]`, taken as an argument so the result is deterministic
+    /// (the reference draws it from the request seed). Bernini's `get_vae_features` uses this for
+    /// **video** source conditioning; images use [`encode`] (`.mode()`).
+    pub fn encode_sample(&self, video: &Array, eps: &Array) -> Result<Array> {
+        let (mean, logvar) = self.encode_moments(video)?;
+        self.normalize_latent(&reparameterize(&mean, &logvar, eps)?)
+    }
+}
+
+/// `DiagonalGaussianDistribution.sample()`: `mean + exp(0.5·clamp(logvar, −30, 20))·eps`. The
+/// `[−30, 20]` log-variance clamp is the diffusers default.
+fn reparameterize(mean: &Array, logvar: &Array, eps: &Array) -> Result<Array> {
+    let logvar = minimum(&maximum(logvar, scalar(-30.0))?, scalar(20.0))?;
+    let std = multiply(&logvar, scalar(0.5))?.exp()?;
+    Ok(add(mean, &multiply(&std, eps)?)?)
 }
 
 #[cfg(test)]
@@ -631,5 +662,26 @@ mod tests {
         let s = (2.0f32).sqrt() / (5.0f32).sqrt();
         assert!((got[0] - 1.0 * s).abs() < 1e-6);
         assert!((got[1] - 2.0 * s).abs() < 1e-6);
+    }
+
+    /// `reparameterize` = `mean + exp(0.5·clamp(logvar, −30, 20))·eps`. Checks the formula and the
+    /// log-variance clamp at both ends (50 → 20, −50 → −30) against hand-computed values.
+    #[test]
+    fn reparameterize_matches_closed_form() {
+        let mean = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0], &[4]);
+        let logvar = Array::from_slice(&[0.0f32, 4.0, 50.0, -50.0], &[4]);
+        let eps = Array::from_slice(&[2.0f32, 1.0, -1.0, 4.0], &[4]);
+        let got = reparameterize(&mean, &logvar, &eps).unwrap();
+        let got = got.as_slice::<f32>();
+        // std = exp(0.5·clamp(logvar)): exp(0)=1, exp(2), exp(10) (clamped 20), exp(-15) (clamped -30).
+        let want = [
+            1.0 + 1.0 * 2.0,
+            -2.0 + (2.0f32).exp() * 1.0,
+            0.5 - (10.0f32).exp(),
+            3.0 + (-15.0f32).exp() * 4.0,
+        ];
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() <= 1e-3 * w.abs().max(1.0), "got {g} want {w}");
+        }
     }
 }

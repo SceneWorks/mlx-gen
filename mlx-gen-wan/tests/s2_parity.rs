@@ -14,6 +14,7 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::WanVae;
+use mlx_rs::Array;
 
 fn fixture() -> Weights {
     let path = concat!(
@@ -77,5 +78,28 @@ fn wan_vae_encode_matches_reference() {
     assert!(
         mean_rel < 1e-3,
         "encode diverged from reference: mean_rel={mean_rel:.3e} max|Δ|={max_abs:.3e}"
+    );
+}
+
+/// `encode_sample` (the `.sample()` path used by Bernini's video `get_vae_features`) reduces to
+/// `encode` (the `.mode()` path) when the injected Gaussian noise is zero — both are
+/// `normalize(mean)`. This gates that the sample path shares the (already-parity'd) chunked encoder
+/// and that the reparameterize plumbing is a no-op at `eps = 0`. The clamp/exp/std·eps formula itself
+/// is unit-tested in `vae.rs` (`reparameterize_matches_closed_form`).
+#[test]
+fn wan_vae_encode_sample_eps0_equals_mode() {
+    let w = fixture();
+    let vae = WanVae::from_weights(&w).expect("build WanVae");
+
+    let enc_in = w.require("enc_in").expect("enc_in");
+    let mode = vae.encode(enc_in).expect("encode");
+    let eps = Array::zeros::<f32>(mode.shape()).expect("zeros eps");
+    let sampled = vae.encode_sample(enc_in, &eps).expect("encode_sample");
+
+    let (max_abs, mean_rel) = diff(sampled.as_slice::<f32>(), mode.as_slice::<f32>());
+    println!("[encode_sample eps=0] max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
+    assert!(
+        max_abs < 1e-6,
+        "encode_sample(eps=0) must equal encode (mode): max|Δ|={max_abs:.3e}"
     );
 }
