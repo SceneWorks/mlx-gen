@@ -15,16 +15,22 @@ use mlx_gen::{Error, Result};
 use mlx_gen_wan::pipeline::preprocess_i2v_image;
 use mlx_gen_wan::WanVae;
 
-/// One conditioning image `[1,16,1,H/8,W/8]` (z16, normalized): resize → `[-1,1]` `[3,H,W]` →
-/// `[1,3,1,H,W]` → `WanVae::encode`.
+/// Drop the leading batch dim of a `WanVae::encode` output `[1, z, T, H, W]` → `[z, T, H, W]`, the
+/// `[C, F, H, W]` layout `patchify` / [`crate::forward`] expect (the target latent is batch-free too).
+fn drop_batch(z: &Array) -> Result<Array> {
+    Ok(z.reshape(&z.shape()[1..])?)
+}
+
+/// One conditioning image `[16, 1, H/8, W/8]` (z16, normalized): resize → `[-1,1]` `[3,H,W]` →
+/// `[1,3,1,H,W]` → `WanVae::encode` → drop batch.
 pub fn encode_image(vae: &WanVae, image: &Image, width: u32, height: u32) -> Result<Array> {
     let chw = preprocess_i2v_image(image, width, height)?; // [3, H, W] in [-1, 1]
     let video = chw.expand_dims(0)?.expand_dims(2)?; // [1, 3, 1, H, W]
-    vae.encode(&video)
+    drop_batch(&vae.encode(&video)?)
 }
 
-/// One conditioning video clip `[1,16,T_lat,H/8,W/8]`: each frame resized to `[3,H,W]`, stacked on the
-/// temporal axis → `[1,3,T,H,W]` (T must be `1 + 4k`), → `WanVae::encode`.
+/// One conditioning video clip `[16,T_lat,H/8,W/8]`: each frame resized to `[3,H,W]`, stacked on the
+/// temporal axis → `[1,3,T,H,W]` (T must be `1 + 4k`), → `WanVae::encode` → drop batch.
 pub fn encode_videoclip(vae: &WanVae, frames: &[Image], width: u32, height: u32) -> Result<Array> {
     if frames.is_empty() {
         return Err(Error::Msg(
@@ -44,5 +50,5 @@ pub fn encode_videoclip(vae: &WanVae, frames: &[Image], width: u32, height: u32)
     }
     let refs: Vec<&Array> = chw_t.iter().collect();
     let video = concatenate_axis(&refs, 1)?.expand_dims(0)?; // [1, 3, T, H, W]
-    vae.encode(&video)
+    drop_batch(&vae.encode(&video)?)
 }
