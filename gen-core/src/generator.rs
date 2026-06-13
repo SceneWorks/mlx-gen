@@ -123,6 +123,13 @@ pub struct GenerationRequest {
     /// Sampling temperature for prompt enhancement (reference default 0.7 when `None`).
     pub enhance_temperature: Option<f32>,
 
+    // --- Super-resolution detail control (SeedVR2, sc-4815; ignored by other models) ---
+    /// SeedVR2 `--softness` (0..1) — pre-blurs the low-res input by round-tripping it through a
+    /// `1 + 7·softness`× smaller size before the model runs, so the generative upscaler invents more
+    /// detail (higher) or stays closer to the source (lower). `None`/0.0 ⇒ the reference default (no
+    /// pre-blur). Only the `seedvr2` model reads it; other models ignore it.
+    pub softness: Option<f32>,
+
     // --- Control ---
     pub cancel: CancelFlag,
 }
@@ -159,6 +166,7 @@ impl Default for GenerationRequest {
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,
             enhance_temperature: None,
+            softness: None,
             cancel: CancelFlag::default(),
         }
     }

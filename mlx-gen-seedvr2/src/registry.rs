@@ -159,7 +159,10 @@ impl Seedvr2Generator {
     ) -> Result<GenerationOutput> {
         self.validate_impl(req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let softness = 0.0; // no request field; the reference default
+        // SeedVR2 `--softness` (0..1): pre-blur the LR input so the upscaler invents more detail
+        // (higher) or stays closer to the source (lower). `None`/out-of-range ⇒ the reference
+        // default 0.0 (no pre-blur). sc-4815.
+        let softness = req.softness.unwrap_or(0.0).clamp(0.0, 1.0);
 
         // Video upscale: a VideoClip carries the LR source frame sequence → one upscaled clip.
         if let Some(clip) = req.video_clips().into_iter().next() {
