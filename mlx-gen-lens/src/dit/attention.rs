@@ -8,20 +8,29 @@ use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, split_sections, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use super::{join, load_weight, Linear};
+use super::{join, load_weight};
 
 /// QK-RMSNorm + block-norm epsilon (the Lens block builds `LensJointAttention(eps=1e-6)` via its own
 /// `eps` default).
 const RMS_EPS: f32 = 1e-6;
 
+/// Load a biased diffusers `[out, in]` projection as an [`AdaptableLinear`] (the LoRA/LoKr adapter
+/// targets, sc-3174). The dense forward is `x·Wᵀ + b`, identical to the sc-3168 [`super::Linear`].
+fn load_adaptable(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
+    let weight = w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?;
+    let bias = w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?;
+    Ok(AdaptableLinear::dense(weight, Some(bias)))
+}
+
 pub struct LensJointAttention {
-    img_qkv: Linear,
-    txt_qkv: Linear,
-    to_out: Linear,
-    to_add_out: Linear,
+    img_qkv: AdaptableLinear,
+    txt_qkv: AdaptableLinear,
+    to_out: AdaptableLinear,
+    to_add_out: AdaptableLinear,
     norm_q: Array,
     norm_k: Array,
     norm_added_q: Array,
@@ -40,10 +49,10 @@ impl LensJointAttention {
         dtype: Dtype,
     ) -> Result<Self> {
         Ok(Self {
-            img_qkv: Linear::load(w, &join(prefix, "img_qkv"), true, dtype)?,
-            txt_qkv: Linear::load(w, &join(prefix, "txt_qkv"), true, dtype)?,
-            to_out: Linear::load(w, &join(prefix, "to_out.0"), true, dtype)?,
-            to_add_out: Linear::load(w, &join(prefix, "to_add_out"), true, dtype)?,
+            img_qkv: load_adaptable(w, &join(prefix, "img_qkv"), dtype)?,
+            txt_qkv: load_adaptable(w, &join(prefix, "txt_qkv"), dtype)?,
+            to_out: load_adaptable(w, &join(prefix, "to_out.0"), dtype)?,
+            to_add_out: load_adaptable(w, &join(prefix, "to_add_out"), dtype)?,
             norm_q: load_weight(w, &join(prefix, "norm_q"), dtype)?,
             norm_k: load_weight(w, &join(prefix, "norm_k"), dtype)?,
             norm_added_q: load_weight(w, &join(prefix, "norm_added_q"), dtype)?,
@@ -72,7 +81,7 @@ impl LensJointAttention {
         let (h, hd) = (self.num_heads, self.head_dim);
 
         // Fused QKV per stream → [B, seq, 3, heads, head_dim] → q/k/v each [B, seq, heads, head_dim].
-        let qkv = |lin: &Linear, x: &Array, seq: i32| -> Result<(Array, Array, Array)> {
+        let qkv = |lin: &AdaptableLinear, x: &Array, seq: i32| -> Result<(Array, Array, Array)> {
             let t = lin.forward(x)?.reshape(&[b, seq, 3, h, hd])?;
             let parts = split(&t, 3, 2)?; // 3 × [B, seq, 1, heads, head_dim]
             let q = parts[0].reshape(&[b, seq, h, hd])?;
@@ -114,6 +123,29 @@ impl LensJointAttention {
         let img_attn = self.to_out.forward(&parts[0])?;
         let txt_attn = self.to_add_out.forward(&parts[1])?;
         Ok((img_attn, txt_attn))
+    }
+}
+
+impl AdaptableHost for LensJointAttention {
+    /// Trained-file (diffusers/peft) module names → the fused attention projections (sc-3174). The
+    /// Lens trainer's `DEFAULT_LORA_TARGET_MODULES` = `img_qkv` / `txt_qkv` / `to_out.0` / `to_add_out`
+    /// (the QKV are fused `[3·inner, in]`, so a LoRA on them merges whole — no q/k/v split). `to_out`
+    /// is a `ModuleList([Linear, Identity])`, addressed `to_out.0`; accept the bare `to_out` alias too.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["img_qkv"] => Some(&mut self.img_qkv),
+            ["txt_qkv"] => Some(&mut self.txt_qkv),
+            ["to_out"] | ["to_out", "0"] => Some(&mut self.to_out),
+            ["to_add_out"] => Some(&mut self.to_add_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["img_qkv", "txt_qkv", "to_out.0", "to_add_out"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 }
 

@@ -6,6 +6,7 @@ use mlx_rs::fast::{layer_norm, rms_norm};
 use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -216,6 +217,33 @@ impl LensTransformer {
 
         let hidden = self.norm_out.forward(&hidden, &temb)?;
         self.proj_out.forward(&hidden)
+    }
+}
+
+impl AdaptableHost for LensTransformer {
+    /// Route trained-file (diffusers/peft) paths into the per-block joint-attention adapter targets
+    /// (sc-3174): `transformer_blocks.{i}.attn.{img_qkv,txt_qkv,to_out.0,to_add_out}`. Only the
+    /// attention projections are adapter targets (the Lens trainer's `DEFAULT_LORA_TARGET_MODULES`);
+    /// any other key surfaces as unmatched (loud), never silently dropped.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(mlx_gen::adapters::prefixed_paths(
+                &format!("transformer_blocks.{i}"),
+                b,
+            ));
+        }
+        out
     }
 }
 

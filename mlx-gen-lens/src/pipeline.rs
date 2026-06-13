@@ -294,6 +294,13 @@ impl LensPipeline {
     pub fn vae(&self) -> &Flux2Vae {
         &self.vae
     }
+
+    /// Apply LoRA/LoKr adapters to the DiT (sc-3174) — stacked, mixed, strict (errors on an unmatched
+    /// target). A LoRA trained on base `microsoft/Lens` applies to `Lens-Turbo` (same architecture).
+    pub fn apply_adapters(&mut self, specs: &[mlx_gen::AdapterSpec]) -> Result<()> {
+        crate::adapters::apply_lens_adapters(&mut self.transformer, specs)?;
+        Ok(())
+    }
 }
 
 /// Zero-pad each `[B, cur, C]` feature layer along the sequence axis to length `target`.

@@ -6,6 +6,7 @@ use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::{add, multiply, split};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -135,6 +136,21 @@ impl LensTransformerBlock {
         )?;
 
         Ok((encoder_hidden_states, hidden_states))
+    }
+}
+
+impl AdaptableHost for LensTransformerBlock {
+    /// The adapter targets live in the joint attention (`attn.{img_qkv,txt_qkv,to_out.0,to_add_out}`);
+    /// the modulations and SwiGLU MLPs are not in the Lens trainer's target set.
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        mlx_gen::adapters::prefixed_paths("attn", &self.attn)
     }
 }
 

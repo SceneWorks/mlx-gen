@@ -9,9 +9,10 @@
 //! arch). A request's explicit `steps` / `guidance` still override the per-id default.
 //!
 //! **Surface.** This is a pure **T2I** generator: no img2img / ControlNet / IP conditioning (none
-//! exists in the Lens port), no LoRA/LoKr inference merge (training stays Python). The dense path is
-//! bf16; the `Fp32` precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE
-//! experts at load (sc-3172 — the ~38 GB / 20 B-param bulk → ~12 GB); the DiT stays dense (sc-3175).
+//! exists in the Lens port). **LoRA + LoKr** merge into the DiT's joint-attention projections at load
+//! (sc-3174 — inference consumption; training stays Python). The dense path is bf16; the `Fp32`
+//! precision override is honored. **Q4/Q8** quantize the gpt-oss encoder's MoE experts at load
+//! (sc-3172 — the ~38 GB / 20 B-param bulk → ~12 GB); the DiT stays dense (sc-3175).
 //!
 //! **Registration mechanism:** the two `inventory::submit!`s below are collected by `mlx_gen`'s
 //! `inventory::collect!` at *link* time, so they activate whenever a consumer (the worker, or this
@@ -67,8 +68,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_guidance: true,
             supports_true_cfg: false,
             conditioning: vec![], // pure T2I — no img2img / control / IP in the Lens port
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-3174: LoRA + LoKr merge into the DiT's joint-attention projections at load.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["flow_match_euler"],
             schedulers: vec!["flow_match"],
             // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
@@ -105,18 +107,12 @@ pub struct LensGenerator {
 ///
 /// `spec.weights` is a `microsoft/Lens-Turbo` (or `microsoft/Lens`) snapshot dir (the diffusers
 /// multi-component tree). Dense runs **bf16**; `Precision::Fp32` loads the tight-gate f32 path.
-/// `spec.quantize` (Q4/Q8) quantizes the encoder's MoE experts at load (sc-3172). `control` /
-/// `ip_adapter` / `adapters` are not part of the Lens port and are rejected.
+/// `spec.quantize` (Q4/Q8) quantizes the encoder's MoE experts at load (sc-3172); `spec.adapters`
+/// (LoRA/LoKr) merge into the DiT (sc-3174). `control` / `ip_adapter` are not part of the Lens port.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> {
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(Error::Msg(format!(
             "{}: ControlNet / IP-Adapter conditioning is not part of the Lens port",
-            defaults.id
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{}: LoRA/LoKr adapters are not wired for inference (training stays Python)",
             defaults.id
         )));
     }
@@ -134,7 +130,10 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
         )))
         }
     };
-    let pipe = LensPipeline::load_quant(&root, dtype, spec.quantize)?;
+    let mut pipe = LensPipeline::load_quant(&root, dtype, spec.quantize)?;
+    if !spec.adapters.is_empty() {
+        pipe.apply_adapters(&spec.adapters)?;
+    }
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
@@ -273,7 +272,9 @@ mod tests {
             assert!(d.capabilities.supports_negative_prompt);
             assert!(!d.capabilities.supports_true_cfg);
             assert!(d.capabilities.conditioning.is_empty());
-            assert!(!d.capabilities.supports_lora);
+            // sc-3174: LoRA + LoKr merge into the DiT joint-attention projections at load.
+            assert!(d.capabilities.supports_lora);
+            assert!(d.capabilities.supports_lokr);
             // sc-3172: encoder MoE experts quantize to Q4/Q8 at load.
             assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
             // The defaults are exercised end-to-end in the e2e test; assert the constants here.
