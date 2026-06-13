@@ -26,7 +26,7 @@ use crate::control_transformer_block::ZImageControlBlock;
 use crate::transformer::{apply_pad, row_indices, ZImageTransformer};
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// Cached step-invariant control-forward inputs: the base patchify metadata + RoPE freqs, plus the
 /// embedded control context `c_emb` (which depends only on the constant `control_context` and the
@@ -376,9 +376,9 @@ impl ZImageControlTransformer {
         let mut hints = Vec::with_capacity(blocks.len());
         for (i, block) in blocks.iter().enumerate() {
             if i == 0 {
-                let bp = block
-                    .before_proj()
-                    .expect("control block 0 carries before_proj");
+                let bp = block.before_proj().ok_or_else(|| {
+                    Error::Msg("z-image control block 0 is missing before_proj".into())
+                })?;
                 c = add(&bp.forward(&c)?, x_base)?;
             }
             c = block.base.forward(&c, freqs_cis, t_emb)?;

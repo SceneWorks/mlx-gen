@@ -19,7 +19,7 @@ use mlx_rs::{
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 #[derive(Clone)]
 pub struct ZImageAttention {
@@ -203,13 +203,17 @@ fn rope_rotate(xr: &Array, xi: &Array, cos: &Array, sin: &Array) -> Result<(Arra
         Ok(vec![out_r, out_i])
     };
     let args = [xr.clone(), xi.clone(), cos.clone(), sin.clone()];
-    let mut out = if crate::compile_glue() {
+    let out = if crate::compile_glue() {
         compile(f, true)(&args)?
     } else {
         f(&args)?
     };
-    let out_i = out.pop().unwrap();
-    let out_r = out.pop().unwrap();
+    let [out_r, out_i]: [Array; 2] = out.try_into().map_err(|v: Vec<Array>| {
+        Error::Msg(format!(
+            "z-image rope_rotate: expected 2 rotated outputs, got {}",
+            v.len()
+        ))
+    })?;
     Ok((out_r, out_i))
 }
 

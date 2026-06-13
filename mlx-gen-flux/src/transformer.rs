@@ -303,16 +303,18 @@ impl FluxTransformer {
             (height / 16) as usize,
             (width / 16) as usize,
         )?;
-        let (e0, h0) = self.blocks[0].forward(&hidden, &encoder, &text_embeddings, &rope)?;
-        out.push(("block0_encoder".into(), e0));
-        out.push(("block0_hidden".into(), h0));
-
         let mut hidden = hidden;
         let mut encoder = encoder;
-        for block in &self.blocks {
+        // Capture block 0's output inside the loop (at i==0) rather than via a standalone pre-call
+        // that recomputed it — the loop already runs every block from the embedder output (F-065).
+        for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(&hidden, &encoder, &text_embeddings, &rope)?;
             encoder = e;
             hidden = h;
+            if i == 0 {
+                out.push(("block0_encoder".into(), encoder.clone()));
+                out.push(("block0_hidden".into(), hidden.clone()));
+            }
         }
         out.push(("joint_hidden".into(), hidden.clone()));
         out.push(("encoder_joint".into(), encoder.clone()));

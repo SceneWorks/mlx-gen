@@ -45,6 +45,11 @@ pub fn preprocess_clip_image_sized(image: &Image, size: usize) -> Result<Array> 
             image.pixels.len()
         )));
     }
+    if iw == 0 || ih == 0 {
+        return Err(Error::Msg(format!(
+            "ip-adapter reference image has a zero dimension ({iw}x{ih})"
+        )));
+    }
     // Resize shortest side to `size` (bicubic), preserving aspect.
     let scale = size as f64 / iw.min(ih) as f64;
     let rw = ((iw as f64 * scale).round() as usize).max(size);

@@ -210,8 +210,16 @@ pub fn encode_control_context(
     let control_latents = encode_init_latents(vae, control_image, target_width, target_height)?;
     let sh = control_latents.shape(); // [16, 1, H/8, W/8]
     let (c, fdim, h, w) = (sh[0], sh[1], sh[2], sh[3]);
-    let mask = Array::from_slice(&vec![0f32; (fdim * h * w) as usize], &[1, fdim, h, w]);
-    let inpaint = Array::from_slice(&vec![0f32; (c * fdim * h * w) as usize], &[c, fdim, h, w]);
+    // i64 intermediates before the usize cast — bounded by the validated max resolution today, but a
+    // raw i32 product is a latent overflow footgun if the caps change (F-056).
+    let mask = Array::from_slice(
+        &vec![0f32; (fdim as i64 * h as i64 * w as i64) as usize],
+        &[1, fdim, h, w],
+    );
+    let inpaint = Array::from_slice(
+        &vec![0f32; (c as i64 * fdim as i64 * h as i64 * w as i64) as usize],
+        &[c, fdim, h, w],
+    );
     Ok(concatenate_axis(&[&control_latents, &mask, &inpaint], 0)?)
 }
 

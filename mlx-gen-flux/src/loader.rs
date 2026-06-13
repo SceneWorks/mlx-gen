@@ -5,7 +5,7 @@ use std::path::Path;
 
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Result, WeightsSource};
+use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 use crate::config::{FluxTokenizerKind, FluxVariant};
@@ -114,7 +114,11 @@ pub fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
         .map(String::from)
         .collect();
     for k in keys {
-        let rest = k.strip_prefix("decoder.").unwrap();
+        let rest = k.strip_prefix("decoder.").ok_or_else(|| {
+            Error::Msg(format!(
+                "flux vae remap: key `{k}` lost its decoder. prefix"
+            ))
+        })?;
         let (target, transpose): (String, bool) = match rest {
             "conv_in.weight" => ("conv_in.conv.weight".into(), true),
             "conv_in.bias" => ("conv_in.conv.bias".into(), false),

@@ -21,7 +21,7 @@ use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::Flux2Config;
 use crate::kv_cache::{Flux2KvCache, Stream};
@@ -454,6 +454,14 @@ impl Modulation {
     fn forward(&self, temb: &Array) -> Result<Vec<(Array, Array, Array)>> {
         let mod_ = self.linear.forward(&silu(temb)?)?.expand_dims(1)?;
         let chunks = split(&mod_, (3 * self.sets) as i32, -1)?;
+        if chunks.len() != 3 * self.sets {
+            return Err(Error::Msg(format!(
+                "flux2 modulation: expected {} chunks (3×{} sets), got {}",
+                3 * self.sets,
+                self.sets,
+                chunks.len()
+            )));
+        }
         Ok((0..self.sets)
             .map(|i| {
                 (
@@ -614,8 +622,16 @@ impl Flux2Transformer {
             .forward(&require_f32_input(encoder_hidden_states)?)?;
 
         let drop_batch = |ids: &Array| -> Result<Array> {
-            if ids.shape().len() == 3 {
-                Ok(ids.reshape(&[ids.shape()[1], ids.shape()[2]])?)
+            let sh = ids.shape();
+            if sh.len() == 3 {
+                // The pos-embed table is built per-position for a single batch row; a B>1 ids tensor
+                // would silently produce the wrong RoPE (and the reshape only works for B==1) (F-063).
+                if sh[0] != 1 {
+                    return Err(Error::Msg(format!(
+                        "flux2 pos-embed ids: batch dim must be 1, got shape {sh:?}"
+                    )));
+                }
+                Ok(ids.reshape(&[sh[1], sh[2]])?)
             } else {
                 Ok(ids.clone())
             }
@@ -650,7 +666,13 @@ impl Flux2Transformer {
         }
 
         // Keep only the image tokens.
-        let img_seq = hidden.shape()[1] - txt_seq;
+        let total_seq = hidden.shape()[1];
+        if total_seq < txt_seq {
+            return Err(Error::Msg(format!(
+                "flux2: combined sequence length {total_seq} is shorter than the text sequence {txt_seq}"
+            )));
+        }
+        let img_seq = total_seq - txt_seq;
         let img_idx = Array::from_slice(
             &(txt_seq..hidden.shape()[1]).collect::<Vec<i32>>(),
             &[img_seq],

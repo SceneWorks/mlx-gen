@@ -144,6 +144,12 @@ impl Vae {
             image.clone()
         };
         let h = encoder.forward(&image4)?; // [1, 2C, H/8, W/8]
+        if h.shape()[1] % 2 != 0 {
+            return Err(Error::Msg(format!(
+                "z-image vae encode: expected an even (2C: mean|logvar) channel count, got {}",
+                h.shape()[1]
+            )));
+        }
         let c = h.shape()[1] / 2;
         let idx = Array::from_slice(&(0..c).collect::<Vec<i32>>(), &[c]);
         let mean = h.take_axis(&idx, 1)?; // first C channels

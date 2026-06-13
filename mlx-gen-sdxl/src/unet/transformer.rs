@@ -12,7 +12,7 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, group_norm};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 const GN_GROUPS: i32 = 32;
 const GN_EPS: f32 = 1e-5;
@@ -197,6 +197,11 @@ impl TransformerBlock {
         let proj_w = g("ff.net.0.proj.weight")?;
         let proj_b = g("ff.net.0.proj.bias")?;
         let two_h = proj_w.shape()[0];
+        if two_h % 2 != 0 {
+            return Err(Error::Msg(format!(
+                "sdxl GEGLU: ff.net.0.proj has odd output dim {two_h}; cannot split value/gate halves"
+            )));
+        }
         let hidden = two_h / 2;
         let split_row = |a: &Array, lo: i32, hi: i32| -> Result<Array> {
             let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);

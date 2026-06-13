@@ -13,7 +13,7 @@ use mlx_rs::ops::multiply;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
-use mlx_gen::{DiffusionSampler, Result};
+use mlx_gen::{DiffusionSampler, Error, Result};
 
 use crate::config::{BetaSchedule, DiffusionConfig};
 
@@ -189,7 +189,12 @@ impl EulerSampler {
     /// dtype (the reference's `.astype(dtype)`), so a `float16=True` denoise starts from f16 latents.
     pub fn scale_prior_noise(&self, noise: &Array) -> Result<Array> {
         use mlx_rs::ops::{add, rsqrt, square};
-        let s = scalar(*self.sigmas.last().unwrap());
+        let s = scalar(
+            *self
+                .sigmas
+                .last()
+                .ok_or_else(|| Error::Msg("sdxl sampler: empty sigma schedule".into()))?,
+        );
         let factor = rsqrt(&add(&square(&s)?, scalar(1.0))?)?;
         let prior = multiply(&multiply(noise, &s)?, &factor)?;
         Ok(prior.as_dtype(self.dtype)?)

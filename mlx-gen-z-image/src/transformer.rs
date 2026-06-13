@@ -619,7 +619,7 @@ pub(crate) fn image_pos_keep(
     let img_pad = (-(img_ori as i64)).rem_euclid(32) as i32;
     let img_total = img_ori + img_pad;
     let s0 = cap_total + 1;
-    let mut pos: Vec<i32> = Vec::with_capacity((img_total * 3) as usize);
+    let mut pos: Vec<i32> = Vec::with_capacity((img_total as i64 * 3) as usize);
     for fi in 0..ft {
         for hi in 0..ht {
             for wi in 0..wt {

@@ -137,6 +137,13 @@ impl Flux2KvCache {
 /// The trailing `n` tokens of `a` along the sequence axis (axis 2 in `[B, H, S, D]`).
 fn trailing(a: &Array, n: i32) -> Result<Array> {
     let s = a.shape()[2];
+    // n>s would make `s - n` negative, producing nonsense take_axis indices (a misconfigured
+    // num_ref_tokens) — surface it instead of silently returning the wrong slice (F-062).
+    if n < 0 || n > s {
+        return Err(Error::Msg(format!(
+            "flux2 kv-cache trailing: requested {n} trailing tokens of a {s}-token sequence"
+        )));
+    }
     let idx = Array::from_slice(&((s - n)..s).collect::<Vec<i32>>(), &[n]);
     Ok(a.take_axis(&idx, 2)?)
 }

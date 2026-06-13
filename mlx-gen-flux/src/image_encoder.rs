@@ -17,7 +17,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_gen_sdxl::{preprocess_clip_image, ClipVisionEncoder, VisionConfig};
 
 /// CLIP LN epsilon (matches the body + diffusers `layer_norm_eps`).
@@ -55,7 +55,9 @@ impl FluxIpImageEncoder {
     pub fn image_embeds(&self, pixel_values: &Array) -> Result<Array> {
         let pixel_values = pixel_values.as_dtype(self.dtype)?;
         let states = self.body.hidden_states(&pixel_values)?;
-        let last = states.last().expect("hidden_states non-empty"); // [B, 257, 1024]
+        let last = states
+            .last()
+            .ok_or_else(|| Error::Msg("flux image encoder produced no hidden states".into()))?; // [B, 257, 1024]
         let cls = last.take_axis(Array::from_int(0), 1)?; // [B, 1024] (CLS token, axis dropped)
         let pooled = layer_norm(&cls, Some(&self.post_ln_w), Some(&self.post_ln_b), LN_EPS)?;
         // visual_projection is a bias-free Linear with weight [proj, hidden] → embeds = pooled · Wᵀ.
