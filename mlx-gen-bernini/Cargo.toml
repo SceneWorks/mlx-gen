@@ -21,3 +21,5 @@ inventory = { workspace = true }
 serde_json = "1"
 # Source-media decode (i2i/v2v/r2v/rv2v conditioning). PNG + JPEG cover the still inputs.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Qwen2.5-VL ChatML tokenizer (planner templating, sc-5136).
+tokenizers = { workspace = true }
