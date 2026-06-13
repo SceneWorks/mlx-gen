@@ -556,6 +556,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-bernini"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-wan",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-chroma"
 version = "0.0.0"
 dependencies = [

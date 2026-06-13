@@ -942,6 +942,43 @@ impl WanTransformer {
             .expect("forward_cached yields one output for batch=1"))
     }
 
+    /// Patch-embed one latent `[C, F, H, W]` (f32) into the DiT token stream `[1, L, dim]` (bf16) +
+    /// its patch grid `(f, h, w)` — the embedding half of [`forward_cached`] exposed as a seam for the
+    /// Bernini renderer (sc-4706), which patch-embeds the noisy target **and** each conditioning source
+    /// separately (each with its own source-id RoPE) and concatenates them on the token axis before a
+    /// single packed forward. `L = f·h·w`.
+    pub fn patch_embed_tokens(&self, latent: &Array) -> Result<(Array, (usize, usize, usize))> {
+        let (tokens, grid) = patchify(latent, self.cfg.patch_size)?;
+        let l = (grid.0 * grid.1 * grid.2) as i32;
+        let x =
+            bf16(&self.patch_embedding.forward(&tokens)?)?.reshape(&[1, l, self.cfg.dim as i32])?;
+        Ok((x, grid))
+    }
+
+    /// Run the block stack + output head over a **pre-embedded, pre-packed** token sequence
+    /// `tokens` `[1, L, dim]` (bf16) with caller-supplied RoPE `cos`/`sin` `[L, 1, half_d]` and the
+    /// (scalar-timestep) cross-attention K/V cache — returning the per-token velocity
+    /// `[1, L, out_dim·∏patch]` (f32) **without** unpatchifying. This is [`forward_cached`]'s body
+    /// minus the (single-latent) patchify in / unpatchify out, the seam the Bernini renderer (sc-4706)
+    /// uses: at batch 1 the packed `[sources…, target]` sequence is plain full self-attention (the
+    /// reference's varlen attention with a single `cu_seqlens` segment), so the caller assembles the
+    /// token + RoPE concat, calls this once, then slices the target tokens and unpatchifies them.
+    pub fn forward_packed(
+        &self,
+        tokens: &Array,
+        t: f32,
+        cross_kv: &[(Array, Array)],
+        cos: &Array,
+        sin: &Array,
+    ) -> Result<Array> {
+        let (e, e0) = self.time_embed(t)?;
+        let mut x = tokens.clone();
+        for (block, kv) in self.blocks.iter().zip(cross_kv.iter()) {
+            x = block.forward(&x, &e0, kv, cos, sin)?;
+        }
+        self.apply_head(&x, &e)
+    }
+
     /// TI2V **per-token-timestep** batched DiT forward (sc-2680). Identical to [`forward_cached`](
     /// Self::forward_cached) but the timestep is a **per-token** vector `t_tokens` `[1, L]` (`L` = the
     /// patch-token count = the reference's `i2v_mask_tokens · timestep`), so each token carries its own
