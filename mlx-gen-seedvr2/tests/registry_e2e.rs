@@ -140,3 +140,32 @@ fn seedvr2_7b_loads_and_generates() {
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("7B generate ok: {}x{}", out.width, out.height);
 }
+
+/// Q8 (sc-5198) real-weight smoke: load 3B, quantize the DiT Linears to Q8, and run `generate`
+/// end-to-end (exercises the `quantized_matmul` forward path + the load-time quantize wiring). The
+/// numeric near-losslessness is gated separately in `quant_parity.rs`.
+#[test]
+fn seedvr2_q8_loads_and_generates() {
+    let Some(snap) = raw_dir() else {
+        eprintln!("SKIP: raw checkpoint absent");
+        return;
+    };
+    let mut pipe = Seedvr2Pipeline::load(
+        &snap,
+        "seedvr2_ema_3b_fp16.safetensors",
+        &DitConfig::seedvr2_3b(),
+        Dtype::Bfloat16,
+    )
+    .expect("load 3B from raw checkpoint");
+    pipe.quantize(8).expect("quantize Q8");
+
+    let lr = Image {
+        width: 96,
+        height: 96,
+        pixels: (0..96 * 96 * 3).map(|i| (i % 256) as u8).collect(),
+    };
+    let out = pipe.generate(&lr, 128, 128, 7, 0.0).expect("Q8 generate");
+    assert_eq!((out.width, out.height), (128, 128));
+    assert_eq!(out.pixels.len(), 128 * 128 * 3);
+    eprintln!("Q8 generate ok: {}x{}", out.width, out.height);
+}

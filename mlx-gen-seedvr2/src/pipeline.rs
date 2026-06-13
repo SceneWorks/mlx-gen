@@ -110,6 +110,14 @@ impl Seedvr2Pipeline {
         self.neg_embed.as_ref()
     }
 
+    /// Quantize the DiT Linears to `bits` (4 or 8) — group-wise affine, Linear-only (sc-5198). The
+    /// VAE stays dense (conv-dominated; its tiny attention Linears are left at `dtype`). `weights_bytes`
+    /// is intentionally **not** reduced — keeping the dense estimate makes the video chunk-size budget
+    /// conservative (quant shrinks weights, not activations, so the headroom is safe).
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.transformer.quantize(bits)
+    }
+
     /// Encode the preprocessed image to the conditioning latent `(B,16,T',h,w)` (scaled mean).
     pub fn encode(&self, processed: &Array) -> Result<Array> {
         self.vae.encode(processed)
