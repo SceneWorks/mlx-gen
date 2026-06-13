@@ -87,9 +87,14 @@ fn lens_dit_matches_reference() {
     let f32 = |k: &str| g.require(k).unwrap().as_dtype(Dtype::Float32).unwrap();
 
     // --- 1. per-block: block 0 ---
-    let block0 =
-        LensTransformerBlock::from_weights(&weights, "transformer_blocks.0", cfg.num_heads, cfg.head_dim, Dtype::Float32)
-            .expect("load block 0");
+    let block0 = LensTransformerBlock::from_weights(
+        &weights,
+        "transformer_blocks.0",
+        cfg.num_heads,
+        cfg.head_dim,
+        Dtype::Float32,
+    )
+    .expect("load block 0");
     let rope = LensRope3d::new(10000.0, cfg.axes_dims_rope);
     let (img_cos, img_sin, txt_cos, txt_sin) = rope.forward(frame, h, w, txt_len).unwrap();
     let (enc0, hid0) = block0
@@ -113,10 +118,19 @@ fn lens_dit_matches_reference() {
     );
 
     // --- 2. full forward ---
-    let transformer = LensTransformer::from_weights(&weights, &cfg, Dtype::Float32).expect("load DiT");
+    let transformer =
+        LensTransformer::from_weights(&weights, &cfg, Dtype::Float32).expect("load DiT");
     let feats: Vec<Array> = (0..n_text).map(|i| f32(&format!("feat_{i}"))).collect();
     let out = transformer
-        .forward(&f32("hidden_states"), &feats, None, &f32("timestep"), frame, h, w)
+        .forward(
+            &f32("hidden_states"),
+            &feats,
+            None,
+            &f32("timestep"),
+            frame,
+            h,
+            w,
+        )
         .expect("full forward");
     let out_pr = peak_rel(&out, &f32("out"));
     let out_cos = cosine(&out, &f32("out"));
@@ -127,9 +141,21 @@ fn lens_dit_matches_reference() {
     // complex RoPE, AdaLN modulation, SwiGLU GateMLP, gated residuals) is correct. The full forward
     // then accumulates the mlx-Metal-vs-CPU f32-matmul floor over 48 residual blocks to ~7e-3 worst
     // element, but cosine stays at 5 nines — a real bug (wrong axis/transpose/order) would crater it.
-    assert!(blk_enc_pr < 5e-3, "block0 enc peak_rel {blk_enc_pr:.3e} ≥ 5e-3");
-    assert!(blk_hid_pr < 5e-3, "block0 hidden peak_rel {blk_hid_pr:.3e} ≥ 5e-3");
-    assert!(out_pr < 1.5e-2, "full forward peak_rel {out_pr:.3e} ≥ 1.5e-2 — beyond 48-block f32 accumulation");
-    assert!(out_cos > 0.9999, "full forward cosine {out_cos:.7} ≤ 0.9999");
+    assert!(
+        blk_enc_pr < 5e-3,
+        "block0 enc peak_rel {blk_enc_pr:.3e} ≥ 5e-3"
+    );
+    assert!(
+        blk_hid_pr < 5e-3,
+        "block0 hidden peak_rel {blk_hid_pr:.3e} ≥ 5e-3"
+    );
+    assert!(
+        out_pr < 1.5e-2,
+        "full forward peak_rel {out_pr:.3e} ≥ 1.5e-2 — beyond 48-block f32 accumulation"
+    );
+    assert!(
+        out_cos > 0.9999,
+        "full forward cosine {out_cos:.7} ≤ 0.9999"
+    );
     eprintln!("ALL PASS");
 }
