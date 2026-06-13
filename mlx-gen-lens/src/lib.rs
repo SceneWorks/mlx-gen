@@ -37,11 +37,20 @@
 //!   (multi-layer text front-end + fused-QKV joint attention with complex axial RoPE + AdaLN
 //!   modulation + SwiGLU GateMLP + `AdaLayerNormContinuous`). Validated against the vendor
 //!   `LensTransformer2DModel` on real f32 weights (block-0 peak_rel 1.2e-3, full-forward cosine 0.99998).
+//! - **sc-3169** — the **VAE decode shim** ([`vae`]): the Lens latent space is the Flux.2 one, so
+//!   `_decode` reduces to a reshape into the packed grid + the shared `mlx_gen_flux2::Flux2Vae`
+//!   (bn de-normalize + 2×2 unpatchify + conv decode). Real-weight f32 vs `_decode` (peak_rel 8.7e-3,
+//!   the conv-VAE floor).
+//! - **sc-3170** — the **sampling schedule + CFG** ([`schedule`]): the Lens empirical-μ schedule is
+//!   the core [`mlx_gen::FlowMatchEuler`] verbatim (same constants), plus the shifted-σ timestep
+//!   convention and the norm-rescaled CFG. Bit-exact vs the diffusers scheduler (sigmas Δ 0, CFG 2e-7).
 //!
-//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), VAE shim
-//! (sc-3169), scheduler (sc-3170), and the generate/e2e integration (sc-3173).
+//! Still to come: the memory-efficient weight conversion / Q4-Q8 re-quant (sc-3172), and the
+//! generate/e2e integration (sc-3173 — ties encoder + DiT + VAE + scheduler together).
 
 pub mod config;
 pub mod dit;
+pub mod schedule;
 pub mod text;
 pub mod text_encoder;
+pub mod vae;
