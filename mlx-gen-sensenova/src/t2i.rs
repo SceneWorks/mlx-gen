@@ -186,6 +186,15 @@ pub struct T2iModel {
 impl T2iModel {
     /// Build from a loaded checkpoint (`language_model.*` + `fm_modules.*`).
     pub fn from_weights(w: &Weights, cfg: &NeoChatConfig) -> Result<Self> {
+        // `noise_scale_embed` divides each denoise step's conditioning by `noise_scale_max_value`
+        // (`scale.min(max)` then `/max`); a zero/negative value from a misconfigured config.json
+        // would inject NaN/Inf conditioning silently. Reject it at load (F-012).
+        if cfg.noise_scale_max_value <= 0.0 || cfg.noise_scale_max_value.is_nan() {
+            return Err(Error::Msg(format!(
+                "sensenova: noise_scale_max_value must be > 0 (got {})",
+                cfg.noise_scale_max_value
+            )));
+        }
         let noise_scale_embedder = if cfg.add_noise_scale_embedding {
             Some(TimestepEmbedder::from_weights(
                 w,

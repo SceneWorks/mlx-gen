@@ -14,7 +14,7 @@ use mlx_rs::Array;
 
 use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::image_processor::{
     resize_bicubic_u8, resize_lanczos_u8, ImageInput, QwenImageProcessor,
@@ -77,6 +77,16 @@ pub fn preprocess_edit_image(
 ) -> Result<EditImage> {
     // 1. Condition resize (BICUBIC, /32) — clip8-rounded f32 back to u8 for the processor.
     let (cw, ch) = condition_resize_dims(image.width, image.height);
+    // An extreme aspect ratio collapses a side to 0 here (see `condition_resize_dims`), which would
+    // feed a zero-dim resize / patchify downstream. The Edit generator rejects this at the request
+    // boundary; guard direct callers too (F-005).
+    if cw == 0 || ch == 0 {
+        return Err(Error::Msg(format!(
+            "qwen-image edit: condition-resize of a {}x{} reference collapses to a zero dimension \
+             ({cw}x{ch}); aspect ratio is too extreme",
+            image.width, image.height
+        )));
+    }
     let resized: Vec<u8> = if (image.height, image.width) == (ch, cw) {
         image.data.to_vec()
     } else {
@@ -190,5 +200,31 @@ mod tests {
         assert_eq!(condition_resize_dims(512, 512), (384, 384)); // square
         assert_eq!(condition_resize_dims(768, 512), (480, 320)); // 3:2 landscape
         assert_eq!(condition_resize_dims(512, 768), (320, 480)); // 2:3 portrait
+    }
+
+    #[test]
+    fn preprocess_edit_image_rejects_extreme_aspect_ratio() {
+        // A thin strip (ratio < ~1/576) collapses a condition-resize side to 0 (F-005); the
+        // function must reject it instead of feeding a zero-dim resize downstream.
+        let (cw, ch) = condition_resize_dims(1, 600);
+        assert!(
+            cw == 0 || ch == 0,
+            "expected a collapsed dim, got ({cw},{ch})"
+        );
+        let processor = QwenImageProcessor::default();
+        let pixels = vec![0u8; 600 * 3];
+        // `.err()` (not `.unwrap_err()`) so the `Ok` type `EditImage` need not be `Debug`.
+        let err = preprocess_edit_image(
+            &processor,
+            ImageInput {
+                data: &pixels,
+                width: 1,
+                height: 600,
+            },
+        )
+        .err()
+        .expect("expected an extreme-aspect-ratio error")
+        .to_string();
+        assert!(err.contains("zero dimension"), "got: {err}");
     }
 }

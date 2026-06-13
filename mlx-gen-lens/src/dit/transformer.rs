@@ -12,7 +12,7 @@ use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::nn::silu;
 use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::rope::LensRope3d;
 use super::{join, load_weight, LensTransformerBlock, Linear};
@@ -209,13 +209,15 @@ impl LensTransformer {
         h: usize,
         w: usize,
     ) -> Result<Array> {
-        assert_eq!(
-            text_feats.len(),
-            self.cfg.num_text_layers,
-            "expected {} text-feature layers, got {}",
-            self.cfg.num_text_layers,
-            text_feats.len()
-        );
+        // Reachable from the `Result`-returning public forward; error instead of panicking the
+        // worker if the capture-layer count ever drifts from the config (F-014).
+        if text_feats.len() != self.cfg.num_text_layers {
+            return Err(Error::Msg(format!(
+                "lens dit: expected {} text-feature layers, got {}",
+                self.cfg.num_text_layers,
+                text_feats.len()
+            )));
+        }
         let (b, img_len) = (hidden_states.shape()[0], hidden_states.shape()[1]);
         let txt_len = text_feats[0].shape()[1];
 
@@ -291,13 +293,15 @@ impl LensTransformer {
         block_local_targets: &[Vec<String>],
         alpha: f32,
     ) -> Result<Array> {
-        assert_eq!(
-            text_feats.len(),
-            self.cfg.num_text_layers,
-            "expected {} text-feature layers, got {}",
-            self.cfg.num_text_layers,
-            text_feats.len()
-        );
+        // Reachable from the `Result`-returning public forward; error instead of panicking the
+        // worker if the capture-layer count ever drifts from the config (F-014).
+        if text_feats.len() != self.cfg.num_text_layers {
+            return Err(Error::Msg(format!(
+                "lens dit: expected {} text-feature layers, got {}",
+                self.cfg.num_text_layers,
+                text_feats.len()
+            )));
+        }
         let (b, img_len) = (hidden_states.shape()[0], hidden_states.shape()[1]);
         let txt_len = text_feats[0].shape()[1];
 

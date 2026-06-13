@@ -392,6 +392,15 @@ impl ChatGlmModel {
     ) -> Result<Vec<Array>> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
+        // Per-row `position_ids` ([B,S]) are flattened to a single RoPE table below, which only lines
+        // up with the [B,S,…] activations when B==1; a B>1 caller would build a B·S-row table that
+        // shape-mismatches in `apply_rope`. Production encode is always B==1, so reject B>1 with
+        // per-row positions cleanly instead of crashing in Metal (F-025).
+        if position_ids.is_some() && b != 1 {
+            return Err(Error::Msg(format!(
+                "kolors chatglm3: per-row position_ids requires batch size 1 (got {b})"
+            )));
+        }
         let ids = input_ids.reshape(&[-1])?;
         let mut h = self
             .embed

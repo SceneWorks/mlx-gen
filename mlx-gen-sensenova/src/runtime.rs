@@ -185,6 +185,7 @@ impl Qwen3Backbone {
         let mut t = t_idx;
         let mut next = argmax(first_logits);
         let mut think_token_ids = Vec::new();
+        let mut closed = false;
         for _ in 0..max_think_tokens {
             if next == eos {
                 break;
@@ -194,12 +195,20 @@ impl Qwen3Backbone {
                 // splice it in without an lm_head projection (F-140).
                 t = self.append_tokens(&[next], t, cache)?;
                 think_token_ids.push(next);
+                closed = true;
                 break;
             }
             think_token_ids.push(next);
             // Greedy: argmax the next-token logits on device (single-index transfer; F-140).
             next = self.decode_argmax(next, t + 1, cache)?;
             t += 1;
+        }
+        // Budget exhausted before `</think>` (and the model didn't emit `eos`): synthesize the close
+        // so the cache is not primed on an unclosed `<think>` token sequence the model was never
+        // trained on, which would degrade the subsequent image generation (F-013).
+        if !closed && next != eos {
+            t = self.append_tokens(&[think_end_id], t, cache)?;
+            think_token_ids.push(think_end_id);
         }
         t = self.append_tokens(append_ids, t, cache)?;
         Ok(ThinkRollout {

@@ -64,10 +64,19 @@ fn resident_weight_bytes(files: &[&std::path::Path], dt: Dtype) -> usize {
 /// The bundled precomputed negative-prompt embedding → `(1, 58, 5120)` at `dt`.
 fn load_neg_embed(dt: Dtype) -> Result<Array> {
     const BYTES: &[u8] = include_bytes!("../data/neg_embed.safetensors");
-    let path = std::env::temp_dir().join("mlx_gen_seedvr2_neg_embed.safetensors");
-    if !path.exists() {
-        std::fs::write(&path, BYTES)?;
-    }
+    let dir = std::env::temp_dir();
+    let path = dir.join("mlx_gen_seedvr2_neg_embed.safetensors");
+    // Materialize atomically: write to a process-unique temp file, then `rename` into place (atomic
+    // on POSIX). The previous `!exists() { write }` left a *partial* file if a write was interrupted,
+    // which every later run then `exists()`-skipped and failed to deserialize, and blindly trusted a
+    // pre-existing (stale or hostile) file. Rewriting+renaming each load self-heals corruption and
+    // overwrites a planted file; the embed is tiny (~0.6 MB) so the cost is negligible (F-026).
+    let tmp = dir.join(format!(
+        "mlx_gen_seedvr2_neg_embed.{}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, BYTES)?;
+    std::fs::rename(&tmp, &path)?;
     let w = Weights::from_file(&path)?;
     Ok(w.require("embedding")?.as_dtype(dt)?.expand_dims(0)?)
 }

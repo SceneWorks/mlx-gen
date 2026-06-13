@@ -442,10 +442,20 @@ impl VisionTower {
         let seq = merged * mu;
         let cu_window = dedup_consecutive(&cu_window);
 
-        // inverse permutation (`argsort(window_index)` for a permutation).
-        let mut reverse = vec![0i32; merged as usize];
+        // inverse permutation (`argsort(window_index)` for a permutation). This is only well-defined
+        // if `window_index` is a genuine permutation of `0..merged`; a non-divisible grid would push
+        // an out-of-range index (OOB panic) or leave gaps (a token silently mapped to position 0).
+        // Validate it and error on a malformed grid instead (F-024).
+        let mut reverse = vec![-1i32; merged as usize];
         for (i, &wi) in window_index.iter().enumerate() {
-            reverse[wi as usize] = i as i32;
+            let wi = wi as usize;
+            if wi >= reverse.len() || reverse[wi] != -1 {
+                return Err(Error::Msg(format!(
+                    "bernini vision: window_index is not a valid permutation (index {wi} at \
+                     position {i}, merged={merged})"
+                )));
+            }
+            reverse[wi] = i as i32;
         }
 
         Ok(Plan {

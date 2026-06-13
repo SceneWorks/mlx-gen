@@ -15,7 +15,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::gelu_exact;
 use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::Sam3TextConfig;
 
@@ -175,6 +175,15 @@ impl Sam3TextEncoder {
             .token_embedding
             .take_axis(&ids_flat, 0)?
             .reshape(&[b, n, dim])?;
+        // The position-embedding table has only `max_position_embeddings` rows; the tokenizer pads to
+        // that, but a direct `forward` with a longer sequence would index it out of bounds. Reject it
+        // (F-019).
+        let max_pos = self.position_embedding.shape()[0];
+        if n > max_pos {
+            return Err(Error::Msg(format!(
+                "sam3 text: sequence length {n} exceeds max_position_embeddings ({max_pos})"
+            )));
+        }
         let pos_idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
         let pos = self.position_embedding.take_axis(&pos_idx, 0)?; // [N, D]
         let mut x = add(&tok, &pos.reshape(&[1, n, dim])?)?;

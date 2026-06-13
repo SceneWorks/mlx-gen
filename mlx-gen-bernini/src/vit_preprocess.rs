@@ -100,6 +100,11 @@ pub fn smart_video_nframes(
         }
         nframes = (mn + add).max(nframes);
     }
+    // `linspace_round` returns empty for a zero-frame input; seed a single 0 so the min-frames pad
+    // below repeats a valid index instead of panicking on `last().unwrap()` of an empty vec (F-021).
+    if idx.is_empty() && nframes > 0 {
+        idx.push(0);
+    }
     while (idx.len() as i64) < nframes {
         idx.push(*idx.last().unwrap());
     }

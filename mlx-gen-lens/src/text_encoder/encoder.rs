@@ -20,7 +20,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Quant, Result};
+use mlx_gen::{Error, Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer};
@@ -76,16 +76,18 @@ impl LensTextEncoder {
         selected_layers: Vec<usize>,
         quant: Option<Quant>,
     ) -> Result<Self> {
-        assert!(
-            !selected_layers.is_empty(),
-            "selected_layers must be non-empty"
-        );
-        let max_layer = *selected_layers.iter().max().unwrap();
-        assert!(
-            max_layer < cfg.num_layers,
-            "selected layer {max_layer} out of range (model has {} layers)",
-            cfg.num_layers
-        );
+        // Reachable from `Result`-returning public APIs, so error rather than panic the worker on a
+        // bad capture-index list (F-014).
+        let max_layer = *selected_layers
+            .iter()
+            .max()
+            .ok_or_else(|| Error::Msg("lens encoder: selected_layers must be non-empty".into()))?;
+        if max_layer >= cfg.num_layers {
+            return Err(Error::Msg(format!(
+                "lens encoder: selected layer {max_layer} out of range (model has {} layers)",
+                cfg.num_layers
+            )));
+        }
 
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
         let mut layers = Vec::with_capacity(max_layer + 1);

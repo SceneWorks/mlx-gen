@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{conv2d, gelu_exact, linear};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::Sam3VisionConfig;
 use crate::vision::{Backbone, FpnLayer};
@@ -953,6 +953,15 @@ fn apply_rope_2d(
     let k_rot = slice_axis(k, 2, 0, n_rot)?;
     let q_seq = q.shape()[2];
     let (cos_k, sin_k) = if repeat_freqs_k && n_rot != q_seq {
+        // `repeat_interleave` builds `rf·q_seq` frequency rows; if `n_rot` isn't an exact multiple of
+        // `q_seq` the table won't line up with `k_rot`'s `n_rot` positions → a Metal shape failure.
+        // Canonical window/feature sizes satisfy the invariant; reject a non-canonical one cleanly
+        // instead of producing a wrong-shape RoPE table (F-016).
+        if q_seq == 0 || n_rot % q_seq != 0 {
+            return Err(Error::Msg(format!(
+                "sam3 tracker: rope key length {n_rot} is not a multiple of query length {q_seq}"
+            )));
+        }
         let rf = (n_rot / q_seq) as usize;
         (
             concatenate_axis(&vec![cos; rf], 0)?,
@@ -1368,7 +1377,16 @@ impl Sam3Tracker {
         object_pointers: &[(i32, Array)],
         max_object_pointers_to_use: i32,
     ) -> Result<Array> {
-        let g = (current_vision_features.shape()[0] as f64).sqrt() as i32;
+        // Recover the square grid side from the flat sequence length. A bare `sqrt() as i32` would
+        // truncate one short on a non-perfect-square length, mis-shaping the `[g,g,…]` reshape below
+        // → a panic. Round and verify the length really is a perfect square (F-018).
+        let seq = current_vision_features.shape()[0];
+        let g = (seq as f64).sqrt().round() as i32;
+        if g * g != seq {
+            return Err(Error::Msg(format!(
+                "sam3 tracker: vision feature length {seq} is not a perfect square (g={g})"
+            )));
+        }
 
         // Spatial memory: concat each gathered frame's features + (pos + temporal-pos[offset−1]).
         let mut mem_feats: Vec<Array> = Vec::new();

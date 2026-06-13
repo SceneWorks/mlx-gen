@@ -17,7 +17,7 @@ use mlx_rs::Array;
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_nearest_u8;
 use mlx_gen::media::Image;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::sampler::EulerSampler;
 
@@ -106,7 +106,15 @@ impl<'a> InpaintBlend<'a> {
     /// Blend after denoise step `i`: `latents = (1 - mask)·init_noised + mask·latents`, where
     /// `init_noised = add_noise_with(x₀, noise, σ(t_prev[i]))`. Draws no RNG.
     pub fn blend(&self, latents: &Array, i: usize) -> Result<Array> {
-        let t = self.t_prev[i];
+        // `t_prev` has `eff = (steps·strength)` entries, but the denoise loop drives `i` by
+        // `sampler.num_steps()`; an off-by-one between the two would panic on a bare index. Error
+        // instead (F-011).
+        let t = *self.t_prev.get(i).ok_or_else(|| {
+            Error::Msg(format!(
+                "sdxl inpaint: blend step {i} out of range (t_prev has {} entries)",
+                self.t_prev.len()
+            ))
+        })?;
         let init_noised = self.sampler.add_noise_with(&self.x0, &self.noise, t)?;
         let one = scalar(1.0);
         let keep = multiply(&subtract(&one, &self.mask)?, &init_noised)?;

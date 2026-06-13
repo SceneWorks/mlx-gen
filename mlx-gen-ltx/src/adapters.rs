@@ -108,7 +108,13 @@ const SUFFIXES: [(&str, Role); 9] = [
 /// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
 /// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
 fn read_alpha(a: &Array) -> Result<f32> {
-    Ok(a.as_dtype(Dtype::Float32)?.as_slice::<f32>()[0])
+    // Adapter files are external input; an empty `.alpha` tensor would panic on `[0]`. Read the first
+    // element defensively and error on an empty tensor instead (F-010).
+    a.as_dtype(Dtype::Float32)?
+        .as_slice::<f32>()
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Msg("ltx_2_3 adapter: empty .alpha tensor".into()))
 }
 
 /// Per-pass user strengths for one adapter: `spec.pass_scales` (one per distilled stage, validated

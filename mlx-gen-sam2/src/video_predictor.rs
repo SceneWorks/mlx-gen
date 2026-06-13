@@ -133,7 +133,7 @@ impl Sam2VideoModel {
         let vision_pos_enc = out
             .vision_pos_enc
             .last()
-            .expect("at least one pos level")
+            .ok_or_else(|| Error::Msg("sam2 video: encoder produced no position levels".into()))?
             .clone();
         Ok(Encoded {
             vision_features: out.vision_features,

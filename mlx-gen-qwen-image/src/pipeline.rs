@@ -261,7 +261,11 @@ pub fn qwen_scheduler(num_steps: usize, width: u32, height: u32) -> FlowMatchEul
 }
 
 fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
-    let n = num_steps.max(1);
+    // The terminal-sigma rescale below divides by `1 - shifted.last()`, which is `0` at `n == 1`
+    // (`shifted == [1.0]`) → a `[NaN, 0.0]` schedule. The production Generator already rejects
+    // `steps < 2` with a clear error (F-113); clamp here so this helper never emits a NaN schedule
+    // even when called directly (F-004), yielding a valid 2-step schedule instead.
+    let n = num_steps.max(2);
     // linspace(1.0, 1.0/n, n)
     let (start, end) = (1.0_f32, 1.0_f32 / n as f32);
     let linspace: Vec<f32> = (0..n)

@@ -20,7 +20,7 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::Sam3DetrConfig;
 
@@ -544,6 +544,14 @@ impl Sam3Detector {
         let mut hidden = concatenate_axis(&[&presence, &query_embeds], 1)?; // [1, 1+Q, D]
         let mut reference_boxes = sigmoid(&self.reference_points.reshape(&[1, q, 4])?)?;
 
+        // The post-loop output reads `last_*`, which are only set inside the decoder loop; a config
+        // with zero decoder layers would skip the loop and `unwrap()` on `None`. Reject it up front
+        // so a non-canonical config errors instead of aborting the worker (F-015).
+        if self.dec_layers.is_empty() {
+            return Err(Error::Msg(
+                "sam3 detr: decoder has zero layers (num_decoder_layers must be >= 1)".into(),
+            ));
+        }
         let mut last_query_hidden = None;
         let mut last_ref_input = None;
         let mut last_presence = None;

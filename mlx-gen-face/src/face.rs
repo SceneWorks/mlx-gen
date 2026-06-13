@@ -208,6 +208,14 @@ impl FaceAnalysis {
     /// embedding just that one) use this and skip embedding every detection (F-090). `h`/`w` are the
     /// image dimensions.
     pub fn detect(&self, img: &[u8], h: usize, w: usize) -> Result<Vec<Detection>> {
+        // A zero dimension passes the `len() < h*w*3` check below (`h*w*3 == 0`) but makes
+        // `detector_blob` compute `det_scale = new_h / 0 = NaN`, which contaminates every bbox/kps
+        // coordinate downstream. Reject it first (F-030).
+        if h == 0 || w == 0 {
+            return Err(Error::Msg(format!(
+                "face detect: image has a zero dimension ({h}×{w})"
+            )));
+        }
         // The worker hands us a decoded buffer plus `(h, w)`; a mismatch would index out of bounds in
         // the detector primitives. Reject it with a typed error rather than crash generation (F-081).
         if img.len() < h * w * 3 {

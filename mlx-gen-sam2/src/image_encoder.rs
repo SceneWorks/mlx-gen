@@ -15,7 +15,7 @@ use mlx_rs::Array;
 
 use mlx_gen::nn::{conv2d, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::{Sam2ImageEncoderConfig, Sam2ModelSize};
 use crate::hiera::Hiera;
@@ -168,7 +168,7 @@ impl Sam2ImageEncoder {
         let vision_pos_enc = pos_nhwc.iter().map(to_nchw).collect::<Result<Vec<_>>>()?;
         let vision_features = backbone_fpn
             .last()
-            .expect("FPN yields at least one feature level")
+            .ok_or_else(|| Error::Msg("sam2 image encoder: FPN produced no feature levels".into()))?
             .clone();
         Ok(Sam2ImageEncoderOutput {
             backbone_fpn,

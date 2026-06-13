@@ -808,10 +808,10 @@ impl MMAttention {
 
 struct Block {
     attn: MMAttention,
-    mlp_vid: Mlp,
-    mlp_txt: Option<Mlp>, // None when shared (uses mlp_vid as `.all`) handled via shared flag
-    mlp_all: Option<Mlp>,
-    ada_vid: AdaParams,
+    mlp_vid: Option<Mlp>, // None when shared (the `.all` MLP is held once in `mlp_all`)
+    mlp_txt: Option<Mlp>, // None when shared or last-layer-vid-only
+    mlp_all: Option<Mlp>, // Some only when shared
+    ada_vid: Option<AdaParams>, // None when shared (the `.all` ada is held once in `ada_all`)
     ada_txt: Option<AdaParams>,
     ada_all: Option<AdaParams>,
     shared: bool,
@@ -824,9 +824,13 @@ impl Block {
         let shared = idx >= cfg.mm_layers;
         let is_last = cfg.last_layer_vid_only && idx == cfg.num_layers - 1;
         let attn = MMAttention::load(w, &format!("{prefix}.attn"), cfg)?;
+        // Shared blocks (`idx >= mm_layers`) route both streams through `.mlp.all`/`.ada.params_all`
+        // (see `mlp_v`/`mlp_t`/`ada_v`/`ada_t`), so only load that single copy — the previous code
+        // also loaded a dead `mlp_vid`/`ada_vid` copy of the same `.all` weights (and quantized the
+        // MLP one), ~2× the shared-block MLP footprint for nothing (F-027).
         let (mlp_vid, mlp_txt, mlp_all) = if shared {
             (
-                Mlp::load(w, &format!("{prefix}.mlp.all"), cfg.swiglu_mlp)?,
+                None,
                 None,
                 Some(Mlp::load(w, &format!("{prefix}.mlp.all"), cfg.swiglu_mlp)?),
             )
@@ -837,14 +841,14 @@ impl Block {
                 Some(Mlp::load(w, &format!("{prefix}.mlp.txt"), cfg.swiglu_mlp)?)
             };
             (
-                Mlp::load(w, &format!("{prefix}.mlp.vid"), cfg.swiglu_mlp)?,
+                Some(Mlp::load(w, &format!("{prefix}.mlp.vid"), cfg.swiglu_mlp)?),
                 txt,
                 None,
             )
         };
         let (ada_vid, ada_txt, ada_all) = if shared {
             (
-                AdaParams::load(w, &format!("{prefix}.ada.params_all"))?,
+                None,
                 None,
                 Some(AdaParams::load(w, &format!("{prefix}.ada.params_all"))?),
             )
@@ -855,7 +859,7 @@ impl Block {
                 Some(AdaParams::load(w, &format!("{prefix}.ada.params_txt"))?)
             };
             (
-                AdaParams::load(w, &format!("{prefix}.ada.params_vid"))?,
+                Some(AdaParams::load(w, &format!("{prefix}.ada.params_vid"))?),
                 txt,
                 None,
             )
@@ -878,7 +882,7 @@ impl Block {
         if self.shared {
             self.ada_all.as_ref().unwrap()
         } else {
-            &self.ada_vid
+            self.ada_vid.as_ref().unwrap()
         }
     }
     fn ada_t(&self) -> &AdaParams {
@@ -892,7 +896,7 @@ impl Block {
         if self.shared {
             self.mlp_all.as_ref().unwrap()
         } else {
-            &self.mlp_vid
+            self.mlp_vid.as_ref().unwrap()
         }
     }
     fn mlp_t(&self) -> &Mlp {
@@ -969,7 +973,9 @@ impl Block {
 
     fn quantize(&mut self, bits: i32, group: i32) -> Result<()> {
         self.attn.quantize(bits, group)?;
-        self.mlp_vid.quantize(bits, group)?;
+        if let Some(m) = &mut self.mlp_vid {
+            m.quantize(bits, group)?;
+        }
         if let Some(m) = &mut self.mlp_txt {
             m.quantize(bits, group)?;
         }

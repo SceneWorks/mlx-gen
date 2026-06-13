@@ -21,7 +21,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, split, subtract};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// The complex RoPE rotation `(a+bi)·(cos+sin·i)` → `(out_real, out_imag)`. When the sc-2957 compile
 /// toggle is on, MLX fuses the 4 multiplies + add/sub into one kernel (vs 6 eager ops on ~200 MB f32
@@ -116,6 +116,14 @@ impl RopeTable {
     /// `[B, seq_len, n_heads, half_d]` real/imag split. Mirrors `rope_precompute_cos_sin`.
     pub fn precompute_cos_sin(&self, grid: (usize, usize, usize)) -> Result<(Array, Array)> {
         let (f, h, w) = grid;
+        // The per-axis frequency table holds only `MAX_SEQ_LEN` rows; `src_{t,h,w} = idx * half_d`
+        // below indexes into it by grid coordinate, so any axis ≥ MAX_SEQ_LEN (an extreme
+        // resolution / very long video) would index out of bounds and panic. Reject up front (F-006).
+        if f > MAX_SEQ_LEN || h > MAX_SEQ_LEN || w > MAX_SEQ_LEN {
+            return Err(Error::Msg(format!(
+                "wan rope: grid ({f},{h},{w}) exceeds MAX_SEQ_LEN ({MAX_SEQ_LEN}) on some axis"
+            )));
+        }
         let seq_len = f * h * w;
         let half_d = self.half_d;
         let t0 = self.temporal_half;

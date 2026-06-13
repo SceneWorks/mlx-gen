@@ -152,7 +152,13 @@ impl BerniniTemplate {
                     ));
                 }
                 "image" | "image_gen" => {
-                    let n = image_token_nums[img_cur];
+                    let n = *image_token_nums.get(img_cur).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "bernini template: image_token_nums has {} entries but message {img_cur} \
+                             is an image",
+                            image_token_nums.len()
+                        ))
+                    })?;
                     img_cur += 1;
                     let (ttype, flex) = if has_loss == 1 {
                         indicator += 1;
@@ -176,7 +182,13 @@ impl BerniniTemplate {
                     visual_id += 1;
                 }
                 "video" | "frame_gen" | "video_gen" => {
-                    let n = video_token_nums[vid_cur];
+                    let n = *video_token_nums.get(vid_cur).ok_or_else(|| {
+                        Error::Msg(format!(
+                            "bernini template: video_token_nums has {} entries but message {vid_cur} \
+                             is a video",
+                            video_token_nums.len()
+                        ))
+                    })?;
                     vid_cur += 1;
                     let (ttype, flex) = if has_loss == 1 {
                         indicator += 1;

@@ -9,7 +9,7 @@ use mlx_rs::ops::{add, concatenate_axis, multiply, subtract, zeros_like};
 use mlx_rs::Array;
 
 use mlx_gen::array::scalar;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::SchedulerConfig;
 use crate::scheduler::{euler_step, scale_model_input, v_pred_denoised, EdmSchedule};
@@ -150,6 +150,15 @@ impl SvdPipeline {
     /// (roughly `[-1, 1]`; the caller maps to `[0, 1]` for display).
     pub fn decode(&self, latents: &Array, num_frames: i32, chunk: i32) -> Result<Array> {
         let sh = latents.shape();
+        // The reshape below collapses `[B, F, h, w, 4] → [num_frames, h, w, 4]`, which only preserves
+        // frame identity when `B == 1`; a `B > 1` caller would silently interleave `B·F` frames as
+        // `F`. The generator caps `max_count = 1`, but `decode` is public — reject `B > 1` (F-029).
+        if sh[0] != 1 {
+            return Err(Error::Msg(format!(
+                "svd decode: batch size must be 1 (got {})",
+                sh[0]
+            )));
+        }
         let (h, w_) = (sh[2], sh[3]);
         let flat = latents.reshape(&[num_frames, h, w_, sh[4]])?; // [F,h,w,4]
         let z = multiply(&flat, scalar(1.0 / self.vae.scaling_factor()))?;

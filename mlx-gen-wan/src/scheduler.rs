@@ -377,7 +377,7 @@ impl FlowUniPC {
                 let rhos_p: Vec<f64> = if effective_order <= 2 {
                     vec![0.5]
                 } else {
-                    let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order);
+                    let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order)?;
                     solve_linear(&r, &b)?
                 };
                 // pred_res = Σ ρ·D1 ; x_t -= (α_t·B_h)·pred_res. (rhos_p.len() == d1s.len().)
@@ -451,7 +451,7 @@ impl FlowUniPC {
         let rhos_c: Vec<f64> = if effective_order == 1 {
             vec![0.5]
         } else {
-            let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order + 1);
+            let (r, b) = build_rb(&rks, h_phi_1, hh, b_h, 1, effective_order + 1)?;
             solve_linear(&r, &b)?
         };
 
@@ -541,7 +541,16 @@ fn build_rb(
     b_h: f64,
     j_start: usize,
     j_end: usize,
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+) -> Result<(Vec<Vec<f64>>, Vec<f64>)> {
+    // `hh = λ_{s0} − λ_t`; equal consecutive sigmas (a degenerate/single-step schedule) make it 0,
+    // so `h_phi_1 / hh` and the `h_phi_k / hh` recurrence below become ±Inf/NaN and would silently
+    // corrupt the predictor coefficients (solve_linear's near-zero-pivot guard only fires *after*
+    // NaN has entered the matrix). Reject the degenerate step here instead (F-008).
+    if hh.abs() < f64::EPSILON {
+        return Err(Error::Msg(format!(
+            "wan scheduler: degenerate schedule (equal consecutive sigmas, hh={hh:.3e}) in build_rb"
+        )));
+    }
     let mut h_phi_k = h_phi_1 / hh - 1.0;
     let mut factorial_i = 1.0_f64;
     let mut r_rows: Vec<Vec<f64>> = Vec::new();
@@ -552,7 +561,7 @@ fn build_rb(
         factorial_i *= (j + 1) as f64;
         h_phi_k = h_phi_k / hh - 1.0 / factorial_i;
     }
-    (r_rows, b_vals)
+    Ok((r_rows, b_vals))
 }
 
 /// Solve `R·x = b` for a small dense square system via Gaussian elimination with partial pivoting

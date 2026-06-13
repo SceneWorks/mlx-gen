@@ -185,6 +185,11 @@ impl Sam3MaskHead {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &Sam3DetrConfig) -> Result<Self> {
         let p = join(prefix, "mask_decoder");
         Ok(Self {
+            // `num_upsampling_stages = 3` (the checkpoint ships `conv_layers.{0,1,2}` + `norms.{0,1,2}`).
+            // The FPN is fed 3 levels (288²,144²,72² — the 4-level backbone with the 36² dropped,
+            // matching the reference `fpn_hidden_states[:-1]`), so the coarse→fine loop runs 2 conv
+            // steps and the last pair (`conv_layers.2`/`norms.2`) is loaded but unused — exactly as in
+            // the upstream `Sam3PixelDecoder` (F-017, verified: e2e mask parity holds).
             pixel_decoder: PixelDecoder::from_weights(w, &join(&p, "pixel_decoder"), 3)?,
             mask_embedder: MaskEmbedder::from_weights(w, &join(&p, "mask_embedder"))?,
             instance_proj_w: conv_w(w.require(&join(&p, "instance_projection.weight"))?)?,

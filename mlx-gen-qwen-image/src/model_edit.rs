@@ -313,6 +313,17 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
                 img.pixels.len()
             )));
         }
+        // An extreme aspect ratio (a thin strip) survives the nonzero-dims check above but rounds
+        // a condition-resize side down to 0 (`round_ties_even(side/32) == 0`), which then feeds a
+        // zero-dim resize / `sqrt(minp/0)` downstream → empty latents or NaN. Reject it here so the
+        // dual-latent (`last`) and VL (`first`) reference dims are both validated (F-005).
+        let (cw, ch) = condition_resize_dims(w, h);
+        if cw == 0 || ch == 0 {
+            return Err(Error::Msg(format!(
+                "qwen_image_edit: reference image aspect ratio ({w}x{h}) is too extreme; its \
+                 condition-resize collapses to a zero dimension ({cw}x{ch})"
+            )));
+        }
     }
     Ok(())
 }

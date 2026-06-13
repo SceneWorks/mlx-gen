@@ -21,7 +21,7 @@
 use mlx_rs::Array;
 use serde_json::{json, Value};
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// Qwen2.5-VL / Bernini token-id + MRoPE constants (from the snapshot config).
 #[derive(Clone, Debug)]
@@ -165,6 +165,17 @@ pub fn mrope_position_ids(
                 remain_videos -= 1;
                 (g, 1.0f64, ed_video)
             };
+            // `find_from` returns the `l+1` sentinel when a counted vision token isn't actually
+            // present; using it as `ed` would make `text_len` overshoot and push more than `l` rows,
+            // silently corrupting the MRoPE positions (or erroring at the final reshape). Reject the
+            // malformed token sequence instead (F-023).
+            if ed > l {
+                return Err(Error::Msg(
+                    "bernini mrope: a counted vision token was not found in input_ids \
+                     (malformed token sequence)"
+                        .into(),
+                ));
+            }
             let (lt, lh, lw) = (g[0], g[1] / sms, g[2] / sms);
             let text_len = (ed - st) as i64;
             let st_idx = if appended { last_max + 1 } else { 0 };
