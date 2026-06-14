@@ -28,10 +28,12 @@ pub mod config;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
+pub mod resize;
 pub mod rope;
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
 pub use model::{Scail2Dit, Scail2Inputs};
 pub use preprocess::extract_and_compress_mask_to_latent;
+pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;
