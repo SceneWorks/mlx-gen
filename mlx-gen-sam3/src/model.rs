@@ -132,6 +132,26 @@ impl Sam3ImageSegmenter {
         self.detect_and_segment(&fpn, &text, text_mask)
     }
 
+    /// Run **only** the shared PE backbone over the frame's pixels, returning the raw NHWC
+    /// `[1, 72, 72, C]` feature map. Lets the video pipeline reuse one backbone pass for both the
+    /// detector and the tracker neck instead of running the 32-layer ViT twice (sc-5409).
+    pub fn backbone_features(&self, pixel_values: &Array) -> Result<Array> {
+        self.vision.backbone_features(pixel_values)
+    }
+
+    /// [`Self::forward`] over already-computed backbone features (see [`Self::backbone_features`]):
+    /// runs the FPN neck on `features` then the full detector + mask head, skipping the ViT pass.
+    pub fn forward_from_backbone(
+        &self,
+        features: &Array,
+        input_ids: &Array,
+        text_mask: &[i32],
+    ) -> Result<SegmentationOutput> {
+        let fpn = self.vision.fpn_from_backbone(features)?; // NHWC [288²,144²,72²,36²]
+        let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
+        self.detect_and_segment(&fpn, &text, text_mask)
+    }
+
     /// Box-prompted **PVS** path (sc-4923): the geometry encoder turns `boxes` (normalized cxcywh,
     /// `[1, N, 4]`) + `box_labels` (length `N`, `1`=positive/`0`=negative) into `N + 1` prompt
     /// tokens, which are concatenated *after* the text features as the reference's

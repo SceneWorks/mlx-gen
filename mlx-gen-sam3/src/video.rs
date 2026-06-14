@@ -168,12 +168,13 @@ impl Sam3VideoModel {
         input_ids: &Array,
         text_mask: &[i32],
     ) -> Result<VideoFrameOutput> {
-        // --- Step 1: vision + detection ---
-        let (img_emb, high_res) = self.tracker.encode_frame(pixels)?; // [1,72,72,256], [s0,s1]
+        // --- Step 1: vision + detection (one shared PE backbone pass feeds both necks, sc-5409) ---
+        let features = self.segmenter.backbone_features(pixels)?; // [1,72,72,C], 32-layer ViT once
+        let (img_emb, high_res) = self.tracker.encode_frame_from_features(&features)?; // [1,72,72,256], [s0,s1]
         let g = img_emb.shape()[1];
         let cvf = img_emb.reshape(&[g * g, 1, 256])?;
         let cvp = self.tracker.frame_position_encoding(g)?;
-        let det = self.run_detection(pixels, input_ids, text_mask)?;
+        let det = self.run_detection(&features, input_ids, text_mask)?;
 
         // --- Step 2: propagate existing identities (run_mem_encoder = false) ---
         let num_existing = self.obj_ids.len();
@@ -283,13 +284,17 @@ impl Sam3VideoModel {
     }
 
     // ----- detection (run_detection, single prompt, NMS off) -----
+    // Takes the shared backbone features (sc-5409) so the detector FPN reuses the same ViT pass as
+    // the tracker neck instead of re-running the backbone.
     fn run_detection(
         &self,
-        pixels: &Array,
+        features: &Array,
         input_ids: &Array,
         text_mask: &[i32],
     ) -> Result<DetFrame> {
-        let seg = self.segmenter.forward(pixels, input_ids, text_mask)?;
+        let seg = self
+            .segmenter
+            .forward_from_backbone(features, input_ids, text_mask)?;
         let presence = sigmoid(&seg.presence_logits)?.item::<f32>();
         let probs: Vec<f32> = sigmoid(&seg.pred_logits)?
             .as_slice::<f32>()
@@ -845,6 +850,67 @@ mod tests {
                 &model.tracker.backbone_rc(),
             ),
             "after quantize: the shared backbone must stay a single quantized copy",
+        );
+    }
+
+    /// sc-5409: running the PE backbone **once** and feeding both necks must be **bit-identical** to
+    /// the old two-pass path (`encode_frame` / `segmenter.forward`, each re-running the backbone).
+    /// Weights-gated (no torch fixture — only the real `facebook/sam3` weights).
+    #[test]
+    #[ignore = "needs SAM3_WEIGHTS=<facebook/sam3 model.safetensors>"]
+    fn single_backbone_pass_matches_two_pass() {
+        use mlx_rs::ops::{abs, max, subtract};
+
+        let weights_path = std::env::var("SAM3_WEIGHTS")
+            .expect("set SAM3_WEIGHTS to facebook/sam3 model.safetensors");
+        let w = Weights::from_file(&weights_path).expect("load sam3 weights");
+        let model = Sam3VideoModel::from_weights(&w).expect("build video model");
+
+        // Deterministic non-constant frame + a fixed text prompt.
+        let n = 3 * 1008 * 1008;
+        let px: Vec<f32> = (0..n).map(|i| (i % 251) as f32 / 251.0 - 0.5).collect();
+        let px = Array::from_slice(&px, &[1, 3, 1008, 1008]);
+        let input_ids = Array::from_slice(&[0i32; 32], &[1, 32]);
+        let text_mask = vec![1i32; 32];
+
+        let max_abs_diff = |a: &Array, b: &Array| -> f32 {
+            let diff = abs(subtract(a, b).unwrap()).unwrap();
+            max(diff, None)
+                .unwrap()
+                .as_dtype(Dtype::Float32)
+                .unwrap()
+                .item::<f32>()
+        };
+
+        // Tracker neck: old (backbone+neck) vs new (neck over the shared backbone features).
+        let (emb_two_pass, _) = model.tracker.encode_frame(&px).expect("encode_frame");
+        let features = model
+            .segmenter
+            .backbone_features(&px)
+            .expect("backbone_features");
+        let (emb_one_pass, _) = model
+            .tracker
+            .encode_frame_from_features(&features)
+            .expect("encode_frame_from_features");
+        assert_eq!(
+            max_abs_diff(&emb_two_pass, &emb_one_pass),
+            0.0,
+            "tracker neck output must be bit-identical between two-pass and single-pass",
+        );
+
+        // Detector: old (forward) vs new (forward over the shared backbone features).
+        let seg_two_pass = model
+            .segmenter
+            .forward(&px, &input_ids, &text_mask)
+            .expect("forward");
+        let seg_one_pass = model
+            .segmenter
+            .forward_from_backbone(&features, &input_ids, &text_mask)
+            .expect("forward_from_backbone");
+        assert_eq!(
+            max_abs_diff(&seg_two_pass.pred_masks, &seg_one_pass.pred_masks),
+            0.0,
+            "detector masks must be bit-identical between two-pass and single-pass",
         );
     }
 }

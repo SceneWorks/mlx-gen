@@ -531,8 +531,9 @@ impl Sam3VisionEncoder {
     }
 
     /// Run **only** the PE ViT backbone (the half shared by the detector neck and the tracker neck),
-    /// returning the NHWC `[1, grid, grid, C]` feature map. The video tracker runs this once per
-    /// frame and feeds both necks, avoiding a second backbone pass (sc-4924).
+    /// returning the NHWC `[1, grid, grid, C]` feature map. The video pipeline runs this once per
+    /// frame and feeds both necks (`fpn_from_backbone` + the tracker neck), avoiding a second
+    /// backbone pass (sc-5409).
     pub fn backbone_features(&self, pixel_values: &Array) -> Result<Array> {
         self.backbone.forward(pixel_values)
     }

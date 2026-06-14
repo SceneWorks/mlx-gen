@@ -1519,11 +1519,25 @@ impl Sam3Tracker {
         Ok(MemoryFeatures { features, pos })
     }
 
-    /// Encode a frame's pixels `[1, 3, 1008, 1008]` → `(image_embedding, high_res)`. Runs the shared
-    /// PE backbone once; the detector path can run its own neck over the same backbone separately.
+    /// Encode a frame's pixels `[1, 3, 1008, 1008]` → `(image_embedding, high_res)`: the shared PE
+    /// backbone followed by the tracker neck.
     pub fn encode_frame(&self, pixel_values: &Array) -> Result<(Array, [Array; 2])> {
-        let backbone = self.backbone.forward(pixel_values)?;
-        self.neck.forward(&backbone)
+        let backbone = self.backbone_features(pixel_values)?;
+        self.encode_frame_from_features(&backbone)
+    }
+
+    /// Run **only** the shared PE backbone over a frame's pixels `[1, 3, 1008, 1008]`, returning the
+    /// raw NHWC `[1, 72, 72, C]` feature map. The tracker neck and the detector FPN neck both consume
+    /// this — the video pipeline computes it once per frame and feeds both, instead of running the
+    /// 32-layer ViT twice (sc-5409).
+    pub fn backbone_features(&self, pixel_values: &Array) -> Result<Array> {
+        self.backbone.forward(pixel_values)
+    }
+
+    /// The tracker-neck half of [`Self::encode_frame`], over already-computed backbone features (see
+    /// [`Self::backbone_features`]) — `(image_embedding, high_res)`.
+    pub fn encode_frame_from_features(&self, features: &Array) -> Result<(Array, [Array; 2])> {
+        self.neck.forward(features)
     }
 
     /// The neck's 72² sine position encoding (`Sam3SinePositionEmbedding`, `num_position_features=128`,
