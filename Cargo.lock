@@ -703,6 +703,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-scail2"
+version = "0.0.0"
+dependencies = [
+ "inventory",
+ "mlx-gen",
+ "mlx-gen-wan",
+ "pmetal-mlx-rs",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-sdxl"
 version = "0.0.0"
 dependencies = [

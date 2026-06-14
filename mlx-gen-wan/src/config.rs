@@ -195,6 +195,32 @@ impl WanModelConfig {
         }
     }
 
+    /// SCAIL-2 14B: Wan2.1-14B **I2V** dense DiT for end-to-end character animation / cross-identity
+    /// replacement (zai-org/SCAIL-2). Same block dims as the 14B (dim 5120, ffn 13824, 40 layers/heads),
+    /// but `in_dim` is **20** (16 VAE-z + 4 binary i2v mask channels) and the model carries two extra
+    /// patch-embed stems (pose + a 28-channel mask) plus CLIP image cross-attention — those live in the
+    /// `mlx-gen-scail2` provider, not in the base Wan DiT. z16 Wan2.1 VAE, plain single-scale CFG.
+    pub fn scail2_14b() -> Self {
+        Self {
+            model_type: "i2v".into(),
+            model_version: "2.1".into(),
+            in_dim: 20,
+            out_dim: 16,
+            dim: 5120,
+            ffn_dim: 13824,
+            num_heads: 40,
+            num_layers: 40,
+            dual_model: false,
+            boundary: 0.0,
+            sample_shift: 3.0,
+            sample_steps: 40,
+            sample_guide_scale: GuideScale::Single(5.0),
+            vae_z_dim: 16,
+            vae_stride: (4, 8, 8),
+            ..Self::base()
+        }
+    }
+
     /// Wan2.1 T2V 1.3B: single (dense) model, 30 layers, dim 1536.
     pub fn wan21_t2v_1_3b() -> Self {
         Self {
