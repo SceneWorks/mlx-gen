@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, LoadSpec, Progress, WeightsSource};
+use mlx_gen::{CancelFlag, Error, LoadSpec, Progress, WeightsSource};
 use mlx_gen_chroma::{encode_prompt, load_chroma, ChromaVariant};
 use mlx_rs::ops::{abs, concatenate_axis, max, multiply, subtract, sum};
 use mlx_rs::{Array, Dtype};
@@ -212,6 +212,71 @@ fn chroma_hd_quant_bounded() {
 fn chroma_base_e2e_matches_diffusers() {
     // Base uses the beta sigma schedule (use_beta_sigmas).
     run_image_parity(ChromaVariant::Base, "Chroma1-Base", "chroma_e2e_base", 4.0);
+}
+
+/// sc-5514 / sc-5399: the per-step `eval` in the denoise loop makes the per-step `CancelFlag`
+/// check actually interrupt a render. Trip the flag from a timer thread shortly after the render
+/// starts (an external user cancel mid-denoise, exactly as the SceneWorks worker's cancel poll
+/// does) and assert the run aborts early with `Error::Canceled`, having executed far fewer than the
+/// requested steps. Before the fix the denoise built ONE lazy graph and returned `Ok` (the real
+/// compute is deferred to VAE decode) before the async cancel was ever observed by the per-step
+/// check — so it ran every step and never aborted, which this test catches via the `Err(Canceled)`
+/// assertion. 256² so a step is cheap; 28 steps so an ~80ms cancel leaves most of them unrun.
+#[test]
+#[ignore = "needs the ~18GB Chroma1-Flash snapshot"]
+fn chroma_flash_async_cancel_interrupts_denoise() {
+    use std::time::{Duration, Instant};
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let g = Weights::from_file(format!("{dir}/chroma_e2e_flash.safetensors")).unwrap();
+    let init = g.require("init_latents").unwrap().clone();
+    let model = load_chroma(
+        ChromaVariant::Flash,
+        &LoadSpec::new(WeightsSource::Dir(hf_snapshot("Chroma1-Flash"))),
+    )
+    .expect("load Chroma1-Flash");
+
+    const CANCEL_STEPS: u32 = 28;
+    let cancel = CancelFlag::default();
+    let cancel_bg = cancel.clone();
+    let bg = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(80));
+        cancel_bg.cancel();
+    });
+
+    let mut steps_seen = 0u32;
+    let mut on_p = |p: Progress| {
+        if matches!(p, Progress::Step { .. }) {
+            steps_seen += 1;
+        }
+    };
+    let started = Instant::now();
+    let result = model.denoise(
+        PROMPT,
+        NEG,
+        W,
+        H,
+        CANCEL_STEPS,
+        1.0,
+        init,
+        &cancel,
+        &mut on_p,
+    );
+    let elapsed = started.elapsed();
+    bg.join().unwrap();
+
+    eprintln!(
+        "[cancel] steps_seen={steps_seen}/{CANCEL_STEPS} elapsed={elapsed:?} canceled={}",
+        result.is_err()
+    );
+    assert!(
+        matches!(result, Err(Error::Canceled)),
+        "an async mid-denoise cancel must abort with Error::Canceled (steps_seen={steps_seen}/{CANCEL_STEPS})"
+    );
+    assert!(
+        steps_seen < CANCEL_STEPS,
+        "cancel must stop the denoise early; ran all {steps_seen}/{CANCEL_STEPS} steps"
+    );
 }
 
 #[test]

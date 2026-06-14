@@ -250,6 +250,16 @@ impl Chroma {
                 None => pos,
             };
             latents = sampler.step(&pred, &latents, t)?;
+            // Force this step's compute now (sc-5514 / sc-5399). MLX is lazily evaluated, so
+            // without a per-step eval the entire denoise builds ONE graph that only runs at VAE
+            // decode — the per-step `cancel.is_cancelled()` above then passes for every step
+            // during graph-building and never interrupts the single monolithic eval (cancel
+            // becomes effectively per-image, not per-step). Evaluating here makes each step a
+            // real compute boundary so a mid-render cancel lands within ~1 step, gives accurate
+            // per-step progress timing, and bounds peak graph memory. Bit-identical to decoding
+            // the un-eval'd graph (eval forces the same ops, no new math) — the e2e parity
+            // goldens are unaffected.
+            mlx_rs::transforms::eval([&latents])?;
             on_progress(Progress::Step {
                 current: t as u32 + 1,
                 total: n as u32,
