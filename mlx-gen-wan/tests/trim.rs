@@ -21,10 +21,10 @@ fn trim_preserves_output_frame_count() {
     let stride_t = stride.0 as i32;
 
     for frames in [5usize, 49, 81] {
-        let base_out = latent_shape(frames, 256, 256, z, stride)[1] * stride_t;
+        let base_out = latent_shape(frames, 256, 256, z, stride).unwrap()[1] * stride_t;
         for trim in [0usize, 1, 2, 4] {
             let gen_frames = frames + trim * stride.0; // requested + trim·4
-            let gen_out = latent_shape(gen_frames, 256, 256, z, stride)[1] * stride_t;
+            let gen_out = latent_shape(gen_frames, 256, 256, z, stride).unwrap()[1] * stride_t;
             let kept = gen_out - (trim as i32) * stride_t; // drop the leading trim·4 output frames
             assert_eq!(
                 kept, base_out,

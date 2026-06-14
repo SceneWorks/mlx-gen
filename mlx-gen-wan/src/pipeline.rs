@@ -46,11 +46,17 @@ pub fn latent_shape(
     width: u32,
     z_dim: usize,
     vae_stride: (usize, usize, usize),
-) -> [i32; 4] {
-    let t_lat = (frames - 1) / vae_stride.0 + 1;
+) -> Result<[i32; 4]> {
+    // `frames == 0` would underflow `frames - 1` (usize) into a massive `t_lat`; reject it here,
+    // co-located with the subtraction, so a config/parse path that bypasses the upstream frame
+    // validation gets a clear error rather than a silent wrong latent shape (F-007).
+    let frames_minus_1 = frames
+        .checked_sub(1)
+        .ok_or_else(|| Error::Msg("wan latent_shape: frames must be >= 1".to_string()))?;
+    let t_lat = frames_minus_1 / vae_stride.0 + 1;
     let h_lat = height as usize / vae_stride.1;
     let w_lat = width as usize / vae_stride.2;
-    [z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32]
+    Ok([z_dim as i32, t_lat as i32, h_lat as i32, w_lat as i32])
 }
 
 /// Transformer sequence length: `ceil(h_lat · w_lat / (patch_h · patch_w) · t_lat)`.
@@ -783,16 +789,21 @@ pub fn build_i2v_y(
     vae_stride: (usize, usize, usize),
 ) -> Result<Array> {
     let (h, w) = (height as i32, width as i32);
+    // `frames == 0` would make both the `frames − 1` zero-pad count (negative i32) and the `t_lat`
+    // subtraction (usize underflow) bogus; reject it up front (F-007).
+    let frames_minus_1 = frames
+        .checked_sub(1)
+        .ok_or_else(|| Error::Msg("wan build_i2v_y: frames must be >= 1".to_string()))?;
     // Conditioning video [3, F, H, W]: first frame = image, rest zeros.
     let first = preprocess_i2v_image(image, width, height)?.reshape(&[3, 1, h, w])?;
-    let rest = Array::zeros::<f32>(&[3, frames as i32 - 1, h, w])?;
+    let rest = Array::zeros::<f32>(&[3, frames_minus_1 as i32, h, w])?;
     let video = concatenate_axis(&[&first, &rest], 1)?; // [3, F, H, W]
 
     // VAE-encode → [1, 16, T_lat, h_lat, w_lat], drop the batch axis → [16, T_lat, h_lat, w_lat].
     let z_video = vae.encode(&video.reshape(&[1, 3, frames as i32, h, w])?)?;
     let z_video = z_video.reshape(&z_video.shape()[1..])?;
 
-    let t_lat = (frames - 1) / vae_stride.0 + 1;
+    let t_lat = frames_minus_1 / vae_stride.0 + 1;
     let h_lat = height as usize / vae_stride.1;
     let w_lat = width as usize / vae_stride.2;
     let mask = build_i2v_mask(t_lat, h_lat, w_lat);
@@ -1139,11 +1150,18 @@ mod tests {
     #[test]
     fn latent_shape_and_seq_len_match_reference_formulas() {
         // 49 frames, 512×512, z16, stride (4,8,8), patch (1,2,2).
-        let ls = latent_shape(49, 512, 512, 16, (4, 8, 8));
+        let ls = latent_shape(49, 512, 512, 16, (4, 8, 8)).unwrap();
         assert_eq!(ls, [16, 13, 64, 64]); // (49-1)/4+1=13, 512/8=64
         let sl = seq_len(ls, (1, 2, 2));
         // ceil(64*64/(2*2) * 13) = 1024 * 13 = 13312
         assert_eq!(sl, 13312);
+    }
+
+    #[test]
+    fn latent_shape_rejects_zero_frames() {
+        // frames == 0 must be a clean error, not a usize underflow → huge t_lat (F-007).
+        assert!(latent_shape(0, 512, 512, 16, (4, 8, 8)).is_err());
+        assert!(latent_shape(1, 512, 512, 16, (4, 8, 8)).is_ok());
     }
 
     #[test]

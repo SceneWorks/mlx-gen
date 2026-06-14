@@ -265,7 +265,7 @@ impl Wan {
             .clone()
             .unwrap_or_else(|| cfg.sample_neg_prompt.clone());
 
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         preflight_denoise_memory_guard(
@@ -744,7 +744,7 @@ impl Wan14b {
 
         // Init-noise latent geometry: [z_dim, t_lat, h_lat, w_lat] for the (possibly trim-extended)
         // generation length.
-        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+        let lat = latent_shape(gen_frames, height, width, cfg.vae_z_dim, cfg.vae_stride)?;
 
         // sc-4986 — fail fast (catchable) if the DiT-denoise stage won't fit, before any heavy load.
         // The MoE keeps BOTH experts resident, and always runs cond+uncond (batch 2).

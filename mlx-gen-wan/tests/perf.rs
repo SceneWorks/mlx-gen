@@ -75,7 +75,8 @@ fn wan_a14b_per_step_cached_vs_legacy() {
     let frames = env_usize("WAN_PERF_FRAMES", 25);
     let height = env_usize("WAN_PERF_HEIGHT", 480) as u32;
     let width = env_usize("WAN_PERF_WIDTH", 832) as u32;
-    let lat = latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride);
+    let lat =
+        latent_shape(frames, height, width, cfg.vae_z_dim, cfg.vae_stride).expect("frames >= 1");
     let sl = seq_len(lat, cfg.patch_size);
     println!(
         "geometry: {frames}f {height}x{width} → latent {:?}, seq_len={sl}",

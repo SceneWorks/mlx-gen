@@ -122,8 +122,8 @@ fn read_alpha(a: &Array) -> Result<f32> {
 /// is the user knob; `alpha/rank` is folded in separately (into B for LoRA via [`pass_scales`], into
 /// the delta for LoKr via `reconstruct_lokr_delta`).
 fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
-    match &spec.pass_scales {
-        None => Ok(vec![spec.scale]),
+    let scales = match &spec.pass_scales {
+        None => vec![spec.scale],
         Some(v) => {
             if v.len() != num_passes {
                 return Err(Error::Msg(format!(
@@ -133,9 +133,18 @@ fn pass_strengths(spec: &AdapterSpec, num_passes: usize) -> Result<Vec<f32>> {
                     v.len()
                 )));
             }
-            Ok(v.clone())
+            v.clone()
         }
+    };
+    // An empty pass_scale (reachable when num_passes == 0 and pass_scales = Some([])) would later
+    // underflow `Linear::forward`'s per-pass index; reject it at load time instead (F-009).
+    if scales.is_empty() {
+        return Err(Error::Msg(format!(
+            "ltx_2_3 adapter {}: pass_scales must have at least one entry",
+            spec.path.display()
+        )));
     }
+    Ok(scales)
 }
 
 /// LoRA per-pass effective scales for one resolved module: `(alpha/rank)·strength`. `strength` comes
@@ -412,6 +421,18 @@ mod tests {
         // Wrong length errors.
         spec.pass_scales = Some(vec![0.5]);
         assert!(pass_scales(&spec, 16.0, 8.0, 2).is_err());
+    }
+
+    #[test]
+    fn empty_pass_scales_rejected() {
+        // num_passes == 0 + an empty pass_scales vec passes the length check but must still be
+        // rejected at load — it would otherwise underflow Linear::forward's per-pass index (F-009).
+        let mut spec = AdapterSpec::new("x.safetensors".into(), 0.5, AdapterKind::Lora);
+        spec.pass_scales = Some(vec![]);
+        assert!(pass_strengths(&spec, 0).is_err());
+        // The default (no pass_scales) still yields the single uniform strength.
+        let plain = AdapterSpec::new("x.safetensors".into(), 0.5, AdapterKind::Lora);
+        assert_eq!(pass_strengths(&plain, 2).unwrap(), vec![0.5]);
     }
 
     /// sc-3671: the LTX crate reconstructs third-party LoKr/LoHa deltas (via the shared core pub

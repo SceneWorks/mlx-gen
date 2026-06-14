@@ -383,7 +383,17 @@ impl Linear {
                 // reference's weak Python-float `scale·…`).
                 let r = ad.residual(x)?;
                 let ps = ad.pass_scale();
-                let s = ps[pass.min(ps.len() - 1)];
+                // A malformed adapter with an empty `pass_scale` would underflow `ps.len() - 1`
+                // (usize) into an out-of-bounds index → panic; use a checked access and surface a
+                // clear error instead (F-009). The loader rejects this earlier in `pass_strengths`,
+                // but keep the access itself safe regardless of how the stack was built.
+                let s = *ps
+                    .get(pass.min(ps.len().saturating_sub(1)))
+                    .ok_or_else(|| {
+                        Error::Msg(
+                            "ltx adapter: pass_scale must have at least one entry".to_string(),
+                        )
+                    })?;
                 out = add(&out, &multiply(&r, &scalar(s).as_dtype(r.dtype())?)?)?;
             }
         }
@@ -2169,6 +2179,19 @@ mod tests {
         assert!(all_close(&got, &want, 1e-6, 1e-6, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    #[test]
+    fn empty_pass_scale_forward_errors_not_panics() {
+        // A malformed adapter with an empty pass_scale must surface a clean error from forward,
+        // not underflow `ps.len() - 1` (usize) into an OOB index and panic (F-009).
+        let w = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3, -0.1, -0.2, 0.4], &[3, 2]);
+        let b = Array::from_slice(&[0.5f32, -0.5, 0.25, 0.75], &[2, 2]);
+        let mut lin = dense(w);
+        lin.push_lora(a, b, vec![]);
+        assert!(lin.forward(&x).is_err());
     }
 
     #[test]
