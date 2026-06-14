@@ -391,8 +391,12 @@ impl LensTransformer {
                 Ok(vec![hs, e])
             });
             let mut out = seg(&inputs)?;
-            enc = out.pop().expect("enc output"); // [hidden_out, enc_out] → enc_out
-            hidden = out.pop().expect("hidden output"); // → hidden_out
+            enc = out.pop().ok_or_else(|| {
+                Error::Msg("lens: checkpoint block produced no enc output".into())
+            })?; // [hidden_out, enc_out] → enc_out
+            hidden = out.pop().ok_or_else(|| {
+                Error::Msg("lens: checkpoint block produced no hidden output".into())
+            })?; // → hidden_out
         }
 
         let hidden = self.norm_out.forward(&hidden, &temb)?;

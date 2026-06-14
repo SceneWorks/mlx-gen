@@ -156,10 +156,9 @@ impl LensJointAttention {
                 };
                 Ok(vec![o])
             });
-            seg(&[q, k, v])?
-                .into_iter()
-                .next()
-                .expect("one sdpa output")
+            seg(&[q, k, v])?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("lens: checkpoint SDPA produced no output".into())
+            })?
         } else {
             match mask {
                 Some(m) => scaled_dot_product_attention(&q, &k, &v, self.scale, m, None)?,

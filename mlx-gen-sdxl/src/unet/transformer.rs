@@ -145,7 +145,7 @@ impl AttentionMHA {
             seg(&[q.clone(), k.clone(), v.clone()])?
                 .into_iter()
                 .next()
-                .expect("one sdpa output")
+                .ok_or_else(|| Error::Msg("sdxl: checkpoint SDPA produced no output".into()))?
         } else {
             scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
         };

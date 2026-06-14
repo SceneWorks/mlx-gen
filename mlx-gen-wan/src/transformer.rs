@@ -290,10 +290,10 @@ fn sdpa_maybe_checkpoint(q: &Array, k: &Array, v: &Array, scale: f32, ckpt: bool
             &inp[0], &inp[1], &inp[2], scale, None, None,
         )?])
     });
-    Ok(seg(&[q.clone(), k.clone(), v.clone()])?
+    seg(&[q.clone(), k.clone(), v.clone()])?
         .into_iter()
         .next()
-        .expect("one sdpa output"))
+        .ok_or_else(|| Error::Msg("wan: checkpoint SDPA produced no output".into()))
 }
 
 #[derive(Clone)]
@@ -741,7 +741,10 @@ impl WanTransformer {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![out])
             });
-            x = seg(&inputs)?.into_iter().next().expect("one block output");
+            x = seg(&inputs)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Msg("wan: checkpoint block produced no output".into()))?;
         }
 
         let x = self.apply_head(&x, &e)?; // [1, L, out_dim·∏patch] f32

@@ -554,7 +554,7 @@ impl UNet2DConditionModel {
             x = seg(&inputs)?
                 .into_iter()
                 .next()
-                .expect("one up-block output");
+                .ok_or_else(|| mlx_gen::Error::Msg("sdxl: up block produced no output".into()))?;
         }
 
         // Conv head — not checkpointed.

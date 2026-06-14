@@ -152,7 +152,7 @@ impl ZImageAttention {
             seg(&[q, k, v])?
                 .into_iter()
                 .next()
-                .expect("one sdpa output")
+                .ok_or_else(|| Error::Msg("z-image: checkpoint SDPA produced no output".into()))?
         } else {
             scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
         };

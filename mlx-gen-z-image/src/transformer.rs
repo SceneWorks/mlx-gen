@@ -450,7 +450,9 @@ impl ZImageTransformer {
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 Ok(vec![out])
             });
-            unified = seg(&inputs)?.into_iter().next().expect("one block output");
+            unified = seg(&inputs)?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("z-image: checkpoint block produced no output".into())
+            })?;
         }
 
         // Final layer + unpatchify — identical to `forward_with`.

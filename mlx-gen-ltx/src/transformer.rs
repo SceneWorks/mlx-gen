@@ -645,7 +645,7 @@ impl Attention {
             seg(&[qh, kh, vh])?
                 .into_iter()
                 .next()
-                .expect("one sdpa output")
+                .ok_or_else(|| Error::Msg("ltx: checkpoint SDPA produced no output".into()))?
         } else {
             match mask {
                 Some(m) => scaled_dot_product_attention(&qh, &kh, &vh, scale, m, None)?,
