@@ -18,6 +18,7 @@ pub mod media;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
+pub mod textllm;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
@@ -39,10 +40,15 @@ pub use registry::{
     load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
     TransformRegistration,
 };
+pub use registry::{load_textllm, TextLlmRegistration};
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
     WeightsSource,
+};
+pub use textllm::{
+    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmFinishReason, TextLlmOutput,
+    TextLlmRequest, TextLlmSampling,
 };
 pub use tiling::{TilingConfig, VaeTiling};
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and

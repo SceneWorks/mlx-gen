@@ -9,6 +9,7 @@
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{Generator, ModelDescriptor};
 use crate::runtime::LoadSpec;
+use crate::textllm::{TextLlm, TextLlmDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
 use crate::{Error, Result};
@@ -47,6 +48,14 @@ pub struct CaptionerRegistration {
 
 inventory::collect!(CaptionerRegistration);
 
+/// A text-LLM provider's registration (parallel to [`ModelRegistration`]).
+pub struct TextLlmRegistration {
+    pub descriptor: fn() -> TextLlmDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn TextLlm>>,
+}
+
+inventory::collect!(TextLlmRegistration);
+
 /// All registered generators (one per linked provider crate).
 pub fn generators() -> impl Iterator<Item = &'static ModelRegistration> {
     inventory::iter::<ModelRegistration>.into_iter()
@@ -65,6 +74,11 @@ pub fn trainers() -> impl Iterator<Item = &'static TrainerRegistration> {
 /// All registered captioners (one per linked provider crate that supports image-to-text captioning).
 pub fn captioners() -> impl Iterator<Item = &'static CaptionerRegistration> {
     inventory::iter::<CaptionerRegistration>.into_iter()
+}
+
+/// All registered text-LLM providers (one per linked provider crate that supports text generation).
+pub fn textllms() -> impl Iterator<Item = &'static TextLlmRegistration> {
+    inventory::iter::<TextLlmRegistration>.into_iter()
 }
 
 /// Load a generator by model id (e.g. `"z_image_turbo"`).
@@ -99,6 +113,14 @@ pub fn load_captioner(id: &str, spec: &LoadSpec) -> Result<Box<dyn Captioner>> {
     (reg.load)(spec)
 }
 
+/// Load a text-LLM provider by id (e.g. `"prompt_refine"`).
+pub fn load_textllm(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+    let reg = textllms()
+        .find(|r| (r.descriptor)().id == id)
+        .ok_or_else(|| Error::Msg(format!("no textllm registered for id '{id}'")))?;
+    (reg.load)(spec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +132,9 @@ mod tests {
     };
     use crate::media::Image;
     use crate::runtime::{Progress, WeightsSource};
+    use crate::textllm::{
+        TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest,
+    };
 
     struct DummyGen {
         desc: ModelDescriptor,
@@ -244,5 +269,75 @@ mod tests {
     #[test]
     fn dummy_captioner_appears_in_iteration() {
         assert!(captioners().any(|r| (r.descriptor)().id == "dummy_test_captioner"));
+    }
+
+    struct DummyTextLlm {
+        desc: TextLlmDescriptor,
+    }
+
+    impl TextLlm for DummyTextLlm {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.desc
+        }
+        fn validate(&self, _req: &TextLlmRequest) -> Result<()> {
+            Ok(())
+        }
+        fn generate(
+            &self,
+            _req: &TextLlmRequest,
+            _on_progress: &mut dyn FnMut(Progress),
+        ) -> Result<TextLlmOutput> {
+            Ok(TextLlmOutput {
+                text: "refined".to_owned(),
+                generated_tokens: Some(1),
+                finish_reason: None,
+            })
+        }
+    }
+
+    fn dummy_textllm_descriptor() -> TextLlmDescriptor {
+        TextLlmDescriptor {
+            id: "dummy_test_textllm",
+            family: "test",
+            backend: "mlx",
+            capabilities: TextLlmCapabilities {
+                max_prompt_chars: 8000,
+                max_system_chars: 16000,
+                supports_system_prompt: true,
+                max_new_tokens: 1024,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dummy_textllm_load(_spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
+        Ok(Box::new(DummyTextLlm {
+            desc: dummy_textllm_descriptor(),
+        }))
+    }
+
+    inventory::submit! {
+        TextLlmRegistration {
+            descriptor: dummy_textllm_descriptor,
+            load: dummy_textllm_load,
+        }
+    }
+
+    #[test]
+    fn textllm_registry_resolves_by_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t = load_textllm("dummy_test_textllm", &spec).expect("dummy textllm is registered");
+        assert_eq!(t.descriptor().id, "dummy_test_textllm");
+    }
+
+    #[test]
+    fn unknown_textllm_id_errors() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(load_textllm("no_such_textllm", &spec).is_err());
+    }
+
+    #[test]
+    fn dummy_textllm_appears_in_iteration() {
+        assert!(textllms().any(|r| (r.descriptor)().id == "dummy_test_textllm"));
     }
 }

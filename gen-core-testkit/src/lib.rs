@@ -34,11 +34,16 @@
 //! at a time; the `*_conformance` entry points run them all and panic with the aggregated failures.
 
 pub mod captioner;
+pub mod textllm;
 pub mod trainer;
 
 pub use captioner::{
     captioner_conformance, check_captioner_cancellation, check_captioner_progress,
     check_captioner_registry, check_captioner_validate, CaptionerProfile,
+};
+pub use textllm::{
+    check_textllm_cancellation, check_textllm_progress, check_textllm_registry,
+    check_textllm_validate, textllm_conformance, TextLlmProfile,
 };
 pub use trainer::{
     check_trainer_cancellation, check_trainer_progress, check_trainer_registry,
