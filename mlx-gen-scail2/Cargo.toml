@@ -1,0 +1,22 @@
+[package]
+name = "mlx-gen-scail2"
+version = "0.0.0"
+edition = "2021"
+description = "zai-org SCAIL-2 (Wan2.1-14B I2V end-to-end character animation / cross-identity replacement) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "video", "character-animation", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# SCAIL-2 is Wan2.1-14B I2V: the DiT blocks, z16 VAE, UMT5, RoPE table, flow/UniPC scheduler, and
+# patchify all come from mlx-gen-wan. The SCAIL-2 deltas (3 patch-embed stems + additive mask/pose
+# embeds, per-source RoPE shifts, Wan-I2V image cross-attn, CLIP encoder) layer on top.
+mlx-gen-wan = { path = "../mlx-gen-wan" }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration into mlx-gen's model registry.
+inventory = { workspace = true }
+# config.json (mask_dim / dims) sidecar reading.
+serde_json = "1"
