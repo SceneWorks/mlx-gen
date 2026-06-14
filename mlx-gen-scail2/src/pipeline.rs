@@ -1,22 +1,36 @@
 //! SCAIL-2 provider: capability surface, registration, snapshot/config resolution, and the
 //! [`Generator`] entrypoint.
 //!
-//! WIP (sc-5442): the DiT forward — three patch-embed stems (latent / pose / 28-channel mask) with the
-//! mask & pose embeds *added* to the latent embeds, per-source RoPE shifts (the `replace_flag`
-//! reference H-shift + pose freq-downsample), Wan-I2V image cross-attention, the open-CLIP XLM-RoBERTa
-//! ViT-H/14 image encode, the 28-channel mask preprocessing, and the plain-CFG denoise loop — is being
-//! built. This file lands the registration + capability surface + config/snapshot resolution;
-//! [`Generator::generate`] returns an explicit not-yet-implemented error until the forward lands.
+//! [`Generator::generate`] maps the [`GenerationRequest`] conditioning onto the SCAIL-2 inputs and
+//! runs the live [`crate::generate`] denoise pipeline: the primary **reference character** is a
+//! [`Conditioning::Reference`] image paired with its color-coded [`Conditioning::Mask`]; the
+//! **driving video + per-frame color masks** are a [`Conditioning::ControlClip`]; `video_mode ==
+//! "replacement"` toggles the cross-identity `replace_flag` (else animation). Multi-reference (extra
+//! characters, each needing its own paired mask) and the LoRA path await the sc-5448 request contract
+//! and sc-5451; the [`crate::generate`] core already supports extra characters via
+//! [`crate::CharacterRef`].
 
 use std::path::PathBuf;
 
 use mlx_gen::gen_core;
 use mlx_gen::{
-    Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
+    Result, WeightsSource,
 };
+use mlx_gen_wan::SolverKind;
 
 use crate::config::Scail2Config;
+use crate::generate::{CharacterRef, Scail2Job};
+
+/// Default driving-segment window + clean-history overlap (upstream `scail.py` defaults).
+const SEGMENT_LEN: usize = 81;
+const SEGMENT_OVERLAP: usize = 5;
+/// Upstream `generate()` sampler defaults: 40 steps, shift 5.0 (3.0 at 480p), guide 5.0, 16 fps.
+const DEFAULT_STEPS: u32 = 40;
+const DEFAULT_SHIFT: f32 = 5.0;
+const DEFAULT_GUIDANCE: f32 = 5.0;
+const DEFAULT_FPS: u32 = 16;
 
 /// SceneWorks/engine model id. A still image is `num_frames == 1`.
 pub const MODEL_ID: &str = "scail2_14b";
@@ -34,13 +48,13 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // Reference character (Reference) + extra characters (MultiReference); the driving video +
-            // its color-coded mask map to ControlClip; the reference's own mask rides with the
-            // Reference in the worker-side mapping (sc-5448).
+            // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
+            // characters (MultiReference, experimental); the driving video + its per-frame color masks
+            // map to ControlClip.
             conditioning: vec![
                 ConditioningKind::Reference,
+                ConditioningKind::Mask,
                 ConditioningKind::MultiReference,
-                ConditioningKind::VideoClip,
                 ConditioningKind::ControlClip,
             ],
             // LoRA (incl. the Bias-Aware DPO refinement LoRA) is wired in sc-5451.
@@ -60,13 +74,12 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// The loaded SCAIL-2 model: resolved config + snapshot dir + optional load-time quant. The heavy
-/// components (DiT / VAE / UMT5 / CLIP) are staged inside `generate` once the forward lands.
+/// components (DiT / VAE / UMT5 / CLIP) are staged per-stage inside [`crate::generate`].
 pub struct Scail2 {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)]
     config: Scail2Config,
-    #[allow(dead_code)]
     root: PathBuf,
+    /// Q4/Q8 load-time quant (sc-5445) — threaded through but not yet applied (generate uses bf16).
     #[allow(dead_code)]
     quant: Option<Quant>,
 }
@@ -120,14 +133,89 @@ impl Generator for Scail2 {
 
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        Err(Error::Msg(
-            "scail2: DiT forward not yet implemented (sc-5442 WIP — converter + turnkey snapshot done; \
-             3 patch-embeds / per-source RoPE / I2V cross-attn / CLIP encode / denoise in progress)"
-                .into(),
-        )
-        .into())
+        Ok(self.run(req, on_progress)?)
+    }
+}
+
+/// The first conditioning input matching `f`.
+fn find_conditioning<'a, T>(
+    req: &'a GenerationRequest,
+    f: impl Fn(&'a Conditioning) -> Option<T>,
+) -> Option<T> {
+    req.conditioning.iter().find_map(f)
+}
+
+impl Scail2 {
+    /// Map the request conditioning onto a [`Scail2Job`] and run the denoise pipeline.
+    fn run(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let reference = find_conditioning(req, |c| match c {
+            Conditioning::Reference { image, .. } => Some(image),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Msg("scail2: a Reference character image is required".into()))?;
+        let ref_mask = find_conditioning(req, |c| match c {
+            Conditioning::Mask { image } => Some(image),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::Msg(
+                "scail2: a Mask (the reference character's color-coded segmentation mask) is required"
+                    .into(),
+            )
+        })?;
+        let driving = req.control_clip().ok_or_else(|| {
+            Error::Msg(
+                "scail2: a ControlClip (driving video frames + per-frame color masks) is required"
+                    .into(),
+            )
+        })?;
+
+        // Target size: the request's (aligned to 32 in the core), else the driving frame's native size.
+        let first: &Image = driving
+            .frames
+            .first()
+            .ok_or_else(|| Error::Msg("scail2: the ControlClip has no driving frames".into()))?;
+        let width = if req.width > 0 {
+            req.width
+        } else {
+            first.width
+        };
+        let height = if req.height > 0 {
+            req.height
+        } else {
+            first.height
+        };
+
+        let neg = req.negative_prompt.clone().unwrap_or_default();
+        let job = Scail2Job {
+            prompt: &req.prompt,
+            negative_prompt: &neg,
+            width,
+            height,
+            reference: CharacterRef {
+                image: reference,
+                mask: ref_mask,
+            },
+            additional: Vec::new(),
+            driving_frames: driving.frames,
+            driving_masks: driving.mask,
+            replace_flag: req.video_mode.as_deref() == Some("replacement"),
+            seed: req.seed.unwrap_or_else(default_seed),
+            steps: req.steps.unwrap_or(DEFAULT_STEPS) as usize,
+            shift: req.scheduler_shift.unwrap_or(DEFAULT_SHIFT),
+            guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+            sampler: SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc")),
+            fps: req.fps.unwrap_or(DEFAULT_FPS),
+            segment_len: SEGMENT_LEN,
+            segment_overlap: SEGMENT_OVERLAP,
+        };
+        crate::generate::generate(&self.root, &self.config, &job, on_progress)
     }
 }

@@ -18,13 +18,14 @@
 //! Weights: the turnkey `SceneWorks/scail2-mlx` snapshot (converted bf16 DiT + stock Wan2.1 VAE / UMT5
 //! / CLIP). Plain single-scale CFG; macOS-only.
 //!
-//! Status (sc-5442): the registration + capability surface + config/snapshot resolution, the
-//! [`model::Scail2Dit`] DiT forward, and the per-chunk [`rope::ScailRope`] land here (parity-gated
-//! against the upstream `SCAIL2Model.forward` on a tiny seeded model). The CLIP/VAE/mask preprocessing
-//! (sc-5443), real-weight parity (sc-5446), and the live `generate` denoise loop are the next slices.
+//! Status (sc-5443): the registration + capability surface, the [`model::Scail2Dit`] DiT forward, the
+//! per-chunk [`rope::ScailRope`], the CLIP/VAE/mask preprocessing, and the live [`generate`] denoise
+//! loop all land here (each parity-gated against upstream on tiny seeded fixtures). Real-weight 40-layer
+//! + end-to-end parity is sc-5446; Q4/Q8 load-time quant is sc-5445.
 
 pub mod clip;
 pub mod config;
+pub mod generate;
 pub mod model;
 pub mod pipeline;
 pub mod preprocess;
@@ -33,6 +34,7 @@ pub mod rope;
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
+pub use generate::{generate, CharacterRef, Scail2Job};
 pub use model::{Scail2Dit, Scail2Inputs};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
