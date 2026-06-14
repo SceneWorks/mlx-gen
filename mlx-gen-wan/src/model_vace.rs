@@ -361,6 +361,7 @@ impl WanVace {
                 &context,
                 context_null.as_ref(),
                 &init_noise,
+                &req.cancel,
                 &mut on_step,
             )?
         };

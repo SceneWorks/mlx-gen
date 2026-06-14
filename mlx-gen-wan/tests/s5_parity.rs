@@ -97,6 +97,7 @@ fn wan_moe_denoise_matches_reference() {
         5.0,
         init_noise,
         None,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("denoise_moe");
@@ -123,4 +124,71 @@ fn wan_moe_denoise_matches_reference() {
     // bf16 DiT cross-build envelope (see S4); a routing/boundary bug gives mean_rel ~O(1).
     assert!(la_mr < 2e-2, "moe latents diverged: mean_rel={la_mr:.3e}");
     assert!(vid_mr < 2e-2, "moe video diverged: mean_rel={vid_mr:.3e}");
+}
+
+/// sc-5551 — `denoise_moe` must honor the engine cancel flag mid-loop (the video sibling of chroma's
+/// per-step cancel, sc-5514). The `on_step` callback trips a cloned `CancelFlag` after the first step;
+/// the check at the top of the next step must abort with `Error::Canceled` before all 4 steps run.
+/// Deterministic (the flag is tripped from the callback, not a timer) and reuses the tiny S5 fixture,
+/// so it runs in CI without real weights. The per-step `eval` is what makes the check effective —
+/// without it MLX's lazy graph would defer all compute to VAE decode and the check would never fire.
+#[test]
+fn wan_moe_denoise_honors_midloop_cancel() {
+    let low_w = load("s5_low.safetensors");
+    let high_w = load("s5_high.safetensors");
+    let cfg = tiny_cfg();
+
+    let low_dit = WanTransformer::from_weights(&low_w, &cfg).expect("low DiT");
+    let high_dit = WanTransformer::from_weights(&high_w, &cfg).expect("high DiT");
+
+    let ctx_cond = low_w.require("ctx_cond").unwrap();
+    let ctx_uncond = low_w.require("ctx_uncond").unwrap();
+    let init_noise = low_w.require("init_noise").unwrap();
+
+    let low = Expert {
+        transformer: &low_dit,
+        ctx_cond: low_dit.embed_text(ctx_cond).unwrap(),
+        ctx_uncond: Some(low_dit.embed_text(ctx_uncond).unwrap()),
+        guidance: 3.0,
+    };
+    let high = Expert {
+        transformer: &high_dit,
+        ctx_cond: high_dit.embed_text(ctx_cond).unwrap(),
+        ctx_uncond: Some(high_dit.embed_text(ctx_uncond).unwrap()),
+        guidance: 4.0,
+    };
+    let boundary_timestep = cfg.boundary * cfg.num_train_timesteps as f32;
+
+    let cancel = mlx_gen::CancelFlag::default();
+    let cancel_cb = cancel.clone();
+    let mut steps_seen = 0u32;
+    let result = denoise_moe(
+        &low,
+        &high,
+        boundary_timestep,
+        SolverKind::Euler,
+        cfg.num_train_timesteps,
+        4,
+        5.0,
+        init_noise,
+        None,
+        &cancel,
+        &mut |_| {
+            steps_seen += 1;
+            if steps_seen == 1 {
+                cancel_cb.cancel();
+            }
+        },
+    );
+
+    assert!(
+        matches!(result, Err(mlx_gen::Error::Canceled)),
+        "denoise_moe must return Error::Canceled when the flag is tripped mid-loop (got ok={})",
+        result.is_ok()
+    );
+    // step 0 runs (steps_seen→1, trips cancel); step 1's top-of-loop check aborts before on_step.
+    assert_eq!(
+        steps_seen, 1,
+        "cancel tripped after step 1 must abort at the top of step 2, before all 4 steps run"
+    );
 }

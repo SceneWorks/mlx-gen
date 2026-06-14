@@ -109,6 +109,7 @@ fn wan_ti2v_mask_blend_matches_reference() {
         z_img,
         mask,
         mask_tokens,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| steps_seen += 1,
     )
     .expect("denoise_ti2v");

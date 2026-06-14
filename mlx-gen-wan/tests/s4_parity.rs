@@ -77,6 +77,7 @@ fn wan_t2v_pipeline_matches_reference() {
         &ctx_cond,
         Some(&ctx_uncond),
         init_noise,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| steps_seen += 1,
     )
     .expect("denoise");

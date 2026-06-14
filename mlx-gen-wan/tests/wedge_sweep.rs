@@ -265,6 +265,7 @@ fn wan_ti2v_5b_wedge_sweep() {
         &z_img,
         &mask,
         &mask_tokens,
+        &mlx_gen::CancelFlag::default(),
         &mut |i| {
             let dt = last.elapsed().as_secs_f64();
             last = Instant::now();

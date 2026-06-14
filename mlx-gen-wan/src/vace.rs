@@ -29,7 +29,7 @@
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, concatenate_axis, cos, gt, multiply, sigmoid, sin, split, subtract};
 use mlx_rs::{Array, Dtype};
@@ -851,6 +851,7 @@ pub fn denoise_vace(
     ctx_cond: &Array,
     ctx_uncond: Option<&Array>,
     init_noise: &Array,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
@@ -872,6 +873,10 @@ pub fn denoise_vace(
 
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let cond = transformer.forward_vace_cached(&latents, t, &cache, &ctx_cond_emb, scales)?;
         let pred = match &ctx_uncond_emb {
             Some(uncond_emb) => {

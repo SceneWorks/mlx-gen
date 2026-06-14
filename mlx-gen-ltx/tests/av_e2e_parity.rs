@@ -115,6 +115,7 @@ fn av_e2e_matches_reference() {
         mean,
         std,
         &[], // T2V+A (no replace-latent conditioning in this gate)
+        &mlx_gen::CancelFlag::default(),
         &mut |_| steps += 1,
     )
     .expect("generate_av_latents");
@@ -166,4 +167,74 @@ fn av_e2e_matches_reference() {
     );
     assert_eq!(track.channels, 2);
     assert_eq!(track.sample_rate, 48000);
+}
+
+/// sc-5551 — `generate_av_latents` (the production LTX A/V path) must honor the engine cancel flag
+/// mid-loop: the `on_step` callback trips a cloned `CancelFlag` after the first step, so the check at
+/// the top of the next `denoise_av` step aborts with `Error::Canceled` before all steps run. The video
+/// sibling of chroma's per-step cancel (sc-5514); the per-step `eval` is what makes the check effective
+/// (otherwise MLX's lazy graph defers all compute to decode). Deterministic (callback-tripped, not a
+/// timer). `#[ignore]` like the rest of this file — run with the real weights:
+/// `LTX_BASE_DIR=… cargo test -p mlx-gen-ltx --test av_e2e_parity av_generate_honors_midloop_cancel -- --ignored`.
+#[test]
+#[ignore = "needs ltx_2_3_base_q8 weights (~20 GB)"]
+fn av_generate_honors_midloop_cancel() {
+    let dir = base_dir();
+    let cfg = LtxConfig::from_model_dir(&dir).expect("config");
+    let split = SplitModel::from_model_dir(&dir).expect("split_model.json");
+    let tw = Weights::from_file(dir.join("transformer.safetensors")).expect("transformer");
+    let dit =
+        AvDiT::from_weights(&tw, &cfg, Precision::quant_f32(split.bits, split.group)).expect("dit");
+    let upsampler = LatentUpsampler::from_weights(
+        &Weights::from_file(dir.join("upsampler.safetensors")).expect("upsampler"),
+    )
+    .expect("upsampler");
+    // Only the per-channel stats are needed (cancel aborts before any decode); load via the VAE weights.
+    let vae_w = Weights::from_file(dir.join("vae_decoder.safetensors")).expect("vae");
+    let mean = vae_w.require("per_channel_statistics.mean").unwrap();
+    let std = vae_w.require("per_channel_statistics.std").unwrap();
+
+    let g = Weights::from_file(GOLDEN).expect("golden");
+    let pos1 = create_position_grid(1, 2, 4, 4);
+    let pos2 = create_position_grid(1, 2, 8, 8);
+    let apos = create_audio_position_grid(1, 9);
+
+    let cancel = mlx_gen::CancelFlag::default();
+    let cancel_cb = cancel.clone();
+    let mut steps = 0u32;
+    let result = generate_av_latents(
+        &dit,
+        &upsampler,
+        g.require("video_s1").unwrap(),
+        &pos1,
+        g.require("video_s2").unwrap(),
+        &pos2,
+        g.require("audio_s1").unwrap(),
+        g.require("audio_s2").unwrap(),
+        &apos,
+        g.require("video_ctx").unwrap(),
+        g.require("audio_ctx").unwrap(),
+        mean,
+        std,
+        &[],
+        &cancel,
+        &mut |_| {
+            steps += 1;
+            if steps == 1 {
+                cancel_cb.cancel();
+            }
+        },
+    );
+
+    assert!(
+        matches!(result, Err(mlx_gen::Error::Canceled)),
+        "generate_av_latents must return Error::Canceled when the flag is tripped mid-loop (got ok={})",
+        result.is_ok()
+    );
+    // The first on_step (step 0) trips cancel; the next step-check — whether the rest of stage 1 or
+    // stage 2's first step — aborts before its on_step, so exactly one step is ever reported.
+    assert_eq!(
+        steps, 1,
+        "cancel tripped after step 1 must abort at the next step-check, before all steps run"
+    );
 }

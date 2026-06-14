@@ -20,7 +20,7 @@ use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
-use mlx_gen::{Error, Image, Result};
+use mlx_gen::{CancelFlag, Error, Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
@@ -438,6 +438,7 @@ pub fn denoise(
     ctx_cond: &Array,
     ctx_uncond: Option<&Array>,
     init_noise: &Array,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
@@ -455,6 +456,13 @@ pub fn denoise(
 
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract (sc-5551, the video sibling of chroma's sc-5514):
+        // a video render runs minutes, so check before each step. The per-step `eval` below makes
+        // this effective — without it MLX's lazy graph defers all compute to VAE decode and this
+        // check would pass for every step.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let pred = predict(transformer, &latents, t, &cache, guidance, None)?;
         latents = sched.step(&pred, &latents)?;
         // Force evaluation each step to bound the lazy graph's peak memory (the reference's
@@ -518,6 +526,7 @@ pub fn denoise_ti2v(
     z_img: &Array,
     mask: &Array,
     mask_tokens: &Array,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
@@ -540,6 +549,10 @@ pub fn denoise_ti2v(
 
     let mut latents = init_latents.clone();
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // Per-token timesteps: 0 for the first-frame tokens (frozen), `t` for the rest. (The 5B's
         // seq_len equals the patch count, so no padding is needed — matches the reference.)
         let t_tokens = multiply(mask_tokens, scalar(t))?;
@@ -586,6 +599,7 @@ pub fn denoise_moe(
     shift: f32,
     init_noise: &Array,
     y: Option<&Array>,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let mut sched = make_scheduler(kind, num_train_timesteps);
@@ -613,6 +627,10 @@ pub fn denoise_moe(
 
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (e, cache) = if t >= boundary_timestep {
             (high, &high_cache)
         } else {

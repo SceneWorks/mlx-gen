@@ -178,6 +178,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         &ctx_cond,
         Some(&ctx_uncond),
         noise,
+        &mlx_gen::CancelFlag::default(),
         &mut |i| println!("  t2v step {i}/{steps}"),
     )
     .expect("denoise");
@@ -204,6 +205,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
         exp_zimg,
         &mask,
         &mask_tokens,
+        &mlx_gen::CancelFlag::default(),
         &mut |i| println!("  ti2v step {i}/{steps}"),
     )
     .expect("denoise_ti2v");

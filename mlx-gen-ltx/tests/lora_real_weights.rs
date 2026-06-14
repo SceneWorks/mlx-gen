@@ -142,6 +142,7 @@ fn render(dir: &std::path::Path, dit: &LtxDiT, g: &Weights) -> (Array, Array) {
         g.require("video_embeddings").unwrap(),
         &mean,
         &std,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("generate_t2v_latents");

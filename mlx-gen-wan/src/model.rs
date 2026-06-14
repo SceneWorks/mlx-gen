@@ -403,6 +403,7 @@ impl Wan {
                     z_img,
                     mask,
                     mask_tokens,
+                    &req.cancel,
                     &mut on_step,
                 )?,
                 None => denoise(
@@ -415,6 +416,7 @@ impl Wan {
                     &ctx_cond,
                     ctx_uncond.as_ref(),
                     &latents_init,
+                    &req.cancel,
                     &mut on_step,
                 )?,
             }
@@ -853,6 +855,7 @@ impl Wan14b {
                 shift,
                 &init_noise,
                 y.as_ref(),
+                &req.cancel,
                 &mut on_step,
             )?
         };

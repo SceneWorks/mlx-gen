@@ -187,6 +187,7 @@ fn run(bits: i32, prequantized: bool) {
         shift,
         noise,
         None,
+        &mlx_gen::CancelFlag::default(),
         &mut |i| println!("  Q{bits} step {i}/{steps}"),
     )
     .expect("denoise_moe");

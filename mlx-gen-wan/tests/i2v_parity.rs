@@ -144,6 +144,7 @@ fn wan_i2v_channel_concat_matches_reference() {
         5.0,
         init_noise,
         Some(&y),
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("denoise_moe");

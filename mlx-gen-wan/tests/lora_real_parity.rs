@@ -175,6 +175,7 @@ fn wan_a14b_lora_real_weight_e2e_matches_reference() {
         shift,
         noise,
         None,
+        &mlx_gen::CancelFlag::default(),
         &mut |i| println!("  step {i}/{steps}"),
     )
     .expect("denoise_moe");

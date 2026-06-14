@@ -232,6 +232,7 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
         &pos2,
         &STAGE2_SIGMAS,
         None,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("stage2");
@@ -253,6 +254,7 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
         ctx,
         &mean,
         &std,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("generate_t2v_latents");

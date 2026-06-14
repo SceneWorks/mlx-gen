@@ -553,6 +553,7 @@ impl Ltx {
                 &self.latent_std,
                 video_clips,
                 (LATENT_CHANNELS, lf as i32, h1 as i32, w1 as i32),
+                &req.cancel,
                 &mut on_step,
             )?
         } else {
@@ -571,6 +572,7 @@ impl Ltx {
                 &self.latent_mean,
                 &self.latent_std,
                 video_keyframes,
+                &req.cancel,
                 &mut on_step,
             )?
         };

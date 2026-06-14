@@ -25,7 +25,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
-use mlx_gen::{Error, Image, Result};
+use mlx_gen::{CancelFlag, Error, Image, Result};
 
 use crate::audio_vae::AudioDecoder;
 use crate::conditioning::{
@@ -88,6 +88,7 @@ pub fn euler_step(x: &Array, denoised: &Array, sigma: f32, sigma_next: f32) -> R
 ///   denoised output blended toward the clean conditioning each step — the reference `denoise(...,
 ///   state=...)` path that pins the conditioned frame).
 /// * `on_step` — progress callback, fired once per completed step.
+#[allow(clippy::too_many_arguments)]
 pub fn denoise(
     dit: &LtxDiT,
     latents: &Array,
@@ -95,6 +96,7 @@ pub fn denoise(
     positions: &Array,
     sigmas: &[f32],
     state: Option<&I2vConditioning>,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let dt = latents.dtype();
@@ -104,6 +106,11 @@ pub fn denoise(
     let mut lat = latents.clone();
 
     for i in 0..sigmas.len() - 1 {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551,
+        // the video sibling of chroma's sc-5514). The per-step `eval` below makes this effective.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         // (B, C, F, H, W) → (B, C, S) → (B, S, C) packed tokens.
         let flat = lat.reshape(&[b, c, -1])?.transpose_axes(&[0, 2, 1])?;
@@ -251,6 +258,7 @@ pub fn generate_t2v_latents(
     context: &Array,
     latent_mean: &Array,
     latent_std: &Array,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the AvDiT's fusable elementwise glue (adaLN affine, gated
@@ -269,6 +277,7 @@ pub fn generate_t2v_latents(
         stage1_positions,
         &STAGE1_SIGMAS,
         None,
+        cancel,
         on_step,
     )?;
     let lat = upsample_latents(&lat, upsampler, latent_mean, latent_std)?;
@@ -281,6 +290,7 @@ pub fn generate_t2v_latents(
         stage2_positions,
         &STAGE2_SIGMAS,
         None,
+        cancel,
         on_step,
     )
 }
@@ -315,6 +325,7 @@ pub fn generate_i2v_latents(
     latent_std: &Array,
     frame_idx: i32,
     strength: f32,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     // Stage 1: condition over a zero base, noise (σ₀ = 1.0), conditioned denoise. The image latent is
@@ -331,6 +342,7 @@ pub fn generate_i2v_latents(
         stage1_positions,
         &STAGE1_SIGMAS,
         Some(&st1),
+        cancel,
         on_step,
     )?;
 
@@ -348,6 +360,7 @@ pub fn generate_i2v_latents(
         stage2_positions,
         &STAGE2_SIGMAS,
         Some(&st2),
+        cancel,
         on_step,
     )
 }
@@ -365,6 +378,7 @@ pub fn generate_t2v(
     context: &Array,
     latent_mean: &Array,
     latent_std: &Array,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<Array> {
     let latents = generate_t2v_latents(
@@ -377,6 +391,7 @@ pub fn generate_t2v(
         context,
         latent_mean,
         latent_std,
+        cancel,
         on_step,
     )?;
     decode_to_frames(vae, &latents)
@@ -407,6 +422,7 @@ pub fn denoise_av(
     audio_pos: &Array,
     sigmas: &[f32],
     video_state: Option<&I2vConditioning>,
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
     let dt = video.dtype();
@@ -419,6 +435,10 @@ pub fn denoise_av(
     let mut vlat = video.clone();
     let mut alat = audio.clone();
     for i in 0..sigmas.len() - 1 {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         // Flatten: video (B,C,F,H,W)→(B,Sv,C); audio (B,C,T,F)→(B,T,C·F).
         let vflat = vlat.reshape(&[vb, vc, -1])?.transpose_axes(&[0, 2, 1])?;
@@ -511,6 +531,7 @@ pub fn denoise_av_tokens(
     audio_ctx: &Array,
     audio_pos: &Array,
     sigmas: &[f32],
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(VideoTokenState, Array)> {
     let dt = video.latent.dtype();
@@ -520,6 +541,10 @@ pub fn denoise_av_tokens(
     let mut vtok = video.latent.clone();
     let mut alat = audio.clone();
     for i in 0..sigmas.len() - 1 {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
         // Video already token-native (B, Sv, C). Audio (B,C,T,F) → (B,T,C·F).
         let aflat = alat
@@ -595,6 +620,7 @@ pub fn generate_av_latents(
     latent_mean: &Array,
     latent_std: &Array,
     video_keyframes: &[StageKeyframe],
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue across the joint video/audio/cross-modal
@@ -626,6 +652,7 @@ pub fn generate_av_latents(
         audio_pos,
         &STAGE1_SIGMAS,
         vstate1.as_ref(),
+        cancel,
         on_step,
     )?;
     let v = upsample_latents(&v, upsampler, latent_mean, latent_std)?;
@@ -650,6 +677,7 @@ pub fn generate_av_latents(
         audio_pos,
         &STAGE2_SIGMAS,
         vstate2.as_ref(),
+        cancel,
         on_step,
     )
 }
@@ -690,6 +718,7 @@ pub fn generate_av_latents_iclora(
     latent_std: &Array,
     clips: &[StageClip],
     grid_dims: (i32, i32, i32, i32),
+    cancel: &CancelFlag,
     on_step: &mut dyn FnMut(usize),
 ) -> Result<(Array, Array)> {
     // sc-2963 compiled elementwise glue at the production boundary; sc-4045/F-049 RAII guard restores
@@ -720,6 +749,7 @@ pub fn generate_av_latents_iclora(
         audio_ctx,
         audio_pos,
         &STAGE1_SIGMAS,
+        cancel,
         on_step,
     )?;
     // Read back the generated grid (the first `target_tokens` tokens) → (B, 128, f, h1, w1).
@@ -744,6 +774,7 @@ pub fn generate_av_latents_iclora(
         audio_pos,
         &STAGE2_SIGMAS,
         None,
+        cancel,
         on_step,
     )
 }

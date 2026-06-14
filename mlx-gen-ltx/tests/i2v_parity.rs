@@ -174,6 +174,7 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
         &pos1,
         &STAGE1_SIGMAS,
         Some(&st1),
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("stage1 denoise");
@@ -212,6 +213,7 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
         &std,
         frame_idx,
         strength,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| step += 1,
     )
     .expect("generate_i2v_latents");

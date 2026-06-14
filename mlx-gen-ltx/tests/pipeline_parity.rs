@@ -101,6 +101,7 @@ fn pipeline_matches_reference() {
         g.require("stage1_positions").unwrap(),
         &STAGE1_SIGMAS,
         None,
+        &mlx_gen::CancelFlag::default(),
         &mut |_| {},
     )
     .expect("stage1 denoise");
@@ -143,6 +144,7 @@ fn pipeline_matches_reference() {
         g.require("context").unwrap(),
         g.require("latent_mean").unwrap(),
         g.require("latent_std").unwrap(),
+        &mlx_gen::CancelFlag::default(),
         &mut |_| steps += 1,
     )
     .expect("generate_t2v_latents");

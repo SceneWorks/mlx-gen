@@ -177,6 +177,7 @@ fn wan_i2v_a14b_real_weight_e2e_matches_reference() {
         cfg.sample_shift,
         noise,
         Some(&y),
+        &mlx_gen::CancelFlag::default(),
         &mut |i| println!("  step {i}/{STEPS}"),
     )
     .expect("denoise_moe");

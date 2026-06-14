@@ -148,6 +148,7 @@ fn av_lora_e2e_matches_reference() {
         mean,
         std,
         &[],
+        &mlx_gen::CancelFlag::default(),
         &mut |_| steps += 1,
     )
     .expect("generate_av_latents");
