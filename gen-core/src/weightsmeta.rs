@@ -239,6 +239,102 @@ pub fn parse_rank_alpha(rank: Option<&str>, alpha: Option<&str>) -> (f32, f32) {
     (rank, alpha)
 }
 
+/// The safetensors `__metadata__` key under which PEFT / diffusers `save_lora_adapter` store the
+/// LoRA config blob (sc-5513). Callers pass `meta(LORA_ADAPTER_METADATA_KEY)` to [`LoraAdapterMeta`].
+pub const LORA_ADAPTER_METADATA_KEY: &str = "lora_adapter_metadata";
+
+/// Parsed view of the PEFT / diffusers `lora_adapter_metadata` config blob (sc-5513 — the MLX sibling
+/// of candle's sc-5374 `LoraAdapterMeta`).
+///
+/// `peft.save_pretrained()` and diffusers `save_lora_adapter` do **not** write a per-target `.alpha`
+/// tensor — the kohya / SceneWorks-trainer convention every inference adapter loader reads first. They
+/// store the LoRA scaling inside the safetensors header `__metadata__["lora_adapter_metadata"]`: a JSON
+/// blob carrying `lora_alpha`, `r`, and the optional per-module `alpha_pattern` / `rank_pattern`
+/// overrides. With no `.alpha` tensor the loaders would otherwise fall back to `alpha = rank` (scale
+/// 1.0) and apply such a file at the WRONG strength whenever `lora_alpha ≠ r` (the common `alpha = 2r`
+/// / `r/2` / fixed-16 cases). Parsing this blob lets the merge recover the true `(alpha/rank)` scaling.
+///
+/// Scope is the **LoRA** path: LoKr carries its `rank`/`alpha` as top-level `__metadata__` strings the
+/// LoKr loaders already read via [`parse_rank_alpha`], so it is unaffected. The MLX/SceneWorks trainer's
+/// own PEFT output writes a per-target `.alpha` tensor (and top-level `rank`/`alpha`, not this blob), so
+/// its round-trip is also unaffected — this is purely external/community adapter coverage (same flavor
+/// as sc-3671 / the candle sc-5225 / sc-5374 lineage).
+#[derive(Debug, Default, Clone)]
+pub struct LoraAdapterMeta {
+    lora_alpha: Option<f32>,
+    r: Option<f32>,
+    alpha_pattern: BTreeMap<String, f32>,
+    rank_pattern: BTreeMap<String, f32>,
+}
+
+impl LoraAdapterMeta {
+    /// Parse the `lora_adapter_metadata` JSON `blob` (the value of [`LORA_ADAPTER_METADATA_KEY`] in a
+    /// safetensors `__metadata__` map). Returns `None` when the blob is absent (`None` — kohya /
+    /// trainer files, which carry a per-target `.alpha` tensor instead) or unparseable — treated as
+    /// absent so a malformed blob can never poison the merge (the caller keeps today's `alpha = rank`
+    /// default).
+    ///
+    /// A non-positive `r` / `rank_pattern` value is dropped (treated as absent): it is the scaling
+    /// denominator, and a `≤ 0` rank would make `alpha/rank` non-finite and NaN-poison the residual —
+    /// same guard as [`parse_rank_alpha`] (sc-5252/F-002). A `0` *alpha* is kept (a legitimate scale-0,
+    /// disabled-adapter value).
+    pub fn from_metadata(blob: Option<&str>) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(blob?).ok()?;
+        let num = |x: &serde_json::Value| x.as_f64().map(|f| f as f32);
+        let pos = |x: &serde_json::Value| x.as_f64().map(|f| f as f32).filter(|&f| f > 0.0);
+        // A `{module: number}` JSON object → `BTreeMap`, applying `keep` per value and skipping any
+        // non-numeric / filtered-out entry.
+        let pattern = |x: Option<&serde_json::Value>,
+                       keep: &dyn Fn(&serde_json::Value) -> Option<f32>|
+         -> BTreeMap<String, f32> {
+            x.and_then(|v| v.as_object())
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, val)| keep(val).map(|f| (k.clone(), f)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Some(Self {
+            lora_alpha: v.get("lora_alpha").and_then(num),
+            r: v.get("r").and_then(pos),
+            alpha_pattern: pattern(v.get("alpha_pattern"), &num),
+            rank_pattern: pattern(v.get("rank_pattern"), &pos),
+        })
+    }
+
+    /// PEFT per-module override resolution. A single `target_name_key` is the first pattern key (across
+    /// `rank_pattern` ∪ `alpha_pattern`) that equals `module_path` or that `module_path` ends with as
+    /// `.{key}` — PEFT's `re.match(r".*\.{key}$")` in `LoraModel._create_and_replace`. Deterministic on
+    /// overlap (`BTreeMap` key order). `None` ⇒ no per-module override, use the globals.
+    fn target_name_key(&self, module_path: &str) -> Option<&str> {
+        self.rank_pattern
+            .keys()
+            .chain(self.alpha_pattern.keys())
+            .map(String::as_str)
+            .find(|&k| module_path == k || module_path.ends_with(&format!(".{k}")))
+    }
+
+    /// The effective `(alpha, rank)` for `module_path`: `alpha_pattern[key] → lora_alpha` and
+    /// `rank_pattern[key] → r`, each `None` when unset. The caller uses `alpha` (falling back to the
+    /// factor rank) as the numerator; `rank` is honored as the scaling denominator (a well-formed PEFT
+    /// file stores `A` as `[r, in]`, so the factor's leading dim already equals this — the metadata
+    /// value is used for faithfulness and as the source of truth PEFT itself scales by). Any returned
+    /// `rank` is `> 0` ([`from_metadata`] drops non-positive ranks).
+    pub fn effective(&self, module_path: &str) -> (Option<f32>, Option<f32>) {
+        let key = self.target_name_key(module_path);
+        let alpha = key
+            .and_then(|k| self.alpha_pattern.get(k))
+            .copied()
+            .or(self.lora_alpha);
+        let rank = key
+            .and_then(|k| self.rank_pattern.get(k))
+            .copied()
+            .or(self.r);
+        (alpha, rank)
+    }
+}
+
 /// Split a factor key into `(module_path, factor_name)` using `suffixes` (exact-suffix match, in
 /// order — list `_a`/`_b` before the bare factor). `factor_name` has the leading `.` dropped (e.g.
 /// `blk.0.lokr_w1_a` → `("blk.0", "lokr_w1_a")`). `None` if no suffix matches.
@@ -308,6 +404,67 @@ mod tests {
         assert_eq!(parse_rank_alpha(Some("0"), None), (1.0, 1.0));
         assert_eq!(parse_rank_alpha(Some("0"), Some("8")), (1.0, 8.0));
         assert_eq!(parse_rank_alpha(Some("-4"), None), (1.0, 1.0));
+    }
+
+    /// sc-5513: a diffusers / PEFT `lora_adapter_metadata` blob with `lora_alpha ≠ r` parses to the
+    /// global pair, so the loaders can recover the true `(alpha/rank)` scaling (the story example:
+    /// `lora_alpha = 16`, `r = 8` ⇒ scale 2.0). The pair applies to any module with no override.
+    #[test]
+    fn lora_adapter_meta_parses_global_alpha_rank() {
+        let blob = r#"{"lora_alpha": 16, "r": 8, "target_modules": ["to_q", "to_v"]}"#;
+        let cfg = LoraAdapterMeta::from_metadata(Some(blob)).expect("blob must parse");
+        assert_eq!(
+            cfg.effective("transformer_blocks.0.attn.to_q"),
+            (Some(16.0), Some(8.0))
+        );
+    }
+
+    /// sc-5513: PEFT `alpha_pattern` / `rank_pattern` override the globals for a module whose dotted
+    /// path ends with the pattern key (`re.match(r".*\.{key}$")`); a non-matching module keeps the
+    /// globals. Mirrors PEFT's single-`target_name_key` resolution.
+    #[test]
+    fn lora_adapter_meta_honors_per_module_patterns() {
+        let blob = r#"{"lora_alpha": 8, "r": 8,
+                       "alpha_pattern": {"to_q": 32},
+                       "rank_pattern": {"to_q": 16}}"#;
+        let cfg = LoraAdapterMeta::from_metadata(Some(blob)).unwrap();
+        // `…attn.to_q` ends with `.to_q` → the override pair.
+        assert_eq!(
+            cfg.effective("transformer_blocks.0.attn.to_q"),
+            (Some(32.0), Some(16.0))
+        );
+        // `…attn.to_k` matches no pattern → the globals.
+        assert_eq!(
+            cfg.effective("transformer_blocks.0.attn.to_k"),
+            (Some(8.0), Some(8.0))
+        );
+    }
+
+    /// sc-5513: an absent blob (`None` — kohya / trainer files) and a malformed blob both yield `None`,
+    /// so the caller falls back to today's per-target-`.alpha`-or-`rank` behavior rather than erroring.
+    #[test]
+    fn lora_adapter_meta_absent_or_malformed_is_none() {
+        assert!(LoraAdapterMeta::from_metadata(None).is_none());
+        assert!(LoraAdapterMeta::from_metadata(Some("{not valid json")).is_none());
+    }
+
+    /// sc-5513: a non-positive `r` / `rank_pattern` value is dropped (treated as absent) so the scaling
+    /// denominator stays `> 0` and `alpha/rank` can never NaN-poison the merge (sc-5252/F-002); the
+    /// caller then falls back to the factor's leading dim. A `0` *alpha* is a legitimate scale-0 value
+    /// and is kept.
+    #[test]
+    fn lora_adapter_meta_drops_nonpositive_rank() {
+        let cfg = LoraAdapterMeta::from_metadata(Some(
+            r#"{"lora_alpha": 16, "r": 0, "rank_pattern": {"to_q": -4}}"#,
+        ))
+        .unwrap();
+        // r = 0 dropped → rank None (caller uses the factor leading dim); alpha still recovered.
+        assert_eq!(cfg.effective("blocks.0.to_k"), (Some(16.0), None));
+        // rank_pattern[to_q] = -4 dropped → falls back to the (absent) global r → None.
+        assert_eq!(cfg.effective("blocks.0.to_q"), (Some(16.0), None));
+        // A scale-0 (disabled) adapter alpha is preserved.
+        let z = LoraAdapterMeta::from_metadata(Some(r#"{"lora_alpha": 0, "r": 8}"#)).unwrap();
+        assert_eq!(z.effective("blocks.0.to_q"), (Some(0.0), Some(8.0)));
     }
 
     #[test]

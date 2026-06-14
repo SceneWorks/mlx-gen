@@ -32,6 +32,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
 };
+use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -185,6 +186,11 @@ fn apply_one(
         }
     }
 
+    // PEFT/diffusers `save_lora_adapter` files carry no per-target `.alpha` tensor — `lora_alpha`/`r`
+    // (+ per-module overrides) live in the `lora_adapter_metadata` header blob (sc-5513). `None` for a
+    // file without it (kohya / trainer files ship a `.alpha` tensor), in which case the per-target
+    // `.alpha` or the factor rank is used exactly as before.
+    let cfg = LoraAdapterMeta::from_metadata(w.metadata(LORA_ADAPTER_METADATA_KEY));
     for (path, parts) in groups {
         let (Some(down), Some(up)) = (parts.down, parts.up) else {
             // A down/up whose partner targeted a non-LoRA key — skip the orphan, surface the path.
@@ -192,8 +198,12 @@ fn apply_one(
             continue;
         };
         let segs: Vec<&str> = path.split('.').collect();
-        let rank = down.shape()[0] as f32;
-        let alpha = parts.alpha.unwrap_or(rank);
+        // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
+        // rank (today's default). The denominator honors the blob `r`/`rank_pattern` when given
+        // (always `> 0`), else the stored `down` leading dim (which equals it for a well-formed file).
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
+        let alpha = parts.alpha.or(cfg_alpha).unwrap_or(rank);
         let scales = pass_scales(spec, alpha, rank, num_passes)?;
         match host.adaptable_mut(&segs) {
             Some(lin) => {

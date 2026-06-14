@@ -55,6 +55,7 @@ use mlx_gen::adapters::loader::{
 };
 use mlx_gen::adapters::{conv_lora_delta, reconstruct_lokr_delta, AdaptableHost};
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -311,12 +312,21 @@ fn merge_one(
         }
     }
 
+    // PEFT/diffusers `save_lora_adapter` files carry no per-target `.alpha` tensor — `lora_alpha`/`r`
+    // (+ per-module overrides) live in the `lora_adapter_metadata` header blob (sc-5513). `None` for
+    // kohya files (those ship a `.alpha` tensor), in which case the per-target `.alpha` or the factor
+    // rank is used exactly as before.
+    let cfg = LoraAdapterMeta::from_metadata(w.metadata(LORA_ADAPTER_METADATA_KEY));
     for (path, t) in triples {
         let (Some(down), Some(up)) = (t.down, t.up) else {
             // Half-pair (a down/up whose partner targeted a non-routable module) — skip.
             report.skipped_keys += 1;
             continue;
         };
+        // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
+        // rank (today's last-resort default). The denominator is the blob `r`/`rank_pattern` when given
+        // (always `> 0`), else the stored `down` leading dim (which equals it for a well-formed file).
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
         // Conv-shaped (4-D) LoRAs (`down [rank,in,kH,kW]`, `up [out,rank,1,1]`): merge under
         // Complete coverage (sc-2919), where they fold into the conv weights (resnet conv1/conv2,
         // conv_shortcut, the down/up-samplers, conv_in/conv_out). Under the Linear-only vendored
@@ -329,8 +339,8 @@ fn merge_one(
                 report.skipped_keys += 2;
                 continue;
             }
-            let rank = down.shape()[0] as f32;
-            let alpha = t.alpha.unwrap_or(rank);
+            let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
+            let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
             let delta = conv_lora_delta(&down, &up, alpha, rank, scale)?;
             merge_conv_routed(unet, &path, &delta, report)?;
             continue;
@@ -347,8 +357,8 @@ fn merge_one(
             report.skipped_keys += 1;
             continue;
         }
-        let rank = down.shape()[0] as f32;
-        let alpha = t.alpha.unwrap_or(rank);
+        let rank = cfg_rank.unwrap_or(down.shape()[0] as f32);
+        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
         let delta = lora_delta(&down, &up, alpha, rank, scale)?;
         // Routes 1:1 for attention/proj/time_emb/mid_block; row-splits the GEGLU `ff.net.0.proj`.
         // A PEFT path naming a genuinely non-routable module surfaces as skipped inside `merge_into`.

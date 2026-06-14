@@ -21,3 +21,5 @@ tokenizers = { workspace = true }
 # Neutral safetensors header/byte-view reader for the weights-metadata layer (sc-3722). NOT a tensor
 # dep — exposes keys/dtypes/shapes/raw bytes only.
 safetensors = { workspace = true }
+# JSON parse for the PEFT/diffusers `lora_adapter_metadata` header blob in weightsmeta (sc-5513).
+serde_json = { workspace = true }

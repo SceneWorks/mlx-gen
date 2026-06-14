@@ -517,7 +517,12 @@ pub fn apply_lora_peft(
         }
     }
 
-    install_lora_groups(host, groups, scale)
+    // PEFT/diffusers `save_lora_adapter` files carry no per-target `.alpha` tensor — `lora_alpha`/`r`
+    // (+ per-module overrides) live in the `lora_adapter_metadata` header blob (sc-5513). `None` for a
+    // file without the blob, in which case the per-target `.alpha` or the factor rank is used exactly
+    // as before. (kohya / BFL loaders ship a `.alpha` tensor and pass `None` here.)
+    let cfg = wmeta::LoraAdapterMeta::from_metadata(w.metadata(wmeta::LORA_ADAPTER_METADATA_KEY));
+    install_lora_groups(host, groups, scale, cfg.as_ref())
 }
 
 /// Install grouped `(down=A, up=B, alpha)` LoRA factors onto `host`, one residual per resolved module
@@ -530,6 +535,7 @@ fn install_lora_groups(
     host: &mut impl AdaptableHost,
     groups: BTreeMap<String, LoraParts>,
     scale: f32,
+    meta: Option<&wmeta::LoraAdapterMeta>,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
     for (path, parts) in groups {
@@ -550,9 +556,16 @@ fn install_lora_groups(
                         b_raw.shape()
                     )));
                 }
-                if let Some(alpha) = parts.alpha {
-                    let rank = a.shape()[1] as f32; // r
-                    if rank == 0.0 {
+                // Effective scaling. Precedence: per-target `.alpha` tensor (kohya / SceneWorks
+                // trainer / BFL) → the PEFT/diffusers `lora_adapter_metadata` blob's
+                // `alpha_pattern`/`lora_alpha` (sc-5513 — that format ships NO `.alpha` tensor) → no
+                // fold (the pre-existing `alpha == rank ⇒ scale 1.0` default). The denominator honors
+                // the blob `r`/`rank_pattern` when given (always `> 0`), else the factor's stored
+                // leading dim (which equals it for a well-formed PEFT file).
+                let (cfg_alpha, cfg_rank) = meta.map_or((None, None), |m| m.effective(&path));
+                if let Some(alpha) = parts.alpha.or(cfg_alpha) {
+                    let factor_rank = a.shape()[1] as f32; // r
+                    if factor_rank == 0.0 {
                         // Zero rank (empty/malformed factor) → non-finite alpha/rank → a NaN residual
                         // folded into the linear, silently corrupting inference. Reject the adapter
                         // instead of installing it (sc-5252/F-002).
@@ -560,6 +573,7 @@ fn install_lora_groups(
                             "lora adapter at '{path}' has zero rank (empty down/up factor)"
                         )));
                     }
+                    let rank = cfg_rank.unwrap_or(factor_rank);
                     b = b.multiply(Array::from_slice(&[alpha / rank], &[1]))?;
                 }
                 lin.push(Adapter::Lora { a, b, scale });
@@ -656,7 +670,9 @@ pub fn apply_lora_kohya(
         }
     }
 
-    let mut report = install_lora_groups(host, groups, scale)?;
+    // kohya / BFL files carry a per-target `.alpha` tensor, not the `lora_adapter_metadata` blob — no
+    // blob to honor here (sc-5513).
+    let mut report = install_lora_groups(host, groups, scale, None)?;
     report.unmatched_paths.extend(unresolved);
     Ok(report)
 }
@@ -857,7 +873,9 @@ pub fn apply_lora_bfl(
         }
     }
 
-    let mut report = install_lora_groups(host, groups, scale)?;
+    // kohya / BFL files carry a per-target `.alpha` tensor, not the `lora_adapter_metadata` blob — no
+    // blob to honor here (sc-5513).
+    let mut report = install_lora_groups(host, groups, scale, None)?;
     report.unmatched_paths.extend(unresolved);
     Ok(report)
 }
@@ -1138,6 +1156,170 @@ mod tests {
         assert!(all_close(&got, &want, 1e-5, 1e-5, false)
             .unwrap()
             .item::<bool>());
+    }
+
+    #[test]
+    fn lora_peft_honors_lora_adapter_metadata_alpha() {
+        // sc-5513: a diffusers / PEFT `save_lora_adapter` file carries NO per-target `.alpha` tensor —
+        // the scaling lives in the `lora_adapter_metadata` header blob. With `lora_alpha = 16`, `r = 8`
+        // the PEFT loader must fold `(16/8) = 2.0` (the metadata strength), not the pre-sc-5513
+        // `alpha = rank` default (factor 1.0). Proves the blob is read and applied.
+        let weight = Array::from_slice(
+            &(0..12).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 3],
+        );
+        // PEFT factors with a TRUE rank of 8 (matching the blob `r`): A [r=8, in=3], B [out=4, r=8].
+        let a_raw = Array::from_slice(
+            &(0..24).map(|i| i as f32 * 0.03 - 0.3).collect::<Vec<_>>(),
+            &[8, 3],
+        );
+        let b_raw = Array::from_slice(
+            &(0..32).map(|i| 0.4 - i as f32 * 0.02).collect::<Vec<_>>(),
+            &[4, 8],
+        );
+
+        let path = tmp("lora_adapter_metadata.safetensors");
+        let meta = HashMap::from([(
+            "lora_adapter_metadata".to_string(),
+            r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
+        )]);
+        // Deliberately NO `lin.alpha` tensor — the scaling must come from the blob.
+        Array::save_safetensors(
+            vec![("lin.lora_A.weight", &a_raw), ("lin.lora_B.weight", &b_raw)],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(w.metadata("lora_adapter_metadata").is_some());
+
+        let mut host = OneLinear {
+            lin: AdaptableLinear::dense(weight.clone(), None),
+        };
+        let report = apply_lora_peft(&mut host, &w, 1.0, None).unwrap();
+        assert_eq!(report.applied, 1);
+
+        // Reference: alpha 16 over rank 8 ⇒ factor 2.0 folded into B (scale 1.0).
+        let mut expected = AdaptableLinear::dense(weight.clone(), None);
+        expected.push(Adapter::Lora {
+            a: a_raw.t(),
+            b: b_raw
+                .t()
+                .multiply(Array::from_slice(&[2.0f32], &[1]))
+                .unwrap(),
+            scale: 1.0,
+        });
+        // The pre-sc-5513 default (alpha = rank ⇒ factor 1.0) would diverge by a full factor of 2.
+        let mut buggy = AdaptableLinear::dense(weight, None);
+        buggy.push(Adapter::Lora {
+            a: a_raw.t(),
+            b: b_raw.t(),
+            scale: 1.0,
+        });
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5], &[1, 3]);
+        let got = host.lin.forward(&x).unwrap();
+        let want = expected.forward(&x).unwrap();
+        let old = buggy.forward(&x).unwrap();
+        assert!(
+            all_close(&got, &want, 1e-5, 1e-5, false)
+                .unwrap()
+                .item::<bool>(),
+            "metadata-alpha fold must match (16/8)·scale"
+        );
+        assert!(
+            !all_close(&got, &old, 1e-4, 1e-4, false)
+                .unwrap()
+                .item::<bool>(),
+            "metadata alpha must differ from the alpha=rank default"
+        );
+    }
+
+    /// sc-5513 **live torch-PEFT A/B** (the epic 3641 / sc-3671 on-device harness; torch IS available
+    /// on the Mac at `~/mlx-flux-venv`). `#[ignore]` — gated on a real diffusers `save_lora_adapter`
+    /// file, generated with peft 0.19 + diffusers 0.37:
+    /// ```text
+    /// ~/mlx-flux-venv/bin/python - <<'PY'
+    /// import os, torch
+    /// from diffusers import UNet2DConditionModel
+    /// from peft import LoraConfig
+    /// torch.manual_seed(0)
+    /// unet = UNet2DConditionModel(sample_size=8, in_channels=4, out_channels=4, layers_per_block=1,
+    ///     block_out_channels=(16,32), down_block_types=("CrossAttnDownBlock2D","DownBlock2D"),
+    ///     up_block_types=("UpBlock2D","CrossAttnUpBlock2D"), cross_attention_dim=16,
+    ///     attention_head_dim=2, norm_num_groups=4)
+    /// unet.add_adapter(LoraConfig(r=8, lora_alpha=16, target_modules=["to_q","to_k","to_v"],
+    ///     alpha_pattern={"to_k":8}, rank_pattern={"to_k":16}, init_lora_weights=False))
+    /// unet.save_lora_adapter("/tmp/sc5513_adapter")
+    /// PY
+    /// SC5513_PEFT_ADAPTER=/tmp/sc5513_adapter/pytorch_lora_weights.safetensors \
+    ///   cargo test -p mlx-gen peft_lora_adapter_metadata_ab -- --ignored --nocapture
+    /// ```
+    /// peft's authoritative per-module scaling (`mod.scaling['default']`) is then `to_q`/`to_v` = 16/8 =
+    /// 2.0 and `to_k` = 8/16 = 0.5 (the override is deliberately discriminating). The Rust core loader
+    /// must install each residual at exactly that scaling — proving the `lora_adapter_metadata` blob is
+    /// honored on a genuine torch file (which carries NO per-target `.alpha` tensor, the bug's premise).
+    #[test]
+    #[ignore = "needs a diffusers save_lora_adapter file via SC5513_PEFT_ADAPTER (see doc comment)"]
+    fn peft_lora_adapter_metadata_ab() {
+        let Ok(path) = std::env::var("SC5513_PEFT_ADAPTER") else {
+            eprintln!("SC5513_PEFT_ADAPTER unset — skipping live torch A/B");
+            return;
+        };
+        let w = Weights::from_file(&path).unwrap();
+        // The whole premise: a real diffusers `save_lora_adapter` file ships NO per-target `.alpha`
+        // tensor — the scaling lives in the `lora_adapter_metadata` blob.
+        assert!(
+            !w.keys().any(|k| k.ends_with(".alpha")),
+            "diffusers save_lora_adapter must not ship a per-target .alpha tensor"
+        );
+        assert!(w.metadata(wmeta::LORA_ADAPTER_METADATA_KEY).is_some());
+
+        let block = "down_blocks.0.attentions.0.transformer_blocks.0.attn1";
+        // peft ground truth (confirmed independently via `mod.scaling`): global 2.0, `to_k` override 0.5.
+        for (leaf, peft_scale) in [("to_q", 2.0f32), ("to_k", 0.5f32)] {
+            let module = format!("{block}.{leaf}");
+            let a_raw = w
+                .require(&format!("{module}.lora_A.weight"))
+                .unwrap()
+                .clone();
+            let b_raw = w
+                .require(&format!("{module}.lora_B.weight"))
+                .unwrap()
+                .clone();
+            let out = b_raw.shape()[0];
+            let inp = a_raw.shape()[1];
+            // Zero base so the forward IS the pure (scaled) residual.
+            let zero = Array::from_slice(&vec![0f32; (out * inp) as usize], &[out, inp]);
+            let mut host = MultiHost::new(&[(module.as_str(), zero.clone())]);
+            let report = apply_lora_peft(&mut host, &w, 1.0, None).unwrap();
+            assert!(report.applied >= 1, "{leaf}: not applied");
+
+            // Reference at peft's ground-truth scaling: residual = (x·Aᵀ·Bᵀ)·peft_scale.
+            let mut expect = AdaptableLinear::dense(zero, None);
+            expect.push(Adapter::Lora {
+                a: a_raw.t(),
+                b: b_raw
+                    .t()
+                    .multiply(Array::from_slice(&[peft_scale], &[1]))
+                    .unwrap(),
+                scale: 1.0,
+            });
+            let x = Array::from_slice(
+                &(0..inp).map(|i| (i as f32 * 0.3).sin()).collect::<Vec<_>>(),
+                &[1, inp],
+            );
+            let segs: Vec<&str> = module.split('.').collect();
+            let got = host.adaptable_mut(&segs).unwrap().forward(&x).unwrap();
+            let want = expect.forward(&x).unwrap();
+            assert!(
+                all_close(&got, &want, 1e-4, 1e-4, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "{leaf}: Rust apply diverged from peft scaling {peft_scale}"
+            );
+            println!("OK {leaf}: Rust apply matches peft scaling {peft_scale}");
+        }
     }
 
     #[test]

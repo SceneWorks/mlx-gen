@@ -45,6 +45,7 @@ use mlx_gen::adapters::loader::{
     resolve_lokr_path,
 };
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -313,6 +314,11 @@ fn merge_one(
         }
     }
 
+    // PEFT/diffusers `save_lora_adapter` files carry no per-target `.alpha` tensor — `lora_alpha`/`r`
+    // (+ per-module overrides) live in the `lora_adapter_metadata` header blob (sc-5513). `None` for a
+    // file without it (kohya / trainer files ship a `.alpha` tensor), in which case the per-target
+    // `.alpha` or the factor rank is used exactly as before.
+    let cfg = LoraAdapterMeta::from_metadata(lw.metadata(LORA_ADAPTER_METADATA_KEY));
     for (path, parts) in groups {
         let (Some(down), Some(up)) = (parts.down, parts.up) else {
             // A down/up whose partner targeted a non-LoRA key — skip the orphan, surface the path.
@@ -325,8 +331,12 @@ fn merge_one(
             continue;
         };
         // lora_A: [rank, in], lora_B: [out, rank]. delta = B·A → [out, in], the weight's shape.
-        let rank = down.shape()[0] as f64;
-        let alpha = parts.alpha.map(|a| a as f64).unwrap_or(rank);
+        // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
+        // rank (today's default). The denominator honors the blob `r`/`rank_pattern` when given
+        // (always `> 0`), else the stored `down` leading dim (which equals it for a well-formed file).
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let rank = cfg_rank.map(|r| r as f64).unwrap_or(down.shape()[0] as f64);
+        let alpha = parts.alpha.or(cfg_alpha).map(|a| a as f64).unwrap_or(rank);
         // (alpha/rank)·strength as a single value, matching the reference's Python-float `scale·strength`.
         let eff = (alpha / rank * spec.scale as f64) as f32;
         let delta = matmul(&up, &down)?;
@@ -890,6 +900,77 @@ mod tests {
         );
         // And the ffn key was the renamed target (ffn.0 → ffn.fc1).
         assert!(w.get("blocks.0.ffn.fc1.weight").is_some());
+    }
+
+    #[test]
+    fn merge_honors_lora_adapter_metadata_alpha() {
+        // sc-5513: a diffusers / PEFT `save_lora_adapter` LoRA carries NO per-target `.alpha` tensor —
+        // the scaling lives in the `lora_adapter_metadata` blob. With `lora_alpha = 16`, `r = 8` (the
+        // factor's true rank) the Wan merge must fold `(16/8) = 2.0`, not the pre-sc-5513 `alpha = rank`
+        // default (factor 1.0).
+        use std::collections::HashMap;
+        let rank = 8;
+        // One target, factor rank 8 (= the blob `r`): A [8, 8], B [16, 8] for the [16,8] base q weight.
+        let a = Array::from_slice(
+            &(0..rank * 8)
+                .map(|i| (i as f32 * 0.001 + 0.1).sin() * 0.02)
+                .collect::<Vec<_>>(),
+            &[rank, 8],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let b = Array::from_slice(
+            &(0..16 * rank)
+                .map(|i| (i as f32 * 0.0007 + 0.1).cos() * 0.02)
+                .collect::<Vec<_>>(),
+            &[16, rank],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let path = tmp("merge_meta_alpha.safetensors");
+        // Deliberately NO `.alpha` tensor — the scaling must come from the blob.
+        let meta = HashMap::from([(
+            "lora_adapter_metadata".to_string(),
+            r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
+        )]);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
+                ("diffusion_model.blocks.0.self_attn.q.lora_B.weight", &b),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+
+        let mut w = synthetic_weights();
+        let report = merge_wan_adapters(&mut w, &[spec(path, 1.0, None)], MoeExpert::High).unwrap();
+        assert_eq!(report.applied, 1);
+
+        // Reference: W += (B·A)·(alpha/rank = 2.0), folded at the factor dtype like the merge does.
+        let base = synthetic_weights();
+        let q_base = base.require("blocks.0.self_attn.q.weight").unwrap();
+        let delta = matmul(&b, &a).unwrap();
+        let two = scalar(2.0f32).as_dtype(delta.dtype()).unwrap();
+        let want = add(
+            q_base,
+            multiply(&delta, &two)
+                .unwrap()
+                .as_dtype(q_base.dtype())
+                .unwrap(),
+        )
+        .unwrap();
+        let got = w.require("blocks.0.self_attn.q.weight").unwrap();
+        assert!(
+            array_eq(got, &want, false).unwrap().item::<bool>(),
+            "metadata-alpha merge must fold (16/8)·strength = 2.0"
+        );
+        // The pre-sc-5513 default (alpha = rank = 8 ⇒ factor 1.0) would diverge by a full factor of 2.
+        let one_want = add(q_base, delta.as_dtype(q_base.dtype()).unwrap()).unwrap();
+        assert!(
+            !array_eq(got, &one_want, false).unwrap().item::<bool>(),
+            "metadata alpha must differ from the alpha=rank default"
+        );
     }
 
     #[test]
