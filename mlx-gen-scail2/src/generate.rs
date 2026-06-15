@@ -228,39 +228,6 @@ fn pixels_to_u8(video_cthw: &Array) -> Result<Array> {
     Ok(clamped.as_dtype(Dtype::Uint8)?)
 }
 
-/// Reject an adapter file the SCAIL-2 LoRA path does not yet faithfully support, rather than
-/// silently applying only the part it understands (sc-5451).
-///
-/// The family-agnostic loader installs the standard `lora_down`/`lora_up` (+ `alpha`) factors as
-/// forward-time residuals. The lightx2v cross-architecture step-distill ("lightning") LoRAs are a
-/// *hybrid* format: alongside the low-rank factors they carry full-rank **diff-patch** tensors
-/// (`.diff` / `.diff_b` — direct weight/bias deltas, including on the norm layers) that the residual
-/// loader does not consume, and they target the vanilla Wan2.1-I2V input embeddings whose shapes
-/// differ from SCAIL-2's (e.g. `patch_embedding` in_dim 36 vs 20). Applying such a file through the
-/// residual path would drop the diff patches and the incompatible-shape targets *silently* — exactly
-/// the "never silently drop" failure the strict installer guards against. Until the diff-patch +
-/// cross-architecture install lands (sc-5684), reject it loudly so a partially-applied lightning LoRA
-/// can't masquerade as a full one. SCAIL-2-native LoRAs (the Bias-Aware DPO refinement
-/// LoRA, any trained-on-SCAIL-2 adapter) carry only the standard factors and pass straight through.
-fn reject_unsupported_adapter_formats(adapters: &[AdapterSpec]) -> Result<()> {
-    for spec in adapters {
-        let w = Weights::from_file(&spec.path)?;
-        if w.keys()
-            .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
-        {
-            return Err(Error::Msg(format!(
-                "scail2 LoRA {}: this is a lightx2v diff-patch ('.diff'/'.diff_b') LoRA. The \
-                 residual loader understands only the low-rank 'lora_down'/'lora_up' factors, so \
-                 applying it would silently drop the full-rank diff patches (and its Wan2.1-I2V \
-                 'patch_embedding' shape differs from SCAIL-2's in_dim). Full diff-patch + \
-                 cross-architecture lightning support is tracked as sc-5684.",
-                spec.path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// Run the full SCAIL-2 generation for `job`, loading each component from the snapshot `root`.
 pub fn generate(
     root: &Path,
@@ -280,9 +247,35 @@ pub fn generate(
             job.driving_frames.len()
         )));
     }
-    // Fail fast on an unsupported adapter format (before the 31 GB DiT load) so a lightx2v
-    // diff-patch LoRA can't get half-applied (sc-5451).
-    reject_unsupported_adapter_formats(adapters)?;
+    // Partition the inference LoRAs (before the 31 GB DiT load, so the gate below fails fast):
+    //   * diff-patch ("lightning") files — full-rank `.diff`/`.diff_b` (+ low-rank factors) that the
+    //     residual loader can't consume — are merged *in place* into the dense weights below (sc-5684).
+    //   * pure low-rank files (the Bias-Aware DPO LoRA, …) install as forward-time residuals over the
+    //     (possibly Q4/Q8) base, the way sc-5451 wired them.
+    let mut diff_patch: Vec<&AdapterSpec> = Vec::new();
+    let mut residual: Vec<AdapterSpec> = Vec::new();
+    for spec in adapters {
+        if crate::lora::has_diff_patch_keys(&spec.path)? {
+            diff_patch.push(spec);
+        } else {
+            residual.push(spec.clone());
+        }
+    }
+    // The in-place diff-patch merge folds dense deltas into the weights, so it needs the DENSE (bf16)
+    // snapshot — a pre-quantized-on-disk DiT carries packed u32 weights that can't take a dense delta.
+    // Fail loudly rather than silently dropping the lightning patch (sc-5684/sc-5445).
+    if !diff_patch.is_empty() {
+        if let Some(q) = cfg.wan.quantization {
+            return Err(Error::Msg(format!(
+                "scail2: a lightx2v diff-patch lightning LoRA needs the DENSE (bf16) snapshot, but \
+                 this one is pre-quantized on disk (Q{}). Point the loader at the bf16 snapshot — \
+                 load-time Q4/Q8 still applies *after* the merge, and the lightning recipe is a \
+                 speed lever (8 steps, CFG off) on activation-bound 480p memory where pre-packed Q4 \
+                 weights help little (sc-5684/sc-5445).",
+                q.bits
+            )));
+        }
+    }
     let (tw, th) = (align(job.width), align(job.height));
     let cfg_disabled = job.guidance <= 1.0;
 
@@ -356,7 +349,16 @@ pub fn generate(
 
     // --- DiT (bf16 production compute; optional Q4/Q8 load-time quant, sc-5445) ---
     let dit = {
-        let w = Weights::from_file(root.join("dit.safetensors"))?;
+        let mut w = Weights::from_file(root.join("dit.safetensors"))?;
+        // sc-5684: merge any lightx2v diff-patch ("lightning") LoRA(s) into the dense weights *before*
+        // building + quantizing — `.diff`/`.diff_b`/low-rank factors fold uniformly into the raw
+        // `{stem}.weight`/`.bias` map (handling the qk-norms, the affine LayerNorms, every bias, and
+        // the full-rank `head.head` delta the residual host can't reach), with the in_dim-36 vanilla
+        // `patch_embedding` deliberately skipped (shape-incompatible) and surfaced loudly.
+        if !diff_patch.is_empty() {
+            let report = crate::lora::merge_diff_patch_adapters(&mut w, &diff_patch)?;
+            crate::lora::report_outcome(&report, crate::pipeline::MODEL_ID)?;
+        }
         let mut d = Scail2Dit::from_weights(&w, cfg)?;
         // f32 matmul compute (sc-5681). The bf16 path overflows to NaN at long sequences: traced to a
         // bf16 quantized-matmul (the self-attention `o` projection is the first to blow up — its
@@ -378,17 +380,18 @@ pub fn generate(
         if let Some(q) = quant {
             d.quantize(q.bits(), None)?;
         }
-        // Install any inference LoRA(s) — the Bias-Aware DPO refinement LoRA, a lightx2v step-distill
-        // lightning LoRA, … — as forward-time residuals over the (now possibly Q4/Q8) base (sc-5451).
-        // Adapters are independent of the base quantization, so they stack cleanly on the packed
-        // weights; applying them *after* `quantize` keeps the residual a dense add over the quantized
-        // matmul. The family-agnostic strict installer (the Z-Image / Qwen path) resolves the
+        // Install any pure low-rank inference LoRA(s) — the Bias-Aware DPO refinement LoRA, a
+        // diff-stripped lightning subset, … — as forward-time residuals over the (now possibly Q4/Q8)
+        // base (sc-5451). Adapters are independent of the base quantization, so they stack cleanly on
+        // the packed weights; applying them *after* `quantize` keeps the residual a dense add over the
+        // quantized matmul. The family-agnostic strict installer (the Z-Image / Qwen path) resolves the
         // diffusers / PEFT / kohya / LoKr keys against SCAIL-2's raw module names and errors — never
-        // silently drops — on a format/prefix mismatch or an unmatched target.
-        if !adapters.is_empty() {
+        // silently drops — on a format/prefix mismatch or an unmatched target. (The diff-patch
+        // lightning files were already merged into the dense weights above, sc-5684.)
+        if !residual.is_empty() {
             mlx_gen::adapters::loader::apply_adapters_strict(
                 &mut d,
-                adapters,
+                &residual,
                 crate::pipeline::MODEL_ID,
             )?;
         }
