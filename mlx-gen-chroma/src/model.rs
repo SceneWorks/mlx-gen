@@ -22,10 +22,10 @@ use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
 
-use crate::config::{ChromaTransformerConfig, ChromaVariant};
+use crate::config::{ChromaTransformerConfig, ChromaVariant, DEFAULT_SAMPLER, HEUN_SAMPLER};
 use crate::loader;
 use crate::text::encode_prompt;
-use crate::transformer::ChromaTransformer;
+use crate::transformer::{ChromaTransformer, RopeTable};
 
 pub fn descriptor_hd() -> ModelDescriptor {
     ChromaVariant::Hd.descriptor()
@@ -92,6 +92,24 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
         transformer: Some(transformer),
         vae: Some(vae),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChromaSamplerKind {
+    Euler,
+    Heun,
+}
+
+impl ChromaSamplerKind {
+    fn from_request(variant: ChromaVariant, sampler: Option<&str>) -> Self {
+        match sampler {
+            Some(HEUN_SAMPLER) => Self::Heun,
+            Some(DEFAULT_SAMPLER | "flow_match") => Self::Euler,
+            None if matches!(variant, ChromaVariant::Flash) => Self::Heun,
+            None => Self::Euler,
+            Some(_) => Self::Euler,
+        }
+    }
 }
 
 pub struct Chroma {
@@ -194,7 +212,7 @@ impl Chroma {
             s
         };
         let sampler = FlowMatchSampler::new(sigmas);
-        let n = sampler.num_steps();
+        let sampler_kind = ChromaSamplerKind::Euler;
 
         // Enable the shared `mx.compile` fusion of the DiT's elementwise glue (adaLN modulate + gated
         // residuals) for the denoise loop, matching FLUX.1/FLUX.2 (F-101/F-102). Process-global +
@@ -215,41 +233,151 @@ impl Chroma {
             None => None,
         };
 
-        let mut latents = latents;
+        self.denoise_loop(
+            latents,
+            sampler,
+            sampler_kind,
+            guidance,
+            &pos_embeds,
+            &rope_pos,
+            mask_pos2d.as_ref(),
+            neg_prepared.as_ref(),
+            cancel,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_with_sampler(
+        &self,
+        prompt: &str,
+        negative: &str,
+        width: u32,
+        height: u32,
+        steps: u32,
+        guidance: f32,
+        latents: Array,
+        sampler_kind: ChromaSamplerKind,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let (tok, t5, tr, _) = self.parts()?;
+        let (pos_embeds, pos_mask) = encode_prompt(tok, t5, prompt)?;
+
+        let h2 = (height / 16) as usize;
+        let w2 = (width / 16) as usize;
+        let si = (h2 * w2) as i32;
+        let img_ids = latent_image_ids(h2, w2);
+        let txt_ids_pos = zero_text_ids(pos_embeds.shape()[1] as usize);
+        let mask_pos = Self::full_mask(&pos_mask, si)?;
+
+        let cfg = if guidance > 1.0 {
+            let (neg_embeds, neg_mask) = encode_prompt(tok, t5, negative)?;
+            let txt_ids_neg = zero_text_ids(neg_embeds.shape()[1] as usize);
+            let mask_neg = Self::full_mask(&neg_mask, si)?;
+            Some((neg_embeds, txt_ids_neg, mask_neg))
+        } else {
+            None
+        };
+
+        let sigmas = if self.variant.use_beta_sigmas() {
+            crate::beta::base_sigmas(steps as usize)
+        } else {
+            let shift = self.variant.sigma_shift();
+            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
+            for v in s.iter_mut().take(steps as usize) {
+                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
+            }
+            s
+        };
+        let sampler = FlowMatchSampler::new(sigmas);
+
+        crate::transformer::set_compile_glue(true);
+
+        let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
+        let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;
+        let neg_prepared = match &cfg {
+            Some((neg_embeds, txt_ids_neg, mask_neg)) => Some((
+                neg_embeds,
+                tr.build_rope_table(txt_ids_neg, &img_ids)?,
+                ChromaTransformer::attention_mask2d(Some(mask_neg))?,
+            )),
+            None => None,
+        };
+
+        self.denoise_loop(
+            latents,
+            sampler,
+            sampler_kind,
+            guidance,
+            &pos_embeds,
+            &rope_pos,
+            mask_pos2d.as_ref(),
+            neg_prepared.as_ref(),
+            cancel,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_loop(
+        &self,
+        mut latents: Array,
+        sampler: FlowMatchSampler,
+        sampler_kind: ChromaSamplerKind,
+        guidance: f32,
+        pos_embeds: &Array,
+        rope_pos: &RopeTable,
+        mask_pos2d: Option<&Array>,
+        neg_prepared: Option<&(&Array, RopeTable, Option<Array>)>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let (_, _, tr, _) = self.parts()?;
+        let n = sampler.num_steps();
+
+        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+            let ts = Array::from_slice(&[sigma], &[1]);
+            let pooled = tr.pooled_temb(&ts)?;
+            let pos = tr.forward_prepared(latents, pos_embeds, &pooled, rope_pos, mask_pos2d)?;
+            match neg_prepared {
+                Some((neg_embeds, rope_neg, mask_neg2d)) => {
+                    let neg = tr.forward_prepared(
+                        latents,
+                        neg_embeds,
+                        &pooled,
+                        rope_neg,
+                        mask_neg2d.as_ref(),
+                    )?;
+                    Ok(add(
+                        &neg,
+                        &multiply(&subtract(&pos, &neg)?, scalar(guidance))?,
+                    )?)
+                }
+                None => Ok(pos),
+            }
+        };
+
         for t in 0..n {
             // Honor the engine cancellation contract every other image provider implements (F-096):
             // an HD 28-step dual-forward 1024² render runs minutes, so check before each step.
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let ts = Array::from_slice(&[sampler.timestep(t)], &[1]);
-            // `pooled_temb` (the 5-layer Approximator) depends only on the timestep, so compute it once
-            // per step and share it across both CFG branches instead of recomputing for the negative
-            // branch (F-102).
-            let pooled = tr.pooled_temb(&ts)?;
-            let pos = tr.forward_prepared(
-                &latents,
-                &pos_embeds,
-                &pooled,
-                &rope_pos,
-                mask_pos2d.as_ref(),
-            )?;
-            // true CFG: neg + g·(pos − neg). At guidance == 1.0 the negative branch is skipped and the
-            // prediction is `pos` exactly (no `neg + 1.0·(pos − neg)` f32 round-trip) — F-095.
-            let pred = match &neg_prepared {
-                Some((neg_embeds, rope_neg, mask_neg2d)) => {
-                    let neg = tr.forward_prepared(
-                        &latents,
-                        neg_embeds,
-                        &pooled,
-                        rope_neg,
-                        mask_neg2d.as_ref(),
-                    )?;
-                    add(&neg, &multiply(&subtract(&pos, &neg)?, scalar(guidance))?)?
+            let pred = predict(&latents, sampler.timestep(t))?;
+            latents = match sampler_kind {
+                ChromaSamplerKind::Euler => sampler.step(&pred, &latents, t)?,
+                ChromaSamplerKind::Heun if t + 1 < n => {
+                    let euler = sampler.step(&pred, &latents, t)?;
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
+                    let pred_next = predict(&euler, sampler.sigma(t + 1))?;
+                    let avg = multiply(&add(&pred, &pred_next)?, scalar(0.5))?;
+                    sampler.step(&avg, &latents, t)?
                 }
-                None => pos,
+                ChromaSamplerKind::Heun => sampler.step(&pred, &latents, t)?,
             };
-            latents = sampler.step(&pred, &latents, t)?;
             // Force this step's compute now (sc-5514 / sc-5399). MLX is lazily evaluated, so
             // without a per-step eval the entire denoise builds ONE graph that only runs at VAE
             // decode — the per-step `cancel.is_cancelled()` above then passes for every step
@@ -358,7 +486,9 @@ impl Chroma {
             }
             let seed = base_seed.wrapping_add(i as u64);
             let latents = create_noise(seed, req.width, req.height)?;
-            let final_latents = self.denoise(
+            let sampler_kind =
+                ChromaSamplerKind::from_request(self.variant, req.sampler.as_deref());
+            let final_latents = self.denoise_with_sampler(
                 &req.prompt,
                 negative,
                 req.width,
@@ -366,6 +496,7 @@ impl Chroma {
                 steps,
                 guidance,
                 latents,
+                sampler_kind,
                 &req.cancel,
                 on_progress,
             )?;

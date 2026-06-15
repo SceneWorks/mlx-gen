@@ -17,8 +17,10 @@ pub const CHROMA1_FLASH_ID: &str = "chroma1_flash";
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
 
-/// The base flow-match sampler name. An unset `req.sampler` resolves to this.
-pub const DEFAULT_SAMPLER: &str = "flow_match";
+/// Flow-match Euler sampler name. Flash's unset sampler resolves to Heun in the generate path, but
+/// Euler stays available for parity tests and manual fallback.
+pub const DEFAULT_SAMPLER: &str = "euler";
+pub const HEUN_SAMPLER: &str = "heun";
 
 /// T5 sequence length Chroma conditions on (diffusers `_get_t5_prompt_embeds(max_sequence_length=512)`).
 pub const MAX_SEQUENCE_LENGTH: usize = 512;
@@ -55,7 +57,7 @@ impl ChromaVariant {
     pub fn default_steps(self) -> u32 {
         match self {
             Self::Hd | Self::Base => 28,
-            Self::Flash => 8,
+            Self::Flash => 12,
         }
     }
 
@@ -103,7 +105,7 @@ impl ChromaVariant {
                 // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
                 supports_lora: true,
                 supports_lokr: true,
-                samplers: vec![DEFAULT_SAMPLER],
+                samplers: vec![DEFAULT_SAMPLER, HEUN_SAMPLER, "flow_match"],
                 schedulers: vec!["linear"],
                 min_size: 256,
                 max_size: 2048,
