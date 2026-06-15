@@ -1,32 +1,33 @@
-//! SCAIL-2 inference LoRA gates (sc-5451).
+//! SCAIL-2 inference LoRA gates (sc-5451 residual path + sc-5684 diff-patch / lightning path).
 //!
-//! Two real-weight `#[ignore]` tests (they need the assembled snapshot and, for the apply smoke, a
-//! LoRA file):
+//! Real-weight `#[ignore]` tests (they need the assembled snapshot and, for the apply smokes, a LoRA
+//! file):
 //!   * `adaptable_paths_resolve_on_real_dit` — load the real DiT and assert every
 //!     [`AdaptableHost::adaptable_paths`] entry resolves through [`AdaptableHost::adaptable_mut`].
 //!     This is the drift guard the trait contract requires (the CI unit tests in `model.rs` cover the
 //!     path-set shape; this proves the paths actually address a Linear on the real model).
-//!   * `lora_apply_smoke` — install a **standard** LoRA (`SCAIL2_LORA`, only `lora_down`/`lora_up`
-//!     (+`alpha`) factors) onto the (optionally Q4) base and run the full pipeline. Driven by env:
+//!   * `lora_apply_smoke` — install a LoRA (`SCAIL2_LORA`) onto the (optionally Q4) base and run the
+//!     full pipeline. Works for BOTH a pure low-rank file (the residual path) AND the raw lightx2v
+//!     **diff-patch** lightning file (merged in place into the dense weights, sc-5684). Driven by env:
 //!       - lightning recipe: the defaults — `SCAIL2_LORA_GUIDE=1.0` (CFG **off**, single DiT
 //!         forward/step), `SCAIL2_LORA_STEPS=8`, `SCAIL2_LORA_SHIFT=1.0`.
 //!       - Bias-Aware DPO refinement: run with `SCAIL2_LORA_GUIDE=5.0` (CFG on). NOTE the DPO LoRA
 //!         ships as a torch pickle (`bias-aware-dpo-lora.pt`) — point `SCAIL2_LORA` at a safetensors
 //!         conversion (the snapshot-assembly / SceneWorks-bundling step), since the loader reads
 //!         safetensors.
-//!   * `diff_patch_lora_rejected` — the raw lightx2v file (`SCAIL2_DIFF_PATCH_LORA`) must error
-//!     loudly rather than half-apply.
-//!
-//! The *raw* lightx2v file is a **diff-patch** LoRA (carries `.diff`/`.diff_b`) and is rejected by
-//! `generate()` (full support is sc-5684). To exercise the residual path with real lightx2v weights,
-//! strip its diff/diff_b keys to a `lora_down/up`-only subset first (the kept factors all target
-//! compatible dim-5120 SCAIL-2 modules).
+//!   * `diff_patch_merge_report` — merge the raw lightx2v file (`SCAIL2_DIFF_PATCH_LORA`) into the
+//!     real dense DiT weight map and assert exactly the right targets merged and that the in_dim-36
+//!     vanilla-Wan `patch_embedding` is the lone cross-architecture skip (the precise sc-5684 contract,
+//!     without a full generate).
+//!   * `diff_patch_rejected_on_prequantized` — the same file against a *pre-quantized-on-disk* snapshot
+//!     (`SCAIL2_Q4_SNAPSHOT_DIR`) must error loudly (the dense delta can't fold into packed u32 weights).
 //!
 //! Run on macOS against the assembled snapshot:
 //! ```text
 //! SCAIL2_SNAPSHOT_DIR=~/.cache/scail2-mlx-convert \
-//! SCAIL2_LORA=~/scail2_compat_lora_only.safetensors \
+//! SCAIL2_DIFF_PATCH_LORA="$HOME/.cache/huggingface/hub/models--lightx2v--Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/snapshots/*/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors" \
 //!   cargo test -p mlx-gen-scail2 --test lora -- --ignored --nocapture
+//! # full lightning e2e: SCAIL2_LORA=<same file> SCAIL2_LORA_QUANT=bf16 … lora_apply_smoke
 //! ```
 
 use std::path::PathBuf;
@@ -241,15 +242,17 @@ fn lora_apply_smoke() {
     );
 }
 
-/// A lightx2v diff-patch (`.diff`/`.diff_b`) LoRA must be rejected loudly — never half-applied (only
-/// its low-rank factors) silently (sc-5451; full support is sc-5684). Fail-fast: the reject fires at
-/// the top of `generate()` before any weight load, so this is cheap (`SCAIL2_DIFF_PATCH_LORA` =
-/// the raw lightx2v file). Skips when the env var is unset.
+/// Merge the **real** lightx2v diff-patch lightning LoRA (`SCAIL2_DIFF_PATCH_LORA`) into the real
+/// dense DiT weight map and assert the precise sc-5684 contract: every compatible dim-5120 target
+/// (the 40 blocks' projections + their qk/`norm3` norm `.diff`s + the dim-5120 globals + `img_emb` +
+/// `head.head`) merges, and the in_dim-36 vanilla-Wan `patch_embedding` is the lone cross-architecture
+/// skip. The merge builds lazy graphs only (no 32 GB materialization), so this is cheap. Skips when the
+/// env var is unset.
 #[test]
-#[ignore = "needs the raw lightx2v diff-patch LoRA file; run with --ignored on macOS"]
-fn diff_patch_lora_rejected() {
+#[ignore = "needs the raw lightx2v diff-patch LoRA file + dense snapshot; run with --ignored on macOS"]
+fn diff_patch_merge_report() {
     let Ok(lora) = std::env::var("SCAIL2_DIFF_PATCH_LORA") else {
-        eprintln!("SCAIL2_DIFF_PATCH_LORA unset — skipping the diff-patch reject test");
+        eprintln!("SCAIL2_DIFF_PATCH_LORA unset — skipping the diff-patch merge test");
         return;
     };
     let lora_path = PathBuf::from(&lora);
@@ -257,8 +260,68 @@ fn diff_patch_lora_rejected() {
         lora_path.exists(),
         "SCAIL2_DIFF_PATCH_LORA not found: {lora}"
     );
+    assert!(
+        mlx_gen_scail2::has_diff_patch_keys(&lora_path).unwrap(),
+        "the file must be a diff-patch (.diff/.diff_b) LoRA"
+    );
 
     let root = snapshot_dir();
+    let dit_path = root.join("dit.safetensors");
+    assert!(
+        dit_path.exists(),
+        "missing dense snapshot at {}",
+        root.display()
+    );
+    let mut w = Weights::from_file(&dit_path).unwrap();
+    let spec = AdapterSpec::new(lora_path, 1.0, AdapterKind::Lora);
+    let report = mlx_gen_scail2::merge_diff_patch_adapters(&mut w, &[&spec]).unwrap();
+    mlx_gen_scail2::lora::report_outcome(&report, MODEL_ID).expect("matched real SCAIL-2 modules");
+
+    println!(
+        "diff-patch merge: {} weights, {} biases merged; cross-arch skips {:?}; unmatched {:?}",
+        report.merged_weights,
+        report.merged_biases,
+        report.skipped_cross_arch,
+        report.skipped_unmatched
+    );
+    // 40 blocks × (12 lora projections + 6 norm `.diff`s = 18) = 720, + dim-5120 globals with a weight
+    // delta (text_embedding.0/.2, time_embedding.0/.2, time_projection.1, img_emb.proj.1/.3 = lora;
+    // img_emb.proj.0/.4 = diff; head.head = diff) = 10 → 730.
+    assert_eq!(
+        report.merged_weights, 730,
+        "every compatible weight delta merges"
+    );
+    // Every `.diff_b` except patch_embedding's (531 total − 1 skipped with the cross-arch module) = 530.
+    assert_eq!(
+        report.merged_biases, 530,
+        "every compatible bias delta merges"
+    );
+    assert_eq!(
+        report.skipped_cross_arch,
+        vec!["patch_embedding".to_string()],
+        "the in_dim-36 vanilla-Wan patch_embedding is the only cross-architecture skip"
+    );
+    assert!(
+        report.skipped_unmatched.is_empty(),
+        "no lightning target should be unmatched"
+    );
+}
+
+/// The same diff-patch file against a **pre-quantized-on-disk** snapshot (`SCAIL2_Q4_SNAPSHOT_DIR`,
+/// e.g. `~/.cache/scail2-mlx-q4`) must error loudly: a dense delta can't fold into packed u32 weights,
+/// so the loader directs the user to the dense bf16 snapshot rather than silently dropping the patch.
+/// Skips when the env var is unset.
+#[test]
+#[ignore = "needs the raw lightx2v file + a pre-quantized snapshot; run with --ignored on macOS"]
+fn diff_patch_rejected_on_prequantized() {
+    let (Ok(lora), Ok(q4_dir)) = (
+        std::env::var("SCAIL2_DIFF_PATCH_LORA"),
+        std::env::var("SCAIL2_Q4_SNAPSHOT_DIR"),
+    ) else {
+        eprintln!("SCAIL2_DIFF_PATCH_LORA / SCAIL2_Q4_SNAPSHOT_DIR unset — skipping");
+        return;
+    };
+    let (lora_path, root) = (PathBuf::from(&lora), PathBuf::from(&q4_dir));
     let (w, h, n) = (64usize, 64usize, 5usize);
     let req = GenerationRequest {
         prompt: "x".into(),
@@ -291,11 +354,11 @@ fn diff_patch_lora_rejected() {
     let gen = mlx_gen::registry::load(MODEL_ID, &spec).expect("load scail2 provider");
     let err = gen
         .generate(&req, &mut |_| {})
-        .expect_err("a diff-patch LoRA must be rejected");
+        .expect_err("a diff-patch LoRA on a pre-quantized snapshot must be rejected");
     let msg = format!("{err}");
     assert!(
-        msg.contains("diff-patch"),
-        "expected a diff-patch rejection, got: {msg}"
+        msg.contains("DENSE") || msg.contains("dense"),
+        "expected a dense-snapshot-required error, got: {msg}"
     );
-    println!("diff-patch LoRA correctly rejected: {msg}");
+    println!("diff-patch on pre-quantized snapshot correctly rejected: {msg}");
 }
