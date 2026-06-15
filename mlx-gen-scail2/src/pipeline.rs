@@ -5,18 +5,19 @@
 //! runs the live [`crate::generate`] denoise pipeline: the primary **reference character** is a
 //! [`Conditioning::Reference`] image paired with its color-coded [`Conditioning::Mask`]; the
 //! **driving video + per-frame color masks** are a [`Conditioning::ControlClip`]; `video_mode ==
-//! "replacement"` toggles the cross-identity `replace_flag` (else animation). Multi-reference (extra
-//! characters, each needing its own paired mask) and the LoRA path await the sc-5448 request contract
-//! and sc-5451; the [`crate::generate`] core already supports extra characters via
-//! [`crate::CharacterRef`].
+//! "replacement"` toggles the cross-identity `replace_flag` (else animation). Inference LoRA(s) from
+//! [`LoadSpec::adapters`] (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
+//! LoRA, sc-5451) install onto the DiT as forward-time residuals. Multi-reference (extra characters,
+//! each needing its own paired mask) awaits the sc-5583 request contract; the [`crate::generate`]
+//! core already supports extra characters via [`crate::CharacterRef`].
 
 use std::path::PathBuf;
 
 use mlx_gen::gen_core;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant,
-    Result, WeightsSource,
+    default_seed, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_wan::SolverKind;
 
@@ -57,9 +58,12 @@ pub fn descriptor() -> ModelDescriptor {
                 ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
-            // LoRA (incl. the Bias-Aware DPO refinement LoRA) is wired in sc-5451.
-            supports_lora: false,
-            supports_lokr: false,
+            // Inference LoRA (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
+            // LoRA) installs as a forward-time residual over the (possibly Q4/Q8) base via the
+            // family-agnostic loader — SCAIL-2 is Wan2.1-14B I2V, so a Wan-I2V LoRA resolves directly
+            // (sc-5451). LoKr/LoHa ride the same residual path.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: vec!["unipc", "dpm++"],
             schedulers: Vec::new(),
             min_size: 32,
@@ -81,6 +85,9 @@ pub struct Scail2 {
     root: PathBuf,
     /// Q4/Q8 load-time quant (sc-5445) — applied to the DiT in [`crate::generate::generate`].
     quant: Option<Quant>,
+    /// Inference LoRA(s) from [`LoadSpec::adapters`] (the Bias-Aware DPO / lightx2v lightning LoRA,
+    /// sc-5451) — installed onto the DiT as forward-time residuals in [`crate::generate::generate`].
+    adapters: Vec<AdapterSpec>,
 }
 
 /// Load SCAIL-2 from a converted MLX snapshot directory (`dit.safetensors` + `config.json` +
@@ -107,6 +114,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         config,
         root,
         quant: spec.quantize,
+        adapters: spec.adapters.clone(),
     }))
 }
 
@@ -215,6 +223,13 @@ impl Scail2 {
             segment_len: SEGMENT_LEN,
             segment_overlap: SEGMENT_OVERLAP,
         };
-        crate::generate::generate(&self.root, &self.config, &job, self.quant, on_progress)
+        crate::generate::generate(
+            &self.root,
+            &self.config,
+            &job,
+            self.quant,
+            &self.adapters,
+            on_progress,
+        )
     }
 }

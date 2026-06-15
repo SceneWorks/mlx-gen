@@ -21,7 +21,7 @@
 //! `amp.autocast(float32)` islands); the matmul-heavy projections run in `compute_dtype` (f32 for the
 //! parity gate, bf16 in production). RoPE is applied in f32.
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
 use mlx_gen::array::scalar;
 use mlx_gen::nn::{gelu_exact, gelu_tanh};
 use mlx_gen::weights::Weights;
@@ -184,6 +184,17 @@ impl SelfAttn {
         push_quant_arrays(&self.o, out);
     }
 
+    /// Resolve a LoRA target projection (`q`/`k`/`v`/`o`) to its [`AdaptableLinear`] (sc-5451).
+    fn adaptable_mut(&mut self, proj: &str) -> Option<&mut AdaptableLinear> {
+        match proj {
+            "q" => Some(&mut self.q),
+            "k" => Some(&mut self.k),
+            "v" => Some(&mut self.v),
+            "o" => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
     /// `x`: `[1, L, dim]` (f32, already adaLN-modulated). `cos`/`sin`: `[L, 1, half_d]` (f32).
     fn forward(&self, x: &Array, cos: &Array, sin: &Array, cdt: Dtype) -> Result<Array> {
         let (b, s) = (x.shape()[0], x.shape()[1]);
@@ -270,6 +281,20 @@ impl CrossAttnI2V {
         push_quant_arrays(&self.v_img, out);
     }
 
+    /// Resolve a LoRA target projection (the text `q`/`k`/`v`/`o` or the I2V image `k_img`/`v_img`)
+    /// to its [`AdaptableLinear`] (sc-5451).
+    fn adaptable_mut(&mut self, proj: &str) -> Option<&mut AdaptableLinear> {
+        match proj {
+            "q" => Some(&mut self.q),
+            "k" => Some(&mut self.k),
+            "v" => Some(&mut self.v),
+            "o" => Some(&mut self.o),
+            "k_img" => Some(&mut self.k_img),
+            "v_img" => Some(&mut self.v_img),
+            _ => None,
+        }
+    }
+
     /// `x`: `[1, L, dim]` (f32). `text_ctx`: `[1, L_text, dim]`. `img_ctx`: `[1, L_img, dim]`.
     fn forward(&self, x: &Array, text_ctx: &Array, img_ctx: &Array, cdt: Dtype) -> Result<Array> {
         let (b, s) = (x.shape()[0], x.shape()[1]);
@@ -349,6 +374,18 @@ impl Block {
         self.cross.push_quant_arrays(out);
         push_quant_arrays(&self.ffn0, out);
         push_quant_arrays(&self.ffn2, out);
+    }
+
+    /// Resolve a LoRA target under this block (`self_attn.*` / `cross_attn.*` / `ffn.0` / `ffn.2`,
+    /// the path tail after `blocks.{i}.`) to its [`AdaptableLinear`] (sc-5451).
+    fn adaptable_mut(&mut self, sub: &[&str]) -> Option<&mut AdaptableLinear> {
+        match sub {
+            ["self_attn", proj] => self.self_attn.adaptable_mut(proj),
+            ["cross_attn", proj] => self.cross.adaptable_mut(proj),
+            ["ffn", "0"] => Some(&mut self.ffn0),
+            ["ffn", "2"] => Some(&mut self.ffn2),
+            _ => None,
+        }
     }
 
     /// `x`: `[1, L, dim]` (f32). `e0`: `[1, 6, dim]` (f32, time modulation).
@@ -720,5 +757,137 @@ impl Scail2Dit {
         let op = xh.shape()[2];
         let vid_tok = xh.take_axis(&idx, 1)?.reshape(&[l_video, op])?;
         unpatchify(&vid_tok, (rope_t, rope_h, rope_w), cfg.wan.out_dim, ps)
+    }
+}
+
+/// Every LoRA-adaptable target in the SCAIL-2 DiT as a dotted `SCAIL2Model` parameter path (the
+/// naming a diffusers/PEFT/kohya LoRA file carries, once its namespace prefix is stripped), for a
+/// model with `num_layers` blocks. SCAIL-2 *is* Wan2.1-14B I2V, so its raw module names are exactly
+/// the targets a Wan-I2V LoRA (the lightx2v step-distill lightning LoRA) or SCAIL-2's own Bias-Aware
+/// DPO LoRA names. This is the single source of truth for [`AdaptableHost::adaptable_paths`] (the
+/// kohya `flattened → dotted` table) and is kept in lock-step with [`Scail2Dit::adaptable_mut`] by
+/// tests (`adaptable_paths_unique_and_kohya_collision_free` here + a real-weight resolution guard).
+pub(crate) fn scail2_adaptable_paths(num_layers: usize) -> Vec<String> {
+    // Globals (the whole-model Linears outside the transformer blocks). `patch_embedding` and the two
+    // SCAIL-2-specific stems (`_pose`/`_mask`) are SCAIL-2-shaped — only SCAIL-2's own DPO LoRA can
+    // name them; an external Wan-I2V LoRA never does, so it never trips the strict installer here.
+    let mut paths: Vec<String> = [
+        "patch_embedding",
+        "patch_embedding_pose",
+        "patch_embedding_mask",
+        "text_embedding.0",
+        "text_embedding.2",
+        "time_embedding.0",
+        "time_embedding.2",
+        "time_projection.1",
+        "img_emb.proj.1",
+        "img_emb.proj.3",
+        "head.head",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    for i in 0..num_layers {
+        for leaf in [
+            "self_attn.q",
+            "self_attn.k",
+            "self_attn.v",
+            "self_attn.o",
+            "cross_attn.q",
+            "cross_attn.k",
+            "cross_attn.v",
+            "cross_attn.o",
+            "cross_attn.k_img",
+            "cross_attn.v_img",
+            "ffn.0",
+            "ffn.2",
+        ] {
+            paths.push(format!("blocks.{i}.{leaf}"));
+        }
+    }
+    paths
+}
+
+/// Install inference LoRA(s) onto the SCAIL-2 DiT as forward-time residuals (sc-5451). SCAIL-2 is
+/// Wan2.1-14B I2V, so the family-agnostic [`mlx_gen::adapters::loader`] path resolves a diffusers /
+/// PEFT / kohya / LoKr / LoHa file directly against the raw module names — the same residual install
+/// the Z-Image / Qwen-Image providers use. Because adapters apply *over* the (possibly Q4/Q8) base
+/// rather than merging into it, they stack cleanly on the pre-quantized packed weights (sc-5445).
+impl AdaptableHost for Scail2Dit {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["patch_embedding"] => Some(&mut self.patch_embedding),
+            ["patch_embedding_pose"] => Some(&mut self.patch_embedding_pose),
+            ["patch_embedding_mask"] => Some(&mut self.patch_embedding_mask),
+            ["text_embedding", "0"] => Some(&mut self.text_embedding_0),
+            ["text_embedding", "2"] => Some(&mut self.text_embedding_2),
+            ["time_embedding", "0"] => Some(&mut self.time_embedding_0),
+            ["time_embedding", "2"] => Some(&mut self.time_embedding_2),
+            ["time_projection", "1"] => Some(&mut self.time_projection),
+            ["img_emb", "proj", "1"] => Some(&mut self.img_emb_1),
+            ["img_emb", "proj", "3"] => Some(&mut self.img_emb_3),
+            ["head", "head"] => Some(&mut self.head),
+            ["blocks", idx, rest @ ..] => {
+                let i: usize = idx.parse().ok()?;
+                self.blocks.get_mut(i)?.adaptable_mut(rest)
+            }
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        scail2_adaptable_paths(self.blocks.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// After the loader strips the `diffusion_model.`/`transformer.` namespace, a Wan2.1-14B-I2V
+    /// step-distill (lightx2v lightning) LoRA and SCAIL-2's own Bias-Aware DPO LoRA name exactly these
+    /// dotted targets — every one must be an adaptable SCAIL-2 path or the strict installer would
+    /// reject the file. Mirrors the wan `lightning_lora_keys_normalize_to_wan_dit_targets` guard.
+    #[test]
+    fn lightx2v_and_dpo_target_keys_are_adaptable() {
+        let paths: BTreeSet<String> = scail2_adaptable_paths(40).into_iter().collect();
+        let must = [
+            "blocks.0.self_attn.q",
+            "blocks.0.self_attn.k",
+            "blocks.0.self_attn.v",
+            "blocks.0.self_attn.o",
+            "blocks.0.cross_attn.q",
+            "blocks.0.cross_attn.k",
+            "blocks.0.cross_attn.v",
+            "blocks.0.cross_attn.o",
+            "blocks.0.cross_attn.k_img",
+            "blocks.0.cross_attn.v_img",
+            "blocks.0.ffn.0",
+            "blocks.0.ffn.2",
+            "blocks.39.self_attn.q",
+            "blocks.39.ffn.2",
+            "head.head",
+        ];
+        for k in must {
+            assert!(
+                paths.contains(k),
+                "`{k}` is not an adaptable SCAIL-2 LoRA target"
+            );
+        }
+    }
+
+    /// The path set must be duplicate-free AND stay collision-free under the kohya `.`→`_` flattening
+    /// (the [`AdaptableHost::adaptable_paths`] contract — the `flattened → dotted` table would
+    /// otherwise lose a target). 11 globals + 12 Linears × `num_layers` blocks.
+    #[test]
+    fn adaptable_paths_unique_and_kohya_collision_free() {
+        let paths = scail2_adaptable_paths(40);
+        let n = paths.len();
+        assert_eq!(n, 11 + 40 * 12);
+        let uniq: BTreeSet<&String> = paths.iter().collect();
+        assert_eq!(uniq.len(), n, "duplicate adaptable path");
+        let flat: BTreeSet<String> = paths.iter().map(|p| p.replace('.', "_")).collect();
+        assert_eq!(flat.len(), n, "kohya-flattened path collision");
     }
 }

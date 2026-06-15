@@ -16,6 +16,9 @@ fn descriptor_is_scail2() {
     assert!(d.capabilities.supports_guidance);
     assert!(!d.capabilities.supports_true_cfg);
     assert_eq!(d.capabilities.max_count, 1);
+    // Inference LoRA (Bias-Aware DPO + lightx2v lightning) is wired (sc-5451).
+    assert!(d.capabilities.supports_lora);
+    assert!(d.capabilities.supports_lokr);
 }
 
 #[test]

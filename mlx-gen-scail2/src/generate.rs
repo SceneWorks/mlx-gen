@@ -23,7 +23,7 @@ use std::path::Path;
 
 use mlx_gen::array::scalar;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, GenerationOutput, Image, Progress, Quant, Result};
+use mlx_gen::{AdapterSpec, Error, GenerationOutput, Image, Progress, Quant, Result};
 use mlx_gen_wan::{
     frames_to_images, load_tokenizer, make_scheduler, SolverKind, Umt5Encoder, WanVae,
 };
@@ -198,12 +198,46 @@ fn pixels_to_u8(video_cthw: &Array) -> Result<Array> {
     Ok(clamped.as_dtype(Dtype::Uint8)?)
 }
 
+/// Reject an adapter file the SCAIL-2 LoRA path does not yet faithfully support, rather than
+/// silently applying only the part it understands (sc-5451).
+///
+/// The family-agnostic loader installs the standard `lora_down`/`lora_up` (+ `alpha`) factors as
+/// forward-time residuals. The lightx2v cross-architecture step-distill ("lightning") LoRAs are a
+/// *hybrid* format: alongside the low-rank factors they carry full-rank **diff-patch** tensors
+/// (`.diff` / `.diff_b` — direct weight/bias deltas, including on the norm layers) that the residual
+/// loader does not consume, and they target the vanilla Wan2.1-I2V input embeddings whose shapes
+/// differ from SCAIL-2's (e.g. `patch_embedding` in_dim 36 vs 20). Applying such a file through the
+/// residual path would drop the diff patches and the incompatible-shape targets *silently* — exactly
+/// the "never silently drop" failure the strict installer guards against. Until the diff-patch +
+/// cross-architecture install lands (sc-5684), reject it loudly so a partially-applied lightning LoRA
+/// can't masquerade as a full one. SCAIL-2-native LoRAs (the Bias-Aware DPO refinement
+/// LoRA, any trained-on-SCAIL-2 adapter) carry only the standard factors and pass straight through.
+fn reject_unsupported_adapter_formats(adapters: &[AdapterSpec]) -> Result<()> {
+    for spec in adapters {
+        let w = Weights::from_file(&spec.path)?;
+        if w.keys()
+            .any(|k| k.ends_with(".diff") || k.ends_with(".diff_b"))
+        {
+            return Err(Error::Msg(format!(
+                "scail2 LoRA {}: this is a lightx2v diff-patch ('.diff'/'.diff_b') LoRA. The \
+                 residual loader understands only the low-rank 'lora_down'/'lora_up' factors, so \
+                 applying it would silently drop the full-rank diff patches (and its Wan2.1-I2V \
+                 'patch_embedding' shape differs from SCAIL-2's in_dim). Full diff-patch + \
+                 cross-architecture lightning support is tracked as sc-5684.",
+                spec.path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Run the full SCAIL-2 generation for `job`, loading each component from the snapshot `root`.
 pub fn generate(
     root: &Path,
     cfg: &Scail2Config,
     job: &Scail2Job,
     quant: Option<Quant>,
+    adapters: &[AdapterSpec],
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<GenerationOutput> {
     if job.driving_frames.is_empty() {
@@ -216,6 +250,9 @@ pub fn generate(
             job.driving_frames.len()
         )));
     }
+    // Fail fast on an unsupported adapter format (before the 31 GB DiT load) so a lightx2v
+    // diff-patch LoRA can't get half-applied (sc-5451).
+    reject_unsupported_adapter_formats(adapters)?;
     let (tw, th) = (align(job.width), align(job.height));
     let cfg_disabled = job.guidance <= 1.0;
 
@@ -296,6 +333,20 @@ pub fn generate(
         // packed Q4/Q8 weights are what stays resident; the bf16 source is freed in `quantize`.
         if let Some(q) = quant {
             d.quantize(q.bits(), None)?;
+        }
+        // Install any inference LoRA(s) — the Bias-Aware DPO refinement LoRA, a lightx2v step-distill
+        // lightning LoRA, … — as forward-time residuals over the (now possibly Q4/Q8) base (sc-5451).
+        // Adapters are independent of the base quantization, so they stack cleanly on the packed
+        // weights; applying them *after* `quantize` keeps the residual a dense add over the quantized
+        // matmul. The family-agnostic strict installer (the Z-Image / Qwen path) resolves the
+        // diffusers / PEFT / kohya / LoKr keys against SCAIL-2's raw module names and errors — never
+        // silently drops — on a format/prefix mismatch or an unmatched target.
+        if !adapters.is_empty() {
+            mlx_gen::adapters::loader::apply_adapters_strict(
+                &mut d,
+                adapters,
+                crate::pipeline::MODEL_ID,
+            )?;
         }
         d
     };
