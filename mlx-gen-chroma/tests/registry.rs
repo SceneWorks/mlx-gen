@@ -17,6 +17,8 @@ fn chroma_variants_resolve_through_core_registry() {
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.supports_guidance);
+        assert!(d.capabilities.samplers.contains(&"euler"));
+        assert!(d.capabilities.samplers.contains(&"heun"));
         // v1 is T2I only.
         assert!(d.capabilities.conditioning.is_empty());
 
@@ -47,4 +49,22 @@ fn chroma_validate_rejects_unsupported_surface() {
         ..Default::default()
     };
     assert!(d.capabilities.validate_request(d.id, &req).is_err());
+
+    let heun = GenerationRequest {
+        prompt: "a cat".into(),
+        width: 512,
+        height: 512,
+        sampler: Some("heun".into()),
+        ..Default::default()
+    };
+    assert!(d.capabilities.validate_request(d.id, &heun).is_ok());
+
+    let bad_sampler = GenerationRequest {
+        prompt: "a cat".into(),
+        width: 512,
+        height: 512,
+        sampler: Some("dpmpp_sde".into()),
+        ..Default::default()
+    };
+    assert!(d.capabilities.validate_request(d.id, &bad_sampler).is_err());
 }
