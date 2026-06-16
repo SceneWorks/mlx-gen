@@ -1,23 +1,20 @@
-//! sc-5988 — Ideogram 4 end-to-end smoke: load the full pipeline (2 DiTs + Qwen3-VL TE + VAE) and
-//! generate a real image from a chat-templated prompt. Proves the engine runs end-to-end on Mac
-//! (not bit-parity — that's the per-component tests).
+//! sc-5988 — Ideogram 4 end-to-end smoke: load the full pipeline (2 DiTs + Qwen3-VL TE + VAE +
+//! tokenizer) and generate a real image from the model's native JSON caption, tokenized **natively
+//! in Rust** (no Python). Proves the engine runs end-to-end on Mac (not bit-parity — that's the
+//! per-component tests; tokenizer parity is `tests/tokenizer_parity.rs`).
 //!
-//! `#[ignore]` — needs the converted snapshot (~53 GB) + prompt ids
-//! (`tools/dump_ideogram4_prompt_ids.py`). Run:
-//!   CARGO_TARGET_DIR=~/Repos/mlx-gen/target \
+//! `#[ignore]` — needs the converted snapshot (~53 GB). Run:
+//!   IDEOGRAM4_MLX=~/.cache/ideogram4-mlx-convert \
 //!     cargo test -p mlx-gen-ideogram --test smoke -- --ignored --nocapture
+
+mod common;
 
 use std::path::PathBuf;
 
+use common::CAPTION_JSON;
 use mlx_gen::array::host_i32;
-use mlx_gen::weights::Weights;
 use mlx_gen_ideogram::Ideogram4Pipeline;
 use mlx_rs::Dtype;
-
-const IDS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/ideogram4_prompt_ids.safetensors"
-);
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("IDEOGRAM4_MLX")
@@ -28,13 +25,12 @@ fn snapshot_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "needs converted weights (~53 GB) + prompt ids"]
+#[ignore = "needs converted weights (~53 GB)"]
 fn smoke_generates_image() {
-    let g = Weights::from_file(IDS).expect("run tools/dump_ideogram4_prompt_ids.py");
-    let ids = host_i32(g.require("input_ids").unwrap()).unwrap();
-    println!("prompt: {} tokens; loading pipeline …", ids.len());
-
     let pipe = Ideogram4Pipeline::load(&snapshot_dir()).expect("load pipeline");
+    let ids = pipe.tokenize(CAPTION_JSON).expect("tokenize JSON caption");
+    println!("native JSON caption → {} tokens; generating …", ids.len());
+
     let envn = |k: &str, d: u32| {
         std::env::var(k)
             .ok()

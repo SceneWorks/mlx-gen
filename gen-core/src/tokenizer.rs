@@ -225,6 +225,19 @@ impl TextTokenizer {
         Ok(encoding.get_ids().iter().map(|&id| id as i32).collect())
     }
 
+    /// Render the configured [`ChatTemplate`] around `prompt`, then [`encode_ids`](Self::encode_ids)
+    /// with the given `add_special_tokens` policy — the reference `apply_chat_template(messages,
+    /// add_generation_prompt=True)` + `tokenizer(text, add_special_tokens=…)` path for MLLM text
+    /// encoders whose conditioning is the raw `input_ids` (e.g. Ideogram 4, which wraps a single
+    /// user-turn JSON caption in [`ChatTemplate::QwenInstruct`] and encodes with
+    /// `add_special_tokens=false`). No padding/truncation — the caller owns sequence-length policy.
+    pub fn encode_chat_ids(&self, prompt: &str, add_special_tokens: bool) -> Result<Vec<i32>> {
+        self.encode_ids(
+            &self.config.chat_template.render(prompt),
+            add_special_tokens,
+        )
+    }
+
     /// Detokenize `ids` back to text via the loaded tokenizer's decoder. `skip_special_tokens`
     /// drops special tokens (BOS/EOS/turn markers) from the output, matching HF
     /// `tokenizer.decode(ids, skip_special_tokens=…)`.

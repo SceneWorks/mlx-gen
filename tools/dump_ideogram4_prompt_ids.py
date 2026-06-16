@@ -22,6 +22,9 @@ import mlx.core as mx
 import torch
 from transformers import AutoTokenizer
 
+# Keep in lockstep with `CAPTION_JSON` in mlx-gen-ideogram/tests/common/mod.rs: `json.dumps(CAPTION)`
+# must be byte-identical to that const (the `tokenizer_parity` test tokenizes the const and asserts
+# it reproduces the `input_ids` this script dumps). If you edit the caption, update both.
 CAPTION = {
     "high_level_description": "A photograph of a red fox sitting in a snowy forest at golden hour.",
     "style_description": {
