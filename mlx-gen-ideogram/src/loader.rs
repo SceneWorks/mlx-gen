@@ -14,8 +14,9 @@ use std::path::Path;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-use crate::config::Ideogram4TextEncoderConfig;
+use crate::config::{Ideogram4DitConfig, Ideogram4TextEncoderConfig};
 use crate::text_encoder::Ideogram4TextEncoder;
+use crate::transformer::Ideogram4Transformer;
 
 /// Load the Qwen3-VL text encoder from the converted `text_encoder` component.
 pub fn load_text_encoder(root: &Path) -> Result<Ideogram4TextEncoder> {
@@ -25,4 +26,17 @@ pub fn load_text_encoder(root: &Path) -> Result<Ideogram4TextEncoder> {
         "language_model",
         &Ideogram4TextEncoderConfig::qwen3_vl_8b(),
     )
+}
+
+/// Load the conditional DiT (`transformer` component). Keys are top-level (empty prefix).
+pub fn load_transformer(root: &Path) -> Result<Ideogram4Transformer> {
+    let w = Weights::from_dir(root.join("transformer"))?;
+    Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())
+}
+
+/// Load the unconditional DiT (`unconditional_transformer` component) — the asymmetric-CFG
+/// negative branch. Same architecture, separately trained weights.
+pub fn load_unconditional_transformer(root: &Path) -> Result<Ideogram4Transformer> {
+    let w = Weights::from_dir(root.join("unconditional_transformer"))?;
+    Ideogram4Transformer::from_weights(&w, "", &Ideogram4DitConfig::v4())
 }

@@ -88,9 +88,9 @@ impl Qwen3Attention {
 
         let mask = mask.as_dtype(q.dtype())?;
         let o = scaled_dot_product_attention(&q, &k, &v, self.scale, &mask, None)?;
-        let o = o
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, s, self.num_heads * self.head_dim])?;
+        let o =
+            o.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, self.num_heads * self.head_dim])?;
         self.o_w.forward(&o)
     }
 }

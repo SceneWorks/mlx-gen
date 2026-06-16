@@ -22,18 +22,20 @@ const GOLDEN: &str = concat!(
 
 /// Converted-snapshot dir: `$IDEOGRAM4_MLX` or `~/.cache/ideogram4-mlx-convert`.
 fn snapshot_dir() -> PathBuf {
-    std::env::var("IDEOGRAM4_MLX").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/ideogram4-mlx-convert")
-    })
+    std::env::var("IDEOGRAM4_MLX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").expect("HOME")).join(".cache/ideogram4-mlx-convert")
+        })
 }
 
 /// Cosine similarity over all elements (robust to bf16 precision/scale): `⟨a,b⟩ / (‖a‖·‖b‖)`.
 fn cosine(a: &Array, b: &Array) -> f32 {
     let a = a.as_dtype(Dtype::Float32).unwrap();
     let b = b.as_dtype(Dtype::Float32).unwrap();
-    let dot = sum(&multiply(&a, &b).unwrap(), false).unwrap();
-    let na = sqrt(&sum(&multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
-    let nb = sqrt(&sum(&multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
+    let dot = sum(multiply(&a, &b).unwrap(), false).unwrap();
+    let na = sqrt(sum(multiply(&a, &a).unwrap(), false).unwrap()).unwrap();
+    let nb = sqrt(sum(multiply(&b, &b).unwrap(), false).unwrap()).unwrap();
     (dot / (na * nb)).item::<f32>()
 }
 
@@ -53,5 +55,8 @@ fn te_matches_transformers_reference() {
 
     let c = cosine(&out, want);
     println!("Ideogram 4 TE parity cosine = {c:.7}");
-    assert!(c > 0.999, "TE parity cosine {c} too low — structural mismatch");
+    assert!(
+        c > 0.999,
+        "TE parity cosine {c} too low — structural mismatch"
+    );
 }

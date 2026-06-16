@@ -31,17 +31,17 @@ pub const MAX_TEXT_TOKENS: usize = 2048;
 /// `Ideogram4Transformer2DModel` dims (transformer/config.json). Single-stream, 34 layers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ideogram4DitConfig {
-    pub emb_dim: i32,           // 4608 = num_heads * head_dim
-    pub num_layers: i32,        // 34
-    pub num_heads: i32,         // 18
-    pub head_dim: i32,          // 256
-    pub mlp_dim: i32,           // 12288 (SwiGLU intermediate)
-    pub adaln_dim: i32,         // 512
-    pub in_channels: i32,       // 128 (32-ch VAE latent, 2x2 patchified)
-    pub llm_features_dim: i32,  // 53248 = 13 * 4096 (concatenated TE layers)
+    pub emb_dim: i32,            // 4608 = num_heads * head_dim
+    pub num_layers: i32,         // 34
+    pub num_heads: i32,          // 18
+    pub head_dim: i32,           // 256
+    pub mlp_dim: i32,            // 12288 (SwiGLU intermediate)
+    pub adaln_dim: i32,          // 512
+    pub in_channels: i32,        // 128 (32-ch VAE latent, 2x2 patchified)
+    pub llm_features_dim: i32,   // 53248 = 13 * 4096 (concatenated TE layers)
     pub mrope_section: [i32; 3], // [24, 20, 20]
-    pub rope_theta: f32,        // 5_000_000
-    pub norm_eps: f32,          // 1e-5
+    pub rope_theta: f32,         // 5_000_000
+    pub norm_eps: f32,           // 1e-5
 }
 
 impl Ideogram4DitConfig {
@@ -67,16 +67,16 @@ impl Ideogram4DitConfig {
 /// [`EXTRACTED_LAYERS`] (13 of them) → `13 * 4096 = 53248` features fed to the DiT.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ideogram4TextEncoderConfig {
-    pub hidden_size: i32,       // 4096
-    pub num_layers: i32,        // 36
-    pub num_heads: i32,         // 32
-    pub num_kv_heads: i32,      // 8
-    pub head_dim: i32,          // 128
-    pub intermediate_size: i32, // 12288
-    pub rms_norm_eps: f32,      // 1e-6
+    pub hidden_size: i32,        // 4096
+    pub num_layers: i32,         // 36
+    pub num_heads: i32,          // 32
+    pub num_kv_heads: i32,       // 8
+    pub head_dim: i32,           // 128
+    pub intermediate_size: i32,  // 12288
+    pub rms_norm_eps: f32,       // 1e-6
     pub mrope_section: [i32; 3], // [24, 20, 20]
-    pub rope_theta: f32,        // 5_000_000
-    pub vocab_size: i32,        // 151936
+    pub rope_theta: f32,         // 5_000_000
+    pub vocab_size: i32,         // 151936
 }
 
 impl Ideogram4TextEncoderConfig {
