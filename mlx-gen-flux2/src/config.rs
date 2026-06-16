@@ -114,6 +114,14 @@ impl Flux2Variant {
         }
     }
 
+    /// Whether the guidance scale is consumed as an **embedded scalar** fed into the transformer's
+    /// guidance embedder (the guidance-distilled dev, FLUX.1-dev pattern) rather than as a true-CFG
+    /// dual-forward over a negative prompt. dev = `true` (single forward, no negative pass); klein =
+    /// `false` (distilled, CFG-free at guidance 1.0; a base variant would do true-CFG when >1).
+    pub fn uses_embedded_guidance(self) -> bool {
+        matches!(self, Self::Dev)
+    }
+
     pub fn descriptor(self) -> ModelDescriptor {
         // Conditioning surface by variant: the edit variant consumes one `Reference` (single image,
         // token concat, sc-2346) or one `MultiReference` (N images, sc-2645); txt2img consumes a

@@ -1,11 +1,15 @@
-//! FLUX.2-klein provider registration + the txt2img generation path.
+//! FLUX.2 provider registration + the generation path, shared across the klein and **dev** variants.
 //!
-//! `load()` assembles the tokenizer, Qwen3 text encoder, MMDiT transformer, and 32-ch VAE from a
-//! snapshot directory; `spec.quantize` (Q4/Q8, sc-2643) then quantizes the whole model in place.
-//! `generate()` runs the flow-match denoise loop (CFG dual-forward when `guidance > 1`; distilled
-//! klein defaults to 1.0 = single forward), then BN-denormalizes + 2×2-unpatchifies + VAE-decodes.
-//! Both the txt2img (`flux2_klein_9b`) and single-reference edit (`flux2_klein_9b_edit`) variants
-//! share this path.
+//! `load()` assembles the tokenizer, text encoder, MMDiT transformer, and 32-ch VAE from a snapshot
+//! directory — klein uses the Qwen3 loaders, dev (sc-2365) the Mistral3 `*_dev` loaders (which load
+//! a pre-quantized Q4 snapshot packed, sc-5917); `spec.quantize` (Q4/Q8, sc-2643) then quantizes the
+//! dense parts in place (a no-op for already-packed dev weights). `generate()` runs the flow-match
+//! denoise loop, then BN-denormalizes + 2×2-unpatchifies + VAE-decodes. Guidance is variant-typed:
+//! distilled klein runs CFG-free (1.0 = single forward; a base variant would CFG dual-forward when
+//! `guidance > 1`); guidance-distilled **dev** feeds its scale as an embedded scalar into the
+//! transformer's guidance embedder (single forward, default ~4.0 over ~28 steps — NOT true-CFG).
+//! txt2img (`flux2_klein_9b`, `flux2_dev`) and the single-/multi-reference edit variants share this
+//! path.
 //!
 //! Activations run f32 (matmul(f32, bf16)→f32): dodges the dense 16-bit Metal GEMM bug and is the
 //! quality target. Pixel-parity with the fork's bf16 render is therefore not the gate (see the
@@ -21,7 +25,7 @@ use mlx_gen::{
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
-use crate::config::{Flux2Variant, DEFAULT_GUIDANCE};
+use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
@@ -56,6 +60,17 @@ pub fn load_klein_9b_kv_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(Flux2Variant::Klein9bKvEdit, spec)
 }
 
+pub fn descriptor_dev() -> ModelDescriptor {
+    Flux2Variant::Dev.descriptor()
+}
+
+/// FLUX.2-dev txt2img (sc-2365): the guidance-distilled 32B flagship. Loads the dev snapshot
+/// (Mistral3 TE + dev DiT, pre-quantized Q4 per sc-5917) and runs the embedded-guidance denoise
+/// (single forward, default guidance ~4.0 over ~28 steps — NOT true-CFG).
+pub fn load_dev(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(Flux2Variant::Dev, spec)
+}
+
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         // The dense path loads at the on-disk dtype and runs f32 activations; an explicit fp32
@@ -69,15 +84,28 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
             return Err(Error::Msg(format!(
-                "{} expects a FLUX.2-klein snapshot directory (tokenizer/ text_encoder/ \
+                "{} expects a FLUX.2 snapshot directory (tokenizer/ text_encoder/ \
                  transformer/ vae/), not a single .safetensors file",
                 variant.id()
             )))
         }
     };
 
-    let mut text_encoder = loader::load_text_encoder(root)?;
-    let mut transformer = loader::load_transformer(root)?;
+    // The dev checkpoint has a different text encoder (Mistral3, not Qwen3) + tokenizer + DiT dims,
+    // so it loads through the `*_dev` loaders; a pre-quantized dev snapshot loads packed directly
+    // (the loaders read the per-component `quantization` manifest, sc-5917). The VAE is identical.
+    let dev = variant == Flux2Variant::Dev;
+    let (mut text_encoder, mut transformer) = if dev {
+        (
+            loader::load_text_encoder_dev(root)?,
+            loader::load_transformer_dev(root)?,
+        )
+    } else {
+        (
+            loader::load_text_encoder(root)?,
+            loader::load_transformer(root)?,
+        )
+    };
     let mut vae = loader::load_vae(root)?;
     // Q4/Q8 quantizes the **whole model** in place after the dense load — the fork's `nn.quantize`
     // over (transformer, text_encoder, vae), group_size 64, every quantizable Linear (+ the text
@@ -99,11 +127,16 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         crate::adapters::apply_flux2_adapters(&mut transformer, &spec.adapters)?;
     }
 
+    let tokenizer = if dev {
+        loader::load_tokenizer_dev(root)?
+    } else {
+        loader::load_tokenizer(root)?
+    };
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
-        tokenizer: Some(loader::load_tokenizer(root)?),
+        tokenizer: Some(tokenizer),
         text_encoder: Some(text_encoder),
         transformer: Some(transformer),
         vae: Some(vae),
@@ -369,8 +402,11 @@ impl Flux2 {
         self.validate(req)?;
         let (tokenizer, te, transformer, vae) = self.parts()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.unwrap_or(crate::config::DEFAULT_STEPS) as usize;
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
+        let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
+        // dev is guidance-DISTILLED: the scale is an embedded scalar fed into the transformer's
+        // guidance embedder (single forward), NOT a true-CFG dual-forward over a negative prompt.
+        let embedded_guidance = self.variant.uses_embedded_guidance().then_some(guidance);
 
         // Edit: build the reference-image conditioning from one `Reference` or one `MultiReference`
         // (sc-2645). The transformer sees the joint sequence `[txt, target, ref0, ref1, …]`; its
@@ -397,8 +433,10 @@ impl Flux2 {
         };
 
         let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &req.prompt)?;
-        // klein is distilled (guidance 1.0); CFG dual-forward only kicks in for base variants.
-        let negative = if guidance > 1.0 {
+        // True-CFG dual-forward only for the (non-embedded-guidance) base path at guidance >1; dev
+        // routes its scale through the embedded guidance embedder instead, so it never takes a
+        // negative pass, and distilled klein runs at guidance 1.0 (also no negative).
+        let negative = if !self.variant.uses_embedded_guidance() && guidance > 1.0 {
             Some(self.encode(tokenizer, te, " ")?)
         } else {
             None
@@ -440,7 +478,15 @@ impl Flux2 {
                 ),
                 _ => (latents.clone(), latent_ids.clone()),
             };
-            let out = transformer.forward_with_cache(&hidden, embeds, &img_ids, ids, ts, cache)?;
+            let out = transformer.forward_with_cache(
+                &hidden,
+                embeds,
+                &img_ids,
+                ids,
+                ts,
+                embedded_guidance,
+                cache,
+            )?;
             let idx = Array::from_slice(&(0..target_seq).collect::<Vec<i32>>(), &[target_seq]);
             Ok(out.take_axis(&idx, 1)?)
         };
@@ -563,6 +609,10 @@ fn load_klein_9b_kv_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn
     load_klein_9b_kv_edit(spec).map_err(Into::into)
 }
 
+fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_dev(spec).map_err(Into::into)
+}
+
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b_registered }
 }
@@ -575,10 +625,17 @@ inventory::submit! {
     ModelRegistration { descriptor: descriptor_klein_9b_kv_edit, load: load_klein_9b_kv_edit_registered }
 }
 
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID};
+    use crate::config::{
+        DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID,
+        FLUX2_KLEIN_9B_ID,
+    };
     use mlx_gen::media::Image;
     use mlx_gen::Conditioning;
 
@@ -587,6 +644,44 @@ mod tests {
         let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
         let req = GenerationRequest {
             prompt: "a hummingbird".into(),
+            ..Default::default()
+        };
+        model.validate(&req).unwrap();
+    }
+
+    // ---- sc-2365 FLUX.2-dev T2I wiring ---------------------------------------------------------
+
+    #[test]
+    fn dev_descriptor_registered_with_t2i_caps() {
+        // The dev variant is registered (loadable by id) with the dev id + txt2img/img2img caps.
+        assert_eq!(descriptor_dev().id, FLUX2_DEV_ID);
+        let d = descriptor_dev();
+        assert!(d.capabilities.supports_guidance, "dev consumes guidance");
+        assert!(
+            !d.capabilities.supports_negative_prompt && !d.capabilities.supports_true_cfg,
+            "dev is guidance-distilled, not true-CFG"
+        );
+        assert!(d.capabilities.mac_only);
+        // A single Reference (img2img init), like klein txt2img — no edit conditioning.
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![mlx_gen::ConditioningKind::Reference]
+        );
+    }
+
+    #[test]
+    fn dev_uses_embedded_guidance_with_dev_defaults() {
+        assert!(Flux2Variant::Dev.uses_embedded_guidance());
+        assert!(!Flux2Variant::Klein9b.uses_embedded_guidance());
+        assert_eq!(Flux2Variant::Dev.default_steps(), DEFAULT_STEPS_DEV);
+        assert_eq!(Flux2Variant::Dev.default_guidance(), DEFAULT_GUIDANCE_DEV);
+    }
+
+    #[test]
+    fn dev_validates_basic_txt2img_request() {
+        let model = Flux2::new_for_tests(Flux2Variant::Dev);
+        let req = GenerationRequest {
+            prompt: "a red fox in fresh snow".into(),
             ..Default::default()
         };
         model.validate(&req).unwrap();

@@ -108,7 +108,7 @@ impl Fixture {
         let img = concatenate_axis(&[&self.target, &self.ref_lat], 1).unwrap();
         let ids = concatenate_axis(&[&self.target_ids, &self.ref_ids], 1).unwrap();
         self.t
-            .forward_with_cache(&img, &self.txt, &ids, &self.txt_ids, TS, cache)
+            .forward_with_cache(&img, &self.txt, &ids, &self.txt_ids, TS, None, cache)
             .unwrap()
     }
 
@@ -121,6 +121,7 @@ impl Fixture {
                 &self.target_ids,
                 &self.txt_ids,
                 TS,
+                None,
                 Some(cache),
             )
             .unwrap()
@@ -227,6 +228,7 @@ fn cached_without_populated_cache_errors() {
             &f.target_ids,
             &f.txt_ids,
             TS,
+            None,
             Some(&cache),
         )
         .unwrap_err()

@@ -45,8 +45,8 @@ pub use loader::{
     load_transformer_dev, load_vae,
 };
 pub use model::{
-    descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit, load_klein_9b,
-    load_klein_9b_edit, load_klein_9b_kv_edit,
+    descriptor_dev, descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit,
+    load_dev, load_klein_9b, load_klein_9b_edit, load_klein_9b_kv_edit,
 };
 pub use pipeline::{
     add_noise_by_interpolation, create_noise, image_seq_len, init_time_step, pack_latents,

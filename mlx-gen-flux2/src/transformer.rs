@@ -528,6 +528,11 @@ pub struct Flux2Transformer {
     pos_embed: Flux2PosEmbed,
     time_linear1: AdaptableLinear,
     time_linear2: AdaptableLinear,
+    /// The embedded-guidance branch (`time_guidance_embed.guidance_embedder.linear_{1,2}`) — `Some`
+    /// for the guidance-distilled **dev** (sc-2365), `None` for the CFG-free klein. When present,
+    /// `temb` adds a guidance embedding to the timestep embedding (the FLUX.1-dev pattern).
+    guidance_linear1: Option<AdaptableLinear>,
+    guidance_linear2: Option<AdaptableLinear>,
     mod_img: Modulation,
     mod_txt: Modulation,
     mod_single: Modulation,
@@ -580,10 +585,24 @@ impl Flux2Transformer {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        // The guidance embedder is present only on the guidance-distilled dev checkpoint; klein has
+        // no `guidance_embedder.*` keys, so this is `None` there (the `.weight` key gates both the
+        // dense and the pre-quantized snapshot — the packed codes also live at `.weight`).
+        let guidance_key = |n: &str| format!("time_guidance_embed.guidance_embedder.{n}.weight");
+        let (guidance_linear1, guidance_linear2) = if w.get(&guidance_key("linear_1")).is_some() {
+            (
+                Some(lin(w, &guidance_key("linear_1"), quant)?),
+                Some(lin(w, &guidance_key("linear_2"), quant)?),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             pos_embed: Flux2PosEmbed::new(cfg.rope_theta, cfg.axes_dim),
             time_linear1: lin(w, "time_guidance_embed.linear_1.weight", quant)?,
             time_linear2: lin(w, "time_guidance_embed.linear_2.weight", quant)?,
+            guidance_linear1,
+            guidance_linear2,
             mod_img: Modulation::from_weights(w, "double_stream_modulation_img", 2, quant)?,
             mod_txt: Modulation::from_weights(w, "double_stream_modulation_txt", 2, quant)?,
             mod_single: Modulation::from_weights(w, "single_stream_modulation", 1, quant)?,
@@ -603,6 +622,12 @@ impl Flux2Transformer {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.time_linear1.quantize(bits, None)?;
         self.time_linear2.quantize(bits, None)?;
+        for g in [&mut self.guidance_linear1, &mut self.guidance_linear2]
+            .into_iter()
+            .flatten()
+        {
+            g.quantize(bits, None)?;
+        }
         self.mod_img.quantize(bits)?;
         self.mod_txt.quantize(bits)?;
         self.mod_single.quantize(bits)?;
@@ -628,12 +653,27 @@ impl Flux2Transformer {
         Some((wq, sc, bi, gs, b))
     }
 
-    fn temb(&self, timestep: f32) -> Result<Array> {
-        // klein has no guidance embedding; timestep is fed as sigma·1000 (>1) so no rescale.
-        let t = Array::from_slice(&[timestep], &[1]);
-        let emb = timestep_embedding(&t, self.time_channels)?;
-        let h = self.time_linear1.forward(&emb)?;
-        self.time_linear2.forward(&silu(&h)?)
+    /// `timestep` is fed as sigma·1000 (the caller scales it). `guidance` is the raw guidance scale
+    /// (e.g. 4.0) for the guidance-distilled dev path, or `None` for klein. Mirrors diffusers
+    /// `Flux2TimestepGuidanceEmbeddings`: `timestep_emb + guidance_emb` (no pooled-CLIP term), each
+    /// `time_proj → linear_1 → silu → linear_2`, with guidance scaled ×1000 here (the
+    /// `transformer_flux2.py` `guidance = guidance * 1000` step) before the shared sinusoidal proj.
+    fn temb(&self, timestep: f32, guidance: Option<f32>) -> Result<Array> {
+        let embed = |scalar: f32, l1: &AdaptableLinear, l2: &AdaptableLinear| -> Result<Array> {
+            let t = Array::from_slice(&[scalar], &[1]);
+            let emb = timestep_embedding(&t, self.time_channels)?;
+            l2.forward(&silu(&l1.forward(&emb)?)?)
+        };
+        let mut temb = embed(timestep, &self.time_linear1, &self.time_linear2)?;
+        if let (Some(g), Some(g1), Some(g2)) =
+            (guidance, &self.guidance_linear1, &self.guidance_linear2)
+        {
+            // diffusers scales guidance ×1000 at the transformer boundary (the timestep is already
+            // ×1000 by the caller). A `Some(guidance)` on a klein transformer (no guidance embedder)
+            // is silently ignored — the embedded-guidance path is dev-only.
+            temb = add(&temb, &embed(g * 1000.0, g1, g2)?)?;
+        }
+        Ok(temb)
     }
 
     fn norm_out(&self, x: &Array, temb: &Array) -> Result<Array> {
@@ -666,14 +706,17 @@ impl Flux2Transformer {
             txt_ids,
             timestep,
             None,
+            None,
         )
     }
 
-    /// As [`Self::forward`], with an optional 9b-kv [`Flux2KvCache`] threaded through every
+    /// As [`Self::forward`], with the embedded-guidance scale (`Some` for dev, `None` for klein —
+    /// see [`temb`](Self::temb)) and an optional 9b-kv [`Flux2KvCache`] threaded through every
     /// attention layer (the double + single stacks indexed independently from 0). On the
     /// [`crate::kv_cache::CacheMode::Extract`] step the `img_ids` carry the reference tokens
     /// (`[target, ref]`); on [`crate::kv_cache::CacheMode::Cached`] steps they carry `[target]`
     /// only and the cached ref K/V are spliced back inside each attention.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_cache(
         &self,
         hidden_states: &Array,
@@ -681,9 +724,10 @@ impl Flux2Transformer {
         img_ids: &Array,
         txt_ids: &Array,
         timestep: f32,
+        guidance: Option<f32>,
         cache: Option<&Flux2KvCache>,
     ) -> Result<Array> {
-        let temb = self.temb(timestep)?;
+        let temb = self.temb(timestep, guidance)?;
         let mut img = self
             .x_embedder
             .forward(&require_f32_input(hidden_states)?)?;
@@ -1242,6 +1286,8 @@ mod tests {
             pos_embed: Flux2PosEmbed::new(2000.0, [32, 32, 32, 32]),
             time_linear1: dummy_lin(),
             time_linear2: dummy_lin(),
+            guidance_linear1: None,
+            guidance_linear2: None,
             mod_img: modulation(2),
             mod_txt: modulation(2),
             mod_single: modulation(1),
