@@ -12,13 +12,14 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::Result;
+use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::{Error, Result};
 use mlx_gen_flux2::Flux2Vae;
 
 use crate::config::Ideogram4DitConfig;
 use crate::latent_norm::{LATENT_SCALE, LATENT_SHIFT};
 use crate::loader::{
-    load_text_encoder, load_transformer, load_unconditional_transformer, load_vae,
+    load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
 use crate::scheduler::{make_step_intervals, LogitNormalSchedule};
 use crate::text_encoder::Ideogram4TextEncoder;
@@ -30,25 +31,63 @@ pub const AE_SCALE: u32 = 8;
 const IMAGE_POSITION_OFFSET: i32 = 65536;
 const LLM_TOKEN_INDICATOR: i32 = 3;
 const OUTPUT_IMAGE_INDICATOR: i32 = 2;
+/// Reference `Ideogram4PipelineConfig.max_text_tokens` — a longer prompt is rejected by `_tokenize`.
+const MAX_TEXT_TOKENS: usize = 2048;
 
 pub struct Ideogram4Pipeline {
     cond: Ideogram4Transformer,
     uncond: Ideogram4Transformer,
     te: Ideogram4TextEncoder,
     vae: Flux2Vae,
+    tok: TextTokenizer,
     dit: Ideogram4DitConfig,
 }
 
 impl Ideogram4Pipeline {
-    /// Load all four components from a converted snapshot dir.
+    /// Load all components (2 DiTs + Qwen3-VL text encoder + VAE + tokenizer) from a converted
+    /// snapshot dir.
     pub fn load(root: &Path) -> Result<Self> {
         Ok(Self {
             cond: load_transformer(root)?,
             uncond: load_unconditional_transformer(root)?,
             te: load_text_encoder(root)?,
             vae: load_vae(root)?,
+            tok: load_tokenizer(root)?,
             dit: Ideogram4DitConfig::v4(),
         })
+    }
+
+    /// Tokenize a prompt to `input_ids` exactly as the reference `_tokenize`: wrap it in the
+    /// Qwen3-VL single-user chat template ([`ChatTemplate::QwenInstruct`](mlx_gen::tokenizer::ChatTemplate::QwenInstruct))
+    /// and encode with `add_special_tokens=false`. Rejects a prompt longer than `MAX_TEXT_TOKENS`.
+    /// The prompt is the model's native **JSON caption** string (SceneWorks builds it); plain text
+    /// is out-of-distribution.
+    pub fn tokenize(&self, prompt: &str) -> Result<Vec<i32>> {
+        let ids = self.tok.encode_chat_ids(prompt, false)?;
+        if ids.len() > MAX_TEXT_TOKENS {
+            return Err(Error::Msg(format!(
+                "prompt has {} tokens, exceeds max_text_tokens={MAX_TEXT_TOKENS}",
+                ids.len()
+            )));
+        }
+        Ok(ids)
+    }
+
+    /// [`tokenize`](Self::tokenize) the prompt, then [`generate`](Self::generate) — the top-level
+    /// text-to-image entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_from_prompt(
+        &self,
+        prompt: &str,
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        mu: f64,
+        seed: u64,
+    ) -> Result<Array> {
+        let ids = self.tokenize(prompt)?;
+        self.generate(&ids, height, width, num_steps, guidance, mu, seed)
     }
 
     /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
