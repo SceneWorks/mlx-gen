@@ -48,6 +48,40 @@ pub fn load_text_encoder(root: &Path) -> Result<Qwen3TextEncoder> {
     Qwen3TextEncoder::from_weights(&w, "model", &Qwen3TextEncoderConfig::klein_9b())
 }
 
+/// `<pad>` token id for the FLUX.2-dev Mistral tokenizer (vs klein's Qwen2 `<|endoftext|>` 151643).
+pub const DEV_PAD_TOKEN_ID: i32 = 11;
+
+/// Load the FLUX.2-dev tokenizer: the Mistral/Pixtral `tokenizer.json` with the dev chat template
+/// (`[SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]…[/INST]`, BOS auto-prepended by the post-processor) and
+/// the fork's `padding="max_length"` (every prompt padded to 512 with `<pad>`). The `PixtralProcessor`
+/// image path is not part of the T2I tokenization (sc-5918).
+pub fn load_tokenizer_dev(root: &Path) -> Result<TextTokenizer> {
+    let path = root.join("tokenizer/tokenizer.json");
+    TextTokenizer::from_file(
+        path,
+        TokenizerConfig {
+            max_length: MAX_LENGTH,
+            pad_token_id: DEV_PAD_TOKEN_ID,
+            chat_template: ChatTemplate::Flux2DevMistral,
+            pad_to_max_length: true,
+        },
+    )
+    .map_err(Into::into)
+}
+
+/// Load the **FLUX.2-dev Mistral** text encoder (sc-5915). The dev `text_encoder` is a
+/// `Mistral3ForConditionalGeneration`; the T2I path consumes only its language tower, whose weights
+/// live under the `language_model.model.*` prefix (the vision tower + projector are unused here,
+/// sc-5918). Same decoder-LM graph as klein's Qwen3 minus the per-head q/k-norm (`qk_norm: false`).
+pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    Qwen3TextEncoder::from_weights(
+        &w,
+        "language_model.model",
+        &Qwen3TextEncoderConfig::mistral_dev(),
+    )
+}
+
 /// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/
 /// `bn.*`) map directly onto the module; conv weights are transposed `[O,I,H,W]→[O,H,W,I]` at
 /// construction.

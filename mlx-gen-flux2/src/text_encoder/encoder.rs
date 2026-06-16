@@ -12,7 +12,9 @@ use mlx_gen::{Error, Result};
 
 use super::{join, Qwen3DecoderLayer, TextRope};
 
-/// Qwen3 LM dimensions (FLUX.2-klein `text_encoder`).
+/// Decoder-LM text-encoder dimensions. Covers both FLUX.2 text encoders: klein's **Qwen3**
+/// (`klein_9b`) and dev's **Mistral** (`mistral_dev`) — they share the GQA + SwiGLU + HF-RoPE
+/// graph and differ only in these fields (chiefly `qk_norm`, the dims, θ, and layer count).
 pub struct Qwen3TextEncoderConfig {
     pub hidden_size: i32,
     pub n_layers: usize,
@@ -21,8 +23,11 @@ pub struct Qwen3TextEncoderConfig {
     pub head_dim: i32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    /// Per-head q/k RMSNorm before RoPE — Qwen3 has it, Mistral does not.
+    pub qk_norm: bool,
     /// Hidden-state indices (into a list whose entry 0 is the token embedding) concatenated into
-    /// `prompt_embeds`. klein: (9, 18, 27) → 3·hidden = 12288.
+    /// `prompt_embeds`. klein Qwen3: (9, 18, 27) → 3·4096 = 12288; dev Mistral: (10, 20, 30) →
+    /// 3·5120 = 15360.
     pub out_layers: [usize; 3],
 }
 
@@ -36,7 +41,26 @@ impl Qwen3TextEncoderConfig {
             head_dim: 128,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
+            qk_norm: true,
             out_layers: [9, 18, 27],
+        }
+    }
+
+    /// FLUX.2-dev `text_encoder` — the **Mistral** language tower of `Mistral3ForConditionalGeneration`
+    /// (text_config: 40 layers, hidden 5120, GQA 32/8, head_dim 128, θ=1e9, eps 1e-5, no qk-norm).
+    /// The vision tower + projector are not part of the T2I path (sc-5918). Hidden states 10/20/30
+    /// are concatenated into the 15360-wide `prompt_embeds` (dev pipeline `_get_mistral_3_small_prompt_embeds`).
+    pub fn mistral_dev() -> Self {
+        Self {
+            hidden_size: 5120,
+            n_layers: 40,
+            n_heads: 32,
+            n_kv_heads: 8,
+            head_dim: 128,
+            rope_theta: 1_000_000_000.0,
+            rms_norm_eps: 1e-5,
+            qk_norm: false,
+            out_layers: [10, 20, 30],
         }
     }
 }
@@ -63,6 +87,7 @@ impl Qwen3TextEncoder {
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 cfg.rms_norm_eps,
+                cfg.qk_norm,
             )?);
         }
         Ok(Self {

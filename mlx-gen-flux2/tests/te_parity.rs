@@ -29,6 +29,7 @@ fn tiny_config() -> Qwen3TextEncoderConfig {
         head_dim: 16,
         rope_theta: 1_000_000.0,
         rms_norm_eps: 1e-6,
+        qk_norm: true,
         out_layers: [0, 1, 2],
     }
 }

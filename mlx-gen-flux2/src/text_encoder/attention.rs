@@ -1,6 +1,10 @@
-//! Qwen3 self-attention: GQA (32 query / 8 kv heads), **bias-less** q/k/v/o projections,
-//! **per-head q/k RMSNorm** on the head dim (the Qwen3 addition over Qwen2.5), HF half-split
-//! RoPE, masked SDPA. Port of `Qwen3VLAttention` for the text path (`mrope_section=None`).
+//! GQA self-attention for the FLUX.2 decoder-LM text encoders: GQA (32 query / 8 kv heads),
+//! **bias-less** q/k/v/o projections, HF half-split RoPE, masked SDPA. Port of `Qwen3VLAttention`
+//! for the text path (`mrope_section=None`).
+//!
+//! **Per-head q/k RMSNorm** on the head dim is the Qwen3 addition over Qwen2.5 — present for the
+//! klein Qwen3 encoder, **absent** for the FLUX.2-dev Mistral encoder (sc-5915), which is otherwise
+//! identical. Gated by `qk_norm`; when off, q/k flow straight into RoPE.
 
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split};
@@ -17,8 +21,9 @@ pub struct Qwen3Attention {
     k_w: AdaptableLinear,
     v_w: AdaptableLinear,
     o_w: AdaptableLinear,
-    q_norm: Array,
-    k_norm: Array,
+    /// Per-head q/k RMSNorm weights — `Some` for Qwen3 (klein), `None` for Mistral (dev).
+    q_norm: Option<Array>,
+    k_norm: Option<Array>,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -34,14 +39,23 @@ impl Qwen3Attention {
         num_kv_heads: i32,
         head_dim: i32,
         eps: f32,
+        qk_norm: bool,
     ) -> Result<Self> {
+        let (q_norm, k_norm) = if qk_norm {
+            (
+                Some(w.require(&join(prefix, "q_norm.weight"))?.clone()),
+                Some(w.require(&join(prefix, "k_norm.weight"))?.clone()),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             q_w: lin(w, &join(prefix, "q_proj.weight"))?,
             k_w: lin(w, &join(prefix, "k_proj.weight"))?,
             v_w: lin(w, &join(prefix, "v_proj.weight"))?,
             o_w: lin(w, &join(prefix, "o_proj.weight"))?,
-            q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
-            k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
+            q_norm,
+            k_norm,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -78,8 +92,15 @@ impl Qwen3Attention {
             .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
 
         // Per-head q/k RMSNorm over the head dim (Qwen3), before RoPE — matches the fork order.
-        let q = rms_norm(&q, &self.q_norm, self.eps)?;
-        let k = rms_norm(&k, &self.k_norm, self.eps)?;
+        // Mistral (dev) has no qk-norm, so q/k pass through unchanged.
+        let q = match &self.q_norm {
+            Some(g) => rms_norm(&q, g, self.eps)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(g) => rms_norm(&k, g, self.eps)?,
+            None => k,
+        };
 
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;

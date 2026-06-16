@@ -26,6 +26,7 @@ impl Qwen3DecoderLayer {
         num_kv_heads: i32,
         head_dim: i32,
         eps: f32,
+        qk_norm: bool,
     ) -> Result<Self> {
         Ok(Self {
             input_ln: w.require(&join(prefix, "input_layernorm.weight"))?.clone(),
@@ -39,6 +40,7 @@ impl Qwen3DecoderLayer {
                 num_kv_heads,
                 head_dim,
                 eps,
+                qk_norm,
             )?,
             mlp: Qwen3Mlp::from_weights(w, &join(prefix, "mlp"))?,
             eps,

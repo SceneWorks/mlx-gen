@@ -43,7 +43,17 @@ pub enum ChatTemplate {
     /// `<|im_end|>\n<|im_start|>assistant\n` as conditioning. Verified token-for-token against the
     /// fork's `Qwen2Tokenizer` (the system prefix tokenizes to exactly 34 tokens).
     QwenImage,
+    /// FLUX.2-**dev**'s Mistral text encoder: the Mistral-v3 system+instruction template the dev
+    /// pipeline builds (`format_input` + the fixed creative `SYSTEM_MESSAGE` + `apply_chat_template`):
+    /// `[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT][INST]{prompt}[/INST]`. The leading `<s>` BOS is added
+    /// by the tokenizer's `TemplateProcessing` post-processor (`add_special_tokens`), not the
+    /// template — so `render` omits it. Verified token-for-token against the dev `PixtralProcessor`.
+    Flux2DevMistral,
 }
+
+/// FLUX.2-dev's fixed creative system message (diffusers `flux2/system_messages.py::SYSTEM_MESSAGE`).
+/// The embedded `\n` (after the second "object") is part of the reference string.
+const FLUX2_DEV_SYSTEM_MESSAGE: &str = "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object\nattribution and actions without speculation.";
 
 impl ChatTemplate {
     fn render(&self, prompt: &str) -> String {
@@ -59,6 +69,10 @@ impl ChatTemplate {
                 "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
                  texture, quantity, text, spatial relationships of the objects and \
                  background:<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            ),
+            ChatTemplate::Flux2DevMistral => format!(
+                "[SYSTEM_PROMPT]{}[/SYSTEM_PROMPT][INST]{}[/INST]",
+                FLUX2_DEV_SYSTEM_MESSAGE, prompt
             ),
         }
     }
@@ -251,5 +265,18 @@ mod tests {
         let r = ChatTemplate::QwenImage.render("a red fox");
         assert!(r.starts_with("<|im_start|>system\nDescribe the image by detailing"));
         assert!(r.ends_with("<|im_start|>user\na red fox<|im_end|>\n<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn flux2_dev_mistral_template_wraps_system_prompt_and_inst() {
+        // The exact string the dev `PixtralProcessor` renders (minus the post-processor `<s>`),
+        // verified against `apply_chat_template(format_input(prompt, SYSTEM_MESSAGE))`.
+        let r = ChatTemplate::Flux2DevMistral.render("a red fox in snow");
+        assert_eq!(
+            r,
+            "[SYSTEM_PROMPT]You are an AI that reasons about image descriptions. You give \
+             structured responses focusing on object relationships, object\nattribution and \
+             actions without speculation.[/SYSTEM_PROMPT][INST]a red fox in snow[/INST]"
+        );
     }
 }

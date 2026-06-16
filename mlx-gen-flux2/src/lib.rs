@@ -36,7 +36,10 @@ pub use config::{
 };
 pub use convert::{build_target_state_dict, convert_and_assemble};
 pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
-pub use loader::{load_text_encoder, load_tokenizer, load_transformer, load_vae};
+pub use loader::{
+    load_text_encoder, load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,
+    load_vae,
+};
 pub use model::{
     descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit, load_klein_9b,
     load_klein_9b_edit, load_klein_9b_kv_edit,
