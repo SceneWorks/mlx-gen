@@ -13,7 +13,7 @@ use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 use mlx_gen_flux2::Flux2Vae;
 
 use crate::config::Ideogram4DitConfig;
@@ -91,7 +91,8 @@ impl Ideogram4Pipeline {
     }
 
     /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
-    /// `uint8` array.
+    /// `uint8` array. No progress/cancellation — see
+    /// [`generate_with_progress`](Self::generate_with_progress).
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
@@ -102,6 +103,37 @@ impl Ideogram4Pipeline {
         guidance: f32,
         mu: f64,
         seed: u64,
+    ) -> Result<Array> {
+        self.generate_with_progress(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            mu,
+            seed,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// [`generate`](Self::generate) with cooperative cancellation + step/decode progress — the path
+    /// the [`Generator`](mlx_gen::Generator) registry adapter uses. `cancel` is checked at each step
+    /// boundary (returns `Err(Error::Canceled)` on trip); `on_progress` receives a
+    /// [`Progress::Step`] per denoise step and [`Progress::Decoding`] before the VAE decode. The
+    /// per-step `eval` makes the cancel check able to interrupt mid-render (MLX is lazy).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        mu: f64,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let patch = PATCH * AE_SCALE;
         assert!(
@@ -143,6 +175,9 @@ impl Ideogram4Pipeline {
         let schedule = LogitNormalSchedule::for_resolution(height, width, mu, 1.0);
         let si = make_step_intervals(num_steps);
         for i in (0..num_steps).rev() {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let t_val = schedule.eval(si[i + 1]);
             let s_val = schedule.eval(si[i]);
             let t = Array::from_slice(&[t_val as f32], &[1]);
@@ -174,8 +209,13 @@ impl Ideogram4Pipeline {
             )?;
             z = add(&z, &multiply(&v, Array::from_f32((s_val - t_val) as f32))?)?;
             eval([&z])?;
+            on_progress(Progress::Step {
+                current: (num_steps - i) as u32,
+                total: num_steps as u32,
+            });
         }
 
+        on_progress(Progress::Decoding);
         self.decode(&z, grid_h, grid_w)
     }
 

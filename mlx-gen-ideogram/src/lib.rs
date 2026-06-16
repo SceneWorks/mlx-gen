@@ -17,13 +17,15 @@
 //! Weights are provisioned offline by `tools/convert_ideogram4_to_mlx.py` (fp8 weight-only →
 //! bf16 MLX safetensors). Runtime is pure Rust/MLX.
 //!
-//! Slice status: **S0** — scaffold + the dimension-parametric [`config`]. The text encoder
-//! (sc-5985), transformer (sc-5986), VAE (sc-5987), and `load()`/`generate()` pipeline
-//! (sc-5988) land next.
+//! Slice status: engine **complete** and self-registered — converter (sc-5984), text encoder
+//! (sc-5985), transformer (sc-5986), VAE (sc-5987), native tokenizer + `generate` pipeline +
+//! [`Generator`](mlx_gen::Generator) registry registration under id `"ideogram_4"` (sc-5988, see
+//! [`model`]). Follow-ons: Q4/Q8 quantization (sc-5989) and the gated turnkey publish (sc-5990).
 
 pub mod config;
 pub mod latent_norm;
 pub mod loader;
+pub mod model;
 pub mod pipeline;
 pub mod scheduler;
 pub mod text_encoder;
@@ -36,6 +38,7 @@ pub use config::{
 pub use loader::{
     load_text_encoder, load_tokenizer, load_transformer, load_unconditional_transformer, load_vae,
 };
+pub use model::{descriptor, load, Ideogram4, MODEL_ID};
 pub use pipeline::Ideogram4Pipeline;
 pub use scheduler::{make_step_intervals, LogitNormalSchedule};
 pub use text_encoder::Ideogram4TextEncoder;

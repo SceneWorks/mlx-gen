@@ -21,10 +21,16 @@ pub const DEFAULT_HEIGHT: u32 = 1024;
 pub const RES_MIN: u32 = 256;
 pub const RES_MAX: u32 = 2048;
 pub const RES_MULTIPLE: u32 = 16;
-/// Euler flow-matching with asymmetric CFG. Provisional — confirm against `ideogram4.PRESETS`
-/// (e.g. `V4_QUALITY_48` ⇒ ~48 steps) before shipping (sc-5988).
+/// Euler flow-matching with asymmetric CFG. The reference `__call__` default is **128** steps;
+/// the SceneWorks default is the `V4_QUALITY_48` quality preset (48 steps), a sanctioned
+/// preset that renders cleanly at a fraction of the cost of 128 over two DiTs (validated:
+/// 50 steps @256² is a clean image, ~8 undercooks badly). (sc-5988)
 pub const DEFAULT_STEPS: u32 = 48;
-pub const DEFAULT_GUIDANCE: f32 = 5.0;
+/// Reference `__call__` default `guidance_scale=7.0` (asymmetric CFG: `v = g·cond + (1−g)·uncond`).
+pub const DEFAULT_GUIDANCE: f32 = 7.0;
+/// Reference `__call__` default `mu=0.5` — the logit-normal schedule's `known_mean`
+/// (`LogitNormalSchedule::for_resolution(h, w, mu, std)`, `std=1.0`).
+pub const DEFAULT_MU: f64 = 0.5;
 /// Max text tokens the model accepts (Qwen3-VL context budget used by Ideogram).
 pub const MAX_TEXT_TOKENS: usize = 2048;
 

@@ -41,7 +41,11 @@ fn smoke_generates_image() {
         envn("IDEOGRAM4_SMOKE_RES", 256),
         envn("IDEOGRAM4_SMOKE_RES", 256),
     );
-    let steps = envn("IDEOGRAM4_SMOKE_STEPS", 8) as usize;
+    // Default to a representative step count (the model's "V4_QUALITY_48" preset range; reference
+    // default is 128). Ideogram 4 is NOT guidance-distilled — at ~8 steps it undercooks badly
+    // (right composition, melted/mushy detail), which misreads as a broken engine. Override low
+    // (`IDEOGRAM4_SMOKE_STEPS=8`) only for a fast "does it run" check, not a quality look.
+    let steps = envn("IDEOGRAM4_SMOKE_STEPS", 50) as usize;
     let guidance = std::env::var("IDEOGRAM4_SMOKE_GUIDANCE")
         .ok()
         .and_then(|v| v.parse().ok())
