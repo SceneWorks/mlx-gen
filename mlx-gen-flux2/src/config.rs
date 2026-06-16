@@ -15,6 +15,8 @@ pub const FLUX2_KLEIN_9B_EDIT_ID: &str = "flux2_klein_9b_edit";
 /// K/V across denoise steps for the ~2.4× single-ref edit speedup. Edit-only — the cache is
 /// meaningless without reference tokens.
 pub const FLUX2_KLEIN_9B_KV_EDIT_ID: &str = "flux2_klein_9b_kv_edit";
+/// FLUX.2-dev txt2img (sc-5916). Undistilled 32B flagship: embedded guidance + more steps.
+pub const FLUX2_DEV_ID: &str = "flux2_dev";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
@@ -22,6 +24,12 @@ pub const DEFAULT_HEIGHT: u32 = 1024;
 pub const DEFAULT_STEPS: u32 = 4;
 /// Distilled klein runs at guidance 1.0 (no CFG). Base (non-distilled) variants allow >1.0.
 pub const DEFAULT_GUIDANCE: f32 = 1.0;
+
+/// FLUX.2-dev is guidance-distilled (embedded scalar, the FLUX.1-dev pattern): ~28 steps (24–50)
+/// at guidance ~4.0 — NOT true CFG with a negative prompt. (BFL reference call: `guidance_scale=4`,
+/// `num_inference_steps=50` with 28 a good trade-off.)
+pub const DEFAULT_STEPS_DEV: u32 = 28;
+pub const DEFAULT_GUIDANCE_DEV: f32 = 4.0;
 
 /// The FLUX.2-klein variants this crate targets. 9b is the story target; the enum keeps the
 /// door open for 4b (a near-free addition — only the dims in [`Flux2Config`] change).
@@ -33,6 +41,10 @@ pub enum Flux2Variant {
     Klein9bEdit,
     /// FLUX.2-klein-9b-kv, distilled, edit with the reference-K/V cache (sc-2347).
     Klein9bKvEdit,
+    /// FLUX.2-dev, guidance-distilled txt2img (sc-5916). Larger MMDiT (48 single blocks, 48 heads,
+    /// joint 15360) + the Mistral text encoder; embedded guidance ~4 over ~28 steps. Image edit is
+    /// a follow-on (sc-5919 — needs the Pixtral vision tower).
+    Dev,
 }
 
 impl Flux2Variant {
@@ -41,6 +53,7 @@ impl Flux2Variant {
             Self::Klein9b => FLUX2_KLEIN_9B_ID,
             Self::Klein9bEdit => FLUX2_KLEIN_9B_EDIT_ID,
             Self::Klein9bKvEdit => FLUX2_KLEIN_9B_KV_EDIT_ID,
+            Self::Dev => FLUX2_DEV_ID,
         }
     }
 
@@ -51,6 +64,7 @@ impl Flux2Variant {
             Self::Klein9b | Self::Klein9bEdit => "black-forest-labs/FLUX.2-klein-9B",
             // The KV-cache variant is a separately distilled checkpoint (same architecture).
             Self::Klein9bKvEdit => "black-forest-labs/FLUX.2-klein-9b-kv",
+            Self::Dev => "black-forest-labs/FLUX.2-dev",
         }
     }
 
@@ -65,7 +79,26 @@ impl Flux2Variant {
 
     /// The dimension-parametric model config for this variant.
     pub fn config(self) -> Flux2Config {
-        Flux2Config::klein_9b()
+        match self {
+            Self::Dev => Flux2Config::dev(),
+            _ => Flux2Config::klein_9b(),
+        }
+    }
+
+    /// Default denoise steps. Distilled klein = 4; guidance-distilled dev ≈ 28 (range 24–50).
+    pub fn default_steps(self) -> u32 {
+        match self {
+            Self::Dev => DEFAULT_STEPS_DEV,
+            _ => DEFAULT_STEPS,
+        }
+    }
+
+    /// Default guidance. klein runs CFG-free (1.0); dev uses embedded guidance ~4.0.
+    pub fn default_guidance(self) -> f32 {
+        match self {
+            Self::Dev => DEFAULT_GUIDANCE_DEV,
+            _ => DEFAULT_GUIDANCE,
+        }
     }
 
     pub fn descriptor(self) -> ModelDescriptor {
@@ -178,6 +211,32 @@ impl Flux2Config {
         }
     }
 
+    /// FLUX.2-dev — the same MMDiT arch as klein, scaled up: 48 single blocks, 48 heads (inner
+    /// 6144), `joint_attention_dim` 15360 (= 3 × the Mistral TE hidden 5120). The VAE + RoPE +
+    /// patch geometry are identical to klein; only the block/head counts, the joint width, and the
+    /// text-encoder dims change. Values from the dev `transformer/config.json` + `text_encoder/config.json`.
+    pub fn dev() -> Self {
+        Self {
+            num_double_layers: 8,
+            num_single_layers: 48,
+            num_heads: 48,
+            head_dim: 128,
+            in_channels: 128,
+            out_channels: 128,
+            joint_attention_dim: 15360,
+            mlp_ratio: 3.0,
+            timestep_channels: 256,
+            axes_dim: [32, 32, 32, 32],
+            rope_theta: 2000.0,
+            te_hidden_size: 5120,
+            te_intermediate_size: 32768,
+            te_out_layers: [10, 20, 30],
+            max_sequence_length: 512,
+            num_latent_channels: 32,
+            vae_scale_factor: 8,
+        }
+    }
+
     /// `num_heads * head_dim` — the transformer inner width (9b: 4096).
     pub fn inner_dim(&self) -> usize {
         self.num_heads * self.head_dim
@@ -208,6 +267,41 @@ mod tests {
         assert_eq!(Flux2Variant::Klein9bKvEdit.id(), FLUX2_KLEIN_9B_KV_EDIT_ID);
         assert!(Flux2Variant::Klein9bEdit.is_edit());
         assert!(!Flux2Variant::Klein9b.is_edit());
+    }
+
+    #[test]
+    fn dev_dims_match_reference() {
+        let c = Flux2Config::dev();
+        assert_eq!(c.num_double_layers, 8);
+        assert_eq!(c.num_single_layers, 48);
+        assert_eq!(c.num_heads, 48);
+        assert_eq!(c.inner_dim(), 6144);
+        // joint_attention_dim = 3 × the Mistral TE hidden (5120) = 15360.
+        assert_eq!(c.joint_attention_dim, 3 * c.te_hidden_size);
+        assert_eq!(c.joint_attention_dim, 15360);
+        assert_eq!(c.in_channels, c.num_latent_channels * 4);
+        assert_eq!(c.axes_dim.iter().sum::<usize>(), c.head_dim);
+        assert_eq!(c.te_out_layers, [10, 20, 30]);
+    }
+
+    #[test]
+    fn dev_variant_is_txt2img_with_embedded_guidance() {
+        let v = Flux2Variant::Dev;
+        assert_eq!(v.id(), FLUX2_DEV_ID);
+        assert_eq!(v.hf_model(), "black-forest-labs/FLUX.2-dev");
+        assert!(!v.is_edit());
+        assert!(!v.is_kv());
+        // Guidance-distilled (embedded scalar): ~28 steps at guidance ~4, not 4-step CFG-free.
+        assert_eq!(v.default_steps(), 28);
+        assert_eq!(v.default_guidance(), 4.0);
+        let caps = v.descriptor().capabilities;
+        assert!(caps.supports_guidance);
+        assert!(!caps.supports_negative_prompt);
+        assert!(!caps.supports_true_cfg);
+        assert!(!caps.supports_kv_cache);
+        assert!(caps.accepts(ConditioningKind::Reference));
+        // config() now returns the dev dims, not klein's (the previous hardcode was a latent bug).
+        assert_eq!(v.config().num_single_layers, 48);
     }
 
     #[test]

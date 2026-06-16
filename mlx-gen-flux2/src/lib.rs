@@ -31,14 +31,15 @@ pub mod vae;
 
 pub use adapters::apply_flux2_adapters;
 pub use config::{
-    Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_HEIGHT, DEFAULT_STEPS, DEFAULT_WIDTH,
-    FLUX2_KLEIN_9B_EDIT_ID, FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
+    Flux2Config, Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_GUIDANCE_DEV, DEFAULT_HEIGHT,
+    DEFAULT_STEPS, DEFAULT_STEPS_DEV, DEFAULT_WIDTH, FLUX2_DEV_ID, FLUX2_KLEIN_9B_EDIT_ID,
+    FLUX2_KLEIN_9B_ID, FLUX2_KLEIN_9B_KV_EDIT_ID,
 };
 pub use convert::{build_target_state_dict, convert_and_assemble};
 pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
 pub use loader::{
     load_text_encoder, load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,
-    load_vae,
+    load_transformer_dev, load_vae,
 };
 pub use model::{
     descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit, load_klein_9b,

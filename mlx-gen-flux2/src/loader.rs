@@ -90,13 +90,13 @@ pub fn load_vae(root: &Path) -> Result<Flux2Vae> {
     Flux2Vae::from_weights(&w)
 }
 
-/// Load the MMDiT transformer, applying the diffusers→internal renames (the fork's
+/// Load the MMDiT transformer for `cfg`, applying the diffusers→internal renames (the fork's
 /// `Flux2WeightMapping`): the time embedding `time_guidance_embed.timestep_embedder.linear_{1,2}`
 /// → `time_guidance_embed.linear_{1,2}`, and each double block's Sequential
-/// `transformer_blocks.{i}.attn.to_out.0` → `to_out`. Everything else matches 1:1.
-pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
+/// `transformer_blocks.{i}.attn.to_out.0` → `to_out`. Everything else matches 1:1. The renames are
+/// arch-general (klein and dev are the same `Flux2Transformer2DModel`); only `cfg` differs.
+fn load_transformer_with(root: &Path, cfg: &Flux2Config) -> Result<Flux2Transformer> {
     let mut w = Weights::from_dir(root.join("transformer"))?;
-    let cfg = Flux2Config::klein_9b();
     for n in ["linear_1", "linear_2"] {
         w.alias(
             &format!("time_guidance_embed.timestep_embedder.{n}.weight"),
@@ -109,5 +109,16 @@ pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
             &format!("transformer_blocks.{i}.attn.to_out.weight"),
         );
     }
-    Flux2Transformer::from_weights(&w, &cfg)
+    Flux2Transformer::from_weights(&w, cfg)
+}
+
+/// Load the FLUX.2-klein MMDiT transformer.
+pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
+    load_transformer_with(root, &Flux2Config::klein_9b())
+}
+
+/// Load the FLUX.2-dev MMDiT transformer (sc-5916): the same parametric module tree as klein at the
+/// dev dims (48 single blocks / 48 heads / joint 15360), via `Flux2Config::dev()`.
+pub fn load_transformer_dev(root: &Path) -> Result<Flux2Transformer> {
+    load_transformer_with(root, &Flux2Config::dev())
 }
