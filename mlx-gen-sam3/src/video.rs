@@ -6,9 +6,12 @@
 //! tracklets, seed new identities from unmatched detections
 //! ([`Sam3Tracker::decode_mask_conditioning_frame`]), and encode each frame's masks into memory.
 //!
-//! Mirrors `transformers` `sam3_video/modeling_sam3_video.py` `_det_track_one_frame`. Matches the
-//! reference's **no-`kernels`** configuration: NMS (`det_nms_thresh`) and hole-filling are no-ops.
-//! Masks flow as raw 288² logits (the processor sigmoids for display).
+//! Mirrors `transformers` `sam3_video/modeling_sam3_video.py` `_det_track_one_frame`. The reference's
+//! optional `kernels` post-processing is ported natively (sc-4995), since the `cv-utils` kernel is
+//! GPU-only and unavailable on this Mac: detection mask-NMS dedup (`det_nms_thresh`) replicates
+//! `generic_nms` with a host greedy mask-IoU pass ([`nms_dedup`]), and hole-fill + sprinkle removal
+//! (`fill_holes_in_mask_scores`) replicates the 8-connected `cc_torch`/skimage path with a host flood
+//! fill ([`fill_holes_in_mask`]). Masks flow as 288² logits (the processor sigmoids for display).
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -26,6 +29,8 @@ use crate::{Sam3ImageSegmenter, Sam3Tracker};
 // --- config (Sam3VideoConfig defaults) -----------------------------------------------------------
 const LOW_RES: i32 = 288; // low_res_mask_size
 const SCORE_THRESH_DET: f32 = 0.5; // score_threshold_detection
+const DET_NMS_THRESH: f32 = 0.1; // det_nms_thresh (mask-IoU NMS dedup; sc-4995)
+const FILL_HOLE_AREA: i32 = 16; // fill_hole_area (hole-fill + sprinkle removal; sc-4995)
 const NEW_DET_THRESH: f32 = 0.7;
 const ASSOC_IOU_THRESH: f32 = 0.1;
 const TRK_ASSOC_IOU_THRESH: f32 = 0.5;
@@ -186,7 +191,10 @@ impl Sam3VideoModel {
                 .tracker
                 .prepare_memory_conditioned_features(&cvf, &cvp, &spatial, &pointers, max_optr)?;
             let out = self.tracker.decode_tracked_frame(&conditioned, &high_res)?;
-            let low = to_vec(&out.low_res)?;
+            let mut low = to_vec(&out.low_res)?;
+            // Hole-fill the propagated mask here (mirrors `run_tracker_propagation`, sc-4995) so the
+            // filled logits flow into association, overlap-suppression, memory encoding, and output.
+            fill_holes_in_mask(&mut low, FILL_HOLE_AREA);
             self.banks[obj_idx].non_cond.insert(
                 frame_idx,
                 FrameMem {
@@ -283,9 +291,10 @@ impl Sam3VideoModel {
         )
     }
 
-    // ----- detection (run_detection, single prompt, NMS off) -----
+    // ----- detection (run_detection, single prompt) -----
     // Takes the shared backbone features (sc-5409) so the detector FPN reuses the same ViT pass as
-    // the tracker neck instead of re-running the backbone.
+    // the tracker neck instead of re-running the backbone. Above-threshold detections are then
+    // de-duplicated by greedy mask-IoU NMS (`det_nms_thresh`, sc-4995).
     fn run_detection(
         &self,
         features: &Array,
@@ -318,6 +327,7 @@ impl Sam3VideoModel {
                 prompt_id: 0,
             });
         }
+        let dets = nms_dedup(dets, DET_NMS_THRESH);
         Ok(DetFrame { dets })
     }
 
@@ -650,10 +660,14 @@ impl Sam3VideoModel {
             }
             masks.push(trk_masks[j].clone());
         }
-        // new identities → raw detection logits (hole-fill skipped: no kernels).
+        // new identities → detection logits with hole-fill applied to the output mask (sc-4995;
+        // reference `build_outputs` Part 2). The raw detection mask is still what seeds the new
+        // object's memory (step 5) and what overrides reconditioned objects (Part 3, above).
         for (&oid, &di) in new_obj_ids.iter().zip(&a.new_det_inds) {
             obj_ids.push(oid);
-            masks.push(det.dets[di].mask.clone());
+            let mut m = det.dets[di].mask.clone();
+            fill_holes_in_mask(&mut m, FILL_HOLE_AREA);
+            masks.push(m);
         }
         Ok(VideoFrameOutput { obj_ids, masks })
     }
@@ -796,6 +810,129 @@ fn mask_iou(a: &[bool], b: &[bool]) -> f32 {
     inter as f32 / (uni.max(1) as f32)
 }
 
+/// Greedy mask-IoU NMS over above-threshold detections (`det_nms_thresh`, sc-4995). Mirrors the
+/// `kernels`-enabled reference `nms_masks` → `generic_nms` (cv-utils, GPU-only) with a host pass:
+/// process detections by **descending score**, keep each not-yet-suppressed one, and suppress any
+/// lower-scored detection whose binarized mask-IoU with it is **strictly greater** than
+/// `iou_threshold` (IoU == threshold is kept, matching `generic_nms_cpu`'s `<= threshold` keep rule).
+/// Survivors are returned in their original (query) order, mirroring the reference's
+/// `where(pred_probs > threshold)` index-order re-selection after zeroing the suppressed scores.
+/// Suppression is confined to detections of the same `prompt_id` (the reference runs NMS per prompt).
+/// Ties in score break by ascending original index (stable sort), matching the CPU oracle.
+fn nms_dedup(dets: Vec<Detection>, iou_threshold: f32) -> Vec<Detection> {
+    let n = dets.len();
+    if iou_threshold <= 0.0 || n <= 1 {
+        return dets;
+    }
+    let bins: Vec<Vec<bool>> = dets.iter().map(|d| binarize(&d.mask)).collect();
+    // descending score; stable so ties keep ascending original index (matches np stable argsort)
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        dets[b]
+            .score
+            .partial_cmp(&dets[a].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut suppressed = vec![false; n];
+    let mut keep = vec![false; n];
+    for pos in 0..n {
+        let i = order[pos];
+        if suppressed[i] {
+            continue;
+        }
+        keep[i] = true;
+        for &j in &order[pos + 1..] {
+            if suppressed[j] || dets[j].prompt_id != dets[i].prompt_id {
+                continue;
+            }
+            if mask_iou(&bins[i], &bins[j]) > iou_threshold {
+                suppressed[j] = true;
+            }
+        }
+    }
+    dets.into_iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, d)| d)
+        .collect()
+}
+
+/// 8-connected component sizes over a `LOW_RES²` boolean grid: each `true` pixel gets the pixel-count
+/// of its component, each `false` pixel gets 0. Iterative flood fill (matches the reference's
+/// `cc_torch`/triton/skimage path, all 8-connectivity). `mask` is row-major `[LOW_RES·LOW_RES]`.
+fn component_areas(mask: &[bool]) -> Vec<usize> {
+    let w = LOW_RES as usize;
+    let h = LOW_RES as usize;
+    let n = mask.len();
+    let mut area = vec![0usize; n];
+    let mut visited = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut comp: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if !mask[start] || visited[start] {
+            continue;
+        }
+        stack.clear();
+        comp.clear();
+        stack.push(start);
+        visited[start] = true;
+        while let Some(p) = stack.pop() {
+            comp.push(p);
+            let (r, c) = (p / w, p % w);
+            let r0 = r.saturating_sub(1);
+            let r1 = (r + 1).min(h - 1);
+            let c0 = c.saturating_sub(1);
+            let c1 = (c + 1).min(w - 1);
+            for nr in r0..=r1 {
+                for nc in c0..=c1 {
+                    let np = nr * w + nc;
+                    if np != p && mask[np] && !visited[np] {
+                        visited[np] = true;
+                        stack.push(np);
+                    }
+                }
+            }
+        }
+        let sz = comp.len();
+        for &p in &comp {
+            area[p] = sz;
+        }
+    }
+    area
+}
+
+/// Fill small holes / remove small sprinkles in a `LOW_RES²` mask of logits, in place
+/// (`fill_holes_in_mask_scores`, sc-4995). Mirrors the reference exactly, using 8-connected
+/// components throughout; `max_area <= 0` is a no-op:
+///
+/// - **fill holes**: background components (logit `<= 0`) of area `<= max_area` become `+0.1`.
+/// - **remove sprinkles**: foreground components (logit `> 0`, evaluated *after* the fill) of area `<= min(total_foreground / 2, max_area)` become `-0.1`.
+fn fill_holes_in_mask(mask: &mut [f32], max_area: i32) {
+    if max_area <= 0 {
+        return;
+    }
+    let max_area = max_area as usize;
+    // fill holes: small background components flip to a small positive score.
+    let bg: Vec<bool> = mask.iter().map(|&v| v <= 0.0).collect();
+    let bg_area = component_areas(&bg);
+    for (i, &is_bg) in bg.iter().enumerate() {
+        if is_bg && bg_area[i] <= max_area {
+            mask[i] = 0.1;
+        }
+    }
+    // remove sprinkles: small foreground components (post-fill) flip to a small negative score. The
+    // area threshold is per-mask: half the foreground area, clamped to `max_area`.
+    let fg: Vec<bool> = mask.iter().map(|&v| v > 0.0).collect();
+    let total_fg = fg.iter().filter(|&&x| x).count();
+    let fg_thresh = (total_fg / 2).min(max_area);
+    let fg_area = component_areas(&fg);
+    for (i, &is_fg) in fg.iter().enumerate() {
+        if is_fg && fg_area[i] <= fg_thresh {
+            mask[i] = -0.1;
+        }
+    }
+}
+
 fn to_vec(a: &Array) -> Result<Vec<f32>> {
     Ok(a.reshape(&[-1])?
         .as_dtype(Dtype::Float32)?
@@ -821,6 +958,180 @@ fn seq_first(a: &Array, bf16: bool) -> Result<Array> {
 mod tests {
     use super::*;
     use mlx_gen::weights::Weights;
+
+    /// Build a detection whose 288² mask is a `+1.0` rectangle (rows `r0..r1`, cols `c0..c1`) on a
+    /// `-1.0` background, so `binarize` (`> 0`) recovers exactly that rectangle.
+    fn rect_det(
+        score: f32,
+        prompt_id: i32,
+        r0: usize,
+        r1: usize,
+        c0: usize,
+        c1: usize,
+    ) -> Detection {
+        let w = LOW_RES as usize;
+        let mut mask = vec![-1.0f32; w * w];
+        for r in r0..r1 {
+            for c in c0..c1 {
+                mask[r * w + c] = 1.0;
+            }
+        }
+        Detection {
+            mask,
+            score,
+            prompt_id,
+        }
+    }
+
+    fn scores(dets: &[Detection]) -> Vec<f32> {
+        dets.iter().map(|d| d.score).collect()
+    }
+
+    /// sc-4995: among heavily-overlapping detections, NMS keeps the highest-scored and drops the rest.
+    #[test]
+    fn nms_dedup_suppresses_overlapping_lower_score() {
+        // two identical full-frame rectangles (IoU 1.0) → only the 0.9 survives.
+        let dets = vec![
+            rect_det(0.6, 0, 0, 100, 0, 100),
+            rect_det(0.9, 0, 0, 100, 0, 100),
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(scores(&kept), vec![0.9]);
+    }
+
+    /// Disjoint detections (IoU 0) are all kept, in original (query) order.
+    #[test]
+    fn nms_dedup_keeps_disjoint() {
+        let dets = vec![
+            rect_det(0.8, 0, 0, 10, 0, 10),
+            rect_det(0.7, 0, 50, 60, 50, 60),
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(scores(&kept), vec![0.8, 0.7]);
+    }
+
+    /// Suppression is **strictly** `IoU > threshold`: IoU exactly at the threshold is kept (matches
+    /// `generic_nms_cpu`'s `<= threshold` keep rule). A=rows 0..3, B=rows 1..4 (full width) → IoU 0.5.
+    #[test]
+    fn nms_dedup_threshold_is_strict() {
+        let pair = || {
+            vec![
+                rect_det(0.9, 0, 0, 3, 0, 100),
+                rect_det(0.8, 0, 1, 4, 0, 100),
+            ]
+        };
+        // IoU == 0.5 is NOT > 0.5 → both kept.
+        assert_eq!(scores(&nms_dedup(pair(), 0.5)), vec![0.9, 0.8]);
+        // IoU 0.5 > 0.4 → lower-scored suppressed.
+        assert_eq!(scores(&nms_dedup(pair(), 0.4)), vec![0.9]);
+    }
+
+    /// Survivors come back in original query order, not score order (mirrors the reference's
+    /// `where(pred_probs > threshold)` index-order re-selection after zeroing suppressed scores).
+    #[test]
+    fn nms_dedup_preserves_query_order() {
+        let dets = vec![
+            rect_det(0.7, 0, 0, 10, 0, 10),    // disjoint, kept
+            rect_det(0.95, 0, 50, 60, 50, 60), // overlaps det2, higher score → kept
+            rect_det(0.6, 0, 50, 60, 50, 60),  // suppressed by det1
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        // query order [0.7, 0.95], NOT score order [0.95, 0.7].
+        assert_eq!(scores(&kept), vec![0.7, 0.95]);
+    }
+
+    /// NMS is confined to a single prompt group: overlapping detections from different prompts coexist.
+    #[test]
+    fn nms_dedup_respects_prompt_groups() {
+        let dets = vec![
+            rect_det(0.9, 0, 0, 100, 0, 100),
+            rect_det(0.8, 1, 0, 100, 0, 100), // same mask, different prompt → not suppressed
+        ];
+        let kept = nms_dedup(dets, DET_NMS_THRESH);
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// Degenerate inputs pass through unchanged.
+    #[test]
+    fn nms_dedup_empty_and_single() {
+        assert!(nms_dedup(Vec::new(), DET_NMS_THRESH).is_empty());
+        let one = nms_dedup(vec![rect_det(0.55, 0, 0, 10, 0, 10)], DET_NMS_THRESH);
+        assert_eq!(scores(&one), vec![0.55]);
+    }
+
+    // --- hole-fill / sprinkle removal (sc-4995) ---
+
+    fn bg_field(val: f32) -> Vec<f32> {
+        vec![val; (LOW_RES * LOW_RES) as usize]
+    }
+    fn paint(m: &mut [f32], r0: usize, r1: usize, c0: usize, c1: usize, val: f32) {
+        let w = LOW_RES as usize;
+        for r in r0..r1 {
+            for c in c0..c1 {
+                m[r * w + c] = val;
+            }
+        }
+    }
+    fn at(m: &[f32], r: usize, c: usize) -> f32 {
+        m[r * LOW_RES as usize + c]
+    }
+
+    /// A small background hole enclosed by foreground (area <= max_area) is filled to +0.1, while the
+    /// large outer background and the surrounding foreground are untouched.
+    #[test]
+    fn fill_holes_fills_small_background_hole() {
+        let mut m = bg_field(-1.0);
+        paint(&mut m, 10, 40, 10, 40, 1.0); // 30x30 foreground block
+        paint(&mut m, 20, 22, 20, 22, -1.0); // 2x2 enclosed hole (area 4)
+        fill_holes_in_mask(&mut m, FILL_HOLE_AREA);
+        assert_eq!(at(&m, 20, 20), 0.1, "enclosed hole filled");
+        assert_eq!(at(&m, 11, 11), 1.0, "foreground untouched");
+        assert_eq!(at(&m, 0, 0), -1.0, "outer background untouched");
+    }
+
+    /// Hole-fill area threshold is `<= max_area`: a 16-pixel hole is filled, a 20-pixel hole is not.
+    #[test]
+    fn fill_holes_area_threshold() {
+        let mut m = bg_field(-1.0);
+        paint(&mut m, 10, 60, 10, 60, 1.0); // 50x50 block
+        paint(&mut m, 15, 19, 15, 19, -1.0); // 4x4 = 16 → filled
+        paint(&mut m, 15, 19, 40, 45, -1.0); // 4x5 = 20 → kept
+        fill_holes_in_mask(&mut m, FILL_HOLE_AREA);
+        assert_eq!(at(&m, 15, 15), 0.1, "16-px hole filled (<= max_area)");
+        assert_eq!(at(&m, 15, 40), -1.0, "20-px hole not filled (> max_area)");
+    }
+
+    /// A small isolated foreground speck (area <= threshold) is removed to -0.1; the dominant blob stays.
+    #[test]
+    fn fill_holes_removes_small_foreground_speck() {
+        let mut m = bg_field(-1.0);
+        paint(&mut m, 10, 60, 10, 60, 1.0); // big block (area 2500)
+        paint(&mut m, 100, 101, 100, 101, 1.0); // 1-px speck
+        fill_holes_in_mask(&mut m, FILL_HOLE_AREA);
+        assert_eq!(at(&m, 100, 100), -0.1, "speck removed");
+        assert_eq!(at(&m, 30, 30), 1.0, "dominant blob kept");
+    }
+
+    /// The sprinkle threshold is clamped to half the total foreground, so a lone small object (area
+    /// <= max_area but > half its own area) is NOT wiped out.
+    #[test]
+    fn fill_holes_half_area_clamp_protects_lone_object() {
+        let mut m = bg_field(-1.0);
+        paint(&mut m, 50, 53, 50, 54, 1.0); // 3x4 = 12 px, the only foreground
+        fill_holes_in_mask(&mut m, FILL_HOLE_AREA);
+        // total_fg = 12 → fg_thresh = min(6, 16) = 6; blob area 12 > 6 → kept.
+        assert_eq!(at(&m, 50, 50), 1.0, "lone small object preserved");
+    }
+
+    /// `max_area <= 0` is a no-op.
+    #[test]
+    fn fill_holes_noop_when_disabled() {
+        let mut m = bg_field(-1.0);
+        paint(&mut m, 10, 12, 10, 12, 1.0);
+        let before = m.clone();
+        fill_holes_in_mask(&mut m, 0);
+        assert_eq!(m, before);
+    }
 
     /// F-028: the detector segmenter and the tracker must share **one** PE backbone instance — both
     /// at load and after quantization — rather than each holding its own ~445M-param copy. Checks
