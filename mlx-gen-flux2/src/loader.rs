@@ -19,6 +19,7 @@ use crate::config::{Flux2Config, Flux2Quant};
 use crate::text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
+use crate::vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
 
 /// Read a component's pre-quantized-snapshot manifest (sc-5917): the `quantization` block
 /// (`{ "bits", "group_size" }`) [`crate::convert`] writes into `{dir}/config.json`. `None` for a
@@ -165,4 +166,23 @@ pub fn load_transformer(root: &Path) -> Result<Flux2Transformer> {
 /// dev dims (48 single blocks / 48 heads / joint 15360), via `Flux2Config::dev()`.
 pub fn load_transformer_dev(root: &Path) -> Result<Flux2Transformer> {
     load_transformer_with(root, &Flux2Config::dev())
+}
+
+/// Load the FLUX.2-dev **Pixtral vision tower** (sc-5918) from the `text_encoder/` snapshot — the
+/// `vision_tower.*` keys of the `Mistral3ForConditionalGeneration` checkpoint. Used for
+/// edit/reference image conditioning (sc-5919), not the T2I path. The tower stays full precision
+/// (only the MMDiT + Mistral language tower quantize), so it loads dense regardless of the
+/// pre-quantized-snapshot manifest.
+pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    PixtralVisionTower::from_weights(&w, "vision_tower", PixtralVisionConfig::dev())
+}
+
+/// Load the FLUX.2-dev **Mistral3 multimodal projector** (sc-5918) from the `text_encoder/`
+/// snapshot (`multi_modal_projector.*` keys). `spatial_merge_size = 2`; the projector's RMSNorm
+/// uses the Mistral **text** `rms_norm_eps` (1e-5), per the reference. Full precision, like the
+/// vision tower.
+pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
+    let w = Weights::from_dir(root.join("text_encoder"))?;
+    Mistral3Projector::from_weights(&w, "multi_modal_projector", 2, 1e-5)
 }

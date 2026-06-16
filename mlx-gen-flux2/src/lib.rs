@@ -28,6 +28,7 @@ pub mod pos_embed;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vision;
 
 pub use adapters::apply_flux2_adapters;
 pub use config::{
@@ -41,8 +42,8 @@ pub use convert::{
 };
 pub use kv_cache::{CacheMode, Flux2KvCache, Stream};
 pub use loader::{
-    load_text_encoder, load_text_encoder_dev, load_tokenizer, load_tokenizer_dev, load_transformer,
-    load_transformer_dev, load_vae,
+    load_multimodal_projector_dev, load_text_encoder, load_text_encoder_dev, load_tokenizer,
+    load_tokenizer_dev, load_transformer, load_transformer_dev, load_vae, load_vision_tower_dev,
 };
 pub use model::{
     descriptor_dev, descriptor_klein_9b, descriptor_klein_9b_edit, descriptor_klein_9b_kv_edit,
@@ -57,3 +58,4 @@ pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
 pub use transformer::{Flux2Transformer, Flux2TransformerConfig};
 pub use vae::Flux2Vae;
+pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};
