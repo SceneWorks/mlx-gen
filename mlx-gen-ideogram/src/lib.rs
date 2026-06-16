@@ -30,6 +30,6 @@ pub use config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_HEIGHT,
     DEFAULT_STEPS, DEFAULT_WIDTH, EXTRACTED_LAYERS, IDEOGRAM_4_FP8_REPO, IDEOGRAM_4_ID,
 };
-pub use loader::{load_text_encoder, load_transformer, load_unconditional_transformer};
+pub use loader::{load_text_encoder, load_transformer, load_unconditional_transformer, load_vae};
 pub use text_encoder::Ideogram4TextEncoder;
 pub use transformer::Ideogram4Transformer;

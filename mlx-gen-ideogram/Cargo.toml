@@ -10,6 +10,9 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
+# Reuse the AutoencoderKLFlux2 VAE: Ideogram 4's VAE is the same architecture as FLUX.2's
+# (model_index `AutoencoderKLFlux2`), so `Flux2Vae` loads Ideogram's converted weights directly.
+mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.

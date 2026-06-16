@@ -618,6 +618,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-flux2",
  "pmetal-mlx-rs",
  "serde_json",
 ]
