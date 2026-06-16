@@ -4,7 +4,7 @@
 //! Llama hidden size, expanded image-token placeholders are replaced by those projected features,
 //! and a Llama-3.1 8B causal decoder generates the caption text.
 
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, matmul, multiply, split};
 use mlx_rs::{Array, Dtype};
 
@@ -207,13 +207,11 @@ impl LlamaDecoder {
             )));
         }
         let (b, q_len) = (sh[0], sh[1]);
-        let k_len = offset + q_len;
-        let mask = decode_mask(q_len, k_len, offset)?;
         let (cos, sin) = self.rope.forward(q_len, offset)?;
 
         let mut hidden = input_embeds.as_dtype(Dtype::Bfloat16)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden = layer.forward_step(&hidden, &cos, &sin, &mask, cache, i)?;
+            hidden = layer.forward_step(&hidden, &cos, &sin, cache, i)?;
         }
 
         let last_idx = Array::from_slice(&[q_len - 1], &[1]);
@@ -330,7 +328,6 @@ impl LlamaLayer {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        mask: &Array,
         cache: &mut LlamaKvCache,
         layer_idx: usize,
     ) -> Result<Array> {
@@ -339,7 +336,7 @@ impl LlamaLayer {
             x,
             &self
                 .attn
-                .forward_step(&normed, cos, sin, mask, cache, layer_idx)?,
+                .forward_step(&normed, cos, sin, cache, layer_idx)?,
         )?;
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         Ok(add(&h, &self.mlp.forward(&normed2)?)?)
@@ -376,7 +373,6 @@ impl LlamaAttention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        mask: &Array,
         cache: &mut LlamaKvCache,
         layer_idx: usize,
     ) -> Result<Array> {
@@ -397,8 +393,18 @@ impl LlamaAttention {
         let groups = self.num_heads / self.num_kv_heads;
         let k_all = repeat_kv_cache(&k_all, groups)?;
         let v_all = repeat_kv_cache(&v_all, groups)?;
-        let mask = mask.as_dtype(q.dtype())?;
-        let out = scaled_dot_product_attention(&q, &k_all, &v_all, self.scale, &mask, None)?;
+        // Causal decode mask is implicit: MLX aligns the `q_len` queries to the last positions of
+        // the `k_len` cached keys (bottom-right), so query `r` attends to keys `0..=offset+r` — the
+        // exact rule the old host-built `decode_mask` materialized per step (F-040). Per-step it
+        // also drops a host→device transfer in the autoregressive loop.
+        let out = scaled_dot_product_attention(
+            &q,
+            &k_all,
+            &v_all,
+            self.scale,
+            ScaledDotProductAttentionMask::Causal,
+            None,
+        )?;
         let out =
             out.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
@@ -720,29 +726,11 @@ fn repeat_kv_cache(x: &Array, groups: i32) -> Result<Array> {
     Ok(x.reshape(&[b, hkv * groups, s, hd])?)
 }
 
-fn decode_mask(q_len: i32, k_len: i32, q_offset: i32) -> Result<Array> {
-    let neg = half_min_bf16();
-    let mut data = vec![0f32; (q_len * k_len) as usize];
-    for r in 0..q_len {
-        let pos = q_offset + r;
-        for j in 0..k_len {
-            if j > pos {
-                data[(r * k_len + j) as usize] = neg;
-            }
-        }
-    }
-    Ok(Array::from_slice(&data, &[1, 1, q_len, k_len]).as_dtype(Dtype::Bfloat16)?)
-}
-
 fn req_bf16(w: &Weights, key: &str) -> Result<Array> {
     Ok(w.require(key)?.as_dtype(Dtype::Bfloat16)?)
 }
 
 use super::join;
-
-fn half_min_bf16() -> f32 {
-    -3.389_531_4e38
-}
 
 struct SplitMix64(u64);
 

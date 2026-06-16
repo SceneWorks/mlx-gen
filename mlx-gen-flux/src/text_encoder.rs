@@ -6,10 +6,8 @@ use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::nn::gelu_tanh;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
-use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{
-    add, broadcast_to, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis,
-};
+use mlx_rs::fast::{layer_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
+use mlx_rs::ops::{add, dequantize, matmul, multiply, power, quantize, sigmoid, softmax_axis};
 use mlx_rs::{Array, Dtype};
 
 pub struct FluxTextEncoders {
@@ -137,9 +135,8 @@ impl ClipTextEncoder {
         let pos_ids = Array::from_slice(&pos_ids, &[1, s]);
         let pos = self.position_embedding.forward(&pos_ids)?;
         let mut hidden = add(&token, &pos)?;
-        let mask = clip_causal_mask(1, s)?;
         for layer in &self.layers {
-            hidden = layer.forward(&hidden, &mask)?;
+            hidden = layer.forward(&hidden)?;
         }
         let hidden = layer_norm(
             &hidden,
@@ -181,10 +178,10 @@ impl ClipEncoderLayer {
         })
     }
 
-    fn forward(&self, hidden: &Array, mask: &Array) -> Result<Array> {
+    fn forward(&self, hidden: &Array) -> Result<Array> {
         let residual = hidden;
         let normed = layer_norm(hidden, Some(&self.ln1_w), Some(&self.ln1_b), 1e-5)?;
-        let hidden = add(residual, &self.attn.forward(&normed, mask)?)?;
+        let hidden = add(residual, &self.attn.forward(&normed)?)?;
         let residual = hidden.clone();
         let normed = layer_norm(&hidden, Some(&self.ln2_w), Some(&self.ln2_b), 1e-5)?;
         Ok(add(&residual, &self.mlp.forward(&normed)?)?)
@@ -220,7 +217,7 @@ impl ClipAttention {
         })
     }
 
-    fn forward(&self, hidden: &Array, mask: &Array) -> Result<Array> {
+    fn forward(&self, hidden: &Array) -> Result<Array> {
         let b = hidden.shape()[0];
         let s = hidden.shape()[1];
         // Read the batch from the input instead of hardcoding 1, so a B>1 CLIP encode reshapes
@@ -240,8 +237,17 @@ impl ClipAttention {
             .forward(hidden)?
             .reshape(&[b, s, 12, 64])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let mask = mask.as_dtype(q.dtype())?;
-        let y = scaled_dot_product_attention(&q, &k, &v, (64.0_f32).powf(-0.5), &mask, None)?;
+        // CLIP text attention is purely causal (no key-padding term — pads are attended causally),
+        // so use the implicit causal mode instead of materializing an `s·s` additive mask host-side
+        // each encode (F-040). q_len == k_len here, so the modes are equivalent.
+        let y = scaled_dot_product_attention(
+            &q,
+            &k,
+            &v,
+            (64.0_f32).powf(-0.5),
+            ScaledDotProductAttentionMask::Causal,
+            None,
+        )?;
         let y = y.transpose_axes(&[0, 2, 1, 3])?.reshape(&[b, s, 768])?;
         self.out.forward(&y)
     }
@@ -511,18 +517,6 @@ fn shape_t5(x: &Array) -> Result<Array> {
 
 fn unshape_t5(x: &Array) -> Result<Array> {
     Ok(x.transpose_axes(&[0, 2, 1, 3])?.reshape(&[1, -1, 4096])?)
-}
-
-fn clip_causal_mask(batch: i32, seq: i32) -> Result<Array> {
-    let seq_usize = seq as usize;
-    let mut data = vec![0f32; seq_usize * seq_usize];
-    for i in 0..seq_usize {
-        for j in (i + 1)..seq_usize {
-            data[i * seq_usize + j] = -3.4e38_f32;
-        }
-    }
-    let mask = Array::from_slice(&data, &[1, 1, seq, seq]);
-    Ok(broadcast_to(&mask, &[batch, 1, seq, seq])?)
 }
 
 fn relative_position_buckets(seq_len: i32) -> Vec<i32> {
