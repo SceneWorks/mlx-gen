@@ -371,19 +371,30 @@ impl TextRope {
 
     /// Returns `(cos, sin)`, each `[1, seq_len, dim]`, for positions `0..seq_len`.
     pub fn forward(&self, seq_len: i32) -> Result<(Array, Array)> {
+        self.forward_offset(seq_len, 0)
+    }
+
+    /// Returns `(cos, sin)`, each `[1, q_len, dim]`, for the absolute positions
+    /// `offset..offset+q_len`. The autoregressive-decode companion to [`forward`](Self::forward)
+    /// (`offset == 0` is exactly `forward`): a KV-cached generate step embeds `q_len` fresh queries
+    /// sitting at positions `offset..` over the cached keys, so it needs the RoPE table at those
+    /// absolute positions, not `0..q_len`. Mirrors the per-step `Llama3Rope::forward(seq_len, offset)`
+    /// the caption decoders use.
+    pub fn forward_offset(&self, q_len: i32, offset: i32) -> Result<(Array, Array)> {
         let half = self.inv_freq.len();
-        // freqs[s, j] = s * inv_freq[j]  → [seq, half]
-        let mut freqs = Vec::with_capacity(seq_len as usize * half);
-        for s in 0..seq_len {
+        // freqs[s, j] = (offset + s) * inv_freq[j]  → [q_len, half]
+        let mut freqs = Vec::with_capacity(q_len as usize * half);
+        for s in 0..q_len {
+            let pos = (offset + s) as f32;
             for &f in &self.inv_freq {
-                freqs.push(s as f32 * f);
+                freqs.push(pos * f);
             }
         }
-        let freqs = Array::from_slice(&freqs, &[seq_len, half as i32]);
-        // emb = concat([freqs, freqs], -1) → [seq, dim]
+        let freqs = Array::from_slice(&freqs, &[q_len, half as i32]);
+        // emb = concat([freqs, freqs], -1) → [q_len, dim]
         let emb = mlx_rs::ops::concatenate_axis(&[&freqs, &freqs], 1)?;
-        let cos = mlx_rs::ops::cos(&emb)?.reshape(&[1, seq_len, self.dim])?;
-        let sin = mlx_rs::ops::sin(&emb)?.reshape(&[1, seq_len, self.dim])?;
+        let cos = mlx_rs::ops::cos(&emb)?.reshape(&[1, q_len, self.dim])?;
+        let sin = mlx_rs::ops::sin(&emb)?.reshape(&[1, q_len, self.dim])?;
         Ok((cos, sin))
     }
 }
@@ -393,6 +404,34 @@ mod tests {
     use super::*;
     use mlx_rs::ops::{abs, array_eq, max, subtract};
     use mlx_rs::Dtype;
+
+    #[test]
+    fn text_rope_offset_zero_equals_forward_and_shifts_positions() {
+        // sc-6030: `forward_offset(q_len, offset)` is the autoregressive-decode companion. At
+        // offset 0 it must reproduce `forward(seq_len)` exactly, and the row at (offset, s) must
+        // equal `forward`'s row at absolute position `offset + s`.
+        let rope = TextRope::new(8, 10_000.0);
+        let (c0, s0) = rope.forward(4).unwrap();
+        let (co, so) = rope.forward_offset(4, 0).unwrap();
+        assert!(array_eq(&c0, &co, false).unwrap().item::<bool>());
+        assert!(array_eq(&s0, &so, false).unwrap().item::<bool>());
+
+        // forward_offset(1, 3) == row 3 of forward(8).
+        let (cfull, sfull) = rope.forward(8).unwrap();
+        let (c3, s3) = rope.forward_offset(1, 3).unwrap();
+        let row = |a: &Array, r: i32| {
+            let idx = Array::from_slice(&[r], &[1]);
+            a.take_axis(&idx, 1).unwrap()
+        };
+        let close = |a: &Array, b: &Array| {
+            max(abs(subtract(a, b).unwrap()).unwrap(), None)
+                .unwrap()
+                .item::<f32>()
+                < 1e-6
+        };
+        assert!(close(&c3, &row(&cfull, 3)));
+        assert!(close(&s3, &row(&sfull, 3)));
+    }
 
     #[test]
     fn compile_glue_helpers_are_bit_exact_and_modulate_dtype_policy() {

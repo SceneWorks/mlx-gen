@@ -11,11 +11,13 @@
 
 pub mod attention;
 pub mod encoder;
+pub mod generate;
 pub mod layer;
 pub mod mlp;
 
 pub use attention::Qwen3Attention;
 pub use encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
+pub use generate::{sample_token, Qwen3KvCache, SplitMix64, UpsampleSampling};
 pub use layer::Qwen3DecoderLayer;
 pub use mlp::Qwen3Mlp;
 

@@ -6,7 +6,7 @@
 //! klein Qwen3 encoder, **absent** for the FLUX.2-dev Mistral encoder (sc-5915), which is otherwise
 //! identical. Gated by `qk_norm`; when off, q/k flow straight into RoPE.
 
-use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
+use mlx_rs::fast::{rms_norm, scaled_dot_product_attention, ScaledDotProductAttentionMask};
 use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
@@ -14,6 +14,7 @@ use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+use super::generate::Qwen3KvCache;
 use super::{join, lin};
 use crate::config::Flux2Quant;
 
@@ -125,6 +126,70 @@ impl Qwen3Attention {
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
         self.o_w.forward(&o)
     }
+
+    /// KV-cached **causal** decode step (caption-upsampling generate, sc-6030). Mirrors
+    /// [`forward`](Self::forward) but appends this step's K/V to the per-layer growable `cache` and
+    /// attends causally over the full cached sequence via the implicit bottom-right causal mask
+    /// (MLX aligns the `q_len` queries to the last cached positions, exactly the joycaption/
+    /// prompt-refine decode rule). `cos`/`sin` are the RoPE table at the step's **absolute** positions
+    /// (`TextRope::forward_offset`), so prefill (offset 0, `q_len = prompt_len`) and each 1-token
+    /// decode (offset = cache length) both index the right frequencies. Used only by the Mistral dev
+    /// tower (`qk_norm` is `None`); the branch is kept for symmetry with `forward`.
+    pub(crate) fn forward_step(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        cache: &mut Qwen3KvCache,
+        layer_idx: usize,
+    ) -> Result<Array> {
+        let sh = x.shape();
+        let (b, s) = (sh[0], sh[1]);
+
+        let q = self
+            .q_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_heads, self.head_dim])?;
+        let k = self
+            .k_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+        let v = self
+            .v_w
+            .forward(x)?
+            .reshape(&[b, s, self.num_kv_heads, self.head_dim])?;
+
+        let q = match &self.q_norm {
+            Some(g) => rms_norm(&q, g, self.eps)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(g) => rms_norm(&k, g, self.eps)?,
+            None => k,
+        };
+
+        let q = apply_rope(&q, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
+        let k = apply_rope(&k, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
+        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let (k_all, v_all) = cache.append(layer_idx, k, v)?;
+
+        let groups = self.num_heads / self.num_kv_heads;
+        let k_all = repeat_kv_cache(&k_all, groups)?;
+        let v_all = repeat_kv_cache(&v_all, groups)?;
+
+        let o = scaled_dot_product_attention(
+            &q,
+            &k_all,
+            &v_all,
+            self.scale,
+            ScaledDotProductAttentionMask::Causal,
+            None,
+        )?;
+        let o =
+            o.transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, s, self.num_heads * self.head_dim])?;
+        self.o_w.forward(&o)
+    }
 }
 
 /// HF half-split RoPE: `x*cos + rotate_half(x)*sin`, `rotate_half(x) = [-x2, x1]`. `cos`/`sin`
@@ -148,4 +213,18 @@ fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
     let x = x.expand_dims(3)?; // [b,s,hkv,1,hd]
     let x = broadcast_to(&x, &[b, s, hkv, groups, hd])?;
     Ok(x.reshape(&[b, s, hkv * groups, hd])?)
+}
+
+/// GQA expand for the **decode** layout `[b,hkv,s,hd]` → `[b,hkv*groups,s,hd]` (the post-transpose,
+/// post-cache K/V), repeating each kv head `groups` times consecutively. The decode companion to
+/// [`repeat_kv`] (which runs pre-transpose).
+fn repeat_kv_cache(x: &Array, groups: i32) -> Result<Array> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let sh = x.shape();
+    let (b, hkv, s, hd) = (sh[0], sh[1], sh[2], sh[3]);
+    let x = x.expand_dims(2)?; // [b,hkv,1,s,hd]
+    let x = broadcast_to(&x, &[b, hkv, groups, s, hd])?;
+    Ok(x.reshape(&[b, hkv * groups, s, hd])?)
 }

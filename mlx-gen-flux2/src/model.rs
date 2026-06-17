@@ -25,6 +25,7 @@ use mlx_gen::{
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
+use crate::caption_upsample;
 use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
@@ -34,6 +35,7 @@ use crate::pipeline::{
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
+use crate::vision::{Mistral3Projector, PixtralVisionTower};
 use crate::{loader, Flux2Config};
 
 pub fn descriptor_klein_9b() -> ModelDescriptor {
@@ -145,6 +147,18 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     } else {
         loader::load_tokenizer(root)?
     };
+    // Caption upsampling (sc-6030) is dev-only: load the Pixtral vision tower + Mistral3 projector
+    // (the `text_encoder/` snapshot's `vision_tower.*` / `multi_modal_projector.*`, full precision).
+    // The Mistral generation head (final norm + LM head) was loaded into `text_encoder` by
+    // `load_text_encoder_dev`. klein has no vision tower → `None` (caption upsampling is unavailable).
+    let (vision_tower, projector) = if dev {
+        (
+            Some(loader::load_vision_tower_dev(root)?),
+            Some(loader::load_multimodal_projector_dev(root)?),
+        )
+    } else {
+        (None, None)
+    };
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
@@ -153,6 +167,8 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         text_encoder: Some(text_encoder),
         transformer: Some(transformer),
         vae: Some(vae),
+        vision_tower,
+        projector,
     }))
 }
 
@@ -165,6 +181,11 @@ pub struct Flux2 {
     text_encoder: Option<Qwen3TextEncoder>,
     transformer: Option<Flux2Transformer>,
     vae: Option<Flux2Vae>,
+    /// FLUX.2-dev caption upsampling (sc-6030): the Pixtral vision tower + Mistral3 projector that
+    /// encode reference images for the image-conditioned (I2I) prompt rewrite. `None` for klein and
+    /// the weightless test instances — caption upsampling is dev-only and gated on `enhance_prompt`.
+    vision_tower: Option<PixtralVisionTower>,
+    projector: Option<Mistral3Projector>,
 }
 
 impl Flux2 {
@@ -178,6 +199,8 @@ impl Flux2 {
             text_encoder: None,
             transformer: None,
             vae: None,
+            vision_tower: None,
+            projector: None,
         }
     }
 
@@ -278,6 +301,96 @@ impl Flux2 {
             )));
         }
         Ok(refs)
+    }
+
+    /// Collect the reference images for caption upsampling (sc-6030): any `Reference` /
+    /// `MultiReference` images in the request, flattened in order. Empty ⇒ the text-only T2I rewrite.
+    /// Unlike [`collect_edit_references`](Self::collect_edit_references) this never errors on empty
+    /// (a T2I prompt rewrite is valid).
+    fn collect_upsample_references<'a>(
+        &self,
+        req: &'a GenerationRequest,
+    ) -> Vec<&'a mlx_gen::media::Image> {
+        let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
+        for c in &req.conditioning {
+            match c {
+                mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
+                mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
+                _ => {}
+            }
+        }
+        refs
+    }
+
+    /// FLUX.2-dev caption upsampling (sc-6030): rewrite the prompt with the Mistral3 multimodal LLM
+    /// before encoding (the diffusers `upsample_prompt`), gated on `req.enhance_prompt` — the
+    /// LTX-2.3 prompt-enhancement contract field (sc-2845), reused here for the image-aware analog.
+    /// Returns the rewritten prompt, or the original `req.prompt` when the gate is off, the variant
+    /// isn't dev, or on **any** upsampler failure / empty output (reference-faithful fallback, like
+    /// `generate_av.py`'s try/except). Logs the LTX `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` tokens.
+    fn maybe_upsample(&self, req: &GenerationRequest) -> String {
+        if !req.enhance_prompt || !self.variant.is_dev() {
+            return req.prompt.clone();
+        }
+        match self.run_upsample(req) {
+            Ok(p) if !p.trim().is_empty() => {
+                eprintln!("ENHANCED_PROMPT:{p}");
+                p
+            }
+            Ok(_) => {
+                eprintln!("ENHANCER_FALLBACK:EmptyOutput:caption upsampler returned empty output");
+                req.prompt.clone()
+            }
+            Err(e) => {
+                eprintln!("ENHANCER_FALLBACK:{e}");
+                req.prompt.clone()
+            }
+        }
+    }
+
+    /// Run the dev caption upsampler: the Mistral3 multimodal `generate()` over the prompt plus any
+    /// reference images (through the Pixtral tower). Errors surface to
+    /// [`maybe_upsample`](Self::maybe_upsample)'s fallback.
+    fn run_upsample(&self, req: &GenerationRequest) -> Result<String> {
+        let id = self.descriptor.id;
+        let not_loaded = |what: &str| Error::Msg(format!("{id}: {what} is not loaded"));
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| not_loaded("tokenizer"))?;
+        let te = self
+            .text_encoder
+            .as_ref()
+            .ok_or_else(|| not_loaded("text encoder"))?;
+        let vision = self
+            .vision_tower
+            .as_ref()
+            .ok_or_else(|| not_loaded("vision tower"))?;
+        let projector = self
+            .projector
+            .as_ref()
+            .ok_or_else(|| not_loaded("projector"))?;
+        let refs = self.collect_upsample_references(req);
+        let temperature = req
+            .enhance_temperature
+            .unwrap_or(caption_upsample::DEFAULT_TEMPERATURE);
+        let max_new_tokens = req
+            .enhance_max_tokens
+            .map(|m| m as usize)
+            .unwrap_or(caption_upsample::DEFAULT_MAX_NEW_TOKENS);
+        let seed = req.seed.unwrap_or_else(default_seed);
+        caption_upsample::upsample_prompt(
+            tokenizer,
+            te,
+            vision,
+            projector,
+            &req.prompt,
+            &refs,
+            temperature,
+            max_new_tokens,
+            seed,
+            &req.cancel,
+        )
     }
 
     /// Extract the single img2img init image + its strength from the txt2img request. The
@@ -445,7 +558,14 @@ impl Flux2 {
             None => 0,
         };
 
-        let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &req.prompt)?;
+        // FLUX.2-dev caption upsampling (sc-6030): optionally rewrite the prompt with the Mistral3
+        // multimodal LLM (using any reference images) before encoding, gated on `enhance_prompt`.
+        // A no-op (returns `req.prompt`) for klein, when the gate is off, or on any upsampler failure.
+        let prompt = self.maybe_upsample(req);
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let (prompt_embeds, text_ids) = self.encode(tokenizer, te, &prompt)?;
         // True-CFG dual-forward only for the (non-embedded-guidance) base path at guidance >1; dev
         // routes its scale through the embedded guidance embedder instead, so it never takes a
         // negative pass, and distilled klein runs at guidance 1.0 (also no negative).

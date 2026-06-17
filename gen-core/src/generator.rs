@@ -118,17 +118,23 @@ pub struct GenerationRequest {
     /// default). Only the `seedvr2` upscaler reads it; other models ignore it.
     pub softness: Option<f32>,
 
-    // --- Prompt enhancement (LTX-2.3, sc-2845; ignored by other models) ---
-    /// Rewrite `prompt` with an autoregressive Gemma-3 LLM before encoding (the reference
-    /// `--enhance-prompt`). Default `false` — the diffusion path is unchanged. On any enhancer
-    /// failure the model falls back to the original prompt (reference-faithful).
+    // --- Prompt enhancement (LTX-2.3 sc-2845 + FLUX.2-dev caption upsampling sc-6030; ignored by
+    //     other models) ---
+    /// Rewrite `prompt` with an autoregressive LLM before encoding. Default `false` — the diffusion
+    /// path is unchanged. On any enhancer failure the model falls back to the original prompt
+    /// (reference-faithful). Consumed by: LTX-2.3 (the Gemma-3 `--enhance-prompt`) and FLUX.2-**dev**
+    /// (the Mistral3 multimodal `upsample_prompt`, sc-6030 — text-only for T2I, image-conditioned on
+    /// the request's reference images for edit; gated like the reference `caption_upsample_temperature`).
     pub enhance_prompt: bool,
     /// Use the separate uncensored 4-bit Gemma enhancer (`--use-uncensored-enhancer`) instead of the
-    /// loaded text-encoder backbone. Only consulted when `enhance_prompt` is set.
+    /// loaded text-encoder backbone. Only consulted when `enhance_prompt` is set. LTX-2.3 only;
+    /// FLUX.2-dev ignores it (its upsampler is the loaded Mistral3 tower).
     pub use_uncensored_enhancer: bool,
-    /// Max tokens for prompt enhancement (reference default 512 when `None`).
+    /// Max tokens for prompt enhancement (LTX default 512, FLUX.2-dev caption-upsample default 512,
+    /// each model's own default when `None`).
     pub enhance_max_tokens: Option<u32>,
-    /// Sampling temperature for prompt enhancement (reference default 0.7 when `None`).
+    /// Sampling temperature for prompt enhancement (model default when `None`: LTX 0.7, FLUX.2-dev
+    /// caption-upsample 0.15 — the reference `caption_upsample_temperature`).
     pub enhance_temperature: Option<f32>,
 
     // --- Control ---

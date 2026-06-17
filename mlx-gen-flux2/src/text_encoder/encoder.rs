@@ -2,15 +2,19 @@
 //! intermediate hidden states. `prompt_embeds` concatenates the outputs of layers 9/18/27 into
 //! the transformer's conditioning. Port of the fork's `Qwen3TextEncoder.get_prompt_embeds`.
 
+use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::host_i32;
 use mlx_gen::nn::TokenEmbedding;
+use mlx_gen::runtime::CancelFlag;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use super::{join, Qwen3DecoderLayer, TextRope};
+use super::generate::{sample_token, Qwen3KvCache, SplitMix64, UpsampleSampling};
+use super::{join, lin, Qwen3DecoderLayer, TextRope};
 use crate::config::Flux2Quant;
 
 /// Decoder-LM text-encoder dimensions. Covers both FLUX.2 text encoders: klein's **Qwen3**
@@ -71,6 +75,13 @@ pub struct Qwen3TextEncoder {
     layers: Vec<Qwen3DecoderLayer>,
     rope: TextRope,
     out_layers: [usize; 3],
+    rms_norm_eps: f32,
+    /// Final RMSNorm + LM head — loaded only for the **autoregressive-generate** path (FLUX.2-dev
+    /// caption upsampling, sc-6030) via [`load_generation_head`](Self::load_generation_head). The
+    /// `prompt_embeds` T2I path never touches them (it discards the final norm and has no LM head),
+    /// so klein and the dev T2I/edit encoders leave these `None` until upsampling needs them.
+    norm: Option<Array>,
+    lm_head: Option<AdaptableLinear>,
 }
 
 impl Qwen3TextEncoder {
@@ -112,7 +123,37 @@ impl Qwen3TextEncoder {
             layers,
             rope: TextRope::new(cfg.head_dim, cfg.rope_theta),
             out_layers: cfg.out_layers,
+            rms_norm_eps: cfg.rms_norm_eps,
+            norm: None,
+            lm_head: None,
         })
+    }
+
+    /// Load the final RMSNorm + LM head so this encoder can run the caption-upsampling
+    /// `generate()` loop (sc-6030), in addition to the `prompt_embeds` extraction it already does.
+    /// `parent_prefix` is the `Mistral3ForConditionalGeneration` language-model root (`language_model`):
+    /// the final norm is `{parent}.model.norm.weight` and the LM head is `{parent}.lm_head.weight`.
+    /// The LM head is dense bf16 in the dev snapshot (no packed `.scales`), so [`lin`] returns the
+    /// dense path even with `quant = Some`; the final norm stays full precision. Idempotent-ish: a
+    /// second call reloads.
+    pub fn load_generation_head(
+        &mut self,
+        w: &Weights,
+        parent_prefix: &str,
+        quant: Option<Flux2Quant>,
+    ) -> Result<()> {
+        self.norm = Some(
+            w.require(&join(parent_prefix, "model.norm.weight"))?
+                .clone(),
+        );
+        self.lm_head = Some(lin(w, &join(parent_prefix, "lm_head.weight"), quant)?);
+        Ok(())
+    }
+
+    /// `true` once [`load_generation_head`](Self::load_generation_head) has run — i.e. this encoder
+    /// can drive the caption-upsampling decode.
+    pub fn can_generate(&self) -> bool {
+        self.norm.is_some() && self.lm_head.is_some()
     }
 
     /// Quantize the text encoder to Q4/Q8 (group_size 64): the token embedding + every layer's
@@ -145,8 +186,10 @@ impl Qwen3TextEncoder {
         }
     }
 
-    /// Token embedding (f32): `input_ids` `[b, s]` int32 → `[b, s, hidden]`.
-    fn embed(&self, input_ids: &Array) -> Result<Array> {
+    /// Token embedding (f32): `input_ids` `[b, s]` int32 → `[b, s, hidden]`. `pub(crate)` so the
+    /// caption-upsampling driver can embed the prompt ids before splicing the projected image
+    /// features into them (sc-6030).
+    pub(crate) fn embed(&self, input_ids: &Array) -> Result<Array> {
         self.embed_tokens.forward(input_ids)
     }
 
@@ -190,6 +233,111 @@ impl Qwen3TextEncoder {
         };
         Ok(concatenate_axis(&[pick(a)?, pick(b_)?, pick(c)?], 2)?)
     }
+
+    // ---- Autoregressive caption-upsampling generate (sc-6030) ----------------------------------
+
+    /// One generation forward: run pre-embedded tokens `[1, q_len, hidden]` at absolute `offset`,
+    /// append each layer's K/V to `cache`, and return logits for the **last** position `[1, vocab]`.
+    /// Requires [`load_generation_head`](Self::load_generation_head). All-layers causal decode (no
+    /// early-stop, unlike `prompt_embeds`): the LM head consumes the final layer's normed output.
+    pub(crate) fn decode_logits_from_embeds(
+        &self,
+        input_embeds: &Array,
+        cache: &mut Qwen3KvCache,
+        offset: i32,
+    ) -> Result<Array> {
+        let norm = self.norm.as_ref().ok_or_else(gen_head_missing)?;
+        let lm_head = self.lm_head.as_ref().ok_or_else(gen_head_missing)?;
+        let sh = input_embeds.shape();
+        let (b, q_len, hidden) = (sh[0], sh[1], sh[2]);
+        let (cos, sin) = self.rope.forward_offset(q_len, offset)?;
+
+        let mut hidden_states = input_embeds.clone();
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden_states = layer.forward_step(&hidden_states, &cos, &sin, cache, i)?;
+        }
+
+        let last_idx = Array::from_slice(&[q_len - 1], &[1]);
+        let last = hidden_states
+            .take_axis(&last_idx, 1)?
+            .reshape(&[b, hidden])?;
+        let normed = rms_norm(&last, norm, self.rms_norm_eps)?;
+        lm_head.forward(&normed)
+    }
+
+    /// [`decode_logits_from_embeds`](Self::decode_logits_from_embeds) from token ids `[1, q_len]`.
+    pub(crate) fn decode_logits(
+        &self,
+        input_ids: &Array,
+        cache: &mut Qwen3KvCache,
+        offset: i32,
+    ) -> Result<Array> {
+        let embeds = self.embed(input_ids)?;
+        self.decode_logits_from_embeds(&embeds, cache, offset)
+    }
+
+    /// Autoregressive generation from already-built prompt embeds `[1, prompt_len, hidden]` (the
+    /// caption-upsampling prompt, whose embeds carry the spliced image features). Returns the
+    /// generated token ids with the `eos_token` excluded. Stops at `eos_token` or
+    /// `max_new_tokens`; honors `cancel`. Evals per step so the lazy graph (and the growing K/V
+    /// cache) stays bounded over the up-to-512-token loop — the same per-step-eval discipline the
+    /// denoise loop uses (sc-5522).
+    pub fn generate_from_embeds(
+        &self,
+        prompt_embeds: &Array,
+        eos_token: i32,
+        sampling: UpsampleSampling,
+        cancel: &CancelFlag,
+    ) -> Result<Vec<i32>> {
+        let sh = prompt_embeds.shape();
+        if sh.len() != 3 || sh[0] != 1 {
+            return Err(Error::Msg(format!(
+                "flux2 caption-upsample: prompt embeds must be [1, seq, hidden], got {sh:?}"
+            )));
+        }
+        if !self.can_generate() {
+            return Err(gen_head_missing());
+        }
+        let prompt_len = sh[1];
+        let mut cache = Qwen3KvCache::new(self.layers.len());
+        let mut rng = SplitMix64::new(sampling.seed);
+        let mut generated: Vec<i32> = Vec::new();
+
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        let mut logits = self.decode_logits_from_embeds(prompt_embeds, &mut cache, 0)?;
+        logits.eval()?;
+
+        for step in 0..sampling.max_new_tokens {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let next = sample_token(&logits, &sampling, &mut rng)?;
+            if next == eos_token {
+                break;
+            }
+            generated.push(next);
+            if step + 1 == sampling.max_new_tokens {
+                break;
+            }
+            let token = Array::from_slice(&[next], &[1, 1]);
+            logits = self.decode_logits(&token, &mut cache, prompt_len + step as i32)?;
+            logits.eval()?;
+        }
+        Ok(generated)
+    }
+}
+
+/// The error the generate path returns when [`load_generation_head`](Qwen3TextEncoder::load_generation_head)
+/// has not run — a programming error (the dev caption loader always loads the head), surfaced loudly
+/// rather than panicking.
+fn gen_head_missing() -> Error {
+    Error::Msg(
+        "flux2 caption-upsample: the generation head (final norm + lm_head) is not loaded; \
+         call load_generation_head first"
+            .to_owned(),
+    )
 }
 
 /// Load the `embed_tokens` table dense, or — with `quant == Some` and packed `.scales` on disk

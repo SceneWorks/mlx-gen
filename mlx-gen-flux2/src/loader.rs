@@ -106,12 +106,18 @@ pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
     let dir = root.join("text_encoder");
     let quant = read_component_quant(&dir)?;
     let w = Weights::from_dir(dir)?;
-    Qwen3TextEncoder::from_weights_quant(
+    let mut encoder = Qwen3TextEncoder::from_weights_quant(
         &w,
         "language_model.model",
         &Qwen3TextEncoderConfig::mistral_dev(),
         quant,
-    )
+    )?;
+    // Also load the final norm + LM head so this encoder can drive the caption-upsampling
+    // `generate()` loop (sc-6030) — the dev `Mistral3ForConditionalGeneration` snapshot carries
+    // `language_model.lm_head.weight` (dense bf16) + `language_model.model.norm.weight`, both
+    // retained by the pre-quant convert. The T2I/edit prompt-embeds path never touches them.
+    encoder.load_generation_head(&w, "language_model", quant)?;
+    Ok(encoder)
 }
 
 /// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/

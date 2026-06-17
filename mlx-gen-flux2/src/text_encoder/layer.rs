@@ -64,4 +64,25 @@ impl Qwen3DecoderLayer {
         let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
         Ok(add(&h, &self.mlp.forward(&normed2)?)?)
     }
+
+    /// KV-cached causal decode step (caption-upsampling generate, sc-6030) — the [`forward`](Self::forward)
+    /// companion that threads the per-layer `cache` through the attention's `forward_step`.
+    pub(crate) fn forward_step(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        cache: &mut super::generate::Qwen3KvCache,
+        layer_idx: usize,
+    ) -> Result<Array> {
+        let normed = rms_norm(x, &self.input_ln, self.eps)?;
+        let h = add(
+            x,
+            &self
+                .attn
+                .forward_step(&normed, cos, sin, cache, layer_idx)?,
+        )?;
+        let normed2 = rms_norm(&h, &self.post_ln, self.eps)?;
+        Ok(add(&h, &self.mlp.forward(&normed2)?)?)
+    }
 }
