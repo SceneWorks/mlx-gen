@@ -1224,8 +1224,17 @@ impl AdaptableHost for Flux2Transformer {
             ["single_stream_modulation", rest @ ..] => self.mod_single.adaptable_mut(rest),
             ["time_guidance_embed", "linear_1"] => Some(&mut self.time_linear1),
             ["time_guidance_embed", "linear_2"] => Some(&mut self.time_linear2),
-            // klein is distilled (no guidance embedding), so `guidance_linear_{1,2}` don't exist
-            // here — a LoRA targeting them is correctly surfaced as unmatched.
+            // The embedded-guidance branch (`time_guidance_embed.guidance_embedder.linear_{1,2}`)
+            // exists only on FLUX.2-**dev** (sc-5920); klein is guidance-distilled so these fields
+            // are `None` → `as_mut()` yields `None` → unmatched, exactly as before. Routed for
+            // symmetry with the timestep branch above so a dev "all-linear" LoRA that includes the
+            // guidance embedder resolves instead of failing the strict no-silent-drop apply.
+            ["time_guidance_embed", "guidance_embedder", "linear_1"] => {
+                self.guidance_linear1.as_mut()
+            }
+            ["time_guidance_embed", "guidance_embedder", "linear_2"] => {
+                self.guidance_linear2.as_mut()
+            }
             ["transformer_blocks", n, rest @ ..] => self
                 .double_blocks
                 .get_mut(n.parse::<usize>().ok()?)?
@@ -1741,6 +1750,204 @@ mod tests {
             "every diffusers-named kohya stem should resolve"
         );
         assert!(report.unmatched_paths.is_empty());
+    }
+
+    // ---- sc-5920 FLUX.2-dev adapters (wider/deeper graph + the dev guidance embedder) ----------
+    //
+    // dev shares the `Flux2Transformer` (so the klein adapter engine + key→module map serve it), but
+    // its DiT is wider/deeper — 8 double + **48** single blocks (vs klein's 24) — and it carries the
+    // embedded-guidance embedder klein lacks. These no-real-weight tests pin that the path-addressed
+    // install covers the full dev graph; `dev_adapter_real_weights.rs` is the on-Mac render check.
+
+    /// A dev-shaped transformer: 8 double + 48 single blocks and the embedded-guidance embedder
+    /// present (`Some`) — the structural deltas from `tiny_transformer` (klein) that this story pins.
+    fn dev_transformer() -> Flux2Transformer {
+        Flux2Transformer {
+            pos_embed: Flux2PosEmbed::new(2000.0, [32, 32, 32, 32]),
+            time_linear1: dummy_lin(),
+            time_linear2: dummy_lin(),
+            // dev's embedded distilled-guidance branch (klein is `None` here).
+            guidance_linear1: Some(dummy_lin()),
+            guidance_linear2: Some(dummy_lin()),
+            mod_img: modulation(2),
+            mod_txt: modulation(2),
+            mod_single: modulation(1),
+            x_embedder: dummy_lin(),
+            context_embedder: dummy_lin(),
+            double_blocks: (0..8)
+                .map(|_| DoubleBlock {
+                    attn: double_attn(),
+                    ff: ff(),
+                    ff_context: ff(),
+                })
+                .collect(),
+            single_blocks: (0..48)
+                .map(|_| SingleBlock {
+                    to_qkv_mlp: dummy_lin(),
+                    to_out: dummy_lin(),
+                    norm_q: dummy_arr(),
+                    norm_k: dummy_arr(),
+                    heads: 1,
+                    head_dim: 1,
+                    inner: 1,
+                })
+                .collect(),
+            norm_out_linear: dummy_lin(),
+            proj_out: dummy_lin(),
+            time_channels: 256,
+        }
+    }
+
+    /// The dev key→module map resolves the WIDER/DEEPER graph (every one of the 8 double + 48 single
+    /// blocks, incl. the last) plus the dev-only embedded-guidance embedder, and still rejects
+    /// out-of-range indices.
+    #[test]
+    fn dev_routes_wider_graph_and_guidance_embedder() {
+        let mut t = dev_transformer();
+
+        // The dev embedded-guidance embedder resolves (on klein, `guidance_linear*` is `None` →
+        // `as_mut()` is `None` → these would NOT resolve — the structural delta this story pins).
+        for p in [
+            "time_guidance_embed.guidance_embedder.linear_1",
+            "time_guidance_embed.guidance_embedder.linear_2",
+        ] {
+            assert!(
+                resolves(&mut t, p),
+                "dev guidance embedder {p} should resolve"
+            );
+        }
+
+        // Every double block (0..8) and EVERY single block (0..48), including the deepest indices that
+        // klein's 24-block graph never reaches — the path-addressed install scales with the config.
+        for i in 0..8 {
+            for tgt in [
+                "attn.to_q",
+                "attn.to_add_out",
+                "ff.linear_out",
+                "ff_context.linear_in",
+            ] {
+                let p = format!("transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "{p} should resolve");
+            }
+        }
+        for i in 0..48 {
+            for tgt in ["attn.to_qkv_mlp_proj", "attn.to_out"] {
+                let p = format!("single_transformer_blocks.{i}.{tgt}");
+                assert!(resolves(&mut t, &p), "{p} should resolve");
+            }
+        }
+
+        // Out of range for dev (8 double: 0..7; 48 single: 0..47) and the klein-spelled guidance
+        // linears (not the dev `guidance_embedder.*` path) must NOT resolve.
+        for p in [
+            "transformer_blocks.8.attn.to_q",
+            "single_transformer_blocks.48.attn.to_out",
+            "time_guidance_embed.guidance_linear_1",
+        ] {
+            assert!(!resolves(&mut t, p), "{p} must not resolve");
+        }
+    }
+
+    /// The full dev kohya surface applies through the strict provider: one `lora_unet_` key-pair per
+    /// enumerated stem resolves, none unmatched. Pins the dev surface count = 8 double × 13 + 48
+    /// single × 2 = 200 (klein's is 8×13 + 24×2 = 152), proving the wider/deeper graph is covered.
+    #[test]
+    fn dev_kohya_full_surface_applies() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+        let small = Array::from_slice(&[0.01f32], &[1, 1]);
+        let meta = None as Option<&std::collections::HashMap<String, String>>;
+
+        let mut t = dev_transformer();
+        let n = t.adaptable_paths().len();
+        assert_eq!(n, 200, "dev kohya surface (8×13 double + 48×2 single)");
+
+        let mut arrays: Vec<(String, &Array)> = Vec::new();
+        for stem in t.adaptable_paths().iter().map(|p| p.replace('.', "_")) {
+            arrays.push((format!("lora_unet_{stem}.lora_down.weight"), &small));
+            arrays.push((format!("lora_unet_{stem}.lora_up.weight"), &small));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let path = tmp("flux2_dev_kohya_full.safetensors");
+        Array::save_safetensors(refs, meta, &path).unwrap();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lora,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.applied, n, "every dev kohya stem should resolve");
+        assert!(report.unmatched_paths.is_empty());
+    }
+
+    /// A peft LoKr file (bare module paths, `networkType=lokr`) resolves + installs across a span of
+    /// the dev graph (first/last single block, a deep double block) — LoKr falls out of the same
+    /// family-agnostic engine as LoRA, on the wider graph.
+    #[test]
+    fn dev_lokr_resolves_on_wider_graph() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+
+        // Minimal valid peft LoKr for a [1,1] base: w1=[1,1], low-rank w2 = w2_a@w2_b = [1,1] →
+        // kron(w1, w2) reshapes to [1,1]. (The real-weight test exercises true block shapes.)
+        let w1 = Array::from_slice(&[1.0f32], &[1, 1]);
+        let w2a = Array::from_slice(&[0.5f32], &[1, 1]);
+        let w2b = Array::from_slice(&[0.5f32], &[1, 1]);
+        let targets = [
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj",
+            "single_transformer_blocks.47.attn.to_out",
+            "transformer_blocks.7.attn.to_q",
+            "transformer_blocks.7.ff.linear_in",
+        ];
+        let mut arrays: Vec<(String, &Array)> = Vec::new();
+        for tgt in targets {
+            arrays.push((format!("{tgt}.lokr_w1"), &w1));
+            arrays.push((format!("{tgt}.lokr_w2_a"), &w2a));
+            arrays.push((format!("{tgt}.lokr_w2_b"), &w2b));
+        }
+        let refs: Vec<(&str, &Array)> = arrays.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let mut md = std::collections::HashMap::new();
+        md.insert("networkType".to_string(), "lokr".to_string());
+        md.insert("rank".to_string(), "1".to_string());
+        md.insert("alpha".to_string(), "1".to_string());
+        let path = tmp("flux2_dev_lokr.safetensors");
+        Array::save_safetensors(refs, Some(&md), &path).unwrap();
+
+        let mut t = dev_transformer();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 1.0,
+                kind: AdapterKind::Lokr,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            report.applied,
+            targets.len(),
+            "every dev LoKr target should resolve"
+        );
+        assert!(report.unmatched_paths.is_empty());
+        // Each target carries one real LoKr delta (not silently dropped / turned into a no-op).
+        for tgt in targets {
+            let segs: Vec<&str> = tgt.split('.').collect();
+            let installed = AdaptableHost::adaptable_mut(&mut t, &segs)
+                .unwrap()
+                .adapters();
+            assert!(
+                matches!(installed, [Adapter::Lokr { .. }]),
+                "expected exactly one LoKr adapter at {tgt}"
+            );
+        }
     }
 
     // ---- sc-2743 BFL / ComfyUI fused→split routing (no real weights) --------------------------
