@@ -185,6 +185,9 @@ impl Seedvr2Pipeline {
     ///
     /// `softness` (0..1) pre-blurs the input by round-tripping through a `1 + 7·softness`× smaller
     /// size (the reference `--softness`). Both dims must be multiples of 16 (the registry validates).
+    ///
+    /// Spatial-tiles when a single full-resolution pass would exceed the memory budget (sc-6067) — the
+    /// image analog of the video path's HD-tiling fallback (sc-5201). See [`Self::generate_budgeted`].
     pub fn generate(
         &self,
         image: &Image,
@@ -193,6 +196,38 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
     ) -> Result<Image> {
+        self.generate_budgeted(
+            image,
+            width,
+            height,
+            seed,
+            softness,
+            video::safe_budget_gib(),
+        )
+    }
+
+    /// [`Self::generate`] with the safe peak-GB ceiling injected (so the spatial-tiling path is
+    /// unit-testable without a multi-GB target — mirrors [`crate::video::plan_chunk_size_with`]).
+    /// When even a single full-resolution pass would exceed `safe_gib`, the image is upscaled by
+    /// feather-blended spatial tiling ([`Self::run_frame_tiled`], the parity-gated sc-5201 tiler)
+    /// rather than one allocation that would blow past Metal's max single-buffer size and panic the
+    /// worker (sc-6067); otherwise the one-pass still path runs (numerically unchanged from before).
+    pub fn generate_budgeted(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        safe_gib: f64,
+    ) -> Result<Image> {
+        if matches!(
+            video::plan_chunk_size_with(self.weights_bytes, height, width, safe_gib),
+            ChunkPlan::OverBudget { .. }
+        ) {
+            return self.generate_tiled(image, width, height, seed, softness, safe_gib);
+        }
+
         let neg = self
             .neg_embed
             .as_ref()
@@ -224,6 +259,36 @@ impl Seedvr2Pipeline {
             0.8,
         )?;
         decoded_to_image(&corrected)
+    }
+
+    /// Spatial-tiling still-image path (sc-6067): upscale one LR image by feather-blended spatial
+    /// tiling — the image analog of the [`Self::generate_video_tiled`] per-frame branch. Reuses the
+    /// budget tile sizer + parity-gated [`Self::run_frame_tiled`] + per-frame color correction, so peak
+    /// stays bounded at any resolution (no single allocation exceeds the budget-sized tile). `safe_gib`
+    /// sizes the tile.
+    fn generate_tiled(
+        &self,
+        image: &Image,
+        width: i32,
+        height: i32,
+        seed: u64,
+        softness: f32,
+        safe_gib: f64,
+    ) -> Result<Image> {
+        let neg = self
+            .neg_embed
+            .as_ref()
+            .expect("neg-embed (use Seedvr2Pipeline::load)")
+            .clone();
+        let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
+        let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
+        let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
+        let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg)?;
+        Ok(self
+            .frames_from_decoded(&decoded, &processed, 1)?
+            .into_iter()
+            .next()
+            .expect("one tiled frame"))
     }
 
     /// Preprocess one LR `Image` to a single-frame clip `(1,3,1,height,width)` in `[-1,1]` at the model
