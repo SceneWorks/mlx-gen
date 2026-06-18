@@ -20,5 +20,10 @@
 
 pub mod config;
 pub mod convert;
+pub mod loader;
+pub mod quant;
+pub mod text_encoder;
 
 pub use config::BooguConfig;
+pub use loader::load_text_encoder;
+pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
