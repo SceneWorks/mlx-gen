@@ -11,13 +11,22 @@
 //!
 //! Both Euler-step `z += v·(s−t)`. Tokenization (the Qwen3-VL chat template) is the caller's job —
 //! `generate` takes `input_ids`.
+//!
+//! **Edit (img2img / mask inpaint, sc-6303/6330).** When an [`EditInit`] is supplied, the denoise
+//! starts from a VAE-encoded source latent noised to a strength-derived step instead of pure noise
+//! (img2img / Remix); an optional latent-grid mask additionally pins the keep region (mask 0) to the
+//! source re-noised to each step's σ while regenerating the white region (mask 1) — the classic
+//! masked-img2img inpaint on this same flow-match loop (no dedicated inpaint UNet). With no
+//! `EditInit`, the path is byte-identical to the original text-to-image render.
 
 use std::path::Path;
 
-use mlx_rs::ops::{add, concatenate_axis, multiply};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::image::{resize_lanczos_u8, resize_nearest_u8};
+use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{CancelFlag, Error, Progress, Result};
@@ -54,6 +63,111 @@ fn preset_mu_std(num_steps: usize) -> (f64, f64) {
         s if s <= 33 => (0.0, 1.75), // V4_DEFAULT_20
         _ => (0.0, 1.5),             // V4_QUALITY_48
     }
+}
+
+/// Edit (img2img / mask inpaint) conditioning prepared **once per request** (seed-independent) by
+/// [`Ideogram4Pipeline::prepare_edit`]: the BN-normalized packed source latent `[1, num_img, 128]`,
+/// an optional latent-grid inpaint mask `[1, num_img, 1]` (1 = repaint, 0 = keep), and the img2img
+/// strength. Passed to [`Ideogram4Pipeline::generate_edit_with_progress`] per seed.
+pub struct EditInit {
+    /// BN-normalized packed source latent `[1, num_img, 128]` (same space as the running `z`).
+    pub z0: Array,
+    /// Latent-grid inpaint mask `[1, num_img, 1]` (1.0 = repaint/white, 0.0 = keep/black). `None`
+    /// for plain img2img (regenerate everywhere from the noised source).
+    pub mask: Option<Array>,
+    /// img2img strength in `(0, 1]` — fraction of the denoise executed from the noised source.
+    pub strength: f32,
+}
+
+/// img2img start step (the flux2/fork `init_time_step`): `max(1, floor(num_steps·strength))` for a
+/// positive strength clamped to `[0,1]`, else `0`. The denoise executes the lowest `num_run` steps
+/// (the high-noise prefix is skipped) over the source noised to `schedule.eval(si[num_run])`.
+fn init_time_step(num_steps: usize, strength: f32) -> usize {
+    if strength > 0.0 {
+        let s = strength.clamp(0.0, 1.0);
+        // Python `int(num_steps * strength)` truncates toward zero == floor for s >= 0.
+        ((num_steps as f32 * s) as usize).max(1)
+    } else {
+        0
+    }
+}
+
+/// Flow-matching interpolation `z = σ·clean + (1−σ)·noise`. **Ideogram's [`LogitNormalSchedule`] is
+/// inverted from the usual flow-match σ**: `eval(0) ≈ t_max ≈ 0.999` is the *clean* end and
+/// `eval(1) ≈ t_min ≈ 0.0001` is *pure noise* (the denoise loop inits from `random::normal` and the
+/// first executed step's `t_val = eval(si[num_run])` is the small-σ noisy end). So a larger σ weights
+/// the clean source more, the mirror of the fork's `add_noise_by_interpolation`.
+fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> Result<Array> {
+    Ok(add(
+        &multiply(clean, Array::from_f32(sigma))?,
+        &multiply(noise, Array::from_f32(1.0 - sigma))?,
+    )?)
+}
+
+/// Preprocess a source image onto the model's input grid: resize (Lanczos) to `width×height`,
+/// normalize to `[-1,1]`, NHWC `[1,H,W,3]` f32. Mirrors flux2 `preprocess_ref_image`.
+fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Array> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    let (tw, th) = (width as usize, height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(Error::Msg(format!(
+            "ideogram edit: source pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let resized: Vec<f32> = if (ih, iw) == (th, tw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+    };
+    let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
+}
+
+/// Build the latent-grid inpaint mask `[1, num_img, 1]` (f32; 1.0 = repaint/white, 0.0 = keep/black)
+/// from a mask image: PIL-"L" luma → binarize at image res → nearest `patch·ae = 16×` downsample
+/// (top-left of each 16×16 block, torch `nearest`'s `floor(dst·scale)`), flattened row-major to
+/// match the image-token order (`j = h·grid_w + w`). Ideogram's token grid is `H/16 × W/16`, so the
+/// downsample factor is 16 (vs 8 in sdxl `preprocess_mask`).
+fn preprocess_mask_packed(mask: &Image, width: u32, height: u32) -> Result<Array> {
+    let (w, h) = (width as usize, height as usize);
+    let patch = (PATCH * AE_SCALE) as usize; // 16
+                                             // Nearest (not bicubic): a mask must not gain interpolated grays that flip the 0.5 binarize.
+    let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
+        rgb_to_luma(&mask.pixels)
+    } else {
+        let resized = resize_nearest_u8(
+            &mask.pixels,
+            mask.height as usize,
+            mask.width as usize,
+            h,
+            w,
+        );
+        let u8s: Vec<u8> = resized
+            .iter()
+            .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+            .collect();
+        rgb_to_luma(&u8s)
+    };
+    let (gh, gw) = (h / patch, w / patch);
+    let mut packed = Vec::with_capacity(gh * gw);
+    for ly in 0..gh {
+        for lx in 0..gw {
+            let v = luma[(ly * patch) * w + (lx * patch)]; // top-left of the block
+            packed.push(if v as f32 / 255.0 >= 0.5 { 1.0f32 } else { 0.0 });
+        }
+    }
+    Ok(Array::from_slice(&packed, &[1, (gh * gw) as i32, 1]))
+}
+
+/// PIL "L" grayscale luma: `round(R·299/1000 + G·587/1000 + B·114/1000)` per RGB pixel.
+fn rgb_to_luma(rgb: &[u8]) -> Vec<u8> {
+    rgb.chunks_exact(3)
+        .map(|p| {
+            let l = (p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114 + 500) / 1000;
+            l.min(255) as u8
+        })
+        .collect()
 }
 
 pub struct Ideogram4Pipeline {
@@ -143,6 +257,48 @@ impl Ideogram4Pipeline {
         Ok(ids)
     }
 
+    /// VAE-encode a source image into the BN-normalized packed latent `[1, num_img, 128]` the
+    /// denoise operates on — the exact inverse of [`decode`](Self::decode)'s de-normalize +
+    /// unpatchify: resize → `encode_mean` → 2×2 patchify (Ideogram's `(ph,pw,c)` c-innermost order)
+    /// → BN-normalize `(x − mean)/std`. Seed-independent; encode once per request.
+    pub fn encode_init_latents(&self, image: &Image, height: u32, width: u32) -> Result<Array> {
+        let patch = PATCH * AE_SCALE;
+        let grid_h = (height / patch) as i32;
+        let grid_w = (width / patch) as i32;
+        let pre = preprocess_source_image(image, width, height)?; // [1, H, W, 3]
+        let enc = self.vae.encode_mean(&pre)?; // [1, H/8, W/8, 32] = [1, gh·2, gw·2, 32]
+                                               // Patchify to packed [1, L, 128] — inverse of decode's unpatchify (channels (ph, pw, c)).
+        let packed = enc
+            .reshape(&[1, grid_h, 2, grid_w, 2, 32])?
+            .transpose_axes(&[0, 1, 3, 2, 4, 5])?
+            .reshape(&[1, grid_h * grid_w, 128])?;
+        // BN-normalize in packed NHWC — inverse of decode's `z·std + mean`.
+        let (bn_std, bn_mean) = self.vae.bn_stats();
+        let normed = divide(
+            &subtract(&packed, &bn_mean.reshape(&[1, 1, 128])?)?,
+            &bn_std.reshape(&[1, 1, 128])?,
+        )?;
+        Ok(normed)
+    }
+
+    /// Prepare the per-request [`EditInit`] (img2img / inpaint): VAE-encode the source once and
+    /// build the optional latent-grid mask. The result is reused across the per-seed count loop.
+    pub fn prepare_edit(
+        &self,
+        source: &Image,
+        mask: Option<&Image>,
+        strength: f32,
+        height: u32,
+        width: u32,
+    ) -> Result<EditInit> {
+        let z0 = self.encode_init_latents(source, height, width)?;
+        let mask = match mask {
+            Some(m) => Some(preprocess_mask_packed(m, width, height)?),
+            None => None,
+        };
+        Ok(EditInit { z0, mask, strength })
+    }
+
     /// [`tokenize`](Self::tokenize) the prompt, then [`generate`](Self::generate) — the top-level
     /// text-to-image entry point.
     #[allow(clippy::too_many_arguments)]
@@ -191,7 +347,8 @@ impl Ideogram4Pipeline {
     /// the [`Generator`](mlx_gen::Generator) registry adapter uses. `cancel` is checked at each step
     /// boundary (returns `Err(Error::Canceled)` on trip); `on_progress` receives a
     /// [`Progress::Step`] per denoise step and [`Progress::Decoding`] before the VAE decode. The
-    /// per-step `eval` makes the cancel check able to interrupt mid-render (MLX is lazy).
+    /// per-step `eval` makes the cancel check able to interrupt mid-render (MLX is lazy). Pure
+    /// text-to-image (no edit conditioning) — byte-identical to the original render path.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_with_progress(
         &self,
@@ -202,6 +359,70 @@ impl Ideogram4Pipeline {
         guidance: f32,
         mu: f64,
         seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.run_denoise(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            mu,
+            seed,
+            None,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// [`generate_with_progress`](Self::generate_with_progress) for an **edit** (img2img / mask
+    /// inpaint, sc-6303/6330): the denoise starts from the [`EditInit`]'s noised source latent at a
+    /// strength-derived step and (if a mask is present) pins the keep region per step. Same
+    /// asymmetric-CFG / turbo denoise loop as the text-to-image path — only the initial latent,
+    /// start step, and optional per-step mask blend differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        mu: f64,
+        seed: u64,
+        edit: &EditInit,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.run_denoise(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            mu,
+            seed,
+            Some(edit),
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// The shared flow-matching denoise behind [`generate_with_progress`] (edit `None`) and
+    /// [`generate_edit_with_progress`] (edit `Some`). With `edit == None` the body is byte-identical
+    /// to the original text-to-image render (pure-noise init, full step range, no mask blend).
+    #[allow(clippy::too_many_arguments)]
+    fn run_denoise(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        mu: f64,
+        seed: u64,
+        edit: Option<&EditInit>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -242,20 +463,38 @@ impl Ideogram4Pipeline {
             )
         });
 
-        // ── Init noise + the text-position latent padding ──
-        let key = random::key(seed)?;
-        let mut z = random::normal::<f32>(&[1, num_img, ch], None, None, Some(&key))?;
-        let text_z_padding = zeros(&[1, num_text, ch]);
-        let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
-
-        // ── Flow-matching Euler denoise (high → low noise) ──
+        // ── Flow-matching schedule (mu/std from the V4 preset for this step count) ──
         // (mu, std) come from the reference V4 preset for this step count (NOT constants); the
         // passed-in `mu` is superseded by the preset.
         let _ = mu;
         let (mu_eff, std_eff) = preset_mu_std(num_steps);
         let schedule = LogitNormalSchedule::for_resolution(height, width, mu_eff, std_eff);
         let si = make_step_intervals(num_steps);
-        for i in (0..num_steps).rev() {
+
+        // Edit (img2img / inpaint): run only `num_run = floor(steps·strength)` of the reversed loop,
+        // which skips the noisiest (smallest-σ) leading steps and starts from the source noised to
+        // σ = schedule.eval(si[num_run]) (Ideogram's schedule is inverted — larger σ = cleaner, so a
+        // larger `num_run`/strength → a smaller start σ → more change). T2I runs the full range from
+        // pure noise. `init_time_step` floors a positive strength to ≥1 step.
+        let num_run = match edit {
+            Some(e) => init_time_step(num_steps, e.strength),
+            None => num_steps,
+        };
+
+        // ── Init: always draw the noise (identical RNG stream); blend with the source for an edit ──
+        let key = random::key(seed)?;
+        let noise = random::normal::<f32>(&[1, num_img, ch], None, None, Some(&key))?;
+        let mut z = match edit {
+            Some(e) => {
+                add_noise_by_interpolation(&e.z0, &noise, schedule.eval(si[num_run]) as f32)?
+            }
+            None => noise.clone(),
+        };
+        let text_z_padding = zeros(&[1, num_text, ch]);
+        let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
+
+        // ── Flow-matching Euler denoise (high → low noise) ──
+        for i in (0..num_run).rev() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -306,10 +545,23 @@ impl Ideogram4Pipeline {
                 None => pos_v,
             };
             z = add(&z, &multiply(&v, Array::from_f32((s_val - t_val) as f32))?)?;
+            // Inpaint: pin the keep region (mask 0) to the source re-noised to this step's σ
+            // (= s_val, the post-step time) and regenerate the white region (mask 1). At the final
+            // step s≈0 the keep region is the clean source. Mirrors sdxl `InpaintBlend`; draws no
+            // RNG, so an all-white mask reduces to plain img2img.
+            if let Some(e) = edit {
+                if let Some(mask) = &e.mask {
+                    let init_noised = add_noise_by_interpolation(&e.z0, &noise, s_val as f32)?;
+                    z = add(
+                        &multiply(mask, &z)?,
+                        &multiply(&subtract(Array::from_f32(1.0), mask)?, &init_noised)?,
+                    )?;
+                }
+            }
             eval([&z])?;
             on_progress(Progress::Step {
-                current: (num_steps - i) as u32,
-                total: num_steps as u32,
+                current: (num_run - i) as u32,
+                total: num_run as u32,
             });
         }
 

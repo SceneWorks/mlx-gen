@@ -50,6 +50,13 @@ pub const DEFAULT_GUIDANCE: f32 = 7.0;
 /// Scheduler" node defaults to `mu=0.0, std=1.75`; the earlier `mu=0.5, std=1.0` port smeared
 /// every render (low-frequency structure formed, detail never resolved).
 pub const DEFAULT_MU: f64 = 0.0;
+/// Default img2img (Remix) strength when an edit `Reference` carries no explicit strength — the
+/// fraction of the denoise run from the noised source (mirrors sdxl's 0.6 plain-edit default). The
+/// SceneWorks worker normally supplies an explicit strength; this is the engine floor.
+pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.6;
+/// Default mask-inpaint strength when an edit supplies a `Mask` without an explicit strength
+/// (mirrors sdxl's 0.85 inpaint/outpaint default — inpaint regenerates the masked region heavily).
+pub const DEFAULT_INPAINT_STRENGTH: f32 = 0.85;
 /// Max text tokens the model accepts (Qwen3-VL context budget used by Ideogram).
 pub const MAX_TEXT_TOKENS: usize = 2048;
 

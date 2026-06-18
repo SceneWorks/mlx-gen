@@ -13,15 +13,16 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::gen_core;
 use mlx_gen::{
-    default_seed, AdapterKind, AdapterSpec, Capabilities, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{
-    DEFAULT_GUIDANCE, DEFAULT_MU, DEFAULT_STEPS, DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID,
-    IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN, RES_MULTIPLE, TURBO_LORA_FILE, TURBO_LORA_SCALE,
+    DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH, DEFAULT_INPAINT_STRENGTH, DEFAULT_MU,
+    DEFAULT_STEPS, DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN,
+    RES_MULTIPLE, TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 use crate::pipeline::Ideogram4Pipeline;
 
@@ -51,9 +52,10 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            // Pure text-to-image (the prompt is the model's native JSON caption); no img2img /
-            // control / reference conditioning in this engine.
-            conditioning: Vec::new(),
+            // Edit (sc-6303/6330): img2img / Remix via a source `Reference`, and mask inpaint via a
+            // `Mask` (white = repaint) alongside the `Reference`. The prompt stays the model's native
+            // JSON caption. No control/pose/multi-reference. Edit works in both quality and turbo.
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
             supports_lora: false,
             supports_lokr: false,
             samplers: Vec::new(),
@@ -223,26 +225,96 @@ impl Ideogram4 {
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
 
+        // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`) and VAE-encode
+        // the source once (seed-independent). `None` → the text-to-image path (byte-identical).
+        let edit_init = match resolve_edit(req)? {
+            Some((source, mask, strength)) => Some(
+                self.pipeline
+                    .prepare_edit(source, mask, strength, req.height, req.width)?,
+            ),
+            None => None,
+        };
+
         // Tokenize once — the JSON caption is identical across the count loop; only the seed varies.
         let ids = self.pipeline.tokenize(&req.prompt)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let seed = base_seed.wrapping_add(n as u64);
-            let arr = self.pipeline.generate_with_progress(
-                &ids,
-                req.height,
-                req.width,
-                steps,
-                guidance,
-                DEFAULT_MU,
-                seed,
-                &req.cancel,
-                on_progress,
-            )?;
+            let arr = match &edit_init {
+                Some(edit) => self.pipeline.generate_edit_with_progress(
+                    &ids,
+                    req.height,
+                    req.width,
+                    steps,
+                    guidance,
+                    DEFAULT_MU,
+                    seed,
+                    edit,
+                    &req.cancel,
+                    on_progress,
+                )?,
+                None => self.pipeline.generate_with_progress(
+                    &ids,
+                    req.height,
+                    req.width,
+                    steps,
+                    guidance,
+                    DEFAULT_MU,
+                    seed,
+                    &req.cancel,
+                    on_progress,
+                )?,
+            };
             images.push(array_to_image(&arr)?);
         }
         Ok(GenerationOutput::Images(images))
+    }
+}
+
+/// Resolve the optional edit conditioning: a single img2img/inpaint source [`Conditioning::Reference`]
+/// plus an optional [`Conditioning::Mask`]. Returns `(source, mask, strength)`; `None` for pure
+/// text-to-image. A per-reference strength wins over `req.strength`, else the img2img/inpaint
+/// default. More than one `Reference`/`Mask`, or a `Mask` without a `Reference`, is an error.
+fn resolve_edit(req: &GenerationRequest) -> Result<Option<(&Image, Option<&Image>, f32)>> {
+    let mut source: Option<(&Image, Option<f32>)> = None;
+    let mut mask: Option<&Image> = None;
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, strength } => {
+                if source.is_some() {
+                    return Err(Error::Msg(
+                        "ideogram_4: only one reference (source) image is supported for edit"
+                            .into(),
+                    ));
+                }
+                source = Some((image, strength.or(req.strength)));
+            }
+            Conditioning::Mask { image } => {
+                if mask.is_some() {
+                    return Err(Error::Msg(
+                        "ideogram_4: only one inpaint mask is supported".into(),
+                    ));
+                }
+                mask = Some(image);
+            }
+            // Other conditioning kinds are rejected by the capability floor in `validate_request`.
+            _ => {}
+        }
+    }
+    match source {
+        Some((image, strength)) => {
+            let default = if mask.is_some() {
+                DEFAULT_INPAINT_STRENGTH
+            } else {
+                DEFAULT_IMG2IMG_STRENGTH
+            };
+            Ok(Some((image, mask, strength.unwrap_or(default))))
+        }
+        None if mask.is_some() => Err(Error::Msg(
+            "ideogram_4: an inpaint mask requires a reference (source) image".into(),
+        )),
+        None => Ok(None),
     }
 }
 
@@ -275,6 +347,22 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             "ideogram_4: aspect ratio of {}x{} exceeds the supported {MAX_ASPECT}:1",
             req.width, req.height
         )));
+    }
+    // Edit: an inpaint `Mask` is meaningless without a source `Reference` to keep/blend against
+    // (the capability floor admits both kinds individually; this enforces the pairing). Multiple
+    // references / masks are caught in `resolve_edit` at generate time.
+    let has_ref = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Reference { .. }));
+    let has_mask = req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::Mask { .. }));
+    if has_mask && !has_ref {
+        return Err(Error::Msg(
+            "ideogram_4: an inpaint mask requires a reference (source) image".into(),
+        ));
     }
     Ok(())
 }
@@ -337,7 +425,15 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
-        assert!(d.capabilities.conditioning.is_empty());
+        // Edit surface (sc-6303/6330): img2img Reference + inpaint Mask.
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::Reference));
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::Mask));
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(
             (d.capabilities.min_size, d.capabilities.max_size),
@@ -414,16 +510,116 @@ mod tests {
         .is_err());
     }
 
+    fn img(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_img2img_reference() {
+        // Edit surface (sc-6303): a single img2img source Reference is now accepted.
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: Some(0.7),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&caps(), &r).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_inpaint_reference_plus_mask() {
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: img(512, 512),
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&caps(), &r).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_mask_without_reference() {
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Mask {
+                image: img(512, 512),
+            }],
+            ..req(512, 512)
+        };
+        let e = validate_request(&caps(), &r).unwrap_err().to_string();
+        assert!(e.contains("requires a reference"), "got: {e}");
+    }
+
     #[test]
     fn validate_rejects_unsupported_conditioning() {
+        // A control/pose conditioning is out of surface → rejected by the capability floor.
         let r = GenerationRequest {
-            conditioning: vec![mlx_gen::Conditioning::Reference {
-                image: Image::default(),
-                strength: None,
+            conditioning: vec![Conditioning::Control {
+                image: img(512, 512),
+                kind: mlx_gen::ControlKind::Pose,
+                scale: 1.0,
             }],
             ..req(512, 512)
         };
         assert!(validate_request(&caps(), &r).is_err());
+    }
+
+    #[test]
+    fn resolve_edit_defaults_and_pairing() {
+        // No conditioning → no edit.
+        assert!(resolve_edit(&req(512, 512)).unwrap().is_none());
+        // Reference only → img2img with the img2img default strength.
+        let r = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: None,
+            }],
+            ..req(512, 512)
+        };
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_none());
+        assert_eq!(strength, DEFAULT_IMG2IMG_STRENGTH);
+        // Reference + Mask → inpaint default strength; per-reference strength wins when present.
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Mask {
+                    image: img(512, 512),
+                },
+            ],
+            ..req(512, 512)
+        };
+        let (_, mask, strength) = resolve_edit(&r).unwrap().expect("edit");
+        assert!(mask.is_some());
+        assert_eq!(strength, DEFAULT_INPAINT_STRENGTH);
+        // A second Reference is an error.
+        let r = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(resolve_edit(&r).is_err());
     }
 
     #[test]
