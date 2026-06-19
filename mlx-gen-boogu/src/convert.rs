@@ -484,6 +484,55 @@ pub fn quantize_mllm(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> 
     Ok(())
 }
 
+/// Copy a single file `src → dst` (creating `dst`'s parent).
+fn copy_file(src: &Path, dst: &Path) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(src, dst).map_err(|e| {
+        Error::Msg(format!(
+            "boogu turnkey copy {} → {}: {e}",
+            src.display(),
+            dst.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Copy every regular file in `src_dir` (non-recursive — the VAE dir is flat) into `dst_dir`.
+fn copy_dir_flat(src_dir: &Path, dst_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst_dir)?;
+    for entry in std::fs::read_dir(src_dir)? {
+        let path = entry?.path();
+        if path.is_file() {
+            let name = path.file_name().expect("dir entry has a name");
+            copy_file(&path, &dst_dir.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// Assemble a **complete, `from_snapshot`-loadable turnkey** at `dst_root` from the dense source
+/// snapshot `src_root`, at `bits` (E9). Pre-quantizes the two big stacks on disk and copies the
+/// small files the loaders need verbatim:
+///   - `transformer/` — packed DiT + `config.json` (`quantize_transformer`),
+///   - `mllm/` — packed Qwen3-VL text tower (vision tower / embedding / norms dense) + `config.json`
+///     (`quantize_mllm`) + `tokenizer.json` (what [`crate::BooguTokenizer`] reads),
+///   - `vae/` — the dense FLUX.1 `AutoencoderKL`, copied unchanged.
+///
+/// The result is lean (no source `.bin`/extra pickles) and loads through the exact
+/// [`crate::BooguPipeline::from_snapshot`] path — the published `SceneWorks/boogu-image-mlx/<variant>`.
+pub fn assemble_quantized_snapshot(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
+    quantize_transformer(src_root, dst_root, bits)?;
+    quantize_mllm(src_root, dst_root, bits)?;
+    copy_file(
+        &src_root.join("mllm").join("tokenizer.json"),
+        &dst_root.join("mllm").join("tokenizer.json"),
+    )?;
+    copy_dir_flat(&src_root.join("vae"), &dst_root.join("vae"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
