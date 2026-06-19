@@ -14,15 +14,22 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 
-use crate::loader::{load_text_encoder, load_transformer, load_vae};
+use crate::loader::{load_text_encoder, load_transformer, load_vae, load_vision_tower};
 use crate::text_encoder::BooguTextEncoder;
 use crate::tokenizer::BooguTokenizer;
 use crate::transformer::BooguTransformer;
+use crate::vision::preprocess::preprocess_image;
+use crate::vision::VisionTower;
 use mlx_gen_z_image::vae::Vae;
+
+/// Qwen3-VL image placeholder token (`mllm/config.json::image_token_id`) — the position the vision
+/// tower's merged embeds are spliced into for image-conditioned editing.
+const IMAGE_TOKEN_ID: i32 = 151655;
 
 /// Static-v1 time-shift parameters from the snapshot `scheduler/scheduler_config.json`
 /// (`base_shift 0.5`, `max_shift 1.15`, `seq_len 4096`). The linear map saturates at `seq_len=4096`,
@@ -86,6 +93,14 @@ pub struct EditOptions {
     pub steps: usize,
     pub text_guidance_scale: f32,
     pub seed: u64,
+    /// Faithful Boogu edit (default): route the reference image through the Qwen3-VL vision tower so
+    /// the MLLM "sees" it (image-conditioned instruction features). When `false`, the instruction is
+    /// encoded text-only (the E7 fallback) — the DiT still gets the spatial reference latent either way.
+    pub condition_on_image: bool,
+    /// Reference `use_input_images_4_neg_instruct`: also condition the CFG-negative (empty-instruction)
+    /// pass on the reference image. Default `false` (the reference default + inference script) — the
+    /// negative is the text-only empty/drop instruction. Only meaningful when `condition_on_image`.
+    pub use_input_images_4_neg_instruct: bool,
 }
 
 impl Default for EditOptions {
@@ -96,20 +111,30 @@ impl Default for EditOptions {
             steps: 50,
             text_guidance_scale: 4.0,
             seed: 0,
+            condition_on_image: true,
+            use_input_images_4_neg_instruct: false,
         }
     }
 }
 
 /// The assembled Boogu Base pipeline: tokenizer + Qwen3-VL condition encoder + DiT + FLUX.1 VAE.
+///
+/// The Qwen3-VL **vision tower** (image-conditioned editing) is loaded lazily on the first
+/// [`Self::generate_edit`] call and cached, so the text-to-image paths keep their original footprint.
 pub struct BooguPipeline {
     tok: BooguTokenizer,
     te: BooguTextEncoder,
     dit: BooguTransformer,
     vae: Vae,
+    /// Snapshot root — kept so the vision tower can be lazily loaded from `mllm/` on first edit.
+    root: PathBuf,
+    /// Lazily-loaded (f32) Qwen3-VL vision tower; `None` until the first image-conditioned edit.
+    vision: RefCell<Option<VisionTower>>,
 }
 
 impl BooguPipeline {
-    /// Load all four components from a standard Boogu snapshot (`mllm/`, `transformer/`, `vae/`).
+    /// Load the text-to-image components from a standard Boogu snapshot (`mllm/`, `transformer/`,
+    /// `vae/`). The vision tower (edit-only) loads lazily on the first [`Self::generate_edit`].
     pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         Ok(Self {
@@ -117,6 +142,8 @@ impl BooguPipeline {
             te: load_text_encoder(root)?,
             dit: load_transformer(root)?,
             vae: load_vae(root)?,
+            root: root.to_path_buf(),
+            vision: RefCell::new(None),
         })
     }
 
@@ -215,9 +242,11 @@ impl BooguPipeline {
     /// image sequence (`forward_edit`). The reference shapes the output spatially; the instruction
     /// drives the edit. Same static-v1 scheduler / true-CFG as [`Self::generate`].
     ///
-    /// Scope: this wires the DiT's **spatial** reference path (the story's named scope). Faithful
-    /// Boogu edit additionally feeds the reference image through the Qwen3-VL vision tower so the MLLM
-    /// "sees" it (image-conditioned instruction features); that semantic path is tracked as E7b.
+    /// Faithful Boogu edit (the default, `opts.condition_on_image`) feeds the reference image through
+    /// the Qwen3-VL **vision tower** so the MLLM "sees" it — the instruction features are
+    /// image-conditioned (semantic path) **and** the DiT gets the spatial reference latent. With
+    /// `condition_on_image = false` the instruction is encoded text-only (the E7 fallback); the DiT
+    /// spatial reference path is identical either way.
     pub fn generate_edit(
         &self,
         reference: &Image,
@@ -233,12 +262,22 @@ impl BooguPipeline {
 
         // Condition encoding: edit instruction + CFG-negative (empty/drop) instruction. Both DiT
         // passes carry the same reference latent — only the instruction differs (TI2I text guidance).
-        let (cond_ids, cond_mask) = self.tok.encode_edit(instruction)?;
-        let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
+        let (cond, cond_mask) = if opts.condition_on_image {
+            self.encode_image_instruction(reference, instruction)?
+        } else {
+            let (ids, mask) = self.tok.encode_edit(instruction)?;
+            (self.te.last_hidden(&ids, &mask)?, mask)
+        };
         let do_cfg = opts.text_guidance_scale > 1.0;
         let uncond = if do_cfg {
-            let (u_ids, u_mask) = self.tok.encode_negative()?;
-            Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
+            // Reference `use_input_images_4_neg_instruct`: condition the negative on the image too
+            // (empty instruction); otherwise the text-only empty/drop instruction.
+            if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
+                Some(self.encode_image_instruction(reference, "")?)
+            } else {
+                let (u_ids, u_mask) = self.tok.encode_negative()?;
+                Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
+            }
         } else {
             None
         };
@@ -273,6 +312,58 @@ impl BooguPipeline {
         }
 
         self.decode_latents(&lat)
+    }
+
+    /// Image-conditioned instruction features for the edit path: preprocess the reference, run the
+    /// (lazily-loaded, f32) Qwen3-VL vision tower, build the chat template with the reference image
+    /// block, and run the image-conditioned MLLM forward. Returns `(features [1, L, 4096], mask [1, L])`
+    /// — the same `(hidden, mask)` shape the DiT `forward_edit` consumes, but now with the
+    /// `<|image_pad|>` positions carrying the vision tower's merged embeds + deepstack injections.
+    fn encode_image_instruction(
+        &self,
+        reference: &Image,
+        instruction: &str,
+    ) -> Result<(Array, Array)> {
+        self.ensure_vision()?;
+        let vision = self.vision.borrow();
+        let tower = vision
+            .as_ref()
+            .expect("vision tower loaded by ensure_vision");
+
+        // Reference → Qwen3-VL preprocessing (its own smart-resize / grid) → vision tower.
+        let rgb =
+            image::RgbImage::from_raw(reference.width, reference.height, reference.pixels.clone())
+                .ok_or_else(|| {
+                    Error::Msg("boogu edit: reference pixels != width·height·3".into())
+                })?;
+        let (pixel_values, grid) = preprocess_image(&rgb)?;
+        let (image_embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
+
+        // Chat template with N = merged vision tokens worth of `<|image_pad|>` placeholders, then the
+        // image-conditioned MLLM forward (vision splice + 3-D MRoPE + deepstack injection).
+        let n = image_embeds.shape()[0] as usize;
+        let (ids, mask) = self.tok.encode_edit_with_image(instruction, n)?;
+        let feats = self.te.last_hidden_with_image(
+            &ids,
+            &mask,
+            &image_embeds,
+            &deepstack,
+            grid,
+            IMAGE_TOKEN_ID,
+        )?;
+        Ok((feats, mask))
+    }
+
+    /// Ensure the Qwen3-VL vision tower is loaded (lazy, cached). Loaded from the snapshot's `mllm/`
+    /// (f32 — see [`load_vision_tower`]) only on the first image-conditioned edit, so the T2I paths
+    /// never pay for it.
+    fn ensure_vision(&self) -> Result<()> {
+        let needs_load = self.vision.borrow().is_none();
+        if needs_load {
+            let tower = load_vision_tower(&self.root)?;
+            *self.vision.borrow_mut() = Some(tower);
+        }
+        Ok(())
     }
 
     /// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`

@@ -22,10 +22,27 @@ pub const SYSTEM_PROMPT_T2I: &str = "You are a helpful assistant that generates 
 /// `SYSTEM_PROMPT_4_TI2I_UNIFIED`).
 pub const SYSTEM_PROMPT_DROP: &str = "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.";
 
+/// Qwen3-VL vision marker tokens (`mllm/tokenizer.json` added tokens). The processor expands a single
+/// `<|image_pad|>` into `merged` copies; we render the expanded block directly.
+const VISION_START: &str = "<|vision_start|>";
+const VISION_END: &str = "<|vision_end|>";
+const IMAGE_PAD: &str = "<|image_pad|>";
+
 /// Render the ChatML string for a `(system, user)` turn pair with no generation prompt:
 /// `<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n`.
 fn render_chat(system: &str, user: &str) -> String {
     format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n")
+}
+
+/// Render the ChatML string for an image-conditioned `(system, user)` turn, with the reference image
+/// block (`<|vision_start|>` + `num_image_tokens`×`<|image_pad|>` + `<|vision_end|>`) prepended to the
+/// user text — exactly the Qwen3-VL chat template + processor expansion for `content = [image, text]`
+/// (verified against the golden `input_ids`: image first, no separator, then the instruction).
+fn render_chat_with_image(system: &str, user: &str, num_image_tokens: usize) -> String {
+    let pads = IMAGE_PAD.repeat(num_image_tokens);
+    format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{VISION_START}{pads}{VISION_END}{user}<|im_end|>\n"
+    )
 }
 
 /// The Boogu condition tokenizer: the snapshot's `mllm/tokenizer.json` wrapped so we can render the
@@ -77,6 +94,25 @@ impl BooguTokenizer {
     /// semantic path is tracked separately (E7b). The DiT's spatial reference path is fully wired.
     pub fn encode_edit(&self, instruction: &str) -> Result<(Array, Array)> {
         ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
+    }
+
+    /// Encode the **image-conditioned edit** instruction → `(input_ids, attention_mask)` `[1, L]`,
+    /// with the reference image's `num_image_tokens` (= merged vision tokens) `<|image_pad|>`
+    /// placeholders spliced into the user turn. The same unified TI2I system prompt
+    /// ([`SYSTEM_PROMPT_DROP`]) is used for the positive instruction and — when the reference image
+    /// is also used on the CFG-negative (`use_input_images_4_neg_instruct`) — the empty instruction.
+    /// The text encoder then replaces the `<|image_pad|>` embeddings with the vision tower's output
+    /// ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image`]).
+    pub fn encode_edit_with_image(
+        &self,
+        instruction: &str,
+        num_image_tokens: usize,
+    ) -> Result<(Array, Array)> {
+        ids_to_arrays(self.encode(&render_chat_with_image(
+            SYSTEM_PROMPT_DROP,
+            instruction,
+            num_image_tokens,
+        ))?)
     }
 
     /// Raw id vector for the positive instruction (parity testing against the golden).
