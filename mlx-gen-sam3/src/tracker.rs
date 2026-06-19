@@ -431,6 +431,49 @@ impl PromptEncoder {
         Ok((sparse, dense))
     }
 
+    /// Foreground/background click points in **1008-input** pixel space with `labels` (`1` =
+    /// foreground, `0` = background) → `(sparse [1, 1, n+1, 256], dense [1, g, g, 256])`. The
+    /// interactive-click sibling of [`Self::encode_box`], mirroring `_embed_points(pad=True)`: each
+    /// point is `+0.5`, normalized by the input size, pos-encoded, and gets `point_embed[label]` added
+    /// (`point_embed[0]`=background, `[1]`=foreground — the same table whose `[2]/[3]` are the box
+    /// corners); one padding point collapses to `not_a_point`. Dense is the broadcast `no_mask_embed`
+    /// (no mask prompt). `labels.len()` must equal `points.len()`.
+    fn encode_points(
+        &self,
+        points: &[(f32, f32)],
+        labels: &[i32],
+        g: i32,
+    ) -> Result<(Array, Array)> {
+        let n = points.len();
+        // n point coords + 1 pad point (0,0), each `+0.5` then normalized by the 1008 input size.
+        let norm = |v: f32| (v + 0.5) / INPUT_SIZE;
+        let mut coords = Vec::with_capacity((n + 1) * 2);
+        for &(x, y) in points {
+            coords.push(norm(x));
+            coords.push(norm(y));
+        }
+        coords.push(0.0);
+        coords.push(0.0);
+        let coords = Array::from_slice(&coords, &[1, 1, (n + 1) as i32, 2]);
+        let emb = self.pe.forward(&coords)?; // [1,1,n+1,256]
+
+        // real point i = PE(coord_i) + point_embed[label_i]; the pad token = not_a_point.
+        let mut rows: Vec<Array> = Vec::with_capacity(n + 1);
+        for (i, &label) in labels.iter().enumerate() {
+            let pe_i = take1(&emb, i as i32, 2)?.reshape(&[1, 1, 1, HIDDEN])?;
+            let pl = take1(&self.point_embed, label.clamp(0, 1), 0)?.reshape(&[1, 1, 1, HIDDEN])?;
+            rows.push(add(&pe_i, &pl)?);
+        }
+        rows.push(self.not_a_point.reshape(&[1, 1, 1, HIDDEN])?);
+        let sparse = concatenate_axis(&rows.iter().collect::<Vec<_>>(), 2)?; // [1,1,n+1,256]
+
+        let dense = broadcast_to(
+            &self.no_mask_embed.reshape(&[1, 1, 1, HIDDEN])?,
+            &[1, g, g, HIDDEN],
+        )?;
+        Ok((sparse, dense))
+    }
+
     /// Empty-prompt encoding for a no-prompt (memory-conditioned) tracking frame: `_single_frame_forward`
     /// pads a single empty point with label −1 then `_embed_points(pad=True)` pads one more, so both
     /// resulting tokens collapse to `not_a_point_embed` (label −1 overwrites the point PE). Dense is the
@@ -1568,19 +1611,50 @@ impl Sam3Tracker {
         multimask: bool,
     ) -> Result<TrackerMask> {
         let g = image_embedding.shape()[1];
-        // No-memory single-frame path: add the learned no-memory bias to the image embedding
-        // (broadcast over the spatial grid). A memory-conditioned video frame skips this (F2).
+        let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
+        self.decode_prompt(image_embedding, high_res, &sparse, &dense, multimask)
+    }
+
+    /// Point-prompt a pre-encoded frame: fg/bg `points` (`1` = foreground, `0` = background) in
+    /// **1008-input** space → best low-res mask (multimask + IoU-argmax — SAM's ambiguity resolution
+    /// for a sparse click). The interactive-click sibling of [`Self::segment_encoded`] (box);
+    /// `labels.len()` must equal `points.len()`. (sc-6346)
+    pub fn segment_encoded_points(
+        &self,
+        image_embedding: &Array,
+        high_res: &[Array; 2],
+        points: &[(f32, f32)],
+        labels: &[i32],
+    ) -> Result<TrackerMask> {
+        let g = image_embedding.shape()[1];
+        let (sparse, dense) = self.prompt.encode_points(points, labels, g)?;
+        self.decode_prompt(image_embedding, high_res, &sparse, &dense, true)
+    }
+
+    /// Shared single-frame PVS decode tail for the box & point prompt paths. Adds the learned
+    /// no-memory bias to the image embedding (broadcast over the spatial grid — a memory-conditioned
+    /// video frame skips this, F2), runs the mask decoder over the encoded prompt (`sparse`/`dense`),
+    /// and selects the best candidate by predicted IoU. Box and point differ only in how
+    /// `sparse`/`dense` are produced (the two callers above).
+    fn decode_prompt(
+        &self,
+        image_embedding: &Array,
+        high_res: &[Array; 2],
+        sparse: &Array,
+        dense: &Array,
+        multimask: bool,
+    ) -> Result<TrackerMask> {
+        let g = image_embedding.shape()[1];
         let image_embedding = add(
             image_embedding,
             &self.no_memory_embedding.reshape(&[1, 1, 1, HIDDEN])?,
         )?;
-        let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
         let image_pe = self.image_pe_embed.dense_pe(g)?;
         let (masks, ious, obj_score, _mask_tokens) = self.decoder.forward(
             &image_embedding,
             &image_pe,
-            &sparse,
-            &dense,
+            sparse,
+            dense,
             high_res,
             multimask,
         )?;
@@ -1769,6 +1843,20 @@ impl Sam3Tracker {
     pub fn segment(&self, pixel_values: &Array, box_xyxy_1008: [f32; 4]) -> Result<TrackerMask> {
         let (emb, high_res) = self.encode_frame(pixel_values)?;
         self.segment_encoded(&emb, &high_res, box_xyxy_1008)
+    }
+
+    /// End-to-end single-frame point prompt: pixels + fg/bg `points` (`1` = foreground, `0` =
+    /// background) in 1008-input space → best low-res mask. The interactive-click sibling of
+    /// [`Self::segment`] (box) — the smart-select point path (sc-6346). (`labels.len()` must equal
+    /// `points.len()`.)
+    pub fn segment_points(
+        &self,
+        pixel_values: &Array,
+        points: &[(f32, f32)],
+        labels: &[i32],
+    ) -> Result<TrackerMask> {
+        let (emb, high_res) = self.encode_frame(pixel_values)?;
+        self.segment_encoded_points(&emb, &high_res, points, labels)
     }
 }
 
