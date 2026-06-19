@@ -10,11 +10,12 @@
 //! pass run on the empty (drop) instruction. Per-sample `B=1` (the DiT runs once per condition).
 
 use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Progress, Result};
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -147,8 +148,22 @@ impl BooguPipeline {
         })
     }
 
-    /// Generate one RGB image from a text prompt.
+    /// Generate one RGB image from a text prompt. Convenience wrapper over
+    /// [`Self::generate_with_progress`] with no cancellation and a no-op progress sink.
     pub fn generate(&self, prompt: &str, opts: &GenerateOptions) -> Result<Image> {
+        self.generate_with_progress(prompt, opts, &CancelFlag::new(), &mut |_| {})
+    }
+
+    /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
+    /// each denoise step. A pre/mid-flight cancellation returns [`Error::Canceled`]; the per-step
+    /// `eval` bounds the lazy MLX graph and lets the cancel check interrupt mid-render.
+    pub fn generate_with_progress(
+        &self,
+        prompt: &str,
+        opts: &GenerateOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
 
         // Condition encoding: positive instruction + CFG-negative (empty/drop) instruction.
@@ -170,6 +185,9 @@ impl BooguPipeline {
         let scale = opts.text_guidance_scale;
 
         for i in 0..opts.steps {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let t = Array::from_slice(&[ts[i] as f32], &[1]);
             let cond_v = self.dit.forward(&lat, &t, &cond, &cond_mask)?;
             let pred = match &uncond {
@@ -190,8 +208,14 @@ impl BooguPipeline {
                 &lat.as_dtype(Dtype::Float32)?,
                 &multiply(&pred.as_dtype(Dtype::Float32)?, Array::from_f32(dt))?,
             )?;
+            eval([&lat])?;
+            on_progress(Progress::Step {
+                current: (i + 1) as u32,
+                total: opts.steps as u32,
+            });
         }
 
+        on_progress(Progress::Decoding);
         self.decode_latents(&lat)
     }
 
@@ -203,6 +227,18 @@ impl BooguPipeline {
     /// last) renoise to the next level `x = (1 − sigma_next)·noise + sigma_next·x` with fresh noise.
     /// Same DiT/TE/VAE as Base — only the sampler differs — so load this from a Turbo snapshot.
     pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
+        self.generate_turbo_with_progress(prompt, opts, &CancelFlag::new(), &mut |_| {})
+    }
+
+    /// [`Self::generate_turbo`] with [`Progress`] streaming and per-step cooperative cancellation
+    /// ([`Error::Canceled`]).
+    pub fn generate_turbo_with_progress(
+        &self,
+        prompt: &str,
+        opts: &TurboOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
 
         let (ids, mask) = self.tok.encode_t2i(prompt)?;
@@ -212,6 +248,9 @@ impl BooguPipeline {
         let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
 
         for i in 0..opts.steps {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let sigma = sigmas[i];
             let t = Array::from_slice(&[sigma], &[1]);
             let pred = self.dit.forward(&lat, &t, &cond, &mask)?;
@@ -232,8 +271,14 @@ impl BooguPipeline {
                     &multiply(&lat, Array::from_f32(sigma_next))?,
                 )?;
             }
+            eval([&lat])?;
+            on_progress(Progress::Step {
+                current: (i + 1) as u32,
+                total: opts.steps as u32,
+            });
         }
 
+        on_progress(Progress::Decoding);
         self.decode_latents(&lat)
     }
 
@@ -252,6 +297,25 @@ impl BooguPipeline {
         reference: &Image,
         instruction: &str,
         opts: &EditOptions,
+    ) -> Result<Image> {
+        self.generate_edit_with_progress(
+            reference,
+            instruction,
+            opts,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// [`Self::generate_edit`] with [`Progress`] streaming and per-step cooperative cancellation
+    /// ([`Error::Canceled`]).
+    pub fn generate_edit_with_progress(
+        &self,
+        reference: &Image,
+        instruction: &str,
+        opts: &EditOptions,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
         validate_multiple_of_16(reference.width, reference.height, "boogu")?;
@@ -287,6 +351,9 @@ impl BooguPipeline {
         let scale = opts.text_guidance_scale;
 
         for i in 0..opts.steps {
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let t = Array::from_slice(&[ts[i] as f32], &[1]);
             let cond_v = self
                 .dit
@@ -309,8 +376,14 @@ impl BooguPipeline {
                 &lat.as_dtype(Dtype::Float32)?,
                 &multiply(&pred.as_dtype(Dtype::Float32)?, Array::from_f32(dt))?,
             )?;
+            eval([&lat])?;
+            on_progress(Progress::Step {
+                current: (i + 1) as u32,
+                total: opts.steps as u32,
+            });
         }
 
+        on_progress(Progress::Decoding);
         self.decode_latents(&lat)
     }
 
