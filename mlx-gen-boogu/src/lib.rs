@@ -26,13 +26,15 @@ pub mod quant;
 pub mod text_encoder;
 pub mod tokenizer;
 pub mod transformer;
+pub mod vision;
 
 pub use config::BooguConfig;
-pub use loader::{load_text_encoder, load_transformer, load_vae};
+pub use loader::{load_text_encoder, load_transformer, load_vae, load_vision_tower};
 pub use pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 pub use tokenizer::BooguTokenizer;
 pub use transformer::BooguTransformer;
+pub use vision::{VisionConfig, VisionTower};
 
 /// Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, reused from `mlx-gen-z-image`.
 pub use mlx_gen_z_image::vae::Vae;
