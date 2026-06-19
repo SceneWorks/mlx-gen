@@ -67,6 +67,18 @@ impl BooguTokenizer {
         ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, ""))?)
     }
 
+    /// Encode the **edit** instruction → `(input_ids, attention_mask)` `[1, L]`. The TI2I system
+    /// prompt is the same unified prompt the reference uses for image editing
+    /// ([`SYSTEM_PROMPT_DROP`] == `SYSTEM_PROMPT_4_TI2I_UNIFIED`), so the CFG negative is just
+    /// [`Self::encode_negative`] (empty user text, same system prompt).
+    ///
+    /// Note: this is the **text-only** instruction encoding. Faithful Boogu edit additionally routes
+    /// the reference image through the Qwen3-VL vision tower (deepstack) so the MLLM "sees" it; that
+    /// semantic path is tracked separately (E7b). The DiT's spatial reference path is fully wired.
+    pub fn encode_edit(&self, instruction: &str) -> Result<(Array, Array)> {
+        ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
+    }
+
     /// Raw id vector for the positive instruction (parity testing against the golden).
     pub fn t2i_ids(&self, prompt: &str) -> Result<Vec<i32>> {
         self.encode(&render_chat(SYSTEM_PROMPT_T2I, prompt))

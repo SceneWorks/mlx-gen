@@ -20,12 +20,14 @@ use mlx_gen::Result;
 
 /// Precomputed `cos`/`sin` rotary tables for one forward pass.
 ///
-/// Layout is `[1, cap_len + img_len, head_dim/2]` (f32). The text tokens occupy `[0, cap_len)` and
-/// the image patch tokens `[cap_len, cap_len + img_len)`, matching the joint `[instruct; img]` order.
+/// Layout is `[1, cap_len + ref_len + img_len, head_dim/2]` (f32) in the joint
+/// `[instruct; ref-image; noise-image]` order. For text-to-image there is no reference image
+/// (`ref_len == 0`) and the layout collapses to `[instruct; image]`.
 pub struct RopeTables {
     cos: Array,
     sin: Array,
     cap_len: i32,
+    ref_len: i32,
 }
 
 impl RopeTables {
@@ -38,47 +40,32 @@ impl RopeTables {
         axes_dim: usize,
         theta: f32,
     ) -> Self {
-        let half_axis = axes_dim / 2; // 20 complex freqs per axis
-        let half = half_axis * 3; // 60 for head_dim 120
-        let inv: Vec<f32> = (0..half_axis)
-            .map(|j| theta.powf(-(2.0 * j as f32) / axes_dim as f32))
-            .collect();
+        let mut positions = Vec::with_capacity(cap_len + h_tokens * w_tokens);
+        text_positions(&mut positions, cap_len);
+        grid_positions(&mut positions, cap_len as f32, h_tokens, w_tokens);
+        from_positions(&positions, axes_dim, theta, cap_len as i32, 0)
+    }
 
-        let img_len = h_tokens * w_tokens;
-        let total = cap_len + img_len;
-        let mut cos = vec![0f32; total * half];
-        let mut sin = vec![0f32; total * half];
-
-        for t in 0..total {
-            let (p0, p1, p2) = if t < cap_len {
-                let i = t as f32;
-                (i, i, i)
-            } else {
-                let it = t - cap_len;
-                (
-                    cap_len as f32,
-                    (it / w_tokens) as f32,
-                    (it % w_tokens) as f32,
-                )
-            };
-            for k in 0..half {
-                let p = match k / half_axis {
-                    0 => p0,
-                    1 => p1,
-                    _ => p2,
-                };
-                let angle = p * inv[k % half_axis];
-                cos[t * half + k] = angle.cos();
-                sin[t * half + k] = angle.sin();
-            }
-        }
-
-        let shape = [1, total as i32, half as i32];
-        Self {
-            cos: Array::from_slice(&cos, &shape),
-            sin: Array::from_slice(&sin, &shape),
-            cap_len: cap_len as i32,
-        }
+    /// Build the joint table for an **edit** forward (one reference image): `cap_len` text positions,
+    /// then a `ref_h × ref_w` reference grid at t-axis `cap_len`, then the `h × w` target grid at
+    /// t-axis `cap_len + max(ref_h, ref_w)` (the reference's `pe_shift` advance) — matching the
+    /// `[instruct; ref; noise]` packing the DiT runs the single-stream over.
+    pub fn build_edit(
+        cap_len: usize,
+        ref_h: usize,
+        ref_w: usize,
+        h_tokens: usize,
+        w_tokens: usize,
+        axes_dim: usize,
+        theta: f32,
+    ) -> Self {
+        let ref_len = ref_h * ref_w;
+        let mut positions = Vec::with_capacity(cap_len + ref_len + h_tokens * w_tokens);
+        text_positions(&mut positions, cap_len);
+        grid_positions(&mut positions, cap_len as f32, ref_h, ref_w);
+        let noise_t = (cap_len + ref_h.max(ref_w)) as f32;
+        grid_positions(&mut positions, noise_t, h_tokens, w_tokens);
+        from_positions(&positions, axes_dim, theta, cap_len as i32, ref_len as i32)
     }
 
     /// `(cos, sin)` for the text tokens only (`context_refiner`).
@@ -89,8 +76,25 @@ impl RopeTables {
         ))
     }
 
-    /// `(cos, sin)` for the image patch tokens only (`noise_refiner`, `img_self_attn`).
+    /// `(cos, sin)` for the reference-image patch tokens only (`ref_image_refiner`). Empty-safe via
+    /// `ref_len == 0` callers (T2I never calls this).
+    pub fn ref_image(&self) -> Result<(Array, Array)> {
+        let start = self.cap_len;
+        let end = self.cap_len + self.ref_len;
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the target (noise) patch tokens only (`noise_refiner`). These sit after the
+    /// reference block, so the range is `[cap_len + ref_len, end)`.
     pub fn image(&self) -> Result<(Array, Array)> {
+        let end = self.cos.shape()[1];
+        let start = self.cap_len + self.ref_len;
+        Ok((axis1(&self.cos, start, end)?, axis1(&self.sin, start, end)?))
+    }
+
+    /// `(cos, sin)` for the combined image sequence `[ref; noise]` (the double-stream image
+    /// self-attention). For T2I (`ref_len == 0`) this equals [`Self::image`].
+    pub fn combined_image(&self) -> Result<(Array, Array)> {
         let end = self.cos.shape()[1];
         Ok((
             axis1(&self.cos, self.cap_len, end)?,
@@ -98,9 +102,66 @@ impl RopeTables {
         ))
     }
 
-    /// `(cos, sin)` for the full joint `[text; image]` sequence (double / single stream).
+    /// `(cos, sin)` for the full joint `[text; ref; noise]` sequence (double / single stream).
     pub fn joint(&self) -> (Array, Array) {
         (self.cos.clone(), self.sin.clone())
+    }
+}
+
+/// Push `cap_len` text positions `(i, i, i)`.
+fn text_positions(out: &mut Vec<(f32, f32, f32)>, cap_len: usize) {
+    for i in 0..cap_len {
+        out.push((i as f32, i as f32, i as f32));
+    }
+}
+
+/// Push an `h × w` row-major image grid at a fixed t-axis position: `(t, row, col)`.
+fn grid_positions(out: &mut Vec<(f32, f32, f32)>, t: f32, h: usize, w: usize) {
+    for r in 0..h {
+        for c in 0..w {
+            out.push((t, r as f32, c as f32));
+        }
+    }
+}
+
+/// Build the `cos`/`sin` tables from 3-axis positions: each rotary freq index `k ∈ [0, 3·axes_dim/2)`
+/// is grouped into three contiguous blocks of `axes_dim/2`, one per axis, all sharing the inverse
+/// frequencies `θ^(−2j/axes_dim)`.
+fn from_positions(
+    positions: &[(f32, f32, f32)],
+    axes_dim: usize,
+    theta: f32,
+    cap_len: i32,
+    ref_len: i32,
+) -> RopeTables {
+    let half_axis = axes_dim / 2; // 20 complex freqs per axis
+    let half = half_axis * 3; // 60 for head_dim 120
+    let inv: Vec<f32> = (0..half_axis)
+        .map(|j| theta.powf(-(2.0 * j as f32) / axes_dim as f32))
+        .collect();
+
+    let total = positions.len();
+    let mut cos = vec![0f32; total * half];
+    let mut sin = vec![0f32; total * half];
+    for (t, &(p0, p1, p2)) in positions.iter().enumerate() {
+        for k in 0..half {
+            let p = match k / half_axis {
+                0 => p0,
+                1 => p1,
+                _ => p2,
+            };
+            let angle = p * inv[k % half_axis];
+            cos[t * half + k] = angle.cos();
+            sin[t * half + k] = angle.sin();
+        }
+    }
+
+    let shape = [1, total as i32, half as i32];
+    RopeTables {
+        cos: Array::from_slice(&cos, &shape),
+        sin: Array::from_slice(&sin, &shape),
+        cap_len,
+        ref_len,
     }
 }
 

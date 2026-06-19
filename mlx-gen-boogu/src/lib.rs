@@ -29,7 +29,7 @@ pub mod transformer;
 
 pub use config::BooguConfig;
 pub use loader::{load_text_encoder, load_transformer, load_vae};
-pub use pipeline::{BooguPipeline, GenerateOptions, TurboOptions};
+pub use pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 pub use tokenizer::BooguTokenizer;
 pub use transformer::BooguTransformer;

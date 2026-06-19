@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_boogu::tokenizer::BooguTokenizer;
-use mlx_gen_boogu::{BooguPipeline, GenerateOptions, TurboOptions};
+use mlx_gen_boogu::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 
 fn snapshot_dir() -> PathBuf {
     PathBuf::from(std::env::var("BOOGU_BASE_DIR").expect("set BOOGU_BASE_DIR to the snapshot root"))
@@ -97,6 +97,82 @@ fn t2i_smoke() {
     )
     .unwrap();
     println!("wrote {}", out.display());
+}
+
+/// Real-weight Edit (single-reference TI2I) smoke: T2I-render a reference, then run the **edit** path
+/// (VAE-encode the reference → packed into the DiT image sequence + true-CFG) with an instruction, and
+/// assert the result is non-degenerate. Both PNGs are saved for visual inspection — coherence (the
+/// output preserves the reference composition while applying the instruction) is judged by eye.
+///
+/// The Base checkpoint carries the full `ref_image_*` DiT path, so this validates against
+/// `BOOGU_BASE_DIR` (no separate Edit download needed; the Edit checkpoint is a same-arch fine-tune).
+#[test]
+#[ignore = "needs real weights (128 GB Mac): set BOOGU_BASE_DIR"]
+fn edit_smoke() {
+    let pipe = BooguPipeline::from_snapshot(snapshot_dir()).expect("load Boogu pipeline");
+
+    // Reference image (T2I), then edit it.
+    let ref_img = pipe
+        .generate(
+            "a red apple on a wooden table",
+            &GenerateOptions {
+                height: 512,
+                width: 512,
+                steps: 24,
+                text_guidance_scale: 4.0,
+                seed: 0,
+            },
+        )
+        .expect("generate reference");
+    let ref_out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../reference/outputs/boogu_mlx_edit_ref_apple_512.png");
+    std::fs::create_dir_all(ref_out.parent().unwrap()).unwrap();
+    image::save_buffer(
+        &ref_out,
+        &ref_img.pixels,
+        ref_img.width,
+        ref_img.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+
+    let edited = pipe
+        .generate_edit(
+            &ref_img,
+            "change the apple to a green apple",
+            &EditOptions {
+                height: 512,
+                width: 512,
+                steps: 24,
+                text_guidance_scale: 4.0,
+                seed: 1,
+            },
+        )
+        .expect("generate_edit");
+
+    assert_eq!((edited.width, edited.height), (512, 512));
+    let (mn, mx) = edited
+        .pixels
+        .iter()
+        .fold((255u8, 0u8), |(mn, mx), &p| (mn.min(p), mx.max(p)));
+    let mean = edited.pixels.iter().map(|&p| p as u64).sum::<u64>() / edited.pixels.len() as u64;
+    println!("edit render stats: min={mn} max={mx} mean={mean}");
+    assert!(
+        mx - mn > 32,
+        "edit render looks degenerate (min={mn} max={mx})"
+    );
+
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../reference/outputs/boogu_mlx_edit_green_apple_512.png");
+    image::save_buffer(
+        &out,
+        &edited.pixels,
+        edited.width,
+        edited.height,
+        image::ExtendedColorType::Rgb8,
+    )
+    .unwrap();
+    println!("wrote {} (ref: {})", out.display(), ref_out.display());
 }
 
 /// Real-weight Turbo (DMD few-step) smoke: render with the Turbo checkpoint + DMD sampler (no CFG)

@@ -76,6 +76,30 @@ impl Default for TurboOptions {
     }
 }
 
+/// Edit (single-reference text+image-to-image) generation knobs. The output resolution is
+/// `height`/`width`; the reference image's own dimensions drive the reference latent (both must be
+/// multiples of 16). Defaults mirror the Base `__call__` (true-CFG, 50 steps).
+#[derive(Debug, Clone)]
+pub struct EditOptions {
+    pub height: u32,
+    pub width: u32,
+    pub steps: usize,
+    pub text_guidance_scale: f32,
+    pub seed: u64,
+}
+
+impl Default for EditOptions {
+    fn default() -> Self {
+        Self {
+            height: 1024,
+            width: 1024,
+            steps: 50,
+            text_guidance_scale: 4.0,
+            seed: 0,
+        }
+    }
+}
+
 /// The assembled Boogu Base pipeline: tokenizer + Qwen3-VL condition encoder + DiT + FLUX.1 VAE.
 pub struct BooguPipeline {
     tok: BooguTokenizer,
@@ -186,6 +210,71 @@ impl BooguPipeline {
         self.decode_latents(&lat)
     }
 
+    /// Generate one RGB image via the **Edit** path: VAE-encode a reference image into a clean
+    /// reference latent, then flow-match denoise (true-CFG) with that reference packed into the DiT's
+    /// image sequence (`forward_edit`). The reference shapes the output spatially; the instruction
+    /// drives the edit. Same static-v1 scheduler / true-CFG as [`Self::generate`].
+    ///
+    /// Scope: this wires the DiT's **spatial** reference path (the story's named scope). Faithful
+    /// Boogu edit additionally feeds the reference image through the Qwen3-VL vision tower so the MLLM
+    /// "sees" it (image-conditioned instruction features); that semantic path is tracked as E7b.
+    pub fn generate_edit(
+        &self,
+        reference: &Image,
+        instruction: &str,
+        opts: &EditOptions,
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        validate_multiple_of_16(reference.width, reference.height, "boogu")?;
+
+        // Reference → clean VAE latent [1, 16, rH/8, rW/8].
+        let ref_pixels = image_to_pixels(reference);
+        let ref_latent = self.vae.encode(&ref_pixels)?;
+
+        // Condition encoding: edit instruction + CFG-negative (empty/drop) instruction. Both DiT
+        // passes carry the same reference latent — only the instruction differs (TI2I text guidance).
+        let (cond_ids, cond_mask) = self.tok.encode_edit(instruction)?;
+        let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
+        let do_cfg = opts.text_guidance_scale > 1.0;
+        let uncond = if do_cfg {
+            let (u_ids, u_mask) = self.tok.encode_negative()?;
+            Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
+        } else {
+            None
+        };
+
+        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let ts = build_timesteps_v1(opts.steps);
+        let scale = opts.text_guidance_scale;
+
+        for i in 0..opts.steps {
+            let t = Array::from_slice(&[ts[i] as f32], &[1]);
+            let cond_v = self
+                .dit
+                .forward_edit(&lat, &ref_latent, &t, &cond, &cond_mask)?;
+            let pred = match &uncond {
+                Some((u_hidden, u_mask)) => {
+                    let uncond_v =
+                        self.dit
+                            .forward_edit(&lat, &ref_latent, &t, u_hidden, u_mask)?;
+                    add(
+                        &cond_v,
+                        &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                    )?
+                }
+                None => cond_v,
+            };
+
+            let dt = (ts[i + 1] - ts[i]) as f32;
+            lat = add(
+                &lat.as_dtype(Dtype::Float32)?,
+                &multiply(&pred.as_dtype(Dtype::Float32)?, Array::from_f32(dt))?,
+            )?;
+        }
+
+        self.decode_latents(&lat)
+    }
+
     /// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
     /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed.
     fn decode_latents(&self, lat: &Array) -> Result<Image> {
@@ -212,6 +301,19 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64) -> Result<Array> {
         None,
         Some(&key),
     )?)
+}
+
+/// Convert an RGB8 [`Image`] (NHWC, `[0, 255]`) into the VAE encoder's expected `[1, 3, H, W]` f32
+/// tensor in `[-1, 1]` — the inverse of [`decoded_to_image`]'s `x·0.5 + 0.5` denormalize.
+fn image_to_pixels(img: &Image) -> Array {
+    let (h, w) = (img.height as i32, img.width as i32);
+    let f: Vec<f32> = img
+        .pixels
+        .iter()
+        .map(|&p| (p as f32 / 255.0) * 2.0 - 1.0)
+        .collect();
+    let nhwc = Array::from_slice(&f, &[1, h, w, 3]);
+    nhwc.transpose_axes(&[0, 3, 1, 2]).expect("NHWC→NCHW")
 }
 
 /// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values

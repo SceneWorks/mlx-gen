@@ -1,6 +1,12 @@
 //! The Boogu mixed single/double-stream DiT (`BooguImageTransformer2DModel`) forward.
 //!
-//! Text-to-image flow (no reference images — the Edit/`ref_image_*` path is E7):
+//! Two entry points share one inner path: [`BooguTransformer::forward`] (text-to-image) and
+//! [`BooguTransformer::forward_edit`] (single-reference text+image-to-image). Edit VAE-encodes a
+//! reference image, patch-embeds it through `ref_image_patch_embedder` + `image_index_embedding`,
+//! refines it in `ref_image_refiner`, and prepends those tokens — `[ref; noise]` — to the image
+//! sequence (with the noise positions shifted by `max(ref_h, ref_w)` in the unified RoPE).
+//!
+//! Text-to-image flow (the reference-image blocks stay dormant):
 //! ```text
 //!   time_caption_embed:  temb = TimestepEmbedder(sinusoid(t·scale));  caption = Linear(RMSNorm(instr))
 //!   patchify(p=2, 16→64) → x_embedder                                 → img tokens  [1, Li, 3360]
@@ -34,17 +40,21 @@ use crate::quant::lin;
 use block::{DoubleBlock, ModBlock, PlainBlock};
 use rope::RopeTables;
 
-/// The Boogu DiT. Holds only the modules the text-to-image path exercises; the reference-image
-/// refiner + patch embedder + index embedding (Edit, E7) are validated-present on disk but not loaded.
+/// The Boogu DiT. Carries the text-to-image modules plus the reference-image conditioning path
+/// (`ref_image_patch_embedder` + `ref_image_refiner` + `image_index_embedding`) the Edit (E7) forward
+/// exercises; the T2I forward simply leaves those dormant.
 pub struct BooguTransformer {
     cfg: BooguConfig,
     x_embedder: AdaptableLinear,
+    ref_image_patch_embedder: AdaptableLinear,
+    image_index_embedding: Array,
     caption_norm: Array,
     caption_linear: AdaptableLinear,
     time_lin1: AdaptableLinear,
     time_lin2: AdaptableLinear,
     context_refiner: Vec<PlainBlock>,
     noise_refiner: Vec<ModBlock>,
+    ref_image_refiner: Vec<ModBlock>,
     double_stream: Vec<DoubleBlock>,
     single_stream: Vec<ModBlock>,
     norm_out_lin1: AdaptableLinear,
@@ -68,6 +78,8 @@ impl BooguTransformer {
         Ok(Self {
             cfg: cfg.clone(),
             x_embedder: lin(w, "x_embedder", true)?,
+            ref_image_patch_embedder: lin(w, "ref_image_patch_embedder", true)?,
+            image_index_embedding: w.require("image_index_embedding")?.clone(),
             caption_norm: w
                 .require("time_caption_embed.caption_embedder.0.weight")?
                 .clone(),
@@ -79,6 +91,9 @@ impl BooguTransformer {
                 .collect::<Result<_>>()?,
             noise_refiner: (0..cfg.num_refiner_layers)
                 .map(|i| mod_(format!("noise_refiner.{i}")))
+                .collect::<Result<_>>()?,
+            ref_image_refiner: (0..cfg.num_refiner_layers)
+                .map(|i| mod_(format!("ref_image_refiner.{i}")))
                 .collect::<Result<_>>()?,
             double_stream: (0..cfg.num_double_stream_layers)
                 .map(|i| dbl(format!("double_stream_layers.{i}")))
@@ -106,6 +121,41 @@ impl BooguTransformer {
         instruction_hidden: &Array,
         instruction_mask: &Array,
     ) -> Result<Array> {
+        self.forward_inner(latent, None, timestep, instruction_hidden, instruction_mask)
+    }
+
+    /// Edit (single-reference text+image-to-image) velocity prediction. Identical to [`Self::forward`]
+    /// but with a clean reference latent `ref_latent` (`[1, 16, rH, rW]`, the VAE-encoded reference)
+    /// packed — after its own `ref_image_patch_embedder` + `image_index_embedding` + `ref_image_refiner`
+    /// — *before* the noise tokens in the combined image sequence the DiT denoises against.
+    pub fn forward_edit(
+        &self,
+        latent: &Array,
+        ref_latent: &Array,
+        timestep: &Array,
+        instruction_hidden: &Array,
+        instruction_mask: &Array,
+    ) -> Result<Array> {
+        self.forward_inner(
+            latent,
+            Some(ref_latent),
+            timestep,
+            instruction_hidden,
+            instruction_mask,
+        )
+    }
+
+    /// Shared T2I / edit forward. With `ref_latent = None` this is the exact text-to-image path
+    /// (no reference block, `combined_image == image`); with `Some(_)` it prepends the refined
+    /// reference-image tokens and shifts the noise positions per the OmniGen2 unified RoPE.
+    fn forward_inner(
+        &self,
+        latent: &Array,
+        ref_latent: Option<&Array>,
+        timestep: &Array,
+        instruction_hidden: &Array,
+        instruction_mask: &Array,
+    ) -> Result<Array> {
         let p = self.cfg.patch_size as i32;
         let (h, w) = (latent.shape()[2], latent.shape()[3]);
         let (ht, wt) = (h / p, w / p);
@@ -128,19 +178,47 @@ impl BooguTransformer {
             self.cfg.norm_eps,
         )?)?; // [1, cap, 3360]
 
-        // Patchify the latent → image tokens.
+        // Patchify the noise latent → target image tokens.
         let img = self.x_embedder.forward(&patchify(&latent, p)?)?; // [1, img_len, 3360]
 
-        // Rotary tables (text / image / joint slices of one 3-axis build).
-        let rope = RopeTables::build_t2i(
-            cap_len as usize,
-            ht as usize,
-            wt as usize,
-            self.cfg.axes_dim_rope[0],
-            self.cfg.rope_theta,
-        );
+        // Reference image (Edit): patch-embed + add the per-image index embedding (single ref ⇒ 0).
+        let (ref_tokens, rope) = match ref_latent {
+            Some(rl) => {
+                let rl = rl.as_dtype(dt)?;
+                let (rht, rwt) = (rl.shape()[2] / p, rl.shape()[3] / p);
+                let ref_t = self.ref_image_patch_embedder.forward(&patchify(&rl, p)?)?; // [1, ref_len, 3360]
+                let idx0 = self
+                    .image_index_embedding
+                    .take_axis(Array::from_slice(&[0], &[1]), 0)?
+                    .as_dtype(dt)?
+                    .reshape(&[1, 1, self.cfg.hidden_size as i32])?;
+                let ref_t = mlx_rs::ops::add(&ref_t, &idx0)?;
+                let rope = RopeTables::build_edit(
+                    cap_len as usize,
+                    rht as usize,
+                    rwt as usize,
+                    ht as usize,
+                    wt as usize,
+                    self.cfg.axes_dim_rope[0],
+                    self.cfg.rope_theta,
+                );
+                (Some(ref_t), rope)
+            }
+            None => (
+                None,
+                RopeTables::build_t2i(
+                    cap_len as usize,
+                    ht as usize,
+                    wt as usize,
+                    self.cfg.axes_dim_rope[0],
+                    self.cfg.rope_theta,
+                ),
+            ),
+        };
+
         let (text_cos, text_sin) = rope.text()?;
-        let (img_cos, img_sin) = rope.image()?;
+        let (noise_cos, noise_sin) = rope.image()?; // target (noise) tokens only
+        let (comb_cos, comb_sin) = rope.combined_image()?; // [ref; noise] for img self-attn
         let (joint_cos, joint_sin) = rope.joint();
 
         // Context refinement (instruction stream).
@@ -149,21 +227,34 @@ impl BooguTransformer {
             instruct_h = blk.forward(&instruct_h, &text_cos, &text_sin)?;
         }
 
-        // Noise refinement (image stream).
+        // Noise refinement (target image stream).
         let mut img = img;
         for blk in &self.noise_refiner {
-            img = blk.forward(&img, &img_cos, &img_sin, &temb)?;
+            img = blk.forward(&img, &noise_cos, &noise_sin, &temb)?;
         }
 
-        // Dual-stream blocks.
+        // Reference refinement, then prepend the refined reference tokens to form the combined
+        // image sequence `[ref; noise]` (Edit). T2I leaves the combined sequence as the noise tokens.
+        let mut img = match ref_tokens {
+            Some(mut ref_t) => {
+                let (ref_cos, ref_sin) = rope.ref_image()?;
+                for blk in &self.ref_image_refiner {
+                    ref_t = blk.forward(&ref_t, &ref_cos, &ref_sin, &temb)?;
+                }
+                concatenate_axis(&[&ref_t, &img], 1)?
+            }
+            None => img,
+        };
+
+        // Dual-stream blocks (joint instruct↔combined-image attn + combined-image self-attn).
         for blk in &self.double_stream {
             let (ni, nt) = blk.forward(
                 &img,
                 &instruct_h,
                 &joint_cos,
                 &joint_sin,
-                &img_cos,
-                &img_sin,
+                &comb_cos,
+                &comb_sin,
                 &temb,
             )?;
             img = ni;
@@ -171,7 +262,7 @@ impl BooguTransformer {
         }
 
         // Fuse to the joint sequence, then single-stream blocks.
-        let mut joint = concatenate_axis(&[&instruct_h, &img], 1)?; // [1, cap+img, 3360]
+        let mut joint = concatenate_axis(&[&instruct_h, &img], 1)?; // [1, cap+ref+img, 3360]
         for blk in &self.single_stream {
             joint = blk.forward(&joint, &joint_cos, &joint_sin, &temb)?;
         }
@@ -180,10 +271,12 @@ impl BooguTransformer {
         let scale = self.norm_out_lin1.forward(&silu(&temb)?)?; // [1, 1, 3360]
         let normed = layer_norm(&joint, None, None, 1e-6)?;
         let normed = multiply(&normed, &mlx_rs::ops::add(&scale, Array::from_f32(1.0))?)?;
-        let out = self.norm_out_lin2.forward(&normed)?; // [1, cap+img, 64]
+        let out = self.norm_out_lin2.forward(&normed)?; // [1, cap+ref+img, 64]
 
-        // Unpatchify the image-token tail into the velocity.
-        let img_tokens = slice_axis1(&out, cap_len, cap_len + img_len)?;
+        // Unpatchify the trailing target-image tokens into the velocity (the reference tokens, when
+        // present, are dropped — only the noise/target slice is the prediction).
+        let total = out.shape()[1];
+        let img_tokens = slice_axis1(&out, total - img_len, total)?;
         unpatchify(&img_tokens, ht, wt, p, self.cfg.out_channels as i32)
     }
 
@@ -205,6 +298,7 @@ impl BooguTransformer {
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.x_embedder.quantize(bits, None)?;
+        self.ref_image_patch_embedder.quantize(bits, None)?;
         self.caption_linear.quantize(bits, None)?;
         self.time_lin1.quantize(bits, None)?;
         self.time_lin2.quantize(bits, None)?;
@@ -212,6 +306,9 @@ impl BooguTransformer {
             b.quantize(bits)?;
         }
         for b in &mut self.noise_refiner {
+            b.quantize(bits)?;
+        }
+        for b in &mut self.ref_image_refiner {
             b.quantize(bits)?;
         }
         for b in &mut self.double_stream {
