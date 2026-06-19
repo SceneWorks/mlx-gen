@@ -21,3 +21,5 @@ mlx-gen-z-image = { path = "../mlx-gen-z-image" }
 [dev-dependencies]
 # Backend-neutral contract conformance suite — Boogu runs through it on the macos-mlx lane.
 sceneworks-gen-core-testkit = { workspace = true }
+# Save the e2e smoke render as a PNG for visual inspection (same dep the SDXL e2e tests use).
+image = { version = "0.25", default-features = false, features = ["png"] }

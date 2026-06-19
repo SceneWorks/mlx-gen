@@ -21,13 +21,17 @@
 pub mod config;
 pub mod convert;
 pub mod loader;
+pub mod pipeline;
 pub mod quant;
 pub mod text_encoder;
+pub mod tokenizer;
 pub mod transformer;
 
 pub use config::BooguConfig;
 pub use loader::{load_text_encoder, load_transformer, load_vae};
+pub use pipeline::{BooguPipeline, GenerateOptions};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
+pub use tokenizer::BooguTokenizer;
 pub use transformer::BooguTransformer;
 
 /// Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, reused from `mlx-gen-z-image`.

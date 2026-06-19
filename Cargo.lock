@@ -572,6 +572,7 @@ dependencies = [
 name = "mlx-gen-boogu"
 version = "0.0.0"
 dependencies = [
+ "image",
  "mlx-gen",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
