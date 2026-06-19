@@ -21,6 +21,7 @@
 pub mod config;
 pub mod convert;
 pub mod loader;
+pub mod model;
 pub mod pipeline;
 pub mod quant;
 pub mod text_encoder;
@@ -30,6 +31,10 @@ pub mod vision;
 
 pub use config::BooguConfig;
 pub use loader::{load_text_encoder, load_transformer, load_vae, load_vision_tower};
+pub use model::{
+    descriptor, descriptor_edit, descriptor_turbo, load, load_edit, load_turbo, Boogu,
+    BOOGU_IMAGE_EDIT_ID, BOOGU_IMAGE_ID, BOOGU_IMAGE_TURBO_ID,
+};
 pub use pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 pub use text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 pub use tokenizer::BooguTokenizer;
