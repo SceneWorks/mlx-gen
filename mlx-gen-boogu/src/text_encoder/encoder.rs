@@ -61,10 +61,12 @@ impl BooguTextEncoder {
         })
     }
 
-    /// Quantize the embedding + every decoder-layer projection in place (group-wise Q4/Q8). The
-    /// per-layer norms + final norm stay dense.
+    /// Quantize every decoder-layer projection in place (group-wise Q4/Q8 at [`crate::quant::GROUP_SIZE`]
+    /// = 32). The **token embedding stays dense**: its only quantizer (`TokenEmbedding::quantize`)
+    /// hardcodes group 64 in shared gen-core, which would clash with the group-32 Linears under the
+    /// single-group-size packed loader — and the embedding is a precision-sensitive lookup table
+    /// (~1.2 GB bf16), a standard dense-keep. The per-layer norms + final norm also stay dense.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.embed_tokens.quantize(bits, true)?;
         for layer in &mut self.layers {
             layer.quantize(bits)?;
         }

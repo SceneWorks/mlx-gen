@@ -31,9 +31,9 @@ impl Qwen3Mlp {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.gate.quantize(bits, None)?;
-        self.up.quantize(bits, None)?;
-        self.down.quantize(bits, None)?;
+        self.gate.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.up.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.down.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
 }

@@ -297,11 +297,16 @@ impl BooguTransformer {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.x_embedder.quantize(bits, None)?;
-        self.ref_image_patch_embedder.quantize(bits, None)?;
-        self.caption_linear.quantize(bits, None)?;
-        self.time_lin1.quantize(bits, None)?;
-        self.time_lin2.quantize(bits, None)?;
+        self.x_embedder
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.ref_image_patch_embedder
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.caption_linear
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.time_lin1
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.time_lin2
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         for b in &mut self.context_refiner {
             b.quantize(bits)?;
         }
@@ -317,8 +322,10 @@ impl BooguTransformer {
         for b in &mut self.single_stream {
             b.quantize(bits)?;
         }
-        self.norm_out_lin1.quantize(bits, None)?;
-        self.norm_out_lin2.quantize(bits, None)?;
+        self.norm_out_lin1
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.norm_out_lin2
+            .quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
 }

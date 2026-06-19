@@ -373,10 +373,13 @@ impl BooguPipeline {
         decoded_to_image(&decoded)
     }
 
-    /// Quantize the DiT + VAE to Q4/Q8 (E8 / memory).
+    /// Quantize the two large weight stacks — the DiT (~20.6 GB bf16) and the Qwen3-VL TE (~17.5 GB
+    /// bf16) — to Q4/Q8 in place (E8 / memory). The FLUX.1 VAE (0.34 GB, decode-precision-sensitive)
+    /// and the lazily-loaded f32 vision tower (E7b-1 parity finding) stay dense. The same group-wise
+    /// affine packing the on-disk converter ([`crate::convert::quantize_transformer`]) writes.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.dit.quantize(bits)?;
-        self.vae.quantize(bits)?;
+        self.te.quantize(bits)?;
         Ok(())
     }
 }

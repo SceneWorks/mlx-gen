@@ -102,10 +102,10 @@ impl SelfAttention {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.q.quantize(bits, None)?;
-        self.k.quantize(bits, None)?;
-        self.v.quantize(bits, None)?;
-        self.o.quantize(bits, None)?;
+        self.q.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.k.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.v.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.o.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
 }
@@ -240,7 +240,7 @@ impl JointAttention {
             &mut self.instruct_out,
             &mut self.to_out,
         ] {
-            p.quantize(bits, None)?;
+            p.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         }
         Ok(())
     }
@@ -268,9 +268,9 @@ impl SwiGlu {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.w1.quantize(bits, None)?;
-        self.w2.quantize(bits, None)?;
-        self.w3.quantize(bits, None)?;
+        self.w1.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.w2.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
+        self.w3.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
     }
 }
@@ -309,7 +309,7 @@ impl ModNorm {
     }
 
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.linear.quantize(bits, None)
+        self.linear.quantize(bits, Some(crate::quant::GROUP_SIZE))
     }
 }
 

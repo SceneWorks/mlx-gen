@@ -9,8 +9,12 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 use mlx_rs::Array;
 
-/// Group size the converter writes — the codebase-wide `mlx_gen::quant::DEFAULT_GROUP_SIZE` (64).
-pub(crate) const GROUP_SIZE: i32 = 64;
+/// Group size for every Boogu group-wise-affine quantization (pack + load). **32, not the codebase
+/// default 64** — the DiT hidden size is **3360 = 32·105**, which is divisible by 32 but NOT 64, so
+/// MLX `quantize` (which requires the last dim be a multiple of the group size) rejects the bulk of
+/// the DiT at group 64. 32 is the largest power-of-two group that divides 3360, and it also divides
+/// every Qwen3-VL TE dimension (4096 / 12288), so one group size serves both stacks.
+pub(crate) const GROUP_SIZE: i32 = 32;
 
 /// Derive the quant bit-width from the packed shapes: `scales` is `[out, in/gs]` and the u32-packed
 /// `weight` is `[out, in·bits/32]`, so `bits = wq.cols·32 / (scales.cols·gs)`.
