@@ -10,6 +10,7 @@ use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 use crate::config::BooguConfig;
 use crate::text_encoder::{BooguTextEncoder, BooguTextEncoderConfig};
 use crate::transformer::BooguTransformer;
+use crate::vision::{VisionConfig, VisionTower};
 
 /// Load the Qwen3-VL-8B condition encoder from a snapshot's `mllm/` dir. The text tower lives under
 /// `model.language_model.*`; the visual tower + `lm_head` are loaded but unused for text-to-image.
@@ -20,6 +21,27 @@ pub fn load_text_encoder(root: impl AsRef<Path>) -> Result<BooguTextEncoder> {
         "model.language_model",
         &BooguTextEncoderConfig::qwen3_vl_8b(),
     )
+}
+
+/// Load the Qwen3-VL **vision tower** from a snapshot's `mllm/` dir (`model.visual.*` keys) — the
+/// image-conditioned edit path (E7b). The text tower + DiT load separately.
+///
+/// The tower runs in **f32**: it is small (~600 M params, run once per edit, not per denoise step)
+/// and a bf16 path drifts ~0.3% over its 27 layers (cross-framework GEMM rounding amplified by the
+/// merger's outlier channels — see the E7b-1 parity finding). f32 is parity-grade (image-embeds
+/// cosine 0.9998 vs the reference) for negligible cost; the 10 B DiT stays bf16.
+pub fn load_vision_tower(root: impl AsRef<Path>) -> Result<VisionTower> {
+    let mut w = Weights::from_dir(root.as_ref().join("mllm"))?;
+    let keys: Vec<String> = w
+        .keys()
+        .filter(|k| k.starts_with("model.visual."))
+        .map(String::from)
+        .collect();
+    for k in keys {
+        let t = w.require(&k)?.as_dtype(mlx_rs::Dtype::Float32)?;
+        w.insert(k, t);
+    }
+    VisionTower::from_weights(&w, VisionConfig::qwen3_vl(), "model.visual")
 }
 
 /// Load the DiT from a snapshot's `transformer/` dir: parse the config, load the (identity-keyed)

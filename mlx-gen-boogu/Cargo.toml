@@ -17,9 +17,9 @@ serde_json = "1"
 # Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, byte-identical to the VAE `mlx-gen-flux` reuses
 # from here — so we reuse the same `Vae`/`VaeDecoderConfig::default_z_image` rather than re-port it.
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Qwen3-VL vision-tower image preprocessing (smart-resize) for the Edit path; also saves e2e renders.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [dev-dependencies]
 # Backend-neutral contract conformance suite — Boogu runs through it on the macos-mlx lane.
 sceneworks-gen-core-testkit = { workspace = true }
-# Save the e2e smoke render as a PNG for visual inspection (same dep the SDXL e2e tests use).
-image = { version = "0.25", default-features = false, features = ["png"] }
