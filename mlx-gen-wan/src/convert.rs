@@ -550,6 +550,78 @@ pub fn assemble_wan_vace_snapshot(
     Ok(out_dir.to_path_buf())
 }
 
+/// Assemble a `wan2_2_vace_fun_14b` snapshot dir (sc-6604) from the diffusers VACE-Fun **dual-expert**
+/// transformers + a converted base-Wan snapshot's shared native components — the dual-expert sibling of
+/// [`assemble_wan_vace_snapshot`], still **packaging, not conversion**.
+///
+/// VACE-Fun (Wan2.2-A14B base) ships TWO diffusers `WanVACETransformer3DModel`s — `transformer/`
+/// (high-noise) + `transformer_2/` (low-noise) — both read directly in diffusers layout by
+/// [`crate::WanVaceTransformer`] (no conversion), and shares the SAME UMT5 text encoder + z16 Wan VAE +
+/// tokenizer as the base Wan 14B (VACE-Fun is z16-VAE like Wan2.1 VACE). This combines:
+///   - `high_transformer_dir` (the diffusers repo's `transformer/`) → `<out_dir>/transformer/`,
+///   - `low_transformer_dir` (the diffusers repo's `transformer_2/`) → `<out_dir>/transformer_2/`, and
+///   - `base_wan_snapshot/{t5_encoder.safetensors, vae.safetensors, tokenizer.json}` → `<out_dir>/`,
+///
+/// producing the dir `mlx_gen::load("wan2_2_vace_fun_14b", WeightsSource::Dir(..))` expects
+/// ([`crate::config::WanVaceConfig::vace_fun_from_model_dir`] reads `transformer/config.json` +
+/// `model_index.json`; [`crate::model_vace`]'s `WanVaceFun` loads the two transformer dirs + the three
+/// shared files from the root). `link`/replace semantics match [`assemble_wan_vace_snapshot`].
+pub fn assemble_wan_vace_fun_snapshot(
+    out_dir: impl AsRef<Path>,
+    high_transformer_dir: impl AsRef<Path>,
+    low_transformer_dir: impl AsRef<Path>,
+    base_wan_snapshot: impl AsRef<Path>,
+    link: bool,
+) -> Result<PathBuf> {
+    let out_dir = out_dir.as_ref();
+    let base = base_wan_snapshot.as_ref();
+    let experts = [
+        ("transformer", high_transformer_dir.as_ref()),
+        ("transformer_2", low_transformer_dir.as_ref()),
+    ];
+    for (label, src) in experts {
+        if !src.join("config.json").is_file() {
+            return Err(Error::Msg(format!(
+                "assemble_wan_vace_fun_snapshot: no config.json under {} (expected the diffusers \
+                 VACE-Fun `{label}/` expert dir)",
+                src.display()
+            )));
+        }
+        let has_shard = std::fs::read_dir(src)?
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"));
+        if !has_shard {
+            return Err(Error::Msg(format!(
+                "assemble_wan_vace_fun_snapshot: no .safetensors shards under {}",
+                src.display()
+            )));
+        }
+    }
+    const SHARED: [&str; 3] = [
+        "t5_encoder.safetensors",
+        "vae.safetensors",
+        "tokenizer.json",
+    ];
+    for name in SHARED {
+        if !base.join(name).is_file() {
+            return Err(Error::Msg(format!(
+                "assemble_wan_vace_fun_snapshot: base snapshot {} is missing {name} (point at a \
+                 converted base-Wan dir, e.g. a convert_t2v_14b/convert_i2v_14b output)",
+                base.display()
+            )));
+        }
+    }
+
+    std::fs::create_dir_all(out_dir)?;
+    for (label, src) in experts {
+        place_component(&out_dir.join(label), src, link)?;
+    }
+    for name in SHARED {
+        place_component(&out_dir.join(name), &base.join(name), link)?;
+    }
+    Ok(out_dir.to_path_buf())
+}
+
 /// Link-or-copy `src` (a file or dir) to `dst`, replacing any existing entry (idempotent assembly).
 fn place_component(dst: &Path, src: &Path, link: bool) -> Result<()> {
     if dst.is_symlink() || dst.exists() {
@@ -1291,6 +1363,65 @@ mod tests {
         std::fs::remove_file(base.join("vae.safetensors")).unwrap();
         let err = assemble_wan_vace_snapshot(out.join("again"), &tf, &base, true).unwrap_err();
         assert!(err.to_string().contains("vae.safetensors"), "got: {err}");
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// `assemble_wan_vace_fun_snapshot` (sc-6604) lays out a load-ready dual-expert `wan2_2_vace_fun_14b`
+    /// dir: `transformer/` (high) + `transformer_2/` (low) + the three shared base-Wan files, linked and
+    /// idempotent. Pure file packaging, no weights.
+    #[test]
+    fn assemble_wan_vace_fun_snapshot_links_both_experts() {
+        let tmp = std::env::temp_dir().join(format!("wanvacefun_assemble_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let high = tmp.join("vace_fun_repo/transformer");
+        let low = tmp.join("vace_fun_repo/transformer_2");
+        let base = tmp.join("base_wan");
+        let out = tmp.join("wan_vace_fun");
+        for tf in [&high, &low] {
+            std::fs::create_dir_all(tf).unwrap();
+            std::fs::write(
+                tf.join("config.json"),
+                b"{\"_class_name\":\"WanVACETransformer3DModel\"}",
+            )
+            .unwrap();
+            std::fs::write(
+                tf.join("diffusion_pytorch_model-00001-of-00001.safetensors"),
+                b"shard",
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(&base).unwrap();
+        for name in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            std::fs::write(base.join(name), name.as_bytes()).unwrap();
+        }
+
+        // Idempotent: assemble twice.
+        assemble_wan_vace_fun_snapshot(&out, &high, &low, &base, true).unwrap();
+        let out = assemble_wan_vace_fun_snapshot(&out, &high, &low, &base, true).unwrap();
+
+        // Both experts land in the layout `WanVaceFun`/`load_vace_fun_expert_weights` resolve.
+        assert!(out.join("transformer").is_symlink());
+        assert!(out.join("transformer_2").is_symlink());
+        assert!(out.join("transformer/config.json").is_file());
+        assert!(out.join("transformer_2/config.json").is_file());
+        for name in [
+            "t5_encoder.safetensors",
+            "vae.safetensors",
+            "tokenizer.json",
+        ] {
+            assert!(out.join(name).is_symlink(), "{name} should be a symlink");
+        }
+
+        // A missing low-noise expert is a clear error (no silent single-expert snapshot).
+        std::fs::remove_file(low.join("config.json")).unwrap();
+        let err = assemble_wan_vace_fun_snapshot(out.join("again"), &high, &low, &base, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("transformer_2"), "got: {err}");
 
         std::fs::remove_dir_all(&tmp).ok();
     }

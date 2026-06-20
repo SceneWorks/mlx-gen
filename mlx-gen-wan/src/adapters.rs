@@ -505,6 +505,20 @@ pub fn merge_vace_adapters(w: &mut Weights, specs: &[AdapterSpec]) -> Result<Wan
     merge_adapters_into(w, specs, MoeExpert::High, normalize_vace_key)
 }
 
+/// Per-expert VACE adapter merge for the **dual-expert (Wan2.2-A14B) VACE-Fun** — the high/low sibling
+/// of [`merge_vace_adapters`]. Shared (untagged) specs merge onto this `expert`'s weight map and a spec
+/// tagged for the *other* expert is skipped, exactly like [`merge_wan_adapters`]'s `MoeExpert` routing,
+/// but on the diffusers-named VACE key surface ([`normalize_vace_key`]). The caller
+/// ([`crate::model_vace`]) merges once per expert (`MoeExpert::High` onto `transformer/`, `Low` onto
+/// `transformer_2/`) and enforces the "matched nothing across both experts" error.
+pub fn merge_vace_adapters_expert(
+    w: &mut Weights,
+    specs: &[AdapterSpec],
+    expert: MoeExpert,
+) -> Result<WanLoraReport> {
+    merge_adapters_into(w, specs, expert, normalize_vace_key)
+}
+
 /// Shared merge core for both the native Wan ([`merge_wan_adapters`]) and the diffusers VACE
 /// ([`merge_vace_adapters`]) hosts — only the `normalize` key→module map differs. Pass 1: shared
 /// (untagged) files. Pass 2: this `expert`'s specific files (the reference `(loras)+(loras_*)` order).

@@ -570,10 +570,56 @@ impl WanVaceConfig {
         })
     }
 
+    /// Build a **dual-expert (Wan2.2-A14B) VACE-Fun** config from a model dir. The transformer dims +
+    /// the two VACE fields come from `transformer/config.json` (diffusers layout — both experts share
+    /// the same architecture, [`from_diffusers_json`](Self::from_diffusers_json)); the **dual-expert
+    /// inference knobs** (the MoE timestep `boundary`, the shifted-sigma `sample_shift`, the per-expert
+    /// `Dual` guidance, step count, fps) are NOT carried in the diffusers transformer config, so they
+    /// are taken from the Wan2.2 T2V-A14B base the VACE-Fun is trained on (boundary 0.875 / shift 12.0 /
+    /// guide `Dual{3,4}` / 40 steps / 16 fps), with the `boundary` overlaid from `model_index.json`'s
+    /// `boundary_ratio` when present. VACE-Fun is Wan2.2-based but z16-VAE/stride-4×8×8 like Wan2.1 VACE,
+    /// so the VAE/T5 knobs keep the Wan2.1 defaults `from_diffusers_json` sets.
+    ///
+    /// (The exact `sample_shift`/`Dual` guidance for VACE-Fun specifically should be confirmed against
+    /// the VideoX-Fun reference at real-weight smoke — they are request-overridable; `boundary_ratio`
+    /// 0.875 is confirmed from the checkpoint's `model_index.json`.)
+    pub fn vace_fun_from_model_dir(root: &Path) -> Result<Self> {
+        let boundary = read_boundary_ratio(root).unwrap_or(0.875);
+        Ok(Self::from_model_dir(root)?.into_vace_fun(boundary))
+    }
+
+    /// Overlay the Wan2.2 dual-expert MoE inference knobs onto a base VACE config (the pure half of
+    /// [`vace_fun_from_model_dir`](Self::vace_fun_from_model_dir), split out so it is testable without
+    /// a model dir on disk). `boundary` is the `model_index.json` `boundary_ratio` (0.875 for VACE-Fun).
+    fn into_vace_fun(mut self, boundary: f32) -> Self {
+        self.base.model_version = "2.2".into();
+        self.base.dual_model = true;
+        self.base.boundary = boundary;
+        self.base.sample_shift = 12.0;
+        self.base.sample_steps = 40;
+        self.base.sample_guide_scale = GuideScale::Dual {
+            low: 3.0,
+            high: 4.0,
+        };
+        self.base.sample_fps = 16;
+        self
+    }
+
     /// Per-head dimension (`dim / num_heads`).
     pub fn head_dim(&self) -> usize {
         self.base.head_dim()
     }
+}
+
+/// Read the MoE `boundary_ratio` from a dual-expert checkpoint's `model_index.json` (the diffusers
+/// `WanVACEPipeline` field; e.g. `0.875` for VACE-Fun-A14B). Returns `None` when the file/field is
+/// absent so the caller falls back to the Wan2.2 A14B default.
+fn read_boundary_ratio(root: &Path) -> Option<f32> {
+    let text = std::fs::read_to_string(root.join("model_index.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("boundary_ratio")
+        .and_then(Value::as_f64)
+        .map(|x| x as f32)
 }
 
 fn parse_guide_scale(v: Option<&Value>) -> Option<GuideScale> {
@@ -723,6 +769,51 @@ mod tests {
             }
         );
         assert!(c.dual_model);
+    }
+
+    #[test]
+    fn vace_fun_applies_dual_expert_knobs() {
+        // The VACE-Fun transformer config is a plain diffusers WanVACETransformer3DModel (dims +
+        // vace fields) — `from_diffusers_json` resolves it to the Wan2.1 DENSE 14B base (single
+        // guidance, no boundary). `into_vace_fun` then overlays the Wan2.2 A14B MoE inference knobs.
+        let base = WanVaceConfig::from_diffusers_json(&serde_json::json!({
+            "num_attention_heads": 40,
+            "attention_head_dim": 128,
+            "num_layers": 40,
+            "ffn_dim": 13824,
+            "in_channels": 16,
+            "out_channels": 16,
+            "text_dim": 4096,
+            "vace_layers": [0, 5, 10, 15, 20, 25, 30, 35],
+            "vace_in_channels": 96
+        }));
+        assert!(
+            !base.base.dual_model,
+            "diffusers base resolves to the dense Wan2.1 preset"
+        );
+        assert_eq!(base.base.dim, 5120);
+
+        let fun = base.into_vace_fun(0.875);
+        assert!(fun.base.dual_model);
+        assert_eq!(fun.base.boundary, 0.875);
+        assert_eq!(fun.base.sample_shift, 12.0);
+        assert_eq!(fun.base.sample_steps, 40);
+        assert_eq!(fun.base.model_version, "2.2");
+        assert_eq!(
+            fun.base.sample_guide_scale,
+            GuideScale::Dual {
+                low: 3.0,
+                high: 4.0
+            }
+        );
+        // The transformer dims + VACE fields are preserved (only the inference knobs change).
+        assert_eq!(fun.base.dim, 5120);
+        assert_eq!(fun.base.num_layers, 40);
+        assert_eq!(fun.vace_layers, vec![0, 5, 10, 15, 20, 25, 30, 35]);
+        assert_eq!(fun.vace_in_channels, 96);
+        // VACE-Fun is z16-VAE / stride 4×8×8 (Wan2.1 VACE lineage), NOT the z48 5B VAE.
+        assert_eq!(fun.base.vae_z_dim, 16);
+        assert_eq!(fun.base.vae_stride, (4, 8, 8));
     }
 
     #[test]

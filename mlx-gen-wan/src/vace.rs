@@ -896,6 +896,93 @@ pub fn denoise_vace(
     Ok(latents)
 }
 
+/// Dual-expert (Wan2.2-A14B) VACE-Fun denoise loop — the VACE sibling of
+/// [`crate::pipeline::denoise_moe`]. Each step picks the **high-noise** expert while the integer
+/// timestep is `≥ boundary_timestep` (`boundary · num_train_timesteps`, e.g. `0.875·1000 = 875`) and
+/// the **low-noise** expert below it, switching the transformer, its per-expert VACE step cache (the
+/// patch-embedded control latent + RoPE — each expert carries its **own** `vace_patch_embedding`, so
+/// `control_emb` differs per expert), its per-expert projected text contexts (each expert has its own
+/// `text_embedder`), and its per-expert guidance together. The control latent + per-vace-layer
+/// `scales` are constant across steps and shared by both experts (built once by the caller from
+/// [`prepare_video_latents`] + [`prepare_masks`] + [`build_vace_control`]).
+///
+/// `ctx_cond`/`ctx_uncond` are the **raw** text embeddings `[1, L, text_dim]` (each expert projects
+/// them via its own `text_embedder`); pass `ctx_uncond = None` for the CFG-disabled fast path.
+/// Returns the denoised `[out_dim, T, h, w]` (f32). Reduces to [`denoise_vace`] when both experts are
+/// the same transformer with equal guidance.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_vace_moe(
+    low: &WanVaceTransformer,
+    high: &WanVaceTransformer,
+    control: &Array,
+    scales: &[f32],
+    kind: SolverKind,
+    num_train_timesteps: usize,
+    steps: usize,
+    shift: f32,
+    boundary_timestep: f32,
+    guidance_low: f32,
+    guidance_high: f32,
+    ctx_cond: &Array,
+    ctx_uncond: Option<&Array>,
+    init_noise: &Array,
+    cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
+) -> Result<Array> {
+    let mut sched = make_scheduler(kind, num_train_timesteps);
+    sched.set_timesteps(steps, shift);
+    let timesteps: Vec<f32> = sched.timesteps().to_vec();
+
+    // Hoist the step-invariant work out of the loop (F-023), per expert: each expert's RoPE +
+    // patch-embedded control latent (its `vace_patch_embedding` differs) and its projected text
+    // contexts (its `text_embedder` differs). The RoPE grid is shared (same latent shape) but cheap
+    // to build twice; keeping the caches fully per-expert mirrors `denoise_moe`'s `build_cache`.
+    let low_cache = low.build_vace_cache(init_noise, control)?;
+    let high_cache = high.build_vace_cache(init_noise, control)?;
+    let low_cond = low.text_embed(ctx_cond)?;
+    let high_cond = high.text_embed(ctx_cond)?;
+    let low_uncond = ctx_uncond.map(|u| low.text_embed(u)).transpose()?;
+    let high_uncond = ctx_uncond.map(|u| high.text_embed(u)).transpose()?;
+    mlx_rs::transforms::eval([
+        &low_cache.cos_t,
+        &low_cache.sin_t,
+        &low_cache.control_emb,
+        &high_cache.control_emb,
+        &low_cond,
+        &high_cond,
+    ])?;
+
+    let mut latents = init_noise.clone();
+    for (i, &t) in timesteps.iter().enumerate() {
+        // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        // Boundary swap: high-noise expert at/above the boundary, low-noise below — switching the
+        // transformer, its cache, its projected contexts, and its guidance together.
+        let (dit, cache, cond_emb, uncond_emb, guidance) = if t >= boundary_timestep {
+            (high, &high_cache, &high_cond, &high_uncond, guidance_high)
+        } else {
+            (low, &low_cache, &low_cond, &low_uncond, guidance_low)
+        };
+        let cond = dit.forward_vace_cached(&latents, t, cache, cond_emb, scales)?;
+        let pred = match uncond_emb {
+            Some(uncond_emb) => {
+                let uncond = dit.forward_vace_cached(&latents, t, cache, uncond_emb, scales)?;
+                add(
+                    &uncond,
+                    &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
+                )?
+            }
+            None => cond,
+        };
+        latents = sched.step(&pred, &latents)?;
+        mlx_rs::transforms::eval([&latents])?;
+        on_step(i + 1);
+    }
+    Ok(latents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
