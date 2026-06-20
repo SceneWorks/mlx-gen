@@ -97,9 +97,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// **Enabled by the production denoise loops** ([`pipeline::denoise`] / [`pipeline::denoise_av`]);
 /// **off by default** so the reference-parity gates run eager. Dtype-preserving (the closures cast
 /// nothing) — the f32 / bf16 / quantized compute paths flow through unchanged.
+///
+/// **Concurrency / single-job invariant (F-007, matches core `mlx_gen::nn` + z-image/qwen):** this is
+/// a process-global `AtomicBool` shared by every in-process render; the `Relaxed` ordering and the
+/// [`CompileGlueGuard`] scoping below are correct only under the one-job-per-thread /
+/// `RUST_TEST_THREADS=1` model — one render on the shared MLX device at a time. A future concurrent
+/// caller would need `SeqCst` + strict per-call scoping (mirroring the thread-local `RopeMemo`);
+/// revisit before adding one.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; prefer the scoped
+/// [`CompileGlueGuard`] in production (the raw setter is for the A/B parity/perf gates).
 pub fn set_compile_glue(on: bool) {
     COMPILE_GLUE.store(on, Ordering::Relaxed);
 }

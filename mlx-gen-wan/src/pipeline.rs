@@ -447,8 +447,9 @@ pub fn denoise(
 
     // sc-2957: run the DiT's fusable elementwise glue (adaLN affine, gated residual, gated-GELU FFN,
     // RoPE rotation) through `mx.compile` — bit-exact (proven `max|Δ|=0` real + tiny, perf.rs /
-    // compile_parity.rs) and ~14% faster/step at production geometry. Process-global, idempotent.
-    crate::transformer::set_compile_glue(true);
+    // compile_parity.rs) and ~14% faster/step at production geometry. Scoped + restored on drop by the
+    // RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context are constant across steps).
     let grid = transformer.patch_grid(init_noise);
@@ -534,8 +535,9 @@ pub fn denoise_ti2v(
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
     // sc-2957: compile the DiT's fusable elementwise glue (bit-exact, ~14% faster/step). The per-token
-    // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once; process-global.
-    crate::transformer::set_compile_glue(true);
+    // modulation shapes differ from T2V's, so `mx.compile` simply re-traces them once. Scoped +
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute the RoPE + cross-K/V caches once (grid + context constant across steps), exactly like
     // [`denoise`]. The per-token timesteps change each step (the only per-step DiT input besides the
@@ -606,8 +608,9 @@ pub fn denoise_moe(
     sched.set_timesteps(steps, shift);
     let timesteps: Vec<f32> = sched.timesteps().to_vec();
 
-    // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`.
-    crate::transformer::set_compile_glue(true);
+    // sc-2957: compiled elementwise glue (bit-exact, ~14% faster/step) — see `denoise`. Scoped +
+    // restored on drop by the RAII guard (F-006/F-007) instead of leaking the process-global on.
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
     // Precompute each expert's RoPE + cross-K/V caches once (the grid is shared — the channel-concat
     // `y` doesn't change F/H/W — and each expert's contexts are constant across steps).

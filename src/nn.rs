@@ -112,7 +112,17 @@ impl TokenEmbedding {
 /// default so reference-parity gates run eager.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
-/// Enable/disable the compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+/// Enable/disable the compiled elementwise glue (sc-2963).
+///
+/// **Process-global scope (F-007):** this flips a single process-wide `AtomicBool` that changes the
+/// numeric path of [`gated`] / [`rope_rotate`] / [`modulate`] for **every** model in the process,
+/// for whoever reads it next. It is correct only under the single-job-per-thread /
+/// `RUST_TEST_THREADS=1` invariant (one render on the shared MLX device at a time); there is no
+/// per-call or per-thread scoping. In production prefer the RAII [`CompileGlueGuard`] over a bare
+/// `set_compile_glue(true)`: the guard restores the prior value on drop (even on an early `?`), so the
+/// toggle is scoped to the render instead of leaking on process-wide — the footgun this setter is.
+/// The raw setter is for the `compile_parity` / `perf` A/B gates, which toggle it directly under the
+/// single-thread test runner.
 pub fn set_compile_glue(on: bool) {
     COMPILE_GLUE.store(on, Ordering::Relaxed);
 }
@@ -120,6 +130,36 @@ pub fn set_compile_glue(on: bool) {
 /// Whether the compiled elementwise glue is currently enabled.
 pub fn compile_glue() -> bool {
     COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// RAII guard that enables the compiled elementwise glue for its lifetime and **restores the prior
+/// [`COMPILE_GLUE`] value on drop** — even on an early `?` return. This is the one shared guard the
+/// per-family transformers were each hand-rolling (F-007); bind one at the top of a denoise loop
+/// (`let _g = CompileGlueGuard::enable();`) so the process-global toggle is scoped to the render and
+/// code that runs afterward — notably the reference-parity gates, which must run eager — sees the
+/// prior value rather than the leaked-on state a bare [`set_compile_glue`]`(true)` leaves behind.
+///
+/// Process-wide like the toggle it wraps: it scopes *when* the global is on, not *which thread* sees
+/// it, so it inherits the single-job-per-thread / `RUST_TEST_THREADS=1` invariant documented on
+/// [`set_compile_glue`]. A future concurrent caller would need `SeqCst` + strict per-call scoping.
+#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
+pub struct CompileGlueGuard {
+    prev: bool,
+}
+
+impl CompileGlueGuard {
+    /// Turn compiled glue on, remembering the prior value to restore on drop.
+    pub fn enable() -> Self {
+        Self {
+            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for CompileGlueGuard {
+    fn drop(&mut self) {
+        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
+    }
 }
 
 /// Gated residual `x + gate·y` (`gate` pre-broadcast). One fused kernel when [`compile_glue`] is on;
@@ -478,6 +518,29 @@ mod tests {
             f32_one.as_dtype(Dtype::Float32).unwrap().item::<f32>(),
             "the dtype policy for the literal 1 must actually change the result"
         );
+    }
+
+    #[test]
+    fn compile_glue_guard_scopes_and_restores() {
+        // F-007: the shared RAII guard enables compiled glue for its scope and restores the PRIOR
+        // value on drop. The single-thread runner (`RUST_TEST_THREADS=1`) makes the process-global
+        // `COMPILE_GLUE` safe to assert on, matching the A/B test above.
+        set_compile_glue(false);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue(), "guard enables compiled glue for its scope");
+        }
+        assert!(!compile_glue(), "guard restores the prior (off) on drop");
+
+        // Restores the *prior* value, not a hardcoded false: a prior `on` stays on after drop.
+        set_compile_glue(true);
+        {
+            let _g = CompileGlueGuard::enable();
+            assert!(compile_glue());
+        }
+        assert!(compile_glue(), "guard restores the prior (on) on drop");
+
+        set_compile_glue(false); // leave the global eager, as the reference-parity gates expect
     }
 
     #[test]

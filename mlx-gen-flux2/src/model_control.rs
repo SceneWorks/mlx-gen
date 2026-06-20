@@ -280,8 +280,9 @@ impl Flux2DevControl {
             _ => None,
         };
 
-        // Compiled elementwise glue (sc-2963), shared with the base flux2 path.
-        crate::transformer::set_compile_glue(true);
+        // Compiled elementwise glue (sc-2963), shared with the base flux2 path. Scoped + restored on
+        // drop by the RAII guard (F-007) instead of leaking the process-global toggle on.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {

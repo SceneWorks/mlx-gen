@@ -215,9 +215,9 @@ impl Chroma {
         let sampler_kind = ChromaSamplerKind::Euler;
 
         // Enable the shared `mx.compile` fusion of the DiT's elementwise glue (adaLN modulate + gated
-        // residuals) for the denoise loop, matching FLUX.1/FLUX.2 (F-101/F-102). Process-global +
-        // idempotent; the fused helpers stay bit-exact to the eager ops.
-        crate::transformer::set_compile_glue(true);
+        // residuals) for the denoise loop, matching FLUX.1/FLUX.2 (F-101/F-102). Scoped + restored on
+        // drop by the RAII guard (F-007); the fused helpers stay bit-exact to the eager ops.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
         // The RoPE table and the additive `[B,1,S,S]` mask are step-invariant (they depend only on the
         // token positions / padding, not the timestep), so build them once per branch instead of every
@@ -292,7 +292,8 @@ impl Chroma {
         };
         let sampler = FlowMatchSampler::new(sigmas);
 
-        crate::transformer::set_compile_glue(true);
+        // Scoped compiled-glue enable (F-007): restored on drop instead of leaking the global on.
+        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
         let rope_pos = tr.build_rope_table(&txt_ids_pos, &img_ids)?;
         let mask_pos2d = ChromaTransformer::attention_mask2d(Some(&mask_pos))?;

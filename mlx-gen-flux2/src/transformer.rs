@@ -39,7 +39,7 @@ const RMS_EPS: f32 = 1e-5;
 // (F-101) so FLUX.1/FLUX.2 share one implementation. Re-export the toggle as this crate's public API;
 // FLUX.2's modulate keeps a strong f32 `1` via `one_matches_scale = false`. SwiGLU stays crate-specific.
 use mlx_gen::nn::compile_glue;
-pub use mlx_gen::nn::set_compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// Wrap a stored `[out, in]` weight as a bias-less [`AdaptableLinear`] (every FLUX.2 transformer
 /// projection is bias-less). With `quant == None` this is the dense path (`matmul(x, wᵀ)`,

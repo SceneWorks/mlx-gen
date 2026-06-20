@@ -15,10 +15,12 @@
 //! sequence mask is sc-3838; the generate path is sc-3839.
 
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear};
+use mlx_gen::nn::{gated, gelu_tanh, silu};
 /// Re-exported so the model's denoise loop can enable the shared `mx.compile` fusion of the DiT's
 /// elementwise glue (adaLN modulate + gated residuals), matching FLUX.1/FLUX.2 (F-101/F-102).
-pub use mlx_gen::nn::set_compile_glue;
-use mlx_gen::nn::{gated, gelu_tanh, silu};
+/// [`CompileGlueGuard`] is the RAII form the production denoise binds so the toggle is restored on
+/// drop (F-007) instead of leaking the process-global on.
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};

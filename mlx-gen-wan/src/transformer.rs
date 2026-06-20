@@ -54,13 +54,40 @@ use crate::text_encoder::gelu_tanh;
 /// so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
-/// Enable/disable compiled elementwise glue (sc-2957). Process-global; set before the denoise loop.
+/// Enable/disable compiled elementwise glue (sc-2957). Process-global; prefer the scoped
+/// [`CompileGlueGuard`] in production (the raw setter is for the A/B `compile_parity`/`perf` gates).
 pub fn set_compile_glue(on: bool) {
     COMPILE_GLUE.store(on, Ordering::Relaxed);
 }
 
 pub(crate) fn compile_glue() -> bool {
     COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// RAII guard (F-006/F-007, mirroring core `mlx_gen::nn::CompileGlueGuard` and z-image's) that enables
+/// compiled glue for its lifetime and **restores the prior [`COMPILE_GLUE`] value on drop** — even on
+/// an early `?`. The production denoise loops ([`denoise`](crate::pipeline::denoise) /
+/// [`denoise_moe`](crate::pipeline::denoise_moe)) bind one across the render so the toggle is scoped,
+/// not left stuck `true` process-wide, and same-process eager code (the `compile_parity`/`perf` gates)
+/// sees the restored value.
+#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
+pub(crate) struct CompileGlueGuard {
+    prev: bool,
+}
+
+impl CompileGlueGuard {
+    /// Turn compiled glue on, remembering the prior value to restore on drop.
+    pub(crate) fn enable() -> Self {
+        Self {
+            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for CompileGlueGuard {
+    fn drop(&mut self) {
+        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
+    }
 }
 
 /// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The

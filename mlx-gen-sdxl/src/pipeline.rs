@@ -326,8 +326,9 @@ fn denoise_core(
     }
     // sc-2963 (rollout of sc-2957): fuse the UNet's SiLU activations via `mx.compile` — bit-exact in
     // fp16 (`max|Δ|=0`, compile_parity.rs), so it does not move the precision-load-bearing fp16
-    // golden. The GELU/GEGLU activations are already compiled (sc-2721). Process-global, idempotent.
-    crate::set_compile_glue(true);
+    // golden. The GELU/GEGLU activations are already compiled (sc-2721). Scoped + restored on drop by
+    // the RAII guard (F-006/F-007) instead of leaking the process-global toggle on.
+    let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
     for i in 0..steps {

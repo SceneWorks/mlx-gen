@@ -30,7 +30,7 @@ const RMS_EPS: f32 = 1e-5;
 // the per-family dtype policy (FLUX.1 casts the modulate `1` to scale's dtype, sc-2787) is the
 // `one_matches_scale = true` argument below. The tanh-GELU FFN glue (`gelu_ffn`) stays crate-specific.
 use mlx_gen::nn::compile_glue;
-pub use mlx_gen::nn::set_compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// adaLN affine `normed·(1+scale)+shift` — FLUX.1 casts the `1` to `scale`'s dtype (bf16-coarse,
 /// sc-2787). Forwards to the shared [`mlx_gen::nn::modulate`].

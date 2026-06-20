@@ -81,13 +81,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// ([`pipeline::denoise`]); **off by default**.
 static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
 
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
+/// Enable/disable compiled elementwise glue (sc-2963). Process-global; prefer the scoped
+/// [`CompileGlueGuard`] in production (the raw setter is for the A/B `compile_parity`/`perf` gates).
 pub fn set_compile_glue(on: bool) {
     COMPILE_GLUE.store(on, Ordering::Relaxed);
 }
 
 pub(crate) fn compile_glue() -> bool {
     COMPILE_GLUE.load(Ordering::Relaxed)
+}
+
+/// RAII guard (F-006/F-007, mirroring core `mlx_gen::nn::CompileGlueGuard` and z-image's) that enables
+/// compiled glue for its lifetime and **restores the prior [`COMPILE_GLUE`] value on drop** — even on
+/// an early `?`. The production [`pipeline::denoise`](crate::pipeline::denoise) binds one across the
+/// render so the toggle is scoped, not left stuck `true` process-wide, and same-process eager code
+/// (the `compile_parity`/`perf` gates) sees the restored value.
+#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
+pub(crate) struct CompileGlueGuard {
+    prev: bool,
+}
+
+impl CompileGlueGuard {
+    /// Turn compiled glue on, remembering the prior value to restore on drop.
+    pub(crate) fn enable() -> Self {
+        Self {
+            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for CompileGlueGuard {
+    fn drop(&mut self) {
+        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
+    }
 }
 
 /// SiLU `x·sigmoid(x)` — one fused kernel when the sc-2963 glue toggle is on, else the eager core

@@ -349,8 +349,9 @@ pub fn denoise_with_progress(
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): run the MMDiT's fusable elementwise glue (adaLN affine, gated
     // residual, tanh-GELU FFN, RoPE rotation) through `mx.compile` — bit-exact (`max|Δ|=0`,
-    // compile_parity.rs) and a per-step win at production geometry. Process-global, idempotent.
-    crate::transformer::set_compile_glue(true);
+    // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
+    // RAII guard (F-006) instead of leaking the process-global toggle on.
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total = (sampler.num_steps() - start_step) as u32;
@@ -407,7 +408,9 @@ pub fn denoise_control_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    crate::transformer::set_compile_glue(true);
+    // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
+    // by the RAII guard (F-006) instead of leaking the process-global toggle on.
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     // Control is pose-only T2I — there is no img2img-with-control path, so the loop always runs
@@ -488,8 +491,8 @@ pub fn denoise_edit_with_progress(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
-    // `denoise_with_progress`. Bit-exact, process-global, idempotent.
-    crate::transformer::set_compile_glue(true);
+    // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
+    let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
     let total = sampler.num_steps() as u32;
