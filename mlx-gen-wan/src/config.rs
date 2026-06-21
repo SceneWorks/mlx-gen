@@ -46,6 +46,29 @@ impl GuideScale {
             GuideScale::Dual { low, high } => low <= 1.0 && high <= 1.0,
         }
     }
+
+    /// Resolve a request's optional scalar override against this config scale for a **single-model**
+    /// (dense) run: an explicit `req_guidance` wins; otherwise the representative [`effective`] scale
+    /// (a config `Dual` collapses to its `low`, which is unreachable for the dense models that take
+    /// this path). The single-guidance resolution shared by the dense 5B and single-expert VACE
+    /// generate paths (F-010).
+    ///
+    /// [`effective`]: GuideScale::effective
+    pub fn resolve_single(self, req_guidance: Option<f32>) -> f32 {
+        req_guidance.unwrap_or_else(|| self.effective())
+    }
+
+    /// Resolve a request's optional scalar override against this config scale for a **dual-expert**
+    /// (MoE) run: an explicit scalar `req_guidance` overrides **both** experts; otherwise the config
+    /// `(low, high)` pair, with a config `Single(s)` broadcasting to `(s, s)`. The dual-guidance
+    /// resolution shared verbatim by the A14B MoE and dual-expert VACE-Fun generate paths (F-010).
+    pub fn resolve_dual(self, req_guidance: Option<f32>) -> (f32, f32) {
+        match (self, req_guidance) {
+            (_, Some(g)) => (g, g),
+            (GuideScale::Dual { low, high }, None) => (low, high),
+            (GuideScale::Single(s), None) => (s, s),
+        }
+    }
 }
 
 /// A pre-quantized snapshot's quantization manifest (`config.json`'s `quantization` block, written by
@@ -677,6 +700,57 @@ fn set_usize3(v: &Value, key: &str, slot: &mut (usize, usize, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guide_scale_resolve_single_matches_inline_match() {
+        // resolve_single must equal the verbose `match (cfg, req)` the dense 5B path used inline.
+        let inline = |scale: GuideScale, req: Option<f32>| match (scale, req) {
+            (_, Some(g)) => g,
+            (GuideScale::Single(s), None) => s,
+            (GuideScale::Dual { low, .. }, None) => low,
+        };
+        for scale in [
+            GuideScale::Single(5.0),
+            GuideScale::Dual {
+                low: 3.0,
+                high: 4.0,
+            },
+        ] {
+            for req in [None, Some(7.5), Some(1.0)] {
+                assert_eq!(
+                    scale.resolve_single(req),
+                    inline(scale, req),
+                    "resolve_single({scale:?}, {req:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guide_scale_resolve_dual_matches_inline_match() {
+        // resolve_dual must equal the byte-identical `match (cfg, req)` the A14B / VACE-Fun MoE
+        // paths used inline (an explicit scalar overrides both; a config Single broadcasts).
+        let inline = |scale: GuideScale, req: Option<f32>| match (scale, req) {
+            (_, Some(g)) => (g, g),
+            (GuideScale::Dual { low, high }, None) => (low, high),
+            (GuideScale::Single(s), None) => (s, s),
+        };
+        for scale in [
+            GuideScale::Single(5.0),
+            GuideScale::Dual {
+                low: 3.0,
+                high: 4.0,
+            },
+        ] {
+            for req in [None, Some(7.5), Some(1.0)] {
+                assert_eq!(
+                    scale.resolve_dual(req),
+                    inline(scale, req),
+                    "resolve_dual({scale:?}, {req:?})"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ti2v_5b_preset_matches_reference() {

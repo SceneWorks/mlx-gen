@@ -27,7 +27,7 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
+    gen_core, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision,
     Progress, Quant, Result, WeightsSource,
 };
@@ -35,11 +35,11 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
-use crate::config::{GuideScale, WanVaceConfig};
+use crate::config::WanVaceConfig;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
+    resolve_sampler_knobs,
 };
-use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, prepare_masks, prepare_video_latents,
@@ -265,16 +265,12 @@ impl WanVace {
         let clip = req.control_clip().expect("validated present");
 
         // --- Resolve knobs ---
+        // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
         let width = align_dim(req.width, base.patch_size.2, VAE_S);
         let height = align_dim(req.height, base.patch_size.1, VAE_S);
-        let steps = req.steps.map(|s| s as usize).unwrap_or(base.sample_steps);
-        let shift = req.scheduler_shift.unwrap_or(base.sample_shift);
-        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
-        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
-        let seed = req.seed.unwrap_or_else(default_seed);
-        let guidance = req
-            .guidance
-            .unwrap_or_else(|| base.sample_guide_scale.effective());
+        let (steps, shift, kind, seed) =
+            resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
+        let guidance = base.sample_guide_scale.resolve_single(req.guidance);
         let cfg_disabled = guidance <= 1.0;
         let neg_prompt = req
             .negative_prompt
@@ -536,18 +532,13 @@ impl WanVaceFun {
         let clip = req.control_clip().expect("validated present");
 
         // --- Resolve knobs ---
+        // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
         let width = align_dim(req.width, base.patch_size.2, VAE_S);
         let height = align_dim(req.height, base.patch_size.1, VAE_S);
-        let steps = req.steps.map(|s| s as usize).unwrap_or(base.sample_steps);
-        let shift = req.scheduler_shift.unwrap_or(base.sample_shift);
-        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
-        let seed = req.seed.unwrap_or_else(default_seed);
+        let (steps, shift, kind, seed) =
+            resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise the config (low, high) pair.
-        let (low_gs, high_gs) = match (base.sample_guide_scale, req.guidance) {
-            (_, Some(g)) => (g, g),
-            (GuideScale::Dual { low, high }, None) => (low, high),
-            (GuideScale::Single(s), None) => (s, s),
-        };
+        let (low_gs, high_gs) = base.sample_guide_scale.resolve_dual(req.guidance);
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
         let neg_prompt = req
             .negative_prompt

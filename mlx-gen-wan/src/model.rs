@@ -18,22 +18,22 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    default_seed, gen_core, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    MoeExpert, Precision, Progress, Quant, Result, WeightsSource,
+    gen_core, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::random;
 use mlx_rs::Array;
 
 use crate::adapters::{merge_wan_adapters, warn_skipped_adapters};
-use crate::config::{GuideScale, WanModelConfig};
+use crate::config::WanModelConfig;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, best_output_size, build_i2v_y,
     build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
     decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images, latent_shape,
-    preflight_denoise_memory_guard, preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
+    preflight_denoise_memory_guard, preprocess_ti2v_image, resolve_sampler_knobs, seq_len,
+    ti2v_blend_init, Expert,
 };
-use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
 use crate::transformer::WanTransformer;
 use crate::vae::WanVae;
@@ -239,25 +239,11 @@ impl Wan {
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
         let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
         let gen_frames = frames + trim_out;
-        let mut width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let mut height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
-        // Enforce the model's max-area cap (704×1280) with an aspect-preserving, grid-aligned fit.
-        if cfg.max_area > 0 && (width as usize) * (height as usize) > cfg.max_area {
-            let dw = (cfg.patch_size.2 * cfg.vae_stride.2) as u32;
-            let dh = (cfg.patch_size.1 * cfg.vae_stride.1) as u32;
-            (width, height) = best_output_size(width, height, dw, dh, cfg.max_area);
-        }
-        let steps = req.steps.map(|s| s as usize).unwrap_or(cfg.sample_steps);
-        let shift = req.scheduler_shift.unwrap_or(cfg.sample_shift);
-        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
-        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
-        let seed = req.seed.unwrap_or_else(default_seed);
+        let (width, height) = resolve_capped_dims(req, cfg);
+        let (steps, shift, kind, seed) =
+            resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // The 5B is dense → a single guidance scale (config Single(5.0), overridable per request).
-        let guidance = match (cfg.sample_guide_scale, req.guidance) {
-            (_, Some(g)) => g,
-            (GuideScale::Single(s), None) => s,
-            (GuideScale::Dual { low, .. }, None) => low, // unreachable for the dense 5B
-        };
+        let guidance = cfg.sample_guide_scale.resolve_single(req.guidance);
         let cfg_disabled = guidance <= 1.0;
         let neg_prompt = req
             .negative_prompt
@@ -703,27 +689,13 @@ impl Wan14b {
         let trim = req.trim_first_frames.unwrap_or(0) as usize;
         let trim_out = trim * cfg.vae_stride.0; // discarded output frames = trim · 4
         let gen_frames = frames + trim * cfg.vae_stride.0;
-        // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid.
-        let mut width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
-        let mut height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
-        // Enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280) with an aspect-preserving,
-        // grid-aligned fit (no-op for T2V, whose `max_area` is 0). Mirrors `generate_wan.py`.
-        if cfg.max_area > 0 && (width as usize) * (height as usize) > cfg.max_area {
-            let dw = (cfg.patch_size.2 * cfg.vae_stride.2) as u32;
-            let dh = (cfg.patch_size.1 * cfg.vae_stride.1) as u32;
-            (width, height) = best_output_size(width, height, dw, dh, cfg.max_area);
-        }
-        let steps = req.steps.map(|s| s as usize).unwrap_or(cfg.sample_steps);
-        let shift = req.scheduler_shift.unwrap_or(cfg.sample_shift);
-        // Unset → UniPC (the reference default); `validate` has already rejected any unadvertised name.
-        let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
-        let seed = req.seed.unwrap_or_else(default_seed);
+        // validate() already rejected sub-tile + bad frame counts; round H/W down to the grid, then
+        // enforce the model's max-area cap (I2V-14B / TI2V-5B: 704×1280; no-op for T2V's max_area 0).
+        let (width, height) = resolve_capped_dims(req, cfg);
+        let (steps, shift, kind, seed) =
+            resolve_sampler_knobs(req, cfg.sample_steps, cfg.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise use the config (low, high).
-        let (low_gs, high_gs) = match (cfg.sample_guide_scale, req.guidance) {
-            (_, Some(g)) => (g, g),
-            (GuideScale::Dual { low, high }, None) => (low, high),
-            (GuideScale::Single(s), None) => (s, s),
-        };
+        let (low_gs, high_gs) = cfg.sample_guide_scale.resolve_dual(req.guidance);
         let neg_prompt = req
             .negative_prompt
             .clone()
@@ -919,6 +891,22 @@ fn i2v_reference(req: &GenerationRequest) -> Option<&Image> {
     })
 }
 
+/// Resolve the output `(width, height)` for a **dense** Wan path (5B TI2V, A14B): round the requested
+/// dims down to the `patch · vae_stride` grid, then enforce the model's `max_area` cap (I2V-14B /
+/// TI2V-5B: 704×1280) with an aspect-preserving, grid-aligned fit (`generate_wan.py`'s
+/// `_best_output_size`). A no-op cap for T2V (`max_area == 0`). Byte-identical block shared by the two
+/// dense `generate_impl` bodies (F-010); the VACE paths align differently (no cap) and don't use this.
+fn resolve_capped_dims(req: &GenerationRequest, cfg: &WanModelConfig) -> (u32, u32) {
+    let mut width = align_dim(req.width, cfg.patch_size.2, cfg.vae_stride.2);
+    let mut height = align_dim(req.height, cfg.patch_size.1, cfg.vae_stride.1);
+    if cfg.max_area > 0 && (width as usize) * (height as usize) > cfg.max_area {
+        let dw = (cfg.patch_size.2 * cfg.vae_stride.2) as u32;
+        let dh = (cfg.patch_size.1 * cfg.vae_stride.1) as u32;
+        (width, height) = best_output_size(width, height, dw, dh, cfg.max_area);
+    }
+    (width, height)
+}
+
 /// Stable identity + advertised capabilities for the Wan2.2 I2V-A14B (dual-expert MoE image→video).
 /// Identical to the T2V-A14B but advertises a single `Reference` conditioning image (the channel-
 /// concat first frame) and the (3.5, 3.5) per-expert guidance.
@@ -1008,4 +996,51 @@ fn load_i2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generato
 
 inventory::submit! {
     mlx_gen::ModelRegistration { descriptor: descriptor_i2v_14b, load: load_i2v_14b_registered }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(width: u32, height: u32) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "x".into(),
+            width,
+            height,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_capped_dims_aligns_down_without_cap() {
+        // T2V config has max_area == 0 (no cap): only the grid round-down applies. 14B aligns to
+        // patch.{1,2}·vae_stride.{1,2} = 2·8 = 16, so 130 → 128 on both axes.
+        let cfg = WanModelConfig::wan22_t2v_14b();
+        assert_eq!(cfg.max_area, 0);
+        assert_eq!(resolve_capped_dims(&req(130, 130), &cfg), (128, 128));
+        // Already on-grid + under any area → unchanged.
+        assert_eq!(resolve_capped_dims(&req(128, 256), &cfg), (128, 256));
+    }
+
+    #[test]
+    fn resolve_capped_dims_enforces_max_area_cap() {
+        // The 5B (704×1280 cap, align 2·16 = 32) shrinks an over-area request, preserving aspect and
+        // the 32-grid; a request already under the cap is only aligned, never enlarged.
+        let cfg = WanModelConfig::wan22_ti2v_5b();
+        let align = (cfg.patch_size.1 * cfg.vae_stride.1) as u32; // 32
+        let (w, h) = resolve_capped_dims(&req(2048, 2048), &cfg);
+        assert!(
+            (w as usize) * (h as usize) <= cfg.max_area,
+            "capped {w}x{h} must fit max_area {}",
+            cfg.max_area
+        );
+        assert_eq!(
+            (w % align, h % align),
+            (0, 0),
+            "capped dims stay grid-aligned"
+        );
+        assert!(w < 2048 && h < 2048, "over-area request must shrink");
+        // Under-cap request: align-only, no enlargement.
+        assert_eq!(resolve_capped_dims(&req(512, 512), &cfg), (512, 512));
+    }
 }

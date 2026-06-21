@@ -20,7 +20,7 @@ use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
-use mlx_gen::{CancelFlag, Error, Image, Result};
+use mlx_gen::{default_seed, CancelFlag, Error, GenerationRequest, Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
 use crate::transformer::WanTransformer;
@@ -36,6 +36,24 @@ fn scalar(v: f32) -> Array {
 pub fn align_dim(value: u32, patch: usize, stride: usize) -> u32 {
     let align = (patch * stride) as u32;
     (value / align) * align
+}
+
+/// Resolve the sampler-loop knobs shared **byte-identically** by every Wan generate path (dense 5B,
+/// A14B MoE, single- and dual-expert VACE): the step count, scheduler shift, solver kind, and seed
+/// (F-010). Each falls back to the config default when the request leaves it unset; an unset sampler
+/// maps to UniPC (the `generate_wan.py` default — `validate` has already rejected any unadvertised
+/// name), and an unset seed draws a fresh [`default_seed`] so repeated calls vary. The four return
+/// types are distinct, so a mis-ordered destructure at a call site is a compile error.
+pub fn resolve_sampler_knobs(
+    req: &GenerationRequest,
+    steps_default: usize,
+    shift_default: f32,
+) -> (usize, f32, SolverKind, u64) {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(steps_default);
+    let shift = req.scheduler_shift.unwrap_or(shift_default);
+    let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
+    let seed = req.seed.unwrap_or_else(default_seed);
+    (steps, shift, kind, seed)
 }
 
 /// Latent shape `[z_dim, t_lat, h_lat, w_lat]` for a `frames × H × W` request.
@@ -1082,6 +1100,32 @@ mod tests {
             "56 GiB resident must be rejected under a 32 GiB budget"
         );
         assert!(ok.is_ok(), "11.5 GiB peak must pass under a 32 GiB budget");
+    }
+
+    #[test]
+    fn resolve_sampler_knobs_falls_back_to_defaults_then_request() {
+        // Unset request fields take the config defaults; an unset sampler → UniPC; the seed is some
+        // value (drawn fresh). This is the byte-identical inline block the four generate paths used.
+        let req = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+        let (steps, shift, kind, _seed) = resolve_sampler_knobs(&req, 40, 5.0);
+        assert_eq!(steps, 40);
+        assert_eq!(shift, 5.0);
+        assert_eq!(kind, SolverKind::UniPC);
+
+        // Explicit request fields win over the defaults, and the sampler name maps through.
+        let req = GenerationRequest {
+            prompt: "x".into(),
+            steps: Some(12),
+            scheduler_shift: Some(3.5),
+            sampler: Some("euler".into()),
+            seed: Some(99),
+            ..Default::default()
+        };
+        let (steps, shift, kind, seed) = resolve_sampler_knobs(&req, 40, 5.0);
+        assert_eq!((steps, shift, kind, seed), (12, 3.5, SolverKind::Euler, 99));
     }
 
     // --- sc-4998: memory-budgeted z48 vae22 decode tiling ---------------------------------------
