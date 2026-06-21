@@ -35,6 +35,7 @@ use crate::Result;
 pub mod latent_ops;
 pub mod model_sampling;
 pub mod schedulers;
+pub mod solvers;
 pub mod unified;
 
 pub use latent_ops::{CpuLatentOps, LatentOps};
@@ -45,6 +46,9 @@ pub use model_sampling::{
 pub use schedulers::{
     beta_sigmas, ddim_uniform_sigmas, exponential_sigmas, karras_sigmas, normal_sigmas,
     schedule_sigmas, simple_sigmas, Scheduler,
+};
+pub use solvers::{
+    sampler_by_name, Ddim, Dpmpp2m, DpmppSde, EulerAncestral, Heun, Lcm, Solver, UniPc,
 };
 pub use unified::{apply_coeffs, DenoiseFn, Euler, Sampler};
 
