@@ -62,6 +62,35 @@ pub trait ModelSampling {
     /// Inverse of [`Self::timestep`]: the sigma at a (float) conditioning value. Used to seed the
     /// img2img / video start-step noise blend and to build schedules in timestep space.
     fn sigma(&self, timestep: f32) -> f32;
+
+    /// The number of discrete training-timestep nodes the table-indexed schedulers (simple / ddim /
+    /// beta, sc-7116) sample over — ComfyUI's `len(model_sampling.sigmas)`. Default 1000 (the
+    /// standard DDPM / flow training-step count); the discrete schedule overrides it to its table
+    /// length.
+    fn num_timesteps(&self) -> usize {
+        1000
+    }
+
+    /// The discrete per-node sigma table the table-indexed schedulers sample, ASCENDING
+    /// (`table[0]` ≈ [`Self::sigma_min`] … `table[last]` ≈ [`Self::sigma_max`]). ComfyUI's
+    /// `model_sampling.sigmas`. The default samples [`Self::sigma`] across the conditioning grid
+    /// `[timestep(σ_min) .. timestep(σ_max)]`, which is EXACT for the discrete schedule (where
+    /// `timestep` is an integer index), log-linear for EDM, and a linear `σ` ramp for flow.
+    fn sigma_table(&self) -> Vec<f32> {
+        let n = self.num_timesteps();
+        let t_lo = self.timestep(self.sigma_min());
+        let t_hi = self.timestep(self.sigma_max());
+        (0..n)
+            .map(|i| {
+                let f = if n <= 1 {
+                    0.0
+                } else {
+                    i as f32 / (n - 1) as f32
+                };
+                self.sigma(t_lo + (t_hi - t_lo) * f)
+            })
+            .collect()
+    }
 }
 
 /// Compute a denoised `x0 = denoise(x, σ)` from a `ModelSampling` and a raw-model closure.
@@ -119,7 +148,11 @@ impl ModelSampling for FlowModelSampling {
         PredictionType::Flow
     }
     fn sigma_min(&self) -> f32 {
-        0.0
+        // Smallest POSITIVE scheduled sigma — the flow clean-end node (σ = 0 is the terminal, not a
+        // schedulable sigma). ComfyUI flux derives σ_min from its table's first entry; for the
+        // unshifted flow schedule that is `1/num_timesteps`. Keeps the σ-schedulers (sc-7116) off
+        // `log(0)` and the `normal`/`sgm_uniform` schedules from ending in a spurious second zero.
+        1.0 / self.num_timesteps() as f32
     }
     fn sigma_max(&self) -> f32 {
         1.0
@@ -222,6 +255,9 @@ impl ModelSampling for DiscreteModelSampling {
         let hi = (lo + 1).min(n - 1);
         let w = t - lo as f32;
         (self.log_sigmas[lo] * (1.0 - w) + self.log_sigmas[hi] * w).exp()
+    }
+    fn num_timesteps(&self) -> usize {
+        self.log_sigmas.len()
     }
 }
 
