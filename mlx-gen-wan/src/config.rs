@@ -293,6 +293,11 @@ impl WanModelConfig {
         let dual = v.get("dual_model").and_then(Value::as_bool);
 
         // Preset selection (the reference's auto-detection).
+        // NOTE (sc-6983): the `i2v` arm always resolves to `wan22_i2v_14b` — the SCAIL-2 preset
+        // (`scail2_14b()`, an `in_dim`-20 i2v variant) is intentionally NOT reachable here. It is
+        // constructed explicitly by the `mlx-gen-scail2` crate, which knows it is loading SCAIL-2,
+        // rather than being auto-detected from a generic `config.json` (the in_dim-20 signature
+        // overlaps the standard i2v config, so JSON sniffing could not disambiguate it reliably).
         let mut cfg = if model_type == "ti2v" && dim == 3072 {
             Self::wan22_ti2v_5b()
         } else if model_type == "i2v" {

@@ -107,7 +107,14 @@ impl ChromaSamplerKind {
             Some(DEFAULT_SAMPLER | "flow_match") => Self::Euler,
             None if matches!(variant, ChromaVariant::Flash) => Self::Heun,
             None => Self::Euler,
-            Some(_) => Self::Euler,
+            // `from_request` runs only after `Capabilities::validate_request` (validate_impl), which
+            // rejects any sampler not in the advertised `samplers` list
+            // (`[DEFAULT_SAMPLER, HEUN_SAMPLER, "flow_match"]`) — all handled above. An unknown name
+            // here means validation was bypassed, so make the contract violation loud instead of
+            // silently defaulting to Euler (sc-6983 — removes the second source of truth).
+            Some(other) => unreachable!(
+                "chroma: sampler {other:?} reached from_request unvalidated (validate_request gates it)"
+            ),
         }
     }
 }

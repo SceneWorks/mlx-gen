@@ -106,9 +106,19 @@ pub struct Scail2Job<'a> {
     pub segment_overlap: usize,
 }
 
-/// Round a requested dim down to a multiple of [`DIM_ALIGN`] (min one tile).
+/// Round a requested dim to a multiple of [`DIM_ALIGN`] (down, with a min-one-tile floor — this
+/// differs from wan/bernini's `align_dim`, which has no floor and would yield 0 for a sub-tile
+/// request). The adjustment is **surfaced** (sc-6983) rather than applied silently: a 720→704 crop
+/// is otherwise an invisible behavior change. The caller stays infallible (no reject).
 fn align(value: u32) -> usize {
-    (value / DIM_ALIGN).max(1) as usize * DIM_ALIGN as usize
+    let aligned = (value / DIM_ALIGN).max(1) * DIM_ALIGN;
+    if aligned != value {
+        eprintln!(
+            "scail2: requested dimension {value} is not a multiple of {DIM_ALIGN}; \
+             aligning to the tile grid -> {aligned}"
+        );
+    }
+    aligned as usize
 }
 
 /// Decode an `Image` (RGB24 `u8`) → `[3, th, tw]` f32 in `[-1, 1]`, resizing if its native size

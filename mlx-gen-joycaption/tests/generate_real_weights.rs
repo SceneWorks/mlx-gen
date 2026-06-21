@@ -30,6 +30,7 @@ fn joycaption_generates_short_caption_from_real_weights() {
             top_p: 1.0,
             max_new_tokens: 8,
             seed: None,
+            ..Default::default()
         },
         ..Default::default()
     };

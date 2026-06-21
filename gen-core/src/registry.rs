@@ -82,42 +82,70 @@ pub fn textllms() -> impl Iterator<Item = &'static TextLlmRegistration> {
 }
 
 /// Load a generator by model id (e.g. `"z_image_turbo"`).
+///
+/// The link-time registry is **first-wins** on duplicate ids; a debug-build assertion surfaces a
+/// duplicate registration (a provider-crate mistake) instead of silently shadowing one (sc-6983).
 pub fn load(id: &str, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let reg = generators()
-        .find(|r| (r.descriptor)().id == id)
+    let mut matches = generators().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
         .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate generator id '{id}' registered (first-wins shadows the rest)"
+    );
     (reg.load)(spec)
 }
 
 /// Load a transform by id.
 pub fn load_transform(id: &str, spec: &LoadSpec) -> Result<Box<dyn Transform>> {
-    let reg = transforms()
-        .find(|r| (r.descriptor)().id == id)
+    let mut matches = transforms().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
         .ok_or_else(|| Error::Msg(format!("no transform registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate transform id '{id}' registered (first-wins shadows the rest)"
+    );
     (reg.load)(spec)
 }
 
 /// Load a trainer by model id (e.g. `"z_image_turbo"`) with its (frozen) base model.
 pub fn load_trainer(id: &str, spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let reg = trainers()
-        .find(|r| (r.descriptor)().id == id)
+    let mut matches = trainers().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
         .ok_or_else(|| Error::Msg(format!("no trainer registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate trainer id '{id}' registered (first-wins shadows the rest)"
+    );
     (reg.load)(spec)
 }
 
 /// Load a captioner by model id (e.g. `"joy_caption"`).
 pub fn load_captioner(id: &str, spec: &LoadSpec) -> Result<Box<dyn Captioner>> {
-    let reg = captioners()
-        .find(|r| (r.descriptor)().id == id)
+    let mut matches = captioners().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
         .ok_or_else(|| Error::Msg(format!("no captioner registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate captioner id '{id}' registered (first-wins shadows the rest)"
+    );
     (reg.load)(spec)
 }
 
 /// Load a text-LLM provider by id (e.g. `"prompt_refine"`).
 pub fn load_textllm(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
-    let reg = textllms()
-        .find(|r| (r.descriptor)().id == id)
+    let mut matches = textllms().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
         .ok_or_else(|| Error::Msg(format!("no textllm registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate textllm id '{id}' registered (first-wins shadows the rest)"
+    );
     (reg.load)(spec)
 }
 

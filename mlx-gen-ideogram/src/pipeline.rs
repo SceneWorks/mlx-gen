@@ -419,7 +419,10 @@ impl Ideogram4Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let patch = PATCH * AE_SCALE;
-        // Request-derived: reject as a typed error rather than abort the worker (F-020/L-A).
+        // Request-derived: reject as a typed error rather than abort the worker (F-020/L-A). The
+        // RES_MIN/RES_MAX (256–2048) range is a Generator-layer guarantee (enforced by the shared
+        // `Capabilities` min/max-size in the registered `validate` path, sc-6983); this lower-level
+        // pipeline entry re-checks only the hard multiple-of-`patch` invariant it cannot recover from.
         if !height.is_multiple_of(patch) || !width.is_multiple_of(patch) {
             return Err(Error::Msg(format!(
                 "ideogram: height/width must be multiples of {patch} (got {height}x{width})"

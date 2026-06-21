@@ -86,6 +86,15 @@ pub struct CaptionSampling {
     /// [`default_seed`](crate::generator::default_seed) so repeated calls vary; pass `Some(seed)` to
     /// reproduce an exact caption. (At `temperature == 0` decoding is greedy and the seed is unused.)
     pub seed: Option<u64>,
+    /// CTRL/HF-style repetition penalty applied to recently-emitted tokens (a port-time deviation
+    /// from the reference JoyCaption sampler, added to curb its tendency to loop on long captions).
+    /// `1.0` is a no-op (reference parity); the default `1.05` is the current shipped behavior. Each
+    /// of the last [`repetition_context`](Self::repetition_context) tokens has its logit divided
+    /// (positive) or multiplied (negative) by this factor.
+    pub repetition_penalty: f32,
+    /// Sliding-window size for [`repetition_penalty`](Self::repetition_penalty): how many of the
+    /// most-recently-emitted history tokens the penalty looks back over.
+    pub repetition_context: usize,
 }
 
 impl Default for CaptionSampling {
@@ -95,6 +104,10 @@ impl Default for CaptionSampling {
             top_p: 0.9,
             max_new_tokens: 256,
             seed: None,
+            // Current shipped JoyCaption behavior (`1.05` over a 256-token window). Set
+            // `repetition_penalty = 1.0` for reference-sampler parity.
+            repetition_penalty: 1.05,
+            repetition_context: 256,
         }
     }
 }

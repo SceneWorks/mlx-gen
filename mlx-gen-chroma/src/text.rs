@@ -76,8 +76,14 @@ pub fn transformer_text_mask(input_ids: &Array, pad: i32) -> Result<Array> {
     let (b, l, lens) = real_lengths(input_ids, pad)?;
     let mut out = vec![0f32; b * l];
     for (bi, &len) in lens.iter().enumerate() {
+        // Keep `len` content tokens + one extra padding token (the `_get_t5_prompt_embeds` quirk),
+        // clamped to the row width `l`. `keep = (len + 1).min(l)` makes the boundary explicit and
+        // byte-identical to the previous `i <= len` (which was only correct because the inner loop
+        // bound clamped `i` at `l`; an MLX `arange <= len` op without `.min(l)` would set an
+        // out-of-range `true` when `len == l`).
+        let keep = (len + 1).min(l);
         for (i, slot) in out[bi * l..(bi + 1) * l].iter_mut().enumerate() {
-            *slot = if i <= len { 1.0 } else { 0.0 };
+            *slot = if i < keep { 1.0 } else { 0.0 };
         }
     }
     Ok(Array::from_slice(&out, &[b as i32, l as i32]))

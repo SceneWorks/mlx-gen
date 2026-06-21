@@ -157,6 +157,11 @@ impl BooguPipeline {
     /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
     /// each denoise step. A pre/mid-flight cancellation returns [`Error::Canceled`]; the per-step
     /// `eval` bounds the lazy MLX graph and lets the cancel check interrupt mid-render.
+    ///
+    /// The `RES_MIN`/`RES_MAX` (256–2048) resolution range and the multiple-of-`RES_MULTIPLE`
+    /// constraint are a **Generator-layer guarantee** — enforced by `model::validate_request` (via
+    /// the shared `Capabilities` min/max-size + the explicit multiple check) before this pipeline
+    /// runs. This entry trusts the already-validated [`GenerateOptions`] dims (sc-6983).
     pub fn generate_with_progress(
         &self,
         prompt: &str,
