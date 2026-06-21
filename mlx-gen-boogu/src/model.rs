@@ -11,14 +11,12 @@
 //! so pointing at a pre-quantized snapshot skips the dense transient. A precision override and LoRA
 //! adapters are rejected rather than silently ignored.
 
-use mlx_gen::array::host_i32;
 use mlx_gen::gen_core;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
     Precision, Progress, Quant, Result, WeightsSource,
 };
-use mlx_rs::{Array, Dtype};
 
 use crate::pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 
@@ -315,21 +313,6 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         }
     }
     Ok(())
-}
-
-/// Host-extract the pipeline's `[H, W, 3]` u8 RGB array into an [`Image`]. (Unused by the pipeline's
-/// own `Image`-returning methods; kept for symmetry with the other provider crates / future raw-array
-/// paths.)
-#[allow(dead_code)]
-fn array_to_image(img: &Array) -> Result<Image> {
-    let sh = img.shape();
-    let (h, w) = (sh[0] as u32, sh[1] as u32);
-    let px = host_i32(&img.as_dtype(Dtype::Int32)?)?;
-    Ok(Image {
-        width: w,
-        height: h,
-        pixels: px.into_iter().map(|v| v as u8).collect(),
-    })
 }
 
 /// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral

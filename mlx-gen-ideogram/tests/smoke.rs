@@ -51,7 +51,7 @@ fn smoke_generates_image() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(7.0f32);
     let img = pipe
-        .generate(&ids, h, w, steps, guidance, 0.5, 0)
+        .generate(&ids, h, w, steps, guidance, 0)
         .expect("generate");
     assert_eq!(img.shape(), &[h as i32, w as i32, 3], "image shape");
 

@@ -49,7 +49,6 @@ fn slice_axis(x: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
 const HIDDEN: i32 = 256;
 const NUM_HEADS: i32 = 8;
 const NUM_MASK_TOKENS: i32 = 4; // num_multimask_outputs (3) + 1
-const ATTN_DOWNSAMPLE: i32 = 2;
 const LN_EPS: f32 = 1e-6;
 const INPUT_SIZE: f32 = 1008.0; // image_size
 const STABILITY_DELTA: f32 = 0.05; // dynamic_multimask_stability_delta
@@ -120,8 +119,10 @@ impl FeedForward {
 
 // --- Attention (Sam3TrackerVideoAttention, with q/k/v down-projection) ---------------------------
 
-/// MHA on `[b, n, hidden]` tokens; q/k/v project to `internal = hidden / downsample`, split into
-/// `NUM_HEADS`, SDPA, then `o_proj` back to `hidden`.
+/// MHA on `[b, n, hidden]` tokens; q/k/v project to `internal` (the reference's `hidden /
+/// downsample_rate`, already baked into the loaded projection widths), split into `NUM_HEADS`, SDPA,
+/// then `o_proj` back to `hidden`. The internal width is derived from the loaded weights at forward
+/// time, so no `downsample` parameter is threaded here (sc-6944 dropped the inert arg).
 struct Attention {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -131,8 +132,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn from_weights(w: &Weights, prefix: &str, downsample: i32) -> Result<Self> {
-        let _ = downsample; // head split is derived from the loaded projection width at forward time
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let l = |n: &str| crate::load_linear(w, &join(prefix, n));
         Ok(Self {
             q: l("q_proj")?,
@@ -187,21 +187,13 @@ struct TwoWayBlock {
 impl TwoWayBlock {
     fn from_weights(w: &Weights, prefix: &str, skip_first_layer_pe: bool) -> Result<Self> {
         Ok(Self {
-            self_attn: Attention::from_weights(w, &join(prefix, "self_attn"), 1)?,
+            self_attn: Attention::from_weights(w, &join(prefix, "self_attn"))?,
             norm1: weight_bias(w, &join(prefix, "layer_norm1"))?,
-            cross_t2i: Attention::from_weights(
-                w,
-                &join(prefix, "cross_attn_token_to_image"),
-                ATTN_DOWNSAMPLE,
-            )?,
+            cross_t2i: Attention::from_weights(w, &join(prefix, "cross_attn_token_to_image"))?,
             norm2: weight_bias(w, &join(prefix, "layer_norm2"))?,
             mlp: FeedForward::from_weights(w, &join(prefix, "mlp"), 2, false)?,
             norm3: weight_bias(w, &join(prefix, "layer_norm3"))?,
-            cross_i2t: Attention::from_weights(
-                w,
-                &join(prefix, "cross_attn_image_to_token"),
-                ATTN_DOWNSAMPLE,
-            )?,
+            cross_i2t: Attention::from_weights(w, &join(prefix, "cross_attn_image_to_token"))?,
             norm4: weight_bias(w, &join(prefix, "layer_norm4"))?,
             skip_first_layer_pe,
         })
@@ -262,11 +254,7 @@ impl TwoWayTransformer {
                 TwoWayBlock::from_weights(w, &join(prefix, "layers.0"), true)?,
                 TwoWayBlock::from_weights(w, &join(prefix, "layers.1"), false)?,
             ],
-            final_attn: Attention::from_weights(
-                w,
-                &join(prefix, "final_attn_token_to_image"),
-                ATTN_DOWNSAMPLE,
-            )?,
+            final_attn: Attention::from_weights(w, &join(prefix, "final_attn_token_to_image"))?,
             norm_final: weight_bias(w, &join(prefix, "layer_norm_final_attn"))?,
         })
     }

@@ -212,6 +212,8 @@ pub struct Flux2Config {
     pub head_dim: usize,
     /// Latent channels entering/leaving the transformer = `num_latent_channels * 4` (2×2 patch).
     pub in_channels: usize,
+    /// Reference-config mirror (= `in_channels`); the output projection width is read from the
+    /// loaded weights, so the forward never consumes this. Carried for variant identity / parity.
     pub out_channels: usize,
     /// Text-embedding width entering the joint blocks = `3 * te_hidden_size` (the concat of the
     /// three Qwen3 hidden-state layers). 9b: 12288, 4b: 7680.
@@ -227,13 +229,18 @@ pub struct Flux2Config {
 
     // --- Qwen3 text encoder (consumed in S1; carried here for variant identity) ---
     pub te_hidden_size: usize,
+    /// Qwen3 FFN width; read from the TE weights in S1, so this mirror is variant-identity only.
     pub te_intermediate_size: usize,
     /// Concatenated hidden-state layers forming `prompt_embeds` (`joint_attention_dim` wide).
     pub te_out_layers: [usize; 3],
+    /// Reference prompt-length cap; the encoder bounds sequence length from its inputs, so this
+    /// mirror is variant-identity only (not read by the forward).
     pub max_sequence_length: usize,
 
     // --- VAE / latent geometry ---
     pub num_latent_channels: usize,
+    /// VAE spatial downsample (= 8); the pipeline applies the 8×/16× latent geometry inline, so
+    /// this mirror documents the variant and is not read by the forward.
     pub vae_scale_factor: usize,
 }
 

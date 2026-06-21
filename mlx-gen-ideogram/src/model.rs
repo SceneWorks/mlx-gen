@@ -20,9 +20,9 @@ use mlx_gen::{
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{
-    DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH, DEFAULT_INPAINT_STRENGTH, DEFAULT_MU,
-    DEFAULT_STEPS, DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN,
-    RES_MULTIPLE, TURBO_LORA_FILE, TURBO_LORA_SCALE,
+    DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH, DEFAULT_INPAINT_STRENGTH, DEFAULT_STEPS,
+    DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN, RES_MULTIPLE,
+    TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
 use crate::pipeline::Ideogram4Pipeline;
 
@@ -248,7 +248,6 @@ impl Ideogram4 {
                     req.width,
                     steps,
                     guidance,
-                    DEFAULT_MU,
                     seed,
                     edit,
                     &req.cancel,
@@ -260,7 +259,6 @@ impl Ideogram4 {
                     req.width,
                     steps,
                     guidance,
-                    DEFAULT_MU,
                     seed,
                     &req.cancel,
                     on_progress,

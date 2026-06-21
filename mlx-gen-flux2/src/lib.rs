@@ -61,9 +61,9 @@ pub use model::{
 };
 pub use model_control::{descriptor_dev_control, load_dev_control, Flux2DevControl};
 pub use pipeline::{
-    add_noise_by_interpolation, create_noise, image_seq_len, init_time_step, pack_latents,
-    patchify_latents, prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
-    timesteps_x1000, unpack_latents,
+    add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
+    unpack_latents,
 };
 pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};

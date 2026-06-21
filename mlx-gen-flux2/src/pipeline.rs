@@ -13,11 +13,6 @@ use mlx_gen::{Error, FlowMatchEuler, Result};
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{random, Array};
 
-/// Transformer token-sequence length: `(height/16) · (width/16)`.
-pub fn image_seq_len(width: u32, height: u32) -> usize {
-    ((height / 16) * (width / 16)) as usize
-}
-
 /// 2×2 patchify: `[B, C, H, W]` → `[B, C·4, H/2, W/2]` (the fork's `patchify_latents`).
 /// Folds each 2×2 spatial block into the channel axis; ordering matches the fork exactly.
 pub fn patchify_latents(latents: &Array) -> Result<Array> {
@@ -54,7 +49,8 @@ pub fn pack_latents(latents: &Array) -> Result<Array> {
 }
 
 /// Unpack transformer tokens `[B, seq, C]` back to spatial latents `[B, C, lat_h, lat_w]`,
-/// where `lat_h = height/16`, `lat_w = width/16` (the fork's `unpack_latents`).
+/// where `lat_h = height/16`, `lat_w = width/16` (the fork's `unpack_latents`). The render path
+/// reshapes inline, so this is `pub` for the `s0_parity` test (the inverse-of-`pack_latents` gate).
 pub fn unpack_latents(latents: &Array, width: u32, height: u32) -> Result<Array> {
     let sh = latents.shape();
     if sh.len() != 3 {

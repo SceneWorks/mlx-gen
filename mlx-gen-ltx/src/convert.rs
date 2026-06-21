@@ -654,6 +654,9 @@ pub fn convert_and_assemble(
         manifest["quantized"] = serde_json::Value::Bool(true);
         manifest["quantization_bits"] = serde_json::Value::from(opts.bits);
         manifest["quantization_group_size"] = serde_json::Value::from(opts.group_size);
+        // Reference-snapshot layout only: our loader reads the quant params from `split_model.json`
+        // (above), but the reference emits a sibling `quantize_config.json` (HF convention), so we
+        // mirror it for downstream-tooling compatibility and the convert-parity golden. Not read here.
         write_json(
             out.join("quantize_config.json"),
             &serde_json::json!({"quantization": {"bits": opts.bits, "group_size": opts.group_size}}),

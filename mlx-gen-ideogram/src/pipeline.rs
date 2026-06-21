@@ -309,11 +309,10 @@ impl Ideogram4Pipeline {
         width: u32,
         num_steps: usize,
         guidance: f32,
-        mu: f64,
         seed: u64,
     ) -> Result<Array> {
         let ids = self.tokenize(prompt)?;
-        self.generate(&ids, height, width, num_steps, guidance, mu, seed)
+        self.generate(&ids, height, width, num_steps, guidance, seed)
     }
 
     /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
@@ -327,7 +326,6 @@ impl Ideogram4Pipeline {
         width: u32,
         num_steps: usize,
         guidance: f32,
-        mu: f64,
         seed: u64,
     ) -> Result<Array> {
         self.generate_with_progress(
@@ -336,7 +334,6 @@ impl Ideogram4Pipeline {
             width,
             num_steps,
             guidance,
-            mu,
             seed,
             &CancelFlag::new(),
             &mut |_| {},
@@ -357,7 +354,6 @@ impl Ideogram4Pipeline {
         width: u32,
         num_steps: usize,
         guidance: f32,
-        mu: f64,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -368,7 +364,6 @@ impl Ideogram4Pipeline {
             width,
             num_steps,
             guidance,
-            mu,
             seed,
             None,
             cancel,
@@ -389,7 +384,6 @@ impl Ideogram4Pipeline {
         width: u32,
         num_steps: usize,
         guidance: f32,
-        mu: f64,
         seed: u64,
         edit: &EditInit,
         cancel: &CancelFlag,
@@ -401,7 +395,6 @@ impl Ideogram4Pipeline {
             width,
             num_steps,
             guidance,
-            mu,
             seed,
             Some(edit),
             cancel,
@@ -420,7 +413,6 @@ impl Ideogram4Pipeline {
         width: u32,
         num_steps: usize,
         guidance: f32,
-        mu: f64,
         seed: u64,
         edit: Option<&EditInit>,
         cancel: &CancelFlag,
@@ -466,9 +458,9 @@ impl Ideogram4Pipeline {
         });
 
         // ── Flow-matching schedule (mu/std from the V4 preset for this step count) ──
-        // (mu, std) come from the reference V4 preset for this step count (NOT constants); the
-        // passed-in `mu` is superseded by the preset.
-        let _ = mu;
+        // (mu, std) come from the reference V4 preset for this step count (NOT a caller-supplied
+        // value): the schedule is fully determined by the step count + resolution, so there is no
+        // `mu` knob on the public API (sc-6944 dropped the inert parameter).
         let (mu_eff, std_eff) = preset_mu_std(num_steps);
         let schedule = LogitNormalSchedule::for_resolution(height, width, mu_eff, std_eff);
         let si = make_step_intervals(num_steps);

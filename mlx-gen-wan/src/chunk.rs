@@ -28,11 +28,12 @@
 //! are opt-in per consumer + overridable from the environment.
 //!
 //! ## Consumers / rollout (sc-5681)
-//! - **SCAIL-2** (`mlx-gen-scail2`) is the driver + first validation target: its reimplemented blocks
-//!   (`model.rs`) call [`map_seq_chunks`] for the FFN + the attention query path and eval-to-free in
-//!   the block loop; `generate.rs` opts into the production config. Bit-exactness vs. the un-chunked
-//!   forward is gated by `mlx-gen-scail2/tests/dit_chunk_equiv.rs`.
-//! - **Wan2.2-T2V / Bernini** share [`crate::transformer::WanTransformer`] (Bernini via
+//! - **SCAIL-2** (`mlx-gen-scail2`) is the **only current consumer** (the driver + first validation
+//!   target): its reimplemented blocks (`model.rs`) call [`map_seq_chunks`] + use [`DitMemoryConfig`]
+//!   for the FFN + the attention query path and eval-to-free in the block loop; `generate.rs` opts
+//!   into the production config. Bit-exactness vs. the un-chunked forward is gated by
+//!   `mlx-gen-scail2/tests/dit_chunk_equiv.rs`.
+//! - **(Prospective)** **Wan2.2-T2V / Bernini** share [`crate::transformer::WanTransformer`] (Bernini via
 //!   `forward_packed`), so they inherit the same levers once wired — the integration points are the
 //!   gated-GELU FFN in `transformer::Block::forward` (wrap in [`map_seq_chunks`]) and a per-block
 //!   `eval` in `forward_with_modulation` / `forward_packed`, gated by a `WanTransformer` memory
