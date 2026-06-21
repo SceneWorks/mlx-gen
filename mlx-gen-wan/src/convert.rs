@@ -149,6 +149,8 @@ pub fn convert_vae22(
 fn weights_to_map(w: &Weights) -> HashMap<String, Array> {
     w.keys()
         .map(|k| {
+            // `require` is infallible here because `k` came straight from `keys()` — the only way it
+            // panics is if key iteration is ever decoupled from the backing store (then revisit this).
             (
                 k.to_string(),
                 w.require(k).expect("key from keys()").clone(),

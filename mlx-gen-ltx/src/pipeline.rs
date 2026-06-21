@@ -359,7 +359,8 @@ pub(crate) fn render_sample(
 /// is a still thumbnail, sc-5637).
 fn frame0_to_image(frames: &Array) -> Result<Image> {
     let sh = frames.shape(); // (F, H, W, 3)
-    if sh[0] < 1 {
+    if sh[0] == 0 {
+        // Shape dims are non-negative, so "no frames decoded" is exactly `F == 0` (clearer than `< 1`).
         return Err(Error::Msg("ltx render_sample: no frames decoded".into()));
     }
     let (h, w, c) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);

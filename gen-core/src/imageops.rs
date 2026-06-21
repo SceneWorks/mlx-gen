@@ -355,6 +355,9 @@ pub fn outpaint_border_mask(src_w: u32, src_h: u32, width: u32, height: u32) -> 
 /// Per-pixel max ("white wins" — PIL `ImageChops.lighter`) of two equal-size RGB8 masks. Unions a
 /// user edit region with a generated outpaint border.
 pub fn union_masks(a: &Image, b: &Image) -> crate::Result<Image> {
+    // For well-formed Images the `pixels.len()` check is implied by the dimension check; it is kept
+    // to also guard the malformed case (a buffer whose length ≠ width·height·channels) so the
+    // element-wise `zip` below can't silently truncate to the shorter buffer.
     if (a.width, a.height) != (b.width, b.height) || a.pixels.len() != b.pixels.len() {
         return Err(Error::Msg(format!(
             "union_masks: size mismatch {}x{} vs {}x{}",

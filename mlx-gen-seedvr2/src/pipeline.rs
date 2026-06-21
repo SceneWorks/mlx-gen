@@ -260,7 +260,7 @@ impl Seedvr2Pipeline {
         let corrected = color::apply_color_correction(
             &decoded.as_dtype(Dtype::Float32)?,
             &style.as_dtype(Dtype::Float32)?,
-            0.8,
+            LUMINANCE_WEIGHT,
         )?;
         decoded_to_image(&corrected)
     }

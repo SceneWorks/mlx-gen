@@ -696,6 +696,10 @@ pub fn denoise_moe(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // Boundary swap: high-noise expert at/above the boundary, low-noise below (mirrors
+        // `vace::denoise_moe`). `t` is the scheduler's integer-valued timestep and
+        // `boundary_timestep = config.boundary · num_train_timesteps`, so this `>=` is an exact
+        // integer-vs-constant comparison — the exact boundary deterministically routes to high-noise.
         let (e, cache) = if t >= boundary_timestep {
             (high, &high_cache)
         } else {
