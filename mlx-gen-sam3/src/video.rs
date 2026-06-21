@@ -421,13 +421,16 @@ impl Sam3VideoModel {
     /// processing `frame_idx` the next gather is at frame ≥ `frame_idx + 1`; heavy tensors are read
     /// back to `(frame_idx+1) − (NUM_MASKMEM−1)` and object pointers back to
     /// `(frame_idx+1) − (MAX_OBJ_PTRS−1)`, and both windows only slide forward — so any entry older
-    /// than that is dead for the rest of the session (F-024). `cond` is left intact (gather's spatial
-    /// fallback + the pointer loop read it at arbitrary keys).
+    /// than that is dead for the rest of the session (F-024). `cond` **entries** are left intact (the
+    /// pointer loop reads their lightweight `object_pointer` at arbitrary keys), but their heavy
+    /// `maskmem_*` tensors are bounded by [`evict_stale_cond_heavy`] once they fall out of every future
+    /// spatial-read window (sc-7060), so a long clip's resident cond memory also stops climbing.
     fn evict_stale_memory(&mut self, frame_idx: i32) {
         let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
         let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
         for bank in &mut self.banks {
             evict_stale_bank(bank, heavy_keep, ptr_keep);
+            evict_stale_cond_heavy(bank, heavy_keep);
         }
     }
 
@@ -807,6 +810,42 @@ fn evict_stale_bank(bank: &mut ObjectBank, heavy_keep: i32, ptr_keep: i32) {
     bank.non_cond.retain(|&k, _| k >= ptr_keep);
 }
 
+/// Bound the per-object **`cond`** bank's resident memory (sc-7060, the F-024 sibling): null the heavy
+/// `maskmem_*` tensors of conditioning frames that no future `gather_memory` can read for spatial
+/// memory, keeping the lightweight `object_pointer` (still read by the pointer loop) and the entry
+/// itself (so [`select_closest_cond_frames`] still sees the key — it just contributes nothing, exactly
+/// as for an unselected frame).
+///
+/// A cond frame at key `k` can be read for spatial memory by a future gather (frame_idx' ≥ `frame_idx`
+/// + 1) iff EITHER:
+///  - it is still *selectable* — fewer than [`MAX_COND_FRAME_NUM`] cond frames have a key `> k`. New
+///    cond frames only accrue (entries are never removed, only heavy-nulled), so once
+///    `MAX_COND_FRAME_NUM` newer keys exist `k` is never among the closest again (for any frame_idx' >
+///    all current keys the closest are the largest keys); OR
+///  - it is inside the spatial *fallback* window, `k >= heavy_keep` (`= frame_idx + 1 −
+///    (NUM_MASKMEM − 1)`), which only slides forward.
+///
+/// So the heavy tensors are dead exactly when BOTH fail: `k < heavy_keep` AND ≥ `MAX_COND_FRAME_NUM`
+/// cond keys exceed `k`. The newest `MAX_COND_FRAME_NUM` keys are therefore always protected. Same
+/// single-source-of-truth derivation as [`evict_stale_bank`]; verified a strict no-op against
+/// `select_closest_cond_frames` over a long synthetic clip in the tests.
+fn evict_stale_cond_heavy(bank: &mut ObjectBank, heavy_keep: i32) {
+    let n = bank.cond.len() as i32;
+    if n <= MAX_COND_FRAME_NUM {
+        return; // every cond frame is always selectable → nothing droppable
+    }
+    // BTreeMap iterates ascending, so index `i` has `n - 1 - i` newer keys; "at least
+    // MAX_COND_FRAME_NUM newer" is `i < n - MAX_COND_FRAME_NUM`. The newest MAX_COND_FRAME_NUM keys
+    // stay selectable and are never nulled.
+    let droppable_below = n - MAX_COND_FRAME_NUM;
+    for (i, (&k, m)) in bank.cond.iter_mut().enumerate() {
+        if (i as i32) < droppable_below && k < heavy_keep {
+            m.maskmem_features = None;
+            m.maskmem_pos_enc = None;
+        }
+    }
+}
+
 /// `_apply_non_overlapping_constraints` + `_suppress_shrinked_masks` per prompt group.
 #[allow(clippy::needless_range_loop)] // pixel-wise argmax over parallel grouped masks
 fn suppress_pw_area_shrinkage(masks: &[Vec<f32>], prompts: &[i32]) -> Vec<Vec<f32>> {
@@ -1106,8 +1145,85 @@ mod tests {
                 "heavy tensors must be kept at key {k}"
             );
         }
-        // cond is never touched by eviction.
+        // cond is never touched by `evict_stale_bank` (its own heavy bound is `evict_stale_cond_heavy`).
         assert!(bank.cond.contains_key(&3), "cond must be left intact");
+        let c = bank.cond.get(&3).unwrap();
+        assert!(
+            c.maskmem_features.is_some() && c.maskmem_pos_enc.is_some(),
+            "evict_stale_bank must not touch cond heavy tensors"
+        );
+    }
+
+    /// sc-7060: `evict_stale_cond_heavy` is a **strict no-op** for spatial memory — it only nulls cond
+    /// heavy tensors that no future `gather_memory` can read. Simulate a long clip (cond seeds +
+    /// reconditioning cadence), and at every frame assert the spatial read-set (the real
+    /// `select_closest_cond_frames` selection ++ the unselected-cond fallback window, exactly as
+    /// `gather_memory` reads) still has its heavy tensors present after all prior-frame evictions.
+    #[test]
+    fn evict_stale_cond_heavy_never_nulls_a_readable_frame() {
+        let mut bank = ObjectBank::default();
+        // cond frames: an initial seed at 0, a second seed at 5, then reconditioning every
+        // RECONDITION_EVERY up to 160 — the long-clip pattern the cond leak comes from.
+        let mut cond_frames: Vec<i32> = vec![0, 5];
+        let mut f = RECONDITION_EVERY;
+        while f <= 160 {
+            cond_frames.push(f);
+            f += RECONDITION_EVERY;
+        }
+
+        let n_frames = 170;
+        let mut nulled_total = 0usize;
+        for frame_idx in 0..n_frames {
+            if cond_frames.contains(&frame_idx) {
+                bank.cond.insert(frame_idx, dummy_fm());
+            }
+            // Read-set exactly as `gather_memory`: selected cond (offset 0) ++ unselected cond in the
+            // `[frame_idx-(NUM_MASKMEM-1), frame_idx-1]` fallback window (no non_cond in this fixture).
+            let (selected, unselected) =
+                select_closest_cond_frames(frame_idx, &bank.cond, MAX_COND_FRAME_NUM);
+            let mut read_keys: std::collections::BTreeSet<i32> = selected.into_iter().collect();
+            for rel in 1..NUM_MASKMEM {
+                let prev = frame_idx - rel;
+                if unselected.contains(&prev) {
+                    read_keys.insert(prev);
+                }
+            }
+            for k in &read_keys {
+                let m = bank.cond.get(k).unwrap();
+                assert!(
+                    m.maskmem_features.is_some() && m.maskmem_pos_enc.is_some(),
+                    "frame {frame_idx}: cond key {k} is in the spatial read-set but its heavy \
+                     tensors were nulled by a prior eviction"
+                );
+            }
+            // Evict after the frame's reads, mirroring `evict_stale_memory`.
+            let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+            evict_stale_cond_heavy(&mut bank, heavy_keep);
+            nulled_total = bank
+                .cond
+                .values()
+                .filter(|m| m.maskmem_features.is_none())
+                .count();
+        }
+        // The eviction must actually bite (not a vacuous pass): old cond frames' heavy tensors are gone
+        // while every entry (and its object_pointer) is retained.
+        assert!(
+            nulled_total > 0,
+            "expected some cond heavy tensors to be nulled over a 170-frame clip"
+        );
+        assert_eq!(
+            bank.cond.len(),
+            cond_frames.len(),
+            "cond entries (object_pointer) must be retained, only heavy tensors nulled"
+        );
+        // The newest MAX_COND_FRAME_NUM cond frames are always protected.
+        for &k in cond_frames.iter().rev().take(MAX_COND_FRAME_NUM as usize) {
+            let m = bank.cond.get(&k).unwrap();
+            assert!(
+                m.maskmem_features.is_some(),
+                "newest cond frame {k} must keep its heavy tensors (always selectable)"
+            );
+        }
     }
 
     /// sc-4995: among heavily-overlapping detections, NMS keeps the highest-scored and drops the rest.
