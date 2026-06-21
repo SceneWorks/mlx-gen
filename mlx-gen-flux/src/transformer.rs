@@ -10,7 +10,7 @@ use mlx_gen::Result;
 use mlx_rs::error::Exception;
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::nn::gelu;
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, power, split, tanh};
+use mlx_rs::ops::{add, concatenate_axis, multiply, power, split, tanh};
 use mlx_rs::transforms::compile::compile;
 use mlx_rs::{Array, Dtype};
 
@@ -915,28 +915,19 @@ impl FluxRope {
                 pos2[row] = w as f32;
             }
         }
-        // Build each axis's cos/sin with MLX ops (sc-2787), bit-matching the fork's `EmbedND`:
-        // `omega = 1/(theta**scale)`, `out = pos·omega`, then `mx.cos`/`mx.sin`. The host libm trig +
-        // `powf` differ from MLX by ~4e-7, which the chaotic 57-block stack amplifies into the only
-        // remaining transformer parity gap (every kernel op is otherwise bit-identical at 0.31.2).
-        let axis = |dim: i32, pos: &[f32]| -> Result<(Array, Array)> {
-            let half = dim / 2;
-            let scale: Vec<f32> = (0..half).map(|k| (2 * k) as f32 / dim as f32).collect();
-            let omega = divide(
-                scalar(1.0),
-                power(scalar(self.theta), Array::from_slice(&scale, &[1, half]))?,
-            )?;
-            let out = multiply(Array::from_slice(pos, &[total, 1]), &omega)?;
-            Ok((out.cos()?, out.sin()?))
-        };
-        let zeros = vec![0f32; total as usize];
-        let (c0, s0) = axis(self.axes_dim[0], &zeros)?;
-        let (c1, s1) = axis(self.axes_dim[1], &pos1)?;
-        let (c2, s2) = axis(self.axes_dim[2], &pos2)?;
-        Ok(RopeTable {
-            cos: concatenate_axis(&[&c0, &c1, &c2], 1)?,
-            sin: concatenate_axis(&[&s0, &s1, &s2], 1)?,
-        })
+        // Build the [N,3] position ids (axis 0 = all-zero, axis 1 = h, axis 2 = w) and delegate to the
+        // shared on-device sinusoid builder (F-015): `omega = 1/(theta**scale)`, `out = pos·omega`,
+        // then `mx.cos`/`mx.sin`. Kept on-device (not host `libm`) — the ~4e-7 host trig gap is what the
+        // chaotic 57-block stack amplifies into the only remaining transformer parity gap; the shared
+        // builder uses the identical MLX op sequence so this stays bit-exact.
+        let mut ids = vec![0f32; total as usize * 3];
+        for (row, (&p1, &p2)) in pos1.iter().zip(pos2.iter()).enumerate() {
+            ids[row * 3 + 1] = p1;
+            ids[row * 3 + 2] = p2;
+        }
+        let ids = Array::from_slice(&ids, &[total, 3]);
+        let (cos, sin) = mlx_gen::nn::rope_sincos_from_ids(&ids, &self.axes_dim, self.theta)?;
+        Ok(RopeTable { cos, sin })
     }
 }
 
@@ -1020,28 +1011,11 @@ fn apply_norm_ff(
 }
 
 fn time_proj(time_steps: &Array) -> Result<Array> {
-    let half = 128i32;
-    let max_period = 10000f64;
-    // Build the sinusoidal freqs with MLX ops (sc-2787) to bit-match the fork's `_time_proj`:
-    // `exp(-log(max_period) * arange(half) / half)`. Host `exp`/`arange` differ from MLX by ~1e-7,
-    // which flips one element of the bf16 conditioning by a ULP and seeds the joint stack. `-log` is
-    // taken in f64 then cast to f32 (the fork's `math.log` is f64, weak-cast at the MLX multiply).
-    let neg_log = -(max_period.ln()) as f32;
-    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
-    let exponent = divide(
-        multiply(Array::from_slice(&arange, &[1, half]), scalar(neg_log))?,
-        scalar(half as f32),
-    )?;
-    let f = exponent.exp()?;
-    let emb = multiply(
-        &time_steps
-            .reshape(&[time_steps.shape()[0], 1])?
-            .as_dtype(Dtype::Float32)?,
-        &f,
-    )?;
-    let sin = emb.sin()?;
-    let cos = emb.cos()?;
-    Ok(concatenate_axis(&[&cos, &sin], 1)?)
+    // diffusers `_time_proj`: `dim=256` (half=128), `max_period=10000`, `downscale_freq_shift=0`,
+    // `flip_sin_to_cos=True`. Delegates to the shared on-device builder (F-016) — bit-exact to the
+    // prior open-coded form (identical MLX op sequence). The MLX-op exponent is load-bearing: the host
+    // path differs by ~1e-7, flipping a bf16 conditioning ULP that the joint stack amplifies.
+    mlx_gen::nn::timestep_sincos(time_steps, 256, 10000.0, 0.0)
 }
 
 fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {

@@ -24,7 +24,7 @@ pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, cos, divide, exp, multiply, power, sin};
+use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::ChromaTransformerConfig;
@@ -44,15 +44,14 @@ const LN_EPS: f32 = 1e-6;
 // ============================ leaf helpers ============================
 
 /// `get_timestep_embedding(timesteps, dim, flip_sin_to_cos=True, downscale_freq_shift)` (diffusers),
-/// in f32. `dim` even. `flip_sin_to_cos=True` ⇒ output order `[cos, sin]`.
+/// in f32. `dim` even. `flip_sin_to_cos=True` ⇒ output order `[cos, sin]`. Delegates to the shared
+/// [`mlx_gen::nn::timestep_sincos`] (F-016) — the FLUX-special-case form parameterized on
+/// `max_period` + `downscale_freq_shift`. NOTE: the shared builder computes the exponent with MLX ops
+/// (vs this port's prior host-f64 loop); the ~1e-7 shift is within the Chroma parity tolerance
+/// (`approximator_parity` / `transformer_parity` gate it) and makes Chroma share FLUX's exact
+/// on-device path.
 fn timestep_embedding(timesteps: &Array, dim: usize, downscale_freq_shift: f64) -> Result<Array> {
-    let half = (dim / 2) as i32;
-    let factor = -MAX_PERIOD.ln() / (half as f64 - downscale_freq_shift);
-    let exponent: Vec<f32> = (0..half).map(|i| (i as f64 * factor) as f32).collect();
-    let freqs = exp(Array::from_slice(&exponent, &[1, half]))?; // [1, half]
-    let t = timesteps.as_dtype(Dtype::Float32)?.reshape(&[-1, 1])?; // [N, 1]
-    let emb = multiply(&t, &freqs)?; // [N, half]
-    Ok(concatenate_axis(&[cos(&emb)?, sin(&emb)?], -1)?) // flip ⇒ [cos, sin]
+    mlx_gen::nn::timestep_sincos(timesteps, dim, MAX_PERIOD, downscale_freq_shift)
 }
 
 /// A dense `nn.Linear` (`[out, in]` weight + bias) wrapping the core [`AdaptableLinear`] — so it can
@@ -113,36 +112,15 @@ pub(crate) struct RopeTable {
 }
 
 /// FluxPosEmbed: per-axis sinusoid tables from position ids `[N,3]`, concatenated to `[N, head_dim/2]`.
-/// Mirrors the (bit-exact) flux port: `omega = theta^-(2k/dim)`, `out = pos·omega`, then `cos`/`sin`.
+/// Delegates to the shared [`mlx_gen::nn::rope_sincos_from_ids`] (F-015) — the same `omega =
+/// theta^-(2k/dim)`, `out = pos·omega`, `cos`/`sin` the FLUX port uses (bit-exact: identical MLX ops).
 fn build_rope(ids: &Array, axes: [usize; 3]) -> Result<RopeTable> {
-    let ids = ids.as_dtype(Dtype::Float32)?;
-    let n = ids.shape()[0];
-    let mut coss = Vec::with_capacity(3);
-    let mut sins = Vec::with_capacity(3);
-    for (a, &dim) in axes.iter().enumerate() {
-        let dim = dim as i32;
-        let half = dim / 2;
-        let pos = ids
-            .take_axis(Array::from_int(a as i32), 1)?
-            .reshape(&[n, 1])?; // [N,1]
-        let scale: Vec<f32> = (0..half).map(|k| (2 * k) as f32 / dim as f32).collect();
-        let omega = divide(
-            mlx_gen::array::scalar(1.0),
-            &power(
-                mlx_gen::array::scalar(ROPE_THETA),
-                Array::from_slice(&scale, &[1, half]),
-            )?,
-        )?; // [1, half]
-        let out = multiply(&pos, &omega)?; // [N, half]
-        coss.push(cos(&out)?);
-        sins.push(sin(&out)?);
-    }
-    let cref: Vec<&Array> = coss.iter().collect();
-    let sref: Vec<&Array> = sins.iter().collect();
-    Ok(RopeTable {
-        cos: concatenate_axis(&cref, 1)?,
-        sin: concatenate_axis(&sref, 1)?,
-    })
+    let (cos, sin) = mlx_gen::nn::rope_sincos_from_ids(
+        ids,
+        &[axes[0] as i32, axes[1] as i32, axes[2] as i32],
+        ROPE_THETA,
+    )?;
+    Ok(RopeTable { cos, sin })
 }
 
 /// Apply RoPE to `x [B,H,S,hd]` (adjacent-pair / interleaved convention), in f32.
@@ -158,8 +136,9 @@ fn apply_rope_one(x: &Array, rope: &RopeTable) -> Result<Array> {
     let imag = p[1].reshape(&[b, heads, seq, half])?;
     let c = rope.cos.reshape(&[1, 1, seq, half])?;
     let s = rope.sin.reshape(&[1, 1, seq, half])?;
-    let out0 = mlx_rs::ops::subtract(&multiply(&real, &c)?, &multiply(&imag, &s)?)?;
-    let out1 = add(&multiply(&imag, &c)?, &multiply(&real, &s)?)?;
+    // Shared complex rotation (F-014): identical math to the prior open-coded subtract/add, but routed
+    // through the FLUX op so it picks up the `compile_glue` fusion (`real*c − imag*s`, `imag*c + real*s`).
+    let (out0, out1) = mlx_gen::nn::rope_rotate(&real, &imag, &c, &s)?;
     Ok(
         concatenate_axis(&[&out0.expand_dims(4)?, &out1.expand_dims(4)?], 4)?
             .reshape(&[b, heads, seq, hd])?,

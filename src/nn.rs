@@ -195,6 +195,71 @@ pub fn rope_rotate(real: &Array, imag: &Array, cos: &Array, sin: &Array) -> Resu
     Ok((out0, out1))
 }
 
+/// Per-axis RoPE sinusoid table from position ids `[N, n_axes]` (diffusers `FluxPosEmbed` /
+/// `EmbedND`): for each axis `i` with `dim = axes_dim[i]`, `omega = theta^-(2k/dim)`,
+/// `out = ids[:,i]·omega`, then `(cos, sin)`; concatenated across axes on the last dim →
+/// `([N, Σ dim/2], [N, Σ dim/2])`. Shared by FLUX.1 + Chroma (F-015) — both previously open-coded the
+/// **identical** MLX op sequence, so this is bit-exact for both (the host `libm` trig the comment in
+/// each caller warned against is avoided; all trig stays on-device).
+pub fn rope_sincos_from_ids(ids: &Array, axes_dim: &[i32], theta: f32) -> Result<(Array, Array)> {
+    let ids = ids.as_dtype(Dtype::Float32)?;
+    let n = ids.shape()[0];
+    let mut coss = Vec::with_capacity(axes_dim.len());
+    let mut sins = Vec::with_capacity(axes_dim.len());
+    for (a, &dim) in axes_dim.iter().enumerate() {
+        let half = dim / 2;
+        let pos = ids
+            .take_axis(Array::from_int(a as i32), 1)?
+            .reshape(&[n, 1])?; // [N,1]
+        let scale: Vec<f32> = (0..half).map(|k| (2 * k) as f32 / dim as f32).collect();
+        let omega = divide(
+            scalar(1.0),
+            &power(scalar(theta), Array::from_slice(&scale, &[1, half]))?,
+        )?; // [1, half]
+        let out = multiply(&pos, &omega)?; // [N, half]
+        coss.push(out.cos()?);
+        sins.push(out.sin()?);
+    }
+    let cref: Vec<&Array> = coss.iter().collect();
+    let sref: Vec<&Array> = sins.iter().collect();
+    Ok((
+        mlx_rs::ops::concatenate_axis(&cref, 1)?,
+        mlx_rs::ops::concatenate_axis(&sref, 1)?,
+    ))
+}
+
+/// diffusers `get_timestep_embedding(timesteps, dim, flip_sin_to_cos=True, downscale_freq_shift,
+/// max_period)` in f32, returning `[N, dim]` ordered `[cos, sin]` (flip). The exponent is built with
+/// **MLX ops** — `exp((arange·−ln(max_period)) / (half − downscale_freq_shift))` — deliberately *not*
+/// a host `libm` loop: FLUX.1's `_time_proj` parity hinges on this on-device computation (the host
+/// path differs by ~1e-7, which flips a bf16 conditioning ULP that the 57-block joint stack amplifies,
+/// F-016). Shared by FLUX.1 (`downscale_freq_shift = 0`) + Chroma; bit-exact for FLUX.1's prior
+/// open-coded form and within Chroma's parity tolerance for its prior host-f64 form.
+pub fn timestep_sincos(
+    timesteps: &Array,
+    dim: usize,
+    max_period: f64,
+    downscale_freq_shift: f64,
+) -> Result<Array> {
+    let half = (dim / 2) as i32;
+    let neg_log = -(max_period.ln()) as f32;
+    let denom = (half as f64 - downscale_freq_shift) as f32;
+    let arange: Vec<f32> = (0..half).map(|i| i as f32).collect();
+    let exponent = divide(
+        multiply(Array::from_slice(&arange, &[1, half]), scalar(neg_log))?,
+        scalar(denom),
+    )?;
+    let f = exponent.exp()?;
+    let t = timesteps
+        .reshape(&[timesteps.shape()[0], 1])?
+        .as_dtype(Dtype::Float32)?;
+    let emb = multiply(&t, &f)?;
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[&emb.cos()?, &emb.sin()?],
+        1,
+    )?) // flip_sin_to_cos ⇒ [cos, sin]
+}
+
 /// adaLN affine `(1 + scale)·norm + shift` (`scale`/`shift` pre-broadcast). One fused kernel when
 /// [`compile_glue`] is on; bit-identical to the eager affine. Shared by FLUX.1/FLUX.2 (F-101) with
 /// **`one_matches_scale`** carrying each family's deliberate dtype policy for the literal `1`: `true`
