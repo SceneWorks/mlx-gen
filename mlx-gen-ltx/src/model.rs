@@ -789,10 +789,9 @@ impl Ltx {
             .enhance_temperature
             .unwrap_or(enhance::DEFAULT_TEMPERATURE);
         let cfg = EnhanceConfig {
-            max_tokens: req
-                .enhance_max_tokens
-                .map(|m| m as usize)
-                .unwrap_or(enhance::DEFAULT_MAX_TOKENS),
+            // F-012 twin: clamp the request-supplied budget so a huge `enhance_max_tokens` can't turn
+            // a single `enhance_prompt=true` request into an effectively unbounded decode job.
+            max_tokens: enhance::clamp_max_tokens(req.enhance_max_tokens),
             seed: req.seed.unwrap_or(enhance::DEFAULT_SEED),
         };
         if req.use_uncensored_enhancer {

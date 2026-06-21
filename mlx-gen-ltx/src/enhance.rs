@@ -39,6 +39,23 @@ pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 /// Reference enhancement default seed (`enhance_t2v(..., seed=42)`).
 pub const DEFAULT_SEED: u64 = 42;
 
+/// Hard ceiling on enhance decode length (F-012 twin of the flux2 cap). Each decode step is a full
+/// Gemma forward over a growing KV cache, so a request-supplied `enhance_max_tokens` must be capped
+/// or a single `enhance_prompt=true` request becomes an effectively unbounded job (only cooperative
+/// `cancel` breaks it). 4× the 512 reference default leaves room for legitimately long rewrites while
+/// bounding the worst case to ~2048 forwards instead of billions.
+pub const MAX_TOKENS_CAP: usize = 2048;
+
+/// Resolve the decode budget from the request's `enhance_max_tokens`: the reference default
+/// ([`DEFAULT_MAX_TOKENS`]) when unset, otherwise the requested value clamped to [`MAX_TOKENS_CAP`]
+/// (F-012). A request is never *rejected* for asking too much — the advisory knob is silently capped
+/// — so callers stay infallible. Inert on the happy path (the reference default is well under the cap).
+pub fn clamp_max_tokens(requested: Option<u32>) -> usize {
+    requested
+        .map(|m| (m as usize).min(MAX_TOKENS_CAP))
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
 /// Stop tokens: `<eos>` (1) and `<end_of_turn>` (106) — see the module note on the reference's `107`.
 pub const STOP_TOKENS: [i32; 2] = [1, 106];
 
@@ -301,6 +318,26 @@ mod tests {
         // Empty / all-punctuation collapses to empty.
         assert_eq!(clean_response("   "), "");
         assert_eq!(clean_response("!!!"), "");
+    }
+
+    #[test]
+    fn clamp_max_tokens_caps_pathological_request_only() {
+        // Unset → reference default, untouched.
+        assert_eq!(clamp_max_tokens(None), DEFAULT_MAX_TOKENS);
+        // Below the cap → honored verbatim (happy path stays inert).
+        assert_eq!(clamp_max_tokens(Some(1)), 1);
+        assert_eq!(clamp_max_tokens(Some(256)), 256);
+        // Exactly at the cap → honored.
+        assert_eq!(
+            clamp_max_tokens(Some(MAX_TOKENS_CAP as u32)),
+            MAX_TOKENS_CAP
+        );
+        // Above the cap (incl. u32::MAX, the unbounded-job case) → clamped to the cap, not rejected.
+        assert_eq!(
+            clamp_max_tokens(Some(MAX_TOKENS_CAP as u32 + 1)),
+            MAX_TOKENS_CAP
+        );
+        assert_eq!(clamp_max_tokens(Some(u32::MAX)), MAX_TOKENS_CAP);
     }
 
     #[test]
