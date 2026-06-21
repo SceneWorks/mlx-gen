@@ -59,11 +59,13 @@ fn chroma_validate_rejects_unsupported_surface() {
     };
     assert!(d.capabilities.validate_request(d.id, &heun).is_ok());
 
+    // A name outside the advertised menu is still rejected. (`dpmpp_sde` and the rest of the curated
+    // set are now supported, epic 7114; `lightning` is a qwen-only profile chroma never advertises.)
     let bad_sampler = GenerationRequest {
         prompt: "a cat".into(),
         width: 512,
         height: 512,
-        sampler: Some("dpmpp_sde".into()),
+        sampler: Some("lightning".into()),
         ..Default::default()
     };
     assert!(d.capabilities.validate_request(d.id, &bad_sampler).is_err());

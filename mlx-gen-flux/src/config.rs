@@ -1,7 +1,9 @@
 //! FLUX.1 family configuration, lifted from the frozen Python mflux fork's
 //! `ModelConfig.{schnell,dev}` and `FluxWeightDefinition.get_tokenizers`.
 
-use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant};
+use mlx_gen::{
+    curated_sampler_names, Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant,
+};
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
@@ -82,13 +84,22 @@ impl FluxVariant {
                 supported_quants: &[Quant::Q4, Quant::Q8],
                 supports_lora: true,
                 supports_lokr: true,
-                // The base flow-match sampler plus, for dev, the Hyper-FLUX few-step profile
-                // (sc-2908). schnell is already a distilled 4-step checkpoint, so it advertises only
-                // the base sampler — Hyper-FLUX is a FLUX.1-dev LoRA.
-                samplers: match self {
-                    Self::Dev => vec![DEFAULT_SAMPLER, HYPER_SAMPLER],
-                    Self::Schnell => vec![DEFAULT_SAMPLER],
+                // The curated unified-framework integrator menu (epic 7114 P3) + the legacy
+                // `flow_match` alias (== Euler) and, for dev, the Hyper-FLUX few-step profile
+                // (sc-2908). schnell is already a distilled 4-step checkpoint, so it omits the
+                // dev-only Hyper-FLUX LoRA profile. The acceleration profiles (`flow_match`/`hyper`)
+                // route to Euler in `run_flow_sampler`; they change the schedule/steps, not the
+                // integrator.
+                samplers: {
+                    let mut s = curated_sampler_names();
+                    s.push(DEFAULT_SAMPLER);
+                    if matches!(self, Self::Dev) {
+                        s.push(HYPER_SAMPLER);
+                    }
+                    s
                 },
+                // Scheduler axis (curated sigma-schedule menu) lands in the epic 7114 follow-up pass;
+                // the native `build_linear_sigmas` (resolution-shifted flow) is still the default.
                 schedulers: vec!["linear"],
                 min_size: 256,
                 max_size: 2048,

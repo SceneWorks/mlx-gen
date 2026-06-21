@@ -20,9 +20,10 @@
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, default_seed, gen_core, run_flow_sampler, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
@@ -31,7 +32,7 @@ use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
-    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2ControlTransformer;
@@ -59,7 +60,8 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             supported_quants: &[Quant::Q4, Quant::Q8],
-            samplers: Vec::new(),
+            // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
+            samplers: curated_sampler_names(),
             schedulers: vec!["flow_match_euler"],
             min_size: 256,
             max_size: 2048,
@@ -264,7 +266,6 @@ impl Flux2DevControl {
         let (prompt_embeds, text_ids) = self.encode(&req.prompt)?;
 
         let sched = schedule(steps, req.width, req.height);
-        let timesteps = timesteps_x1000(&sched);
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
@@ -284,37 +285,43 @@ impl Flux2DevControl {
         // drop by the RAII guard (F-007) instead of leaking the process-global toggle on.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
+        let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
             let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
-            let mut latents = match &clean_init {
+            let latents = match &clean_init {
                 Some(clean) => add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?,
                 None => noise,
             };
-            for (t, &ts) in timesteps.iter().enumerate().skip(start_step) {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                let v = self.transformer.forward(
-                    &latents,
+            // Curated unified-framework solver (epic 7114 P3); the control branch is the `predict`
+            // closure. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma convention).
+            // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
+            // `run_flow_sampler`.
+            let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+                self.transformer.forward(
+                    latents,
                     &prompt_embeds,
                     &latent_ids,
                     &text_ids,
-                    ts,
+                    sigma * 1000.0,
                     embedded_guidance,
                     &control_context,
                     control_scale,
-                )?;
-                latents = sched.step(&latents, &v, t)?;
-                latents.eval()?;
-                on_progress(Progress::Step {
-                    current: t as u32 + 1,
-                    total: steps as u32,
-                });
-            }
+                )
+            };
+            let final_latents = run_flow_sampler(
+                sampler_name,
+                TimestepConvention::Sigma,
+                &sched.sigmas[start_step..],
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                predict,
+            )?;
             on_progress(Progress::Decoding);
-            let packed = latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
+            let packed = final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
             let decoded = self.vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
             let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
             images.push(decoded_to_image(&nchw)?);

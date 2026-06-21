@@ -62,6 +62,7 @@ pub use caption::{
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
 pub use error::{Error, Result};
+pub use gen_core::sampling::TimestepConvention;
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
@@ -78,8 +79,8 @@ pub use runtime::{
     WeightsSource,
 };
 pub use sampler::{
-    AlphaSchedule, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxLatentOps,
-    TcdSampler,
+    curated_sampler_names, curated_scheduler_names, run_flow_sampler, AlphaSchedule,
+    DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxLatentOps, TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};

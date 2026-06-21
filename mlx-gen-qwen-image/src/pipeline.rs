@@ -8,19 +8,18 @@
 //! negative) combined by classifier-free guidance.
 
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtract, sum_axes};
-use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, CancelFlag, DiffusionSampler, Error, FlowMatchEuler, GenerationRequest, Image,
-    Progress, Result,
+    default_seed, run_flow_sampler, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
+    Progress, Result, TimestepConvention,
 };
 
 use crate::control_transformer::QwenControlNet;
-use crate::sampler::{lightning, FlowMatchSampler};
+use crate::sampler::lightning_sigmas;
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
@@ -40,23 +39,41 @@ pub const DEFAULT_GUIDANCE: f32 = 4.0;
 pub const NEGATIVE_FALLBACK: &str = " ";
 /// `req.sampler` value selecting the few-step Lightning recipe (sc-2909).
 pub const LIGHTNING_SAMPLER: &str = "lightning";
+
+/// The advertised sampler menu shared by all three Qwen generators (epic 7114 P3): the curated
+/// unified-framework integrator menu (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / LCM / DDIM)
+/// plus the `lightning` few-step acceleration *profile* (sc-2909). The profile picks the schedule and
+/// falls back to Euler as the integrator inside [`run_flow_sampler`]; a curated name selects that
+/// solver over the production schedule.
+pub fn qwen_samplers() -> Vec<&'static str> {
+    let mut s = mlx_gen::curated_sampler_names();
+    s.push(LIGHTNING_SAMPLER);
+    s
+}
 /// Default step count for the Lightning recipe.
 pub const LIGHTNING_DEFAULT_STEPS: u32 = 8;
 
 /// Per-run scalars shared by all three Qwen generators: the Lightning flag, resolved step count and
-/// guidance, the per-batch base seed, and the (seed-independent) sampler. Extracted so the three
-/// `generate` paths can't drift apart (F-117).
+/// guidance, the per-batch base seed, the selected curated-solver name (epic 7114), and the
+/// (seed-independent) flow-match sigma schedule. Extracted so the three `generate` paths can't drift
+/// apart (F-117).
 pub struct RunParams {
     pub is_lightning: bool,
     pub steps: usize,
     pub guidance: f32,
     pub base_seed: u64,
-    pub sampler: FlowMatchSampler,
+    /// The requested curated solver name (`req.sampler`), passed to [`run_flow_sampler`] — `lightning`
+    /// is an acceleration *profile* (it picks the schedule below, and falls back to Euler as the
+    /// integrator), a curated name (e.g. `dpmpp_2m`) selects that solver, and `None` is Euler.
+    pub sampler_name: Option<String>,
+    /// The flow-match schedule (length `num_steps + 1`, trailing `0.0`).
+    pub sigmas: Vec<f32>,
 }
 
 /// Resolve the shared run parameters from a request: `sampler == "lightning"` selects the few-step
 /// static-shift schedule + its step default; otherwise the production resolution-dependent
-/// `qwen_scheduler`. Identical across T2I/Edit/Control (F-117).
+/// `qwen_scheduler`. The solver (integration method) is chosen separately by [`run_flow_sampler`]
+/// from the same `req.sampler` name. Identical across T2I/Edit/Control (F-117).
 pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> RunParams {
     let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
     let default_steps = if is_lightning {
@@ -65,17 +82,18 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
         DEFAULT_STEPS
     };
     let steps = req.steps.unwrap_or(default_steps) as usize;
-    let sampler = if is_lightning {
-        lightning(steps)
+    let sigmas = if is_lightning {
+        lightning_sigmas(steps)
     } else {
-        FlowMatchSampler::new(qwen_scheduler(steps, width, height).sigmas)
+        qwen_scheduler(steps, width, height).sigmas
     };
     RunParams {
         is_lightning,
         steps,
         guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
         base_seed: req.seed.unwrap_or_else(default_seed),
-        sampler,
+        sampler_name: req.sampler.clone(),
+        sigmas,
     }
 }
 
@@ -336,7 +354,9 @@ fn l2_over_channels(x: &Array) -> Result<Array> {
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &QwenTransformer,
-    sampler: &dyn DiffusionSampler,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
     latents: Array,
     pos_embeds: &Array,
     neg_embeds: Option<&Array>,
@@ -352,36 +372,33 @@ pub fn denoise_with_progress(
     // compile_parity.rs) and a per-step win at production geometry. Scoped + restored on drop by the
     // RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = (sampler.num_steps() - start_step) as u32;
-    for t in start_step..sampler.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let sigma = sampler.timestep(t);
-        // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
-        // proven maskless (see `build_joint_mask`).
-        let pos = transformer.forward(&latents, pos_embeds, None, sigma, lh, lw, &[])?;
-        let velocity = match neg_embeds {
+    // `None` joint mask: the prompt embeds carry no padding into the transformer, so parity is
+    // proven maskless (see `build_joint_mask`). Qwen is flow-match (FLOW prediction) and feeds the
+    // raw schedule sigma as the transformer timestep (Sigma convention).
+    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+        let pos = transformer.forward(latents, pos_embeds, None, sigma, lh, lw, &[])?;
+        match neg_embeds {
             Some(neg) => {
-                let neg = transformer.forward(&latents, neg, None, sigma, lh, lw, &[])?;
-                compute_guided_noise(&pos, &neg, guidance)?
+                let neg = transformer.forward(latents, neg, None, sigma, lh, lw, &[])?;
+                compute_guided_noise(&pos, &neg, guidance)
             }
-            None => pos,
-        };
-        latents = sampler.step(&velocity, &latents, t)?;
-        // Force this step to finish before the next extends the lazy MLX graph (F-119, matching
-        // denoise_edit_with_progress): bound the queued Metal work so the command-buffer watchdog
-        // can't trip on large (up to 2048²) / many-step requests, and so the cancel/progress
-        // callbacks reflect real GPU completion rather than a lazily-queued graph. Bit-neutral.
-        eval([&latents])?;
-        on_progress(Progress::Step {
-            current: (t - start_step) as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+            None => Ok(pos),
+        }
+    };
+    // img2img loops `range(start_step, steps)`: slice the schedule from the matching sigma so the
+    // blended init latents are denoised from there (the fork's `init_time_step`). Cancellation, the
+    // per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114 P3).
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::Sigma,
+        &sigmas[start_step.min(sigmas.len().saturating_sub(1))..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
 }
 
 /// Qwen-Image **ControlNet** (strict pose) denoise loop (epic 3401 / sc-3572). Like
@@ -396,7 +413,9 @@ pub fn denoise_with_progress(
 pub fn denoise_control_with_progress(
     transformer: &QwenTransformer,
     controlnet: &QwenControlNet,
-    sampler: &dyn DiffusionSampler,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
     latents: Array,
     control_cond: &Array,
     pos_embeds: &Array,
@@ -411,20 +430,14 @@ pub fn denoise_control_with_progress(
     // Compiled elementwise glue (sc-2963), as in `denoise_with_progress`. Scoped + restored on drop
     // by the RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    // Control is pose-only T2I — there is no img2img-with-control path, so the loop always runs
-    // every step from 0 (the fork's `init_time_step` plumbing that `denoise_with_progress` carries
-    // for img2img has no caller here, so it is omitted; F-122).
-    let total = sampler.num_steps() as u32;
-    for t in 0..sampler.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let sigma = sampler.timestep(t);
-        let pos_res = controlnet.forward(&latents, control_cond, pos_embeds, sigma, lh, lw)?;
+    // Each step runs the control branch then injects its residuals into the base forward, scaled by
+    // `control_scale` (`= 0` reproduces base T2I). Under true CFG the control branch runs once per
+    // guidance branch. Control is pose-only T2I (no img2img-with-control path; F-122).
+    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+        let pos_res = controlnet.forward(latents, control_cond, pos_embeds, sigma, lh, lw)?;
         let pos = transformer.forward_control(
-            &latents,
+            latents,
             pos_embeds,
             None,
             sigma,
@@ -434,11 +447,11 @@ pub fn denoise_control_with_progress(
             Some(&pos_res),
             control_scale,
         )?;
-        let velocity = match neg_embeds {
+        match neg_embeds {
             Some(neg) => {
-                let neg_res = controlnet.forward(&latents, control_cond, neg, sigma, lh, lw)?;
+                let neg_res = controlnet.forward(latents, control_cond, neg, sigma, lh, lw)?;
                 let neg = transformer.forward_control(
-                    &latents,
+                    latents,
                     neg,
                     None,
                     sigma,
@@ -448,22 +461,22 @@ pub fn denoise_control_with_progress(
                     Some(&neg_res),
                     control_scale,
                 )?;
-                compute_guided_noise(&pos, &neg, guidance)?
+                compute_guided_noise(&pos, &neg, guidance)
             }
-            None => pos,
-        };
-        latents = sampler.step(&velocity, &latents, t)?;
-        // Force this step to finish before the next extends the lazy MLX graph (F-119, matching
-        // denoise_edit_with_progress): bound the queued Metal work so the command-buffer watchdog
-        // can't trip on large (up to 2048²) / many-step requests, and so the cancel/progress
-        // callbacks reflect real GPU completion rather than a lazily-queued graph. Bit-neutral.
-        eval([&latents])?;
-        on_progress(Progress::Step {
-            current: t as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+            None => Ok(pos),
+        }
+    };
+    // Cancellation, the per-step `eval` (F-119), and progress live in `run_flow_sampler` (epic 7114).
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
 }
 
 /// Qwen-Image-**Edit** dual-latent denoise loop, driven by a [`DiffusionSampler`] (sc-2909). Each
@@ -478,7 +491,9 @@ pub fn denoise_control_with_progress(
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_edit_with_progress(
     transformer: &QwenTransformer,
-    sampler: &dyn DiffusionSampler,
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    seed: u64,
     latents: Array,
     static_image_latents: &Array,
     cond_grids: &[(usize, usize)],
@@ -493,43 +508,40 @@ pub fn denoise_edit_with_progress(
     // sc-2963 (rollout of sc-2957): compiled elementwise glue in the Edit denoise loop too — see
     // `denoise_with_progress`. Bit-exact; scoped + restored on drop by the RAII guard (F-006).
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
-    let mut latents = latents;
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    let total = sampler.num_steps() as u32;
-    for t in 0..sampler.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
+    // Each step concatenates the noise latents with the (static) packed reference latents so the RoPE
+    // spans `[noise] + references`, then slices the velocity back to the noise prefix. `None` joint
+    // mask (as in T2I): the spliced prompt embeds are full-valid.
+    let predict = |latents: &Array, sigma: f32| -> Result<Array> {
         let noise_seq = latents.shape()[1];
-        let sigma = sampler.timestep(t);
-        let hidden = concatenate_axis(&[&latents, static_image_latents], 1)?;
-        // `None` joint mask (as in T2I): the spliced prompt embeds are full-valid.
+        let hidden = concatenate_axis(&[latents, static_image_latents], 1)?;
         let pos = slice_seq(
             &transformer.forward(&hidden, pos_embeds, None, sigma, lh, lw, cond_grids)?,
             noise_seq,
         )?;
-        let velocity = match neg_embeds {
+        match neg_embeds {
             Some(neg) => {
                 let neg = slice_seq(
                     &transformer.forward(&hidden, neg, None, sigma, lh, lw, cond_grids)?,
                     noise_seq,
                 )?;
-                compute_guided_noise(&pos, &neg, guidance)?
+                compute_guided_noise(&pos, &neg, guidance)
             }
-            None => pos,
-        };
-        latents = sampler.step(&velocity, &latents, t)?;
-        // Force each edit denoise step to finish before the next step extends the lazy MLX
-        // graph. Without this boundary, 1024px Qwen Edit Lightning + LoRA + some references can
-        // accumulate enough queued Metal work to trip the command-buffer watchdog at final
-        // pixel readback.
-        eval([&latents])?;
-        on_progress(Progress::Step {
-            current: t as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+            None => Ok(pos),
+        }
+    };
+    // Cancellation, the per-step `eval` (the command-buffer-watchdog boundary), and progress live in
+    // `run_flow_sampler` (epic 7114 P3).
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::Sigma,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
 }
 
 /// Slice the transformer velocity `[1, full_seq, 64]` back to the noise prefix `[1, n, 64]`. A

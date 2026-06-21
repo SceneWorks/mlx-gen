@@ -27,7 +27,7 @@ use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
-    encode_prompt, negative_or_fallback, resolve_run_params, LIGHTNING_SAMPLER,
+    encode_prompt, negative_or_fallback, qwen_samplers, resolve_run_params,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -53,7 +53,8 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Control],
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec![LIGHTNING_SAMPLER],
+            // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
+            samplers: qwen_samplers(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -238,7 +239,9 @@ impl QwenImageControl {
                 denoise_control_with_progress(
                     &self.transformer,
                     &self.controlnet,
-                    &params.sampler,
+                    params.sampler_name.as_deref(),
+                    &params.sigmas,
+                    seed,
                     noise,
                     &control_cond,
                     &pos,

@@ -5,9 +5,9 @@ use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Conditioning, DiffusionSampler, Error, FlowMatchSampler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
-    Progress, Result, WeightsSource,
+    default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
@@ -382,11 +382,10 @@ impl Flux1 {
             req.height,
             self.variant.requires_sigma_shift(),
         )?;
-        // Drive the denoise through the swappable `DiffusionSampler` seam (sc-2769): `scale_model_input`
-        // is identity, `timestep(t)` is `sigmas[t]` (fed straight to the transformer), `step` is
-        // `x + v·(σ_{t+1}−σ_t)`.
-        let sampler = FlowMatchSampler::new(sigmas);
-        let n_steps = sampler.num_steps();
+        // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
+        // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
+        // the N1 parity tolerance), and the curated menu (heun / dpmpp_2m / uni_pc / …) becomes
+        // selectable. FLUX feeds the raw schedule sigma as the transformer timestep (Sigma convention).
         // sc-2963: run the MMDiT's fusable elementwise glue (adaLN affine, gated residual, tanh-GELU
         // FFN, RoPE rotation) through `mx.compile` — bit-exact and a per-step win. Scoped to this
         // render by the RAII guard (F-007): the process-global toggle is restored on drop, even on `?`.
@@ -395,25 +394,27 @@ impl Flux1 {
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
-            let mut latents = create_noise(seed, req.width, req.height)?;
-            for t in 0..n_steps {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                let x_in = sampler.scale_model_input(&latents, t)?;
-                let velocity = velocity_fn(&x_in, t, sampler.timestep(t), guidance)?;
-                latents = sampler.step(&velocity, &latents, t)?;
-                // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
-                // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
-                // decode. Output-neutral; matches the qwen/sdxl per-step eval.
-                latents.eval()?;
-                on_progress(Progress::Step {
-                    current: t as u32 + 1,
-                    total: n_steps as u32,
-                });
-            }
+            let latents = create_noise(seed, req.width, req.height)?;
+            // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress are handled inside
+            // `run_flow_sampler`.
+            let final_latents = run_flow_sampler(
+                Some(sampler_name),
+                TimestepConvention::Sigma,
+                &sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x_in, timestep| {
+                    // The curated samplers expose no step index, but the CFG-scheduling consumers
+                    // (`timestep_to_start_cfg`) need one — derive it as the count of schedule nodes
+                    // already descended past (exact for the single-eval default sampler).
+                    let step_idx = sigmas.iter().filter(|&&s| s > timestep).count();
+                    velocity_fn(x_in, step_idx, timestep, guidance)
+                },
+            )?;
             on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&latents, req.width, req.height)?;
+            let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
             let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
             images.push(decoded_to_image(&decoded)?);
         }
@@ -692,12 +693,19 @@ mod tests {
 
     #[test]
     fn dev_advertises_hyper_schnell_does_not() {
-        // Hyper-FLUX is a FLUX.1-dev LoRA: dev exposes the base + `hyper` samplers; schnell (already
-        // a distilled 4-step checkpoint) exposes only the base flow-match sampler.
+        // Both expose the curated unified-framework integrator menu (epic 7114) + the base
+        // `flow_match` profile; Hyper-FLUX is a FLUX.1-dev LoRA, so only dev adds the `hyper` profile.
         let dev = descriptor_for(FluxVariant::Dev).capabilities.samplers;
-        assert_eq!(dev, vec![DEFAULT_SAMPLER, HYPER_SAMPLER]);
         let schnell = descriptor_for(FluxVariant::Schnell).capabilities.samplers;
-        assert_eq!(schnell, vec![DEFAULT_SAMPLER]);
+        assert!(dev.contains(&HYPER_SAMPLER), "dev exposes hyper");
+        assert!(
+            !schnell.contains(&HYPER_SAMPLER),
+            "schnell does not expose the dev-only hyper profile"
+        );
+        for s in [DEFAULT_SAMPLER, "euler", "dpmpp_2m", "uni_pc"] {
+            assert!(dev.contains(&s), "dev exposes {s}");
+            assert!(schnell.contains(&s), "schnell exposes {s}");
+        }
     }
 
     #[test]
@@ -762,9 +770,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported sampler"), "got: {err}");
-        // Any unknown sampler name is rejected on dev too.
+        // A sampler outside the advertised menu is rejected on dev too. (`lcm`/`euler` are now in the
+        // curated menu (epic 7114), so the rejected names are the qwen-only `lightning` profile, a
+        // non-curated solver name `tcd`, and outright garbage.)
         let dev = Flux1::new_for_tests(FluxVariant::Dev);
-        for bad in ["lcm", "lightning", "euler", "nonsense"] {
+        for bad in ["lightning", "tcd", "nonsense"] {
             let err = dev
                 .validate(&GenerationRequest {
                     prompt: "a red fox".into(),

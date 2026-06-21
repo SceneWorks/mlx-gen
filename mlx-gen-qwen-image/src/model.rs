@@ -20,8 +20,8 @@ use mlx_gen::{
 use crate::loader;
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
-    encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, resolve_run_params,
-    LIGHTNING_SAMPLER,
+    encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, qwen_samplers,
+    resolve_run_params, LIGHTNING_SAMPLER,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -54,10 +54,10 @@ pub fn descriptor() -> ModelDescriptor {
             // transformer's `AdaptableHost`; stacked + mixed via the core seam.
             supports_lora: true,
             supports_lokr: true,
-            // `lightning` = the few-step Lightning acceleration sampler (sc-2909); an unset
-            // `req.sampler` is the production flow-match path. Any other name is rejected in
-            // `validate_request` rather than silently downgraded.
-            samplers: vec![LIGHTNING_SAMPLER],
+            // The curated unified-framework integrator menu (epic 7114 P3) + the `lightning` few-step
+            // acceleration profile (sc-2909). An unset `req.sampler` is the production flow-match
+            // Euler path; any name outside the menu is rejected in `validate_request`.
+            samplers: qwen_samplers(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -246,14 +246,16 @@ impl QwenImage {
                     // Blend the (hoisted) clean latents with this image's noise at
                     // `sigma = sigmas[init_time_step]` (fork `create_for_txt2img_or_img2img`).
                     Some(clean) => {
-                        let sigma = params.sampler.sigma(start_step);
+                        let sigma = params.sigmas[start_step];
                         add_noise_by_interpolation(clean, &noise, sigma)?
                     }
                     None => noise,
                 };
                 denoise_with_progress(
                     &self.transformer,
-                    &params.sampler,
+                    params.sampler_name.as_deref(),
+                    &params.sigmas,
+                    seed,
                     latents,
                     &pos,
                     neg.as_ref(),
@@ -375,10 +377,17 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &req).is_ok());
-        // An unknown sampler is rejected, not silently downgraded.
+        // A curated sampler (epic 7114) is now accepted — `lcm`/`dpmpp_2m`/… select that integrator.
         let req = GenerationRequest {
             prompt: "a fox".into(),
-            sampler: Some("lcm".into()),
+            sampler: Some("dpmpp_2m".into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &req).is_ok());
+        // A name outside the menu is still rejected, not silently downgraded.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            sampler: Some("nonsense".into()),
             ..Default::default()
         };
         let err = validate_request(&caps, &req)

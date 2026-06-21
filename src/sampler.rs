@@ -31,7 +31,7 @@ use gen_core::sampling::{
 };
 
 use crate::array::scalar;
-use crate::Result;
+use crate::{CancelFlag, Progress, Result};
 
 /// The DDPM `alphas_cumprod` noise schedule, re-exported from gen-core at the historical
 /// `mlx_gen::sampler::AlphaSchedule` path (SDXL/Kolors build it for the acceleration samplers and
@@ -206,6 +206,103 @@ impl LatentOps for MlxLatentOps {
         // `StepRng::normal` already returns `crate::Result`, which `?` lifts into `gen_core::Error`.
         Ok(StepRng::new(seed).normal(x.shape(), step)?)
     }
+}
+
+/// Drive a curated gen-core unified [`gen_core::sampling::Sampler`] over a flow-match sigma schedule,
+/// applying the per-step cancel / `eval` / progress contract every mlx-gen image engine needs (epic
+/// 7114 P3, the flow-match cohort adoption seam).
+///
+/// This is the engine-side counterpart to [`MlxLatentOps`]: a flow-match (rectified-flow) engine
+/// hands its DiT forward (as `predict`) plus its native sigma schedule, and any curated solver
+/// (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / LCM / DDIM) integrates the latents — replacing
+/// the legacy per-engine [`FlowMatchSampler`] loop with one that can host the multi-eval / multistep
+/// solvers the precomputed-`StepCoeffs` design structurally cannot.
+///
+/// - `sampler_name`: the canonical curated solver name. Unknown / `None` / a non-solver alias (the
+///   acceleration *profiles* `flow_match` / `hyper` / `lightning`, which change the schedule, not the
+///   integrator) falls back to plain Euler (N3 — never hard-fail a generation over a sampling knob,
+///   and `euler` over FLOW reproduces the legacy [`FlowMatchSampler`] within the N1 parity tolerance).
+/// - `conv`: the engine's timestep convention (FLUX / Qwen / Chroma feed the raw sigma →
+///   [`TimestepConvention::Sigma`]; the Z-Image-style DiTs feed `1 − σ` →
+///   [`TimestepConvention::OneMinusSigma`]).
+/// - `sigmas`: the descending schedule, length `num_steps + 1`, trailing `0.0`.
+/// - `predict(x_in, timestep)`: the engine's DiT forward returning the RAW (already CFG-combined)
+///   velocity. `x_in` is the model-input-scaled latent (identity for FLOW) and `timestep` is the
+///   conditioning value the model embeds.
+///
+/// Cancellation, the per-step `eval` (so a mid-render cancel lands within ~1 model eval instead of at
+/// VAE decode, and peak graph memory stays bounded — the sc-5399 rationale), and progress all route
+/// through the `denoise` callback, the sole per-eval hook the callback-form `Sampler` exposes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    latents: Array,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Array, f32) -> Result<Array>,
+) -> Result<Array> {
+    use gen_core::sampling::{
+        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
+    };
+
+    let ops = MlxLatentOps;
+    let ms = FlowModelSampling::new(conv);
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
+    let sampler: Box<dyn Sampler<MlxLatentOps>> = sampler_name
+        .and_then(sampler_by_name::<MlxLatentOps>)
+        .unwrap_or_else(|| Box::new(Euler));
+
+    let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        // Per-eval compute boundary: force the prior step's lazy graph now (MLX is lazy, so without
+        // this the whole denoise is one un-cancellable graph that only runs at VAE decode). Output-
+        // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
+        // back here is always the fresh node to integrate from, so evaluating it is safe.
+        ge(mlx_rs::transforms::eval([x]))?;
+        // Progress as the count of schedule nodes already descended past — robust to the multi-eval
+        // solvers (Heun / DPM++ SDE call this twice per step; the count stays monotone and ≤ total).
+        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+        on_progress(Progress::Step { current, total });
+        gc_denoise(&ops, &ms, x, sigma, |xin, t| {
+            predict(xin, t).map_err(Into::into)
+        })
+    };
+
+    let out = sampler
+        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .map_err(crate::Error::from)?;
+    // Force the final step's advancement (never seen by the callback, which evals only inputs).
+    mlx_rs::transforms::eval([&out])?;
+    Ok(out)
+}
+
+/// The curated unified-framework **sampler** menu (epic 7114 decision 2) as capability strings — every
+/// [`gen_core::sampling::Solver`] name, in menu order. A flow-match (or DDPM) engine advertises this
+/// in its [`gen_core::generator::Capabilities`] `samplers` list (plus any legacy alias it still
+/// honors, e.g. `flow_match`) so the per-generation `sampler` knob can select any curated integrator
+/// and [`run_flow_sampler`] routes the name to its solver.
+pub fn curated_sampler_names() -> Vec<&'static str> {
+    gen_core::sampling::Solver::ALL
+        .iter()
+        .map(|s| s.name())
+        .collect()
+}
+
+/// The curated unified-framework **scheduler** menu (epic 7114 decision 2) as capability strings —
+/// every [`gen_core::sampling::Scheduler`] name, in menu order. Engines that expose the sigma-schedule
+/// axis advertise this in their `schedulers` list; selecting one builds the schedule via
+/// [`gen_core::sampling::schedule_sigmas`].
+pub fn curated_scheduler_names() -> Vec<&'static str> {
+    gen_core::sampling::Scheduler::ALL
+        .iter()
+        .map(|s| s.name())
+        .collect()
 }
 
 // =================================================================================================

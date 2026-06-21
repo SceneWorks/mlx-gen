@@ -207,6 +207,8 @@ fn control_denoise_loop_matches_golden() {
     let out = denoise_control_with_progress(
         &transformer,
         &scheduler,
+        None,
+        0,
         init,
         &cap,
         &cc,
@@ -266,6 +268,8 @@ fn control_dtype_compare() {
         let out = denoise_control_with_progress(
             &transformer,
             &scheduler,
+            None,
+            0,
             init,
             &cap,
             &cc,
@@ -386,6 +390,8 @@ fn control_q8_transformer_matches_golden() {
     let latents = denoise_control_with_progress(
         &transformer,
         &scheduler,
+        None,
+        0,
         init,
         &cap,
         &cc,
@@ -598,6 +604,8 @@ fn control_q8_determinism() {
         denoise_control_with_progress(
             t,
             &scheduler,
+            None,
+            0,
             init.clone(),
             &cap,
             &cc,

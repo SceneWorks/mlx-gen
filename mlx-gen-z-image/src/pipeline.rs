@@ -10,7 +10,8 @@ use mlx_gen::array::host_i32;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image, Progress, Result,
+    run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
+    Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
@@ -72,37 +73,40 @@ pub fn slice_valid(encoder_out: &Array, num_valid: i32) -> Result<Array> {
 ///
 /// Mirrors the fork's loop: `timestep = 1 - sigma[t]` (the transformer applies its own
 /// `t_scale`), `latents += (sigma[t+1] - sigma[t]) * velocity`.
+#[allow(clippy::too_many_arguments)]
 pub fn denoise_with_progress(
     transformer: &ZImageTransformer,
     scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
     latents: Array,
     cap_feats: &Array,
     start_step: usize,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    let mut latents = latents;
-    let total = (scheduler.num_steps() - start_step) as u32;
     // The patchify metadata + RoPE freqs depend only on the (loop-constant) latent dims and caption,
     // so build them once and reuse across steps instead of rederiving them every forward (F-042).
     let sh = latents.shape();
     let prep = transformer.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
-    for t in start_step..scheduler.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let velocity = transformer.forward_with(&prep, &latents, scheduler.timestep(t))?;
-        latents = scheduler.step(&latents, &velocity, t)?;
-        // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399): MLX is
-        // lazy, so without it the whole denoise is one un-cancellable graph run at decode.
-        // Output-neutral; matches the qwen/sdxl per-step eval.
-        latents.eval()?;
-        on_progress(Progress::Step {
-            current: (t - start_step) as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+    // Z-Image is rectified-flow (FLOW prediction) and feeds `1 - sigma` as the transformer timestep
+    // (the model applies its own `t_scale`) — [`TimestepConvention::OneMinusSigma`]. Route through the
+    // unified curated-sampler framework (epic 7114 P3): `euler` reproduces the legacy flow-match step
+    // within the N1 tolerance, and the curated menu becomes selectable. Cancellation, the per-step
+    // `eval` (sc-5522 / sc-5399), and progress live in `run_flow_sampler`. img2img slices the schedule
+    // from `start_step` so the blended init latents are denoised from the matching sigma.
+    let predict = |x: &Array, timestep: f32| transformer.forward_with(&prep, x, timestep);
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::OneMinusSigma,
+        &scheduler.sigmas[start..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
 }
 
 /// [`denoise_with_progress`] from step 0, with no progress callback and no cancellation — the bare
@@ -117,6 +121,8 @@ pub fn denoise(
     denoise_with_progress(
         transformer,
         scheduler,
+        None,
+        0,
         latents,
         cap_feats,
         0,
@@ -134,6 +140,8 @@ pub fn denoise(
 pub fn denoise_control_with_progress(
     transformer: &ZImageControlTransformer,
     scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
     latents: Array,
     cap_feats: &Array,
     control_context: &Array,
@@ -142,35 +150,27 @@ pub fn denoise_control_with_progress(
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Array> {
-    let mut latents = latents;
-    let total = (scheduler.num_steps() - start_step) as u32;
     // Patchify metadata, RoPE freqs, and the embedded (constant) control context depend only on the
     // loop-constant latent dims + caption + control context — build once and reuse every step (F-042).
     let sh = latents.shape();
     let prep =
         transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
-    for t in start_step..scheduler.num_steps() {
-        if cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let velocity = transformer.forward_with_control(
-            &prep,
-            &latents,
-            scheduler.timestep(t),
-            control_context_scale,
-            None,
-        )?;
-        latents = scheduler.step(&latents, &velocity, t)?;
-        // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399): MLX is
-        // lazy, so without it the whole denoise is one un-cancellable graph run at decode.
-        // Output-neutral; matches the qwen/sdxl per-step eval.
-        latents.eval()?;
-        on_progress(Progress::Step {
-            current: (t - start_step) as u32 + 1,
-            total,
-        });
-    }
-    Ok(latents)
+    // Same unified-framework routing as the base loop (epic 7114 P3), with the control branch in the
+    // `predict` closure (the fork's `ZImageControl._control_predict`).
+    let predict = |x: &Array, timestep: f32| {
+        transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)
+    };
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::OneMinusSigma,
+        &scheduler.sigmas[start..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
 }
 
 /// Resolve the img2img start step (the fork's `Config.init_time_step`): for a reference image with
@@ -340,7 +340,7 @@ pub(crate) fn render_batch(
     base_seed: u64,
     req: &GenerationRequest,
     on_progress: &mut dyn FnMut(Progress),
-    mut denoise: impl FnMut(Array, &mut dyn FnMut(Progress)) -> Result<Array>,
+    mut denoise: impl FnMut(Array, u64, &mut dyn FnMut(Progress)) -> Result<Array>,
 ) -> Result<Vec<Image>> {
     // sc-2963 (rollout of sc-2957): run the DiT's fusable elementwise glue through `mx.compile` —
     // bit-exact and a per-step win. sc-4036/F-036: enable it ONCE for the whole render via an RAII
@@ -369,7 +369,7 @@ pub(crate) fn render_batch(
             }
             None => noise,
         };
-        let latents = denoise(latents, on_progress)?;
+        let latents = denoise(latents, seed, on_progress)?;
 
         on_progress(Progress::Decoding);
         // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode.

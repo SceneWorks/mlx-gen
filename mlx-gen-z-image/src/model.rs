@@ -11,9 +11,9 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -69,7 +69,9 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
-            samplers: Vec::new(),
+            // Curated unified-framework integrator menu (epic 7114 P3). Turbo is guidance-distilled to
+            // ~4 steps; an unset `req.sampler` is the curated Euler over the static-shift schedule.
+            samplers: curated_sampler_names(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -219,6 +221,7 @@ impl ZImageTurbo {
 
         // Per-image batch render shared with the control variant (F-035); the base branch's only
         // difference is the plain `denoise_with_progress` step.
+        let sampler_name = req.sampler.as_deref();
         let images = pipeline::render_batch(
             &self.vae,
             &scheduler,
@@ -227,10 +230,12 @@ impl ZImageTurbo {
             base_seed,
             req,
             on_progress,
-            |latents, op| {
+            |latents, seed, op| {
                 denoise_with_progress(
                     &self.transformer,
                     &scheduler,
+                    sampler_name,
+                    seed,
                     latents,
                     &cap,
                     start_step,

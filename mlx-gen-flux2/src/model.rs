@@ -19,8 +19,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, Error, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    ModelDescriptor, ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, gen_core, run_flow_sampler, Error, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
@@ -31,7 +32,7 @@ use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
-    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::{Flux2ForwardInputs, Flux2Transformer};
@@ -613,7 +614,6 @@ impl Flux2 {
         };
 
         let sched = schedule(steps, req.width, req.height);
-        let timesteps = timesteps_x1000(&sched);
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
@@ -697,12 +697,13 @@ impl Flux2 {
         // RAII guard (F-007): the process-global toggle is restored on drop, even on an early `?`.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
+        let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
             let noise = create_noise(seed, req.width, req.height, self.config.in_channels)?;
             // img2img: `(1-σ)·clean + σ·noise` at `σ = sigmas[start_step]`; txt2img: pure noise.
-            let mut latents = match &clean_init {
+            let latents = match &clean_init {
                 Some(clean) => add_noise_by_interpolation(clean, &noise, sched.sigmas[start_step])?,
                 None => noise,
             };
@@ -710,57 +711,64 @@ impl Flux2 {
             let cache = kv_enabled.then(|| {
                 Flux2KvCache::new(self.config.num_double_layers, self.config.num_single_layers)
             });
-            // img2img skips the first `start_step` steps (the fork loops `range(init_time_step, n)`).
-            for (t, &ts) in timesteps.iter().enumerate().skip(start_step) {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                // KV step role: the first executed step extracts the reference K/V (running the full
-                // `[txt, target, ref]` forward); later steps run `[txt, target]` only and splice the
-                // cached ref K/V back in. With no cache, every step includes the reference tokens.
+            // The curated unified-framework solver owns the loop (epic 7114 P3). KV step role: the
+            // first executed forward extracts the reference K/V (the full `[txt, target, ref]` pass);
+            // later forwards run `[txt, target]` and splice the cached ref K/V back in. "First executed
+            // forward" is tracked by `extracted` (not `t == start_step`) so a multi-eval solver still
+            // extracts the ref K/V once and reuses it; the single-eval Euler default is byte-identical
+            // to the prior loop. FLUX.2 feeds `sigma · 1000` as the transformer timestep (Sigma
+            // convention; the ×1000 is applied here).
+            let mut extracted = false;
+            let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+                let ts = sigma * 1000.0;
                 let (include_ref, cache_ref) = match &cache {
                     Some(c) => {
-                        let mode = if t == start_step {
-                            CacheMode::Extract
-                        } else {
+                        let mode = if extracted {
                             CacheMode::Cached
+                        } else {
+                            CacheMode::Extract
                         };
                         c.configure(mode, num_ref);
+                        extracted = true;
                         (mode == CacheMode::Extract, Some(c))
                     }
                     None => (true, None),
                 };
                 let v = run(
-                    &latents,
+                    latents,
                     &prompt_embeds,
                     &text_ids,
                     ts,
                     include_ref,
                     cache_ref,
                 )?;
-                let v = match &negative {
+                match &negative {
                     Some((neg_embeds, neg_ids)) => {
                         // CFG with the cache mirrors the fork: the same cache feeds both forwards
                         // (the negative extract overwrites the positive's slots). Distilled klein
                         // runs guidance 1.0 → no negative pass, so this is the base path in practice.
-                        let vn = run(&latents, neg_embeds, neg_ids, ts, include_ref, cache_ref)?;
+                        let vn = run(latents, neg_embeds, neg_ids, ts, include_ref, cache_ref)?;
                         // noise = neg + guidance·(pos − neg)
-                        add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?
+                        Ok(add(&vn, &multiply(&subtract(&v, &vn)?, scalar(guidance))?)?)
                     }
-                    None => v,
-                };
-                latents = sched.step(&latents, &v, t)?;
-                // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
-                // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
-                // decode. Output-neutral; matches the qwen/sdxl per-step eval.
-                latents.eval()?;
-                on_progress(Progress::Step {
-                    current: t as u32 + 1,
-                    total: steps as u32,
-                });
-            }
+                    None => Ok(v),
+                }
+            };
+            // Cancellation, the per-step `eval` (sc-5522 / sc-5399), and progress live in
+            // `run_flow_sampler`. img2img slices the schedule from `start_step` (the fork's
+            // `range(init_time_step, n)`).
+            let final_latents = run_flow_sampler(
+                sampler_name,
+                TimestepConvention::Sigma,
+                &sched.sigmas[start_step..],
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                predict,
+            )?;
             on_progress(Progress::Decoding);
-            let packed = latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
+            let packed = final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
             let decoded = vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
             let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
             images.push(decoded_to_image(&nchw)?);

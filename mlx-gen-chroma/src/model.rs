@@ -13,9 +13,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, CancelFlag, DiffusionSampler, Error, FlowMatchSampler,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, WeightsSource,
+    default_seed, gen_core, run_flow_sampler, CancelFlag, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
@@ -94,28 +94,16 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChromaSamplerKind {
-    Euler,
-    Heun,
-}
-
-impl ChromaSamplerKind {
-    fn from_request(variant: ChromaVariant, sampler: Option<&str>) -> Self {
-        match sampler {
-            Some(HEUN_SAMPLER) => Self::Heun,
-            Some(DEFAULT_SAMPLER | "flow_match") => Self::Euler,
-            None if matches!(variant, ChromaVariant::Flash) => Self::Heun,
-            None => Self::Euler,
-            // `from_request` runs only after `Capabilities::validate_request` (validate_impl), which
-            // rejects any sampler not in the advertised `samplers` list
-            // (`[DEFAULT_SAMPLER, HEUN_SAMPLER, "flow_match"]`) — all handled above. An unknown name
-            // here means validation was bypassed, so make the contract violation loud instead of
-            // silently defaulting to Euler (sc-6983 — removes the second source of truth).
-            Some(other) => unreachable!(
-                "chroma: sampler {other:?} reached from_request unvalidated (validate_request gates it)"
-            ),
-        }
+/// Resolve the curated sampler **name** to drive [`run_flow_sampler`] with. An explicit `req.sampler`
+/// wins (already gated by `validate_request` against the advertised curated menu); an unset sampler
+/// resolves to the variant default — Flash distills toward the second-order **Heun** (sc-5392),
+/// everything else to flow-match **Euler**. The legacy `flow_match` alias and any non-solver name fall
+/// back to Euler inside [`run_flow_sampler`] (epic 7114 N3), so they need no special-case here.
+fn resolve_sampler_name(variant: ChromaVariant, sampler: Option<&str>) -> &str {
+    match sampler {
+        Some(s) => s,
+        None if matches!(variant, ChromaVariant::Flash) => HEUN_SAMPLER,
+        None => DEFAULT_SAMPLER,
     }
 }
 
@@ -197,7 +185,8 @@ impl Chroma {
             steps,
             guidance,
             latents,
-            ChromaSamplerKind::Euler,
+            DEFAULT_SAMPLER,
+            0,
             cancel,
             on_progress,
         )
@@ -213,7 +202,8 @@ impl Chroma {
         steps: u32,
         guidance: f32,
         latents: Array,
-        sampler_kind: ChromaSamplerKind,
+        sampler_name: &str,
+        seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -246,7 +236,6 @@ impl Chroma {
             }
             s
         };
-        let sampler = FlowMatchSampler::new(sigmas);
 
         // Scoped compiled-glue enable (F-007): restored on drop instead of leaking the global on.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -264,8 +253,9 @@ impl Chroma {
 
         self.denoise_loop(
             latents,
-            sampler,
-            sampler_kind,
+            sigmas,
+            sampler_name,
+            seed,
             guidance,
             &pos_embeds,
             &rope_pos,
@@ -279,9 +269,10 @@ impl Chroma {
     #[allow(clippy::too_many_arguments)]
     fn denoise_loop(
         &self,
-        mut latents: Array,
-        sampler: FlowMatchSampler,
-        sampler_kind: ChromaSamplerKind,
+        latents: Array,
+        sigmas: Vec<f32>,
+        sampler_name: &str,
+        seed: u64,
         guidance: f32,
         pos_embeds: &Array,
         rope_pos: &RopeTable,
@@ -291,8 +282,10 @@ impl Chroma {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let (_, _, tr, _) = self.parts()?;
-        let n = sampler.num_steps();
 
+        // The true-CFG velocity field `v = neg + g·(pos − neg)` (single forward when CFG is off).
+        // Chroma is rectified-flow (FLOW prediction), so the model is fed the raw schedule sigma as
+        // its timestep ([`TimestepConvention::Sigma`]) and `predict` returns the velocity directly.
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
             let ts = Array::from_slice(&[sigma], &[1]);
             let pooled = tr.pooled_temb(&ts)?;
@@ -315,42 +308,23 @@ impl Chroma {
             }
         };
 
-        for t in 0..n {
-            // Honor the engine cancellation contract every other image provider implements (F-096):
-            // an HD 28-step dual-forward 1024² render runs minutes, so check before each step.
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let pred = predict(&latents, sampler.timestep(t))?;
-            latents = match sampler_kind {
-                ChromaSamplerKind::Euler => sampler.step(&pred, &latents, t)?,
-                ChromaSamplerKind::Heun if t + 1 < n => {
-                    let euler = sampler.step(&pred, &latents, t)?;
-                    if cancel.is_cancelled() {
-                        return Err(Error::Canceled);
-                    }
-                    let pred_next = predict(&euler, sampler.sigma(t + 1))?;
-                    let avg = multiply(&add(&pred, &pred_next)?, scalar(0.5))?;
-                    sampler.step(&avg, &latents, t)?
-                }
-                ChromaSamplerKind::Heun => sampler.step(&pred, &latents, t)?,
-            };
-            // Force this step's compute now (sc-5514 / sc-5399). MLX is lazily evaluated, so
-            // without a per-step eval the entire denoise builds ONE graph that only runs at VAE
-            // decode — the per-step `cancel.is_cancelled()` above then passes for every step
-            // during graph-building and never interrupts the single monolithic eval (cancel
-            // becomes effectively per-image, not per-step). Evaluating here makes each step a
-            // real compute boundary so a mid-render cancel lands within ~1 step, gives accurate
-            // per-step progress timing, and bounds peak graph memory. Bit-identical to decoding
-            // the un-eval'd graph (eval forces the same ops, no new math) — the e2e parity
-            // goldens are unaffected.
-            mlx_rs::transforms::eval([&latents])?;
-            on_progress(Progress::Step {
-                current: t as u32 + 1,
-                total: n as u32,
-            });
-        }
-        Ok(latents)
+        // Route through the unified curated-sampler framework (epic 7114 P3): `euler` reproduces the
+        // legacy flow-match step within the N1 parity tolerance, `heun` is the second-order refinement
+        // (identical to the previous hand-rolled velocity-average arm — for FLOW the k-diffusion
+        // derivative `d = (x − x0)/σ` equals the velocity `v`), and the rest of the curated menu
+        // (dpmpp_2m / uni_pc / …) becomes available. Cancellation, the per-step `eval` (sc-5514 /
+        // sc-5399 — bounds the lazy graph so a mid-render cancel lands within ~1 model eval), and
+        // progress are handled inside `run_flow_sampler`.
+        run_flow_sampler(
+            Some(sampler_name),
+            TimestepConvention::Sigma,
+            &sigmas,
+            latents,
+            seed,
+            cancel,
+            on_progress,
+            predict,
+        )
     }
 
     /// Test accessors (real-weight e2e, sc-3839).
@@ -387,7 +361,7 @@ impl Chroma {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let kind = ChromaSamplerKind::from_request(self.variant, sampler);
+        let name = resolve_sampler_name(self.variant, sampler);
         self.denoise_with_sampler(
             prompt,
             negative,
@@ -396,7 +370,8 @@ impl Chroma {
             steps,
             guidance,
             latents,
-            kind,
+            name,
+            0,
             cancel,
             on_progress,
         )
@@ -478,8 +453,7 @@ impl Chroma {
             }
             let seed = base_seed.wrapping_add(i as u64);
             let latents = create_noise(seed, req.width, req.height)?;
-            let sampler_kind =
-                ChromaSamplerKind::from_request(self.variant, req.sampler.as_deref());
+            let name = resolve_sampler_name(self.variant, req.sampler.as_deref());
             let final_latents = self.denoise_with_sampler(
                 &req.prompt,
                 negative,
@@ -488,7 +462,8 @@ impl Chroma {
                 steps,
                 guidance,
                 latents,
-                sampler_kind,
+                name,
+                seed,
                 &req.cancel,
                 on_progress,
             )?;

@@ -25,8 +25,7 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress, resolve_run_params,
-    LIGHTNING_SAMPLER,
+    create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, resolve_run_params,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -61,7 +60,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             // `lightning` = the few-step Lightning sampler (sc-2909), e.g.
             // `lightx2v/Qwen-Image-Edit-2511-Lightning`; an unset sampler is the production path.
-            samplers: vec![LIGHTNING_SAMPLER],
+            // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
+            samplers: qwen_samplers(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -244,7 +244,9 @@ impl QwenImageEdit {
                 let noise = create_noise(seed, out_w, out_h)?;
                 denoise_edit_with_progress(
                     &self.transformer,
-                    &params.sampler,
+                    params.sampler_name.as_deref(),
+                    &params.sigmas,
+                    seed,
                     noise,
                     &static_latents,
                     &cond_grids,

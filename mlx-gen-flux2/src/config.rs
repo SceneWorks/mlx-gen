@@ -7,7 +7,9 @@
 //! `transformer_overrides` / `text_encoder_overrides` (block/head counts, the Qwen3 hidden /
 //! intermediate sizes); everything else is shared.
 
-use mlx_gen::{Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant};
+use mlx_gen::{
+    curated_sampler_names, Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant,
+};
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
 pub const FLUX2_KLEIN_9B_EDIT_ID: &str = "flux2_klein_9b_edit";
@@ -182,7 +184,9 @@ impl Flux2Variant {
                 supports_lora: true,
                 supports_lokr: true,
                 supported_quants: &[Quant::Q4, Quant::Q8],
-                samplers: Vec::new(),
+                // Curated unified-framework integrator menu (epic 7114 P3). An unset `req.sampler` is
+                // the curated Euler over the resolution-shifted flow schedule.
+                samplers: curated_sampler_names(),
                 schedulers: vec!["flow_match_euler"],
                 min_size: 256,
                 max_size: 2048,

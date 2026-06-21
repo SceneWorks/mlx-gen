@@ -17,9 +17,9 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -54,7 +54,8 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Control, ConditioningKind::Reference],
             supports_lora: true,
             supports_lokr: true,
-            samplers: Vec::new(),
+            // Curated unified-framework integrator menu (epic 7114 P3), as the base turbo variant.
+            samplers: curated_sampler_names(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 2048,
@@ -218,6 +219,7 @@ impl ZImageTurboControl {
         // Per-image batch render shared with the base variant (F-035); the control branch's only
         // difference is the `denoise_control_with_progress` step threading the f32 control context +
         // scale (the mixed-precision dtype flow, sc-2720, is preserved inside the closure).
+        let sampler_name = req.sampler.as_deref();
         let images = pipeline::render_batch(
             &self.vae,
             &scheduler,
@@ -226,10 +228,12 @@ impl ZImageTurboControl {
             base_seed,
             req,
             on_progress,
-            |latents, op| {
+            |latents, seed, op| {
                 denoise_control_with_progress(
                     &self.transformer,
                     &scheduler,
+                    sampler_name,
+                    seed,
                     latents,
                     &cap,
                     &control_context,

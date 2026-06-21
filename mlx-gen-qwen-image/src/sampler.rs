@@ -49,7 +49,7 @@ pub fn lightning(num_steps: usize) -> FlowMatchSampler {
 /// 3.0`, applied over `linspace(1.0, 1/num_train_timesteps, n)`, then a trailing `0.0`. The `1/1000`
 /// floor (vs the production schedule's `1/n`) is the whole difference — proven bit-exact vs diffusers
 /// in `tests/lightning_parity.rs` (e.g. 4-step → `[1.0, 0.857.., 0.601.., 0.00299.., 0.0]`).
-fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
+pub fn lightning_sigmas(num_steps: usize) -> Vec<f32> {
     let n = num_steps.max(1);
     let e = LIGHTNING_SHIFT; // exp(μ)
     let sigma_min = 1.0 / LIGHTNING_NUM_TRAIN_TIMESTEPS;

@@ -8,7 +8,7 @@
 //! and attention is **masked** by the T5 padding mask. Generation uses **true CFG** (real negative
 //! prompt), not FLUX's distilled guidance.
 
-use mlx_gen::{Capabilities, Modality, ModelDescriptor, Quant};
+use mlx_gen::{curated_sampler_names, Capabilities, Modality, ModelDescriptor, Quant};
 
 pub const CHROMA1_HD_ID: &str = "chroma1_hd";
 pub const CHROMA1_BASE_ID: &str = "chroma1_base";
@@ -105,7 +105,16 @@ impl ChromaVariant {
                 // (and kohya) `transformer_blocks.*`/`single_transformer_blocks.*` paths.
                 supports_lora: true,
                 supports_lokr: true,
-                samplers: vec![DEFAULT_SAMPLER, HEUN_SAMPLER, "flow_match"],
+                // The curated unified-framework integrator menu (epic 7114 P3) + the legacy
+                // `flow_match` alias (== Euler). `euler`/`heun` (DEFAULT_SAMPLER/HEUN_SAMPLER) are in
+                // the curated set; Flash's unset sampler still resolves to Heun in the generate path.
+                samplers: {
+                    let mut s = curated_sampler_names();
+                    s.push("flow_match");
+                    s
+                },
+                // Scheduler axis (curated sigma-schedule menu) lands in the epic 7114 follow-up pass;
+                // the native static-shift / beta schedule is still the default.
                 schedulers: vec!["linear"],
                 min_size: 256,
                 max_size: 2048,
