@@ -25,7 +25,8 @@ use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, resolve_run_params,
+    create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, qwen_schedulers,
+    resolve_run_params,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -62,7 +63,7 @@ pub fn descriptor() -> ModelDescriptor {
             // `lightx2v/Qwen-Image-Edit-2511-Lightning`; an unset sampler is the production path.
             // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
             samplers: qwen_samplers(),
-            schedulers: Vec::new(),
+            schedulers: qwen_schedulers(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,

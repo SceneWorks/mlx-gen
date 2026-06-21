@@ -21,7 +21,7 @@ use crate::loader;
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
     encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, qwen_samplers,
-    resolve_run_params, LIGHTNING_SAMPLER,
+    qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -58,7 +58,7 @@ pub fn descriptor() -> ModelDescriptor {
             // acceleration profile (sc-2909). An unset `req.sampler` is the production flow-match
             // Euler path; any name outside the menu is rejected in `validate_request`.
             samplers: qwen_samplers(),
-            schedulers: Vec::new(),
+            schedulers: qwen_schedulers(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,

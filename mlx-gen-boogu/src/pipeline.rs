@@ -15,7 +15,10 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
-use mlx_gen::{CancelFlag, Error, Progress, Result};
+use mlx_gen::{
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Progress, Result,
+    TimestepConvention,
+};
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -47,6 +50,12 @@ pub struct GenerateOptions {
     pub steps: usize,
     pub text_guidance_scale: f32,
     pub seed: u64,
+    /// Curated unified-framework integrator (epic 7114). `None` (or an unknown name) is the curated
+    /// Euler — the legacy flow-match step within the N1 tolerance.
+    pub sampler: Option<String>,
+    /// Curated unified-framework scheduler (epic 7114). `None` keeps the native static-shift schedule
+    /// (`mu = 1.15`) byte-exact; a curated name re-shapes σ over the same shift.
+    pub scheduler: Option<String>,
 }
 
 impl Default for GenerateOptions {
@@ -57,6 +66,8 @@ impl Default for GenerateOptions {
             steps: 50,
             text_guidance_scale: 4.0,
             seed: 0,
+            sampler: None,
+            scheduler: None,
         }
     }
 }
@@ -102,6 +113,10 @@ pub struct EditOptions {
     /// pass on the reference image. Default `false` (the reference default + inference script) — the
     /// negative is the text-only empty/drop instruction. Only meaningful when `condition_on_image`.
     pub use_input_images_4_neg_instruct: bool,
+    /// Curated unified-framework integrator (epic 7114); `None` is the curated Euler. As the Base path.
+    pub sampler: Option<String>,
+    /// Curated unified-framework scheduler (epic 7114); `None` keeps the native static-shift schedule.
+    pub scheduler: Option<String>,
 }
 
 impl Default for EditOptions {
@@ -114,6 +129,8 @@ impl Default for EditOptions {
             seed: 0,
             condition_on_image: true,
             use_input_images_4_neg_instruct: false,
+            sampler: None,
+            scheduler: None,
         }
     }
 }
@@ -183,42 +200,54 @@ impl BooguPipeline {
         };
 
         // Initial latent noise [1, 16, H/8, W/8] (f32; the DiT casts to its compute dtype).
-        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
 
-        // Static-v1 timesteps + the trailing 1.0 the Euler step reads as `t_next` at the last step.
-        let ts = build_timesteps_v1(opts.steps);
+        // Route the flow-match denoise through the unified curated-sampler framework (epic 7114): the
+        // native static-shift (`mu = 1.15`, v1 logistic) schedule is the byte-exact default and the
+        // curated sampler/scheduler menus become selectable. Boogu feeds the shifted clean-fraction
+        // timestep `t = 1 − σ` to the DiT (OneMinusSigma) and its DiT predicts the velocity in
+        // clean-fraction time (`dz/dt`), so `predict` negates it into `run_flow_sampler`'s noise-fraction
+        // FLOW convention (`dz/dσ = −dz/dt`) and casts to f32 (the native step's dtype). Cancellation,
+        // the per-step `eval`, and progress all live in `run_flow_sampler`.
+        let native = base_native_sigmas(opts.steps);
+        let sigmas = resolve_flow_schedule(
+            opts.scheduler.as_deref(),
+            base_shift_mu(),
+            opts.steps,
+            &native,
+        );
         let scale = opts.text_guidance_scale;
-
-        for i in 0..opts.steps {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let t = Array::from_slice(&[ts[i] as f32], &[1]);
-            let cond_v = self.dit.forward(&lat, &t, &cond, &cond_mask)?;
-            let pred = match &uncond {
-                Some((u_hidden, u_mask)) => {
-                    let uncond_v = self.dit.forward(&lat, &t, u_hidden, u_mask)?;
-                    // pred = cond + (scale − 1)·(cond − uncond)
-                    add(
-                        &cond_v,
-                        &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
-                    )?
-                }
-                None => cond_v,
-            };
-
-            // Euler step in f32: x += (t_next − t)·v.
-            let dt = (ts[i + 1] - ts[i]) as f32;
-            lat = add(
-                &lat.as_dtype(Dtype::Float32)?,
-                &multiply(&pred.as_dtype(Dtype::Float32)?, Array::from_f32(dt))?,
-            )?;
-            eval([&lat])?;
-            on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total: opts.steps as u32,
-            });
-        }
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            lat,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond_v = self.dit.forward(x, &t, &cond, &cond_mask)?;
+                let pred = match &uncond {
+                    Some((u_hidden, u_mask)) => {
+                        let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
+                        // pred = cond + (scale − 1)·(cond − uncond)
+                        add(
+                            &cond_v,
+                            &multiply(
+                                &subtract(&cond_v, &uncond_v)?,
+                                Array::from_f32(scale - 1.0),
+                            )?,
+                        )?
+                    }
+                    None => cond_v,
+                };
+                Ok(multiply(
+                    &pred.as_dtype(Dtype::Float32)?,
+                    Array::from_f32(-1.0),
+                )?)
+            },
+        )?;
 
         on_progress(Progress::Decoding);
         self.decode_latents(&lat)
@@ -351,42 +380,55 @@ impl BooguPipeline {
             None
         };
 
-        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
-        let ts = build_timesteps_v1(opts.steps);
+        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+
+        // Same unified-framework routing as the Base path (epic 7114), with the spatial reference latent
+        // threaded through `forward_edit`. Native static-shift schedule is the byte-exact default;
+        // velocity is negated into the noise-fraction FLOW convention. The output resolution starts from
+        // pure noise (the reference shapes the DiT sequence, not the init latent), so there is no
+        // start-step slicing.
+        let native = base_native_sigmas(opts.steps);
+        let sigmas = resolve_flow_schedule(
+            opts.scheduler.as_deref(),
+            base_shift_mu(),
+            opts.steps,
+            &native,
+        );
         let scale = opts.text_guidance_scale;
-
-        for i in 0..opts.steps {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            let t = Array::from_slice(&[ts[i] as f32], &[1]);
-            let cond_v = self
-                .dit
-                .forward_edit(&lat, &ref_latent, &t, &cond, &cond_mask)?;
-            let pred = match &uncond {
-                Some((u_hidden, u_mask)) => {
-                    let uncond_v =
-                        self.dit
-                            .forward_edit(&lat, &ref_latent, &t, u_hidden, u_mask)?;
-                    add(
-                        &cond_v,
-                        &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
-                    )?
-                }
-                None => cond_v,
-            };
-
-            let dt = (ts[i + 1] - ts[i]) as f32;
-            lat = add(
-                &lat.as_dtype(Dtype::Float32)?,
-                &multiply(&pred.as_dtype(Dtype::Float32)?, Array::from_f32(dt))?,
-            )?;
-            eval([&lat])?;
-            on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total: opts.steps as u32,
-            });
-        }
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            &sigmas,
+            lat,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond_v = self
+                    .dit
+                    .forward_edit(x, &ref_latent, &t, &cond, &cond_mask)?;
+                let pred = match &uncond {
+                    Some((u_hidden, u_mask)) => {
+                        let uncond_v =
+                            self.dit
+                                .forward_edit(x, &ref_latent, &t, u_hidden, u_mask)?;
+                        add(
+                            &cond_v,
+                            &multiply(
+                                &subtract(&cond_v, &uncond_v)?,
+                                Array::from_f32(scale - 1.0),
+                            )?,
+                        )?
+                    }
+                    None => cond_v,
+                };
+                Ok(multiply(
+                    &pred.as_dtype(Dtype::Float32)?,
+                    Array::from_f32(-1.0),
+                )?)
+            },
+        )?;
 
         on_progress(Progress::Decoding);
         self.decode_latents(&lat)
@@ -505,6 +547,24 @@ fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     let span = 1.0 - conditioning_sigma;
     (0..steps)
         .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
+        .collect()
+}
+
+/// The Base/Edit static-shift `mu` — `lin_mu(SEQ_LEN) = 1.15` for the saturated `seq_len = 4096` (the
+/// snapshot's `time_shift_version="v1"` static config). Fed to the epic 7114 scheduler axis so a curated
+/// `normal` / `sgm_uniform` / … schedule re-shapes σ over the SAME shift the native schedule uses.
+fn base_shift_mu() -> f32 {
+    lin_mu(SEQ_LEN) as f32
+}
+
+/// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
+/// `OneMinusSigma` view of [`build_timesteps_v1`]'s shifted clean-fraction timesteps: `σ_i = 1 − ts_i`.
+/// `run_flow_sampler` feeds `1 − σ = ts_i` back to the DiT, so the unified Euler default is byte-exact
+/// with the legacy `x += (ts_{i+1} − ts_i)·v` loop (the trailing `ts = 1.0` becomes the terminal `σ = 0`).
+fn base_native_sigmas(steps: usize) -> Vec<f32> {
+    build_timesteps_v1(steps)
+        .iter()
+        .map(|&t| 1.0 - t as f32)
         .collect()
 }
 

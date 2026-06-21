@@ -13,9 +13,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, run_flow_sampler, CancelFlag, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision,
-    Progress, Result, TimestepConvention, WeightsSource,
+    default_seed, gen_core, resolve_flow_schedule, run_flow_sampler, CancelFlag, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
@@ -186,6 +186,7 @@ impl Chroma {
             guidance,
             latents,
             DEFAULT_SAMPLER,
+            None, // native schedule (parity / test helper path)
             0,
             cancel,
             on_progress,
@@ -203,6 +204,7 @@ impl Chroma {
         guidance: f32,
         latents: Array,
         sampler_name: &str,
+        scheduler_name: Option<&str>,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -226,7 +228,11 @@ impl Chroma {
             None
         };
 
-        let sigmas = if self.variant.use_beta_sigmas() {
+        // Native schedule (the byte-exact default, epic 7114 N1): Base's beta re-spacing, or HD/Flash's
+        // static-shift linspace. A curated `req.scheduler` then re-shapes σ over the variant's static
+        // shift (HD `ln(3)`; Base/Flash `ln(1) = 0`, since Base's shift is identity before the beta
+        // re-spacing and Flash is unshifted).
+        let native = if self.variant.use_beta_sigmas() {
             crate::beta::base_sigmas(steps as usize)
         } else {
             let shift = self.variant.sigma_shift();
@@ -236,6 +242,8 @@ impl Chroma {
             }
             s
         };
+        let mu = self.variant.sigma_shift().ln();
+        let sigmas = resolve_flow_schedule(scheduler_name, mu, steps as usize, &native);
 
         // Scoped compiled-glue enable (F-007): restored on drop instead of leaking the global on.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -371,6 +379,7 @@ impl Chroma {
             guidance,
             latents,
             name,
+            None, // native schedule (e2e sampler-name accessor)
             0,
             cancel,
             on_progress,
@@ -463,6 +472,7 @@ impl Chroma {
                 guidance,
                 latents,
                 name,
+                req.scheduler.as_deref(),
                 seed,
                 &req.cancel,
                 on_progress,

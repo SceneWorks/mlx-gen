@@ -9,7 +9,8 @@
 
 use mlx_gen::image::{resize_lanczos_u8, validate_multiple_of_16};
 use mlx_gen::media::Image;
-use mlx_gen::{Error, FlowMatchEuler, Result};
+use mlx_gen::scheduler::{compute_mu, image_seq_len};
+use mlx_gen::{resolve_flow_schedule, Error, FlowMatchEuler, Result};
 use mlx_rs::ops::{add, multiply};
 use mlx_rs::{random, Array};
 
@@ -118,6 +119,27 @@ pub fn create_noise(seed: u64, width: u32, height: u32, in_channels: usize) -> R
 /// the fork's `get_timesteps_and_sigmas`.
 pub fn schedule(num_steps: usize, width: u32, height: u32) -> FlowMatchEuler {
     FlowMatchEuler::for_image(num_steps, width, height)
+}
+
+/// [`schedule`] honoring a per-generation curated `scheduler` (epic 7114 scheduler axis). An unset /
+/// unknown / `flow_match_euler`-aliased name keeps the native empirical-mu schedule byte-exact (N1);
+/// a curated name (`normal` / `sgm_uniform` / `karras` / …) re-shapes σ over the SAME empirical mu
+/// (`compute_mu(image_seq_len, num_steps)`), so the schedule stays consistent with FLUX.2's
+/// resolution-dependent shift instead of collapsing to a linear ramp.
+pub fn schedule_with(
+    num_steps: usize,
+    width: u32,
+    height: u32,
+    scheduler_name: Option<&str>,
+) -> FlowMatchEuler {
+    let native = schedule(num_steps, width, height);
+    let mu = compute_mu(image_seq_len(width, height), num_steps);
+    FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+        scheduler_name,
+        mu,
+        num_steps,
+        &native.sigmas,
+    ))
 }
 
 /// The timestep values fed to the transformer's time embedding: `shifted_sigma · 1000` for each

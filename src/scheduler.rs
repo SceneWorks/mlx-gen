@@ -79,6 +79,14 @@ impl FlowMatchEuler {
         Self::new(num_steps, shift.ln())
     }
 
+    /// Wrap an already-built descending sigma schedule (length `num_steps + 1`, trailing `0.0`). Used
+    /// by the epic 7114 scheduler axis ([`crate::resolve_flow_schedule`]): an engine resolves a curated
+    /// `req.scheduler` into a sigma vector and wraps it here to drive the same denoise loop, with the
+    /// native schedule (the `None`/default path) returned byte-for-byte.
+    pub fn from_sigmas(sigmas: Vec<f32>) -> Self {
+        Self { sigmas }
+    }
+
     /// Number of denoising steps (loop iterations).
     pub fn num_steps(&self) -> usize {
         self.sigmas.len() - 1

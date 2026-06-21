@@ -2,12 +2,51 @@
 //! These mirror `FluxLatentCreator` and the fork's default `LinearScheduler`.
 
 use mlx_gen::image::validate_multiple_of_16;
-use mlx_gen::Result;
+use mlx_gen::{resolve_flow_schedule, Result};
 use mlx_rs::ops::{add, divide, linspace, subtract};
 use mlx_rs::{random, Array};
 
 pub fn image_seq_len(width: u32, height: u32) -> usize {
     ((height / 16) * (width / 16)) as usize
+}
+
+/// The FLUX.1 time-shift `mu` for the `requires_sigma_shift` (dev) path — the fork's `LinearScheduler`
+/// resolution-dependent linear fit `mu = m·(w·h/256) + b` (constants base `(256, 0.5)`, max
+/// `(4096, 1.15)`). `0.0` for FLUX.1-schnell (unshifted). Exposed so the epic 7114 scheduler axis can
+/// build a curated schedule over FLUX.1's OWN mu (which is the analytic linear fit, NOT the mflux
+/// empirical `compute_mu`). Kept identical to [`build_linear_sigmas`] so the native default is byte-exact.
+pub fn linear_sigma_mu(width: u32, height: u32, requires_sigma_shift: bool) -> f32 {
+    if !requires_sigma_shift {
+        return 0.0;
+    }
+    let base_seq_len = 256.0_f64;
+    let max_seq_len = 4096.0_f64;
+    let base_shift = 0.5_f64;
+    let max_shift = 1.15_f64;
+    let m = (max_shift - base_shift) / (max_seq_len - base_seq_len);
+    let b = base_shift - m * base_seq_len;
+    (m * (width as f64) * (height as f64) / 256.0 + b) as f32
+}
+
+/// [`build_linear_sigmas`] honoring a per-generation curated `scheduler` (epic 7114 scheduler axis). An
+/// unset / unknown / `linear`-aliased name keeps the native schedule byte-exact (N1); a curated name
+/// (`normal` / `sgm_uniform` / `karras` / …) re-shapes σ over FLUX.1's own [`linear_sigma_mu`] (schnell:
+/// `mu = 0`, an unshifted ramp).
+pub fn build_sigmas_with(
+    num_steps: usize,
+    width: u32,
+    height: u32,
+    requires_sigma_shift: bool,
+    scheduler_name: Option<&str>,
+) -> Result<Vec<f32>> {
+    let native = build_linear_sigmas(num_steps, width, height, requires_sigma_shift)?;
+    let mu = linear_sigma_mu(width, height, requires_sigma_shift);
+    Ok(resolve_flow_schedule(
+        scheduler_name,
+        mu,
+        num_steps,
+        &native,
+    ))
 }
 
 /// Seeded FLUX txt2img latent noise: `[1, (height/16) * (width/16), 64]`.
@@ -56,15 +95,9 @@ pub fn build_linear_sigmas(
     let sigmas = linspace::<f64, f32>(1.0, 1.0 / n as f64, n)?;
 
     let sigmas = if requires_sigma_shift {
-        // FLUX.1-dev mu-shift, mirroring `LinearScheduler` exactly (constants in f64 like the fork's
-        // Python; the shift division/exp in MLX). `mu = m*width*height/256 + b == m*seq + b`.
-        let base_seq_len = 256.0_f64;
-        let max_seq_len = 4096.0_f64;
-        let base_shift = 0.5_f64;
-        let max_shift = 1.15_f64;
-        let m = (max_shift - base_shift) / (max_seq_len - base_seq_len);
-        let b = base_shift - m * base_seq_len;
-        let mu = (m * (width as f64) * (height as f64) / 256.0 + b) as f32;
+        // FLUX.1-dev mu-shift, mirroring `LinearScheduler` exactly: the resolution-dependent `mu` is the
+        // shared [`linear_sigma_mu`] (byte-identical f64 fit), the shift division/exp run in MLX.
+        let mu = linear_sigma_mu(width, height, true);
         let e = Array::from_slice(&[mu], &[1]).exp()?;
         let one = Array::from_slice(&[1.0_f32], &[1]);
         // shifted = exp(mu) / (exp(mu) + (1/sigmas - 1))

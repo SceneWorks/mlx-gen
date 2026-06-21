@@ -27,7 +27,7 @@ use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
-    encode_prompt, negative_or_fallback, qwen_samplers, resolve_run_params,
+    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -55,7 +55,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
             samplers: qwen_samplers(),
-            schedulers: Vec::new(),
+            schedulers: qwen_schedulers(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,

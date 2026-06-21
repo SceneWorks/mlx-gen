@@ -85,6 +85,10 @@ fn assert_coherent(img: &Image, label: &str) {
 }
 
 fn render(sampler: Option<&str>) -> Image {
+    render_with(sampler, None)
+}
+
+fn render_with(sampler: Option<&str>, scheduler: Option<&str>) -> Image {
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
     let generator = mlx_gen::load(MODEL_ID, &spec).expect("load z_image_turbo");
     let req = GenerationRequest {
@@ -94,6 +98,7 @@ fn render(sampler: Option<&str>) -> Image {
         seed: Some(SEED),
         steps: Some(STEPS),
         sampler: sampler.map(Into::into),
+        scheduler: scheduler.map(Into::into),
         ..Default::default()
     };
     match generator.generate(&req, &mut |_| {}).unwrap() {
@@ -136,5 +141,33 @@ fn named_sampler_dpmpp_2m_is_coherent_and_distinct() {
     assert!(
         frac > 0.01,
         "dpmpp_2m must differ from euler (a real solver swap, not a silent fallback); differ {frac}"
+    );
+}
+
+/// Scheduler axis (epic 7114): a curated scheduler re-shapes the σ schedule over the static `shift=3.0`
+/// (the shift-aware `FlowModelSampling`) and renders a coherent image that differs from the native
+/// schedule — proving `req.scheduler` flows through `resolve_flow_schedule` end-to-end. Uses `karras`,
+/// a structurally-distinct σ ramp (`normal`/`sgm_uniform` nearly coincide with the native
+/// `linspace(1,1/N,N)`-through-shift schedule; `karras` re-distributes the steps and differs clearly).
+#[test]
+#[ignore = "needs the real Tongyi-MAI/Z-Image-Turbo snapshot"]
+fn scheduler_karras_is_coherent_and_distinct() {
+    let native = render_with(None, None);
+    let karras = render_with(None, Some("karras"));
+    assert_coherent(&karras, "karras");
+    let differ = native
+        .pixels
+        .iter()
+        .zip(&karras.pixels)
+        .filter(|(a, b)| (**a as i16 - **b as i16).abs() > 4)
+        .count();
+    let frac = differ as f32 / native.pixels.len() as f32;
+    eprintln!(
+        "[karras] differs from native in {:.2}% of pixels",
+        frac * 100.0
+    );
+    assert!(
+        frac > 0.01,
+        "karras must re-shape the schedule vs the native default; differ {frac}"
     );
 }

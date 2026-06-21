@@ -16,12 +16,12 @@ use mlx_gen::array::scalar;
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, CancelFlag, Error, FlowMatchEuler, GenerationRequest, Image,
-    Progress, Result, TimestepConvention,
+    curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
+    Error, FlowMatchEuler, GenerationRequest, Image, Progress, Result, TimestepConvention,
 };
 
 use crate::control_transformer::QwenControlNet;
-use crate::sampler::lightning_sigmas;
+use crate::sampler::{lightning_sigmas, LIGHTNING_SHIFT};
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
 use crate::vae::QwenVae;
@@ -51,6 +51,14 @@ pub fn qwen_samplers() -> Vec<&'static str> {
     let mut s = mlx_gen::curated_sampler_names();
     s.push(LIGHTNING_SAMPLER);
     s
+}
+
+/// The advertised scheduler menu shared by all three Qwen generators (epic 7114 scheduler axis): the
+/// curated sigma-schedule menu (`normal` / `simple` / `karras` / `exponential` / `sgm_uniform` / `beta`
+/// / `ddim_uniform`). An unset `req.scheduler` is the native resolution-shifted (production) or
+/// static-shift (lightning) schedule — the byte-exact default.
+pub fn qwen_schedulers() -> Vec<&'static str> {
+    curated_scheduler_names()
 }
 /// Default step count for the Lightning recipe.
 pub const LIGHTNING_DEFAULT_STEPS: u32 = 8;
@@ -84,11 +92,20 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
         DEFAULT_STEPS
     };
     let steps = req.steps.unwrap_or(default_steps) as usize;
-    let sigmas = if is_lightning {
+    // Native schedule (the byte-exact default, epic 7114 N1): lightning's static-shift few-step
+    // schedule, or the production resolution-shifted `qwen_scheduler`. A curated `req.scheduler` then
+    // re-shapes σ over the SAME mu (lightning: `ln(3)`; production: the qwen area-fit `qwen_mu`).
+    let native = if is_lightning {
         lightning_sigmas(steps)
     } else {
         qwen_scheduler(steps, width, height).sigmas
     };
+    let mu = if is_lightning {
+        LIGHTNING_SHIFT.ln()
+    } else {
+        qwen_mu(width, height)
+    };
+    let sigmas = resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
     RunParams {
         is_lightning,
         steps,
@@ -223,6 +240,16 @@ pub fn encode_init_latents(vae: &QwenVae, image: &Image, width: u32, height: u32
 /// Port of `LinearScheduler._get_sigmas` (the `requires_sigma_shift` + `sigma_shift_terminal`
 /// path). The core [`FlowMatchEuler`] uses FLUX's empirical `mu` and no terminal shift, so we
 /// build the Vec here and wrap it.
+/// The Qwen-Image production time-shift `mu` — the resolution-dependent linear fit
+/// `mu = m·(w·h/256) + b` (the fork's `ModelConfig.qwen_image` shift params). Exposed so the epic 7114
+/// scheduler axis builds a curated schedule over Qwen's OWN mu; kept identical to [`qwen_sigmas`] so the
+/// native production schedule stays byte-exact.
+fn qwen_mu(width: u32, height: u32) -> f32 {
+    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
+    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
+    m * (width as f32 * height as f32 / 256.0) + b
+}
+
 pub fn qwen_scheduler(num_steps: usize, width: u32, height: u32) -> FlowMatchEuler {
     FlowMatchEuler {
         sigmas: qwen_sigmas(num_steps, width, height),
@@ -247,9 +274,7 @@ fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
         })
         .collect();
 
-    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
-    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
-    let mu = m * (width as f32 * height as f32 / 256.0) + b;
+    let mu = qwen_mu(width, height);
     let e = mu.exp();
     // exp(mu) / (exp(mu) + (1/sigma - 1))
     let mut shifted: Vec<f32> = linspace

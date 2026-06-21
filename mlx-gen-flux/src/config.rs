@@ -2,7 +2,8 @@
 //! `ModelConfig.{schnell,dev}` and `FluxWeightDefinition.get_tokenizers`.
 
 use mlx_gen::{
-    curated_sampler_names, Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
+    ModelDescriptor, Quant,
 };
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
@@ -98,9 +99,13 @@ impl FluxVariant {
                     }
                     s
                 },
-                // Scheduler axis (curated sigma-schedule menu) lands in the epic 7114 follow-up pass;
-                // the native `build_linear_sigmas` (resolution-shifted flow) is still the default.
-                schedulers: vec!["linear"],
+                // Scheduler axis (epic 7114): the native `linear` schedule (resolution-shifted flow) is
+                // the byte-exact default; a curated name re-shapes σ over FLUX.1's own mu.
+                schedulers: {
+                    let mut s = curated_scheduler_names();
+                    s.push("linear");
+                    s
+                },
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,

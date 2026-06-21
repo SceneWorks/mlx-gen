@@ -210,8 +210,11 @@ pub fn compute_mu(image_seq_len: usize, num_steps: usize) -> f32 {
 }
 
 /// `exp(mu) / (exp(mu) + (1/t - 1))` — the fork's `_time_shift_exponential_array` at
-/// `sigma_power = 1`.
-fn time_shift_exponential(mu: f32, t: f32) -> f32 {
+/// `sigma_power = 1`. This is ComfyUI's `time_shift(mu, 1.0, t)` and the diffusers static-shift
+/// `shift·t / (1 + (shift−1)·t)` with `shift = exp(mu)` (`mu = 0` is the identity `t`). Shared with
+/// [`model_sampling::FlowModelSampling`] so a curated scheduler built over a flow model reproduces the
+/// engine's resolution-dependent time-shift (epic 7114 scheduler axis, sc-7120).
+pub(crate) fn time_shift_exponential(mu: f32, t: f32) -> f32 {
     let e = mu.exp();
     e / (e + (1.0 / t - 1.0))
 }

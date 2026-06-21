@@ -58,6 +58,14 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::Mask],
             supports_lora: false,
             supports_lokr: false,
+            // Bespoke-by-architecture (epic 7114, sc-7120, task 7184): Ideogram is NOT routed through
+            // the unified curated-sampler framework. Its `LogitNormalSchedule` is an INVERTED, clamped
+            // logit-normal time grid (no `σ = 0` terminal), so the FLOW `x0 = x − σ·v` estimate the
+            // multistep/2nd-order solvers (heun / dpmpp_2m / uni_pc) require is meaningless; it uses a
+            // per-step CFG guidance schedule (POLISH_GUIDANCE on the final steps) and an inpaint
+            // mask-blend interleaved BETWEEN Euler steps (no post-step hook in `run_flow_sampler`).
+            // Advertising the curated menu would expose solvers that produce broken output — so the
+            // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: RES_MIN,

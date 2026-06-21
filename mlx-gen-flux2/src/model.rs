@@ -32,7 +32,7 @@ use crate::config::Flux2Variant;
 use crate::kv_cache::{CacheMode, Flux2KvCache};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
-    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule_with,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::{Flux2ForwardInputs, Flux2Transformer};
@@ -613,7 +613,7 @@ impl Flux2 {
             None
         };
 
-        let sched = schedule(steps, req.width, req.height);
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref());
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);
@@ -925,24 +925,27 @@ mod tests {
     #[test]
     fn rejects_unsupported_scheduler() {
         // F-100: flux2 delegated to the shared floor now validates the scheduler (was silently
-        // accepted). The advertised "flow_match_euler" passes.
+        // accepted). epic 7114 scheduler axis: the curated names (e.g. "karras") + the "flow_match_euler"
+        // native alias now pass; a genuinely unknown name is still rejected.
         let model = Flux2::new_for_tests(Flux2Variant::Klein9b);
         let err = model
             .validate(&GenerationRequest {
                 prompt: "x".into(),
-                scheduler: Some("karras".into()),
+                scheduler: Some("not_a_real_scheduler".into()),
                 ..Default::default()
             })
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported scheduler"), "got: {err}");
-        model
-            .validate(&GenerationRequest {
-                prompt: "x".into(),
-                scheduler: Some("flow_match_euler".into()),
-                ..Default::default()
-            })
-            .unwrap();
+        for ok in ["flow_match_euler", "karras", "sgm_uniform"] {
+            model
+                .validate(&GenerationRequest {
+                    prompt: "x".into(),
+                    scheduler: Some(ok.into()),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| panic!("{ok} should validate: {e}"));
+        }
     }
 
     #[test]

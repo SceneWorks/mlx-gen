@@ -133,13 +133,31 @@ where
 #[derive(Clone, Copy, Debug)]
 pub struct FlowModelSampling {
     conv: TimestepConvention,
+    /// Time-shift `mu` (`exp(mu)` is the diffusers/ComfyUI `shift`). `0.0` is the identity (no shift) —
+    /// the byte-exact pre-shift behaviour. An engine that builds a resolution-/config-shifted native
+    /// schedule passes its own `mu` (e.g. `compute_mu(image_seq_len, steps)` for FLUX.2/Qwen, or
+    /// `shift.ln()` for a static-shift model) so a curated scheduler stays consistent with the engine's
+    /// native time-shift (epic 7114 scheduler axis, sc-7120).
+    mu: f32,
 }
 
 impl FlowModelSampling {
-    /// Build for a timestep convention. FLUX / Qwen / Chroma feed the raw sigma
-    /// ([`TimestepConvention::Sigma`]); Z-Image feeds `1 − σ` ([`TimestepConvention::OneMinusSigma`]).
+    /// Build for a timestep convention with NO time-shift (`mu = 0`). FLUX / Qwen / Chroma feed the raw
+    /// sigma ([`TimestepConvention::Sigma`]); Z-Image feeds `1 − σ`
+    /// ([`TimestepConvention::OneMinusSigma`]).
     pub fn new(conv: TimestepConvention) -> Self {
-        Self { conv }
+        Self { conv, mu: 0.0 }
+    }
+
+    /// Build with an explicit time-shift `mu`, so a curated `normal` / `sgm_uniform` / `simple` / `beta`
+    /// / `ddim_uniform` schedule built over this model reproduces the engine's resolution-/config-shift.
+    /// `mu = 0` reduces to [`Self::new`]. The shift modifies only the schedule-construction map
+    /// ([`Self::sigma`]), NOT the model conditioning ([`Self::timestep`]): schedule construction is
+    /// convention-independent (the σ ramp is the same noise-fraction schedule however the model consumes
+    /// σ), so engines build curated schedules with [`TimestepConvention::Sigma`] regardless of their own
+    /// conditioning convention, and the conditioning flip is applied separately at the model forward.
+    pub fn with_shift(conv: TimestepConvention, mu: f32) -> Self {
+        Self { conv, mu }
     }
 }
 
@@ -165,6 +183,8 @@ impl ModelSampling for FlowModelSampling {
         (1.0, -sigma)
     }
     fn timestep(&self, sigma: f32) -> f32 {
+        // The model conditioning is the post-shift sigma (FLUX/Qwen/Chroma) or `1 − σ` (Z-Image): the
+        // shift lives in the schedule, not here, so this is unchanged by `mu`.
         match self.conv {
             TimestepConvention::Sigma => sigma,
             TimestepConvention::OneMinusSigma => 1.0 - sigma,
@@ -172,7 +192,13 @@ impl ModelSampling for FlowModelSampling {
     }
     fn sigma(&self, timestep: f32) -> f32 {
         match self.conv {
-            TimestepConvention::Sigma => timestep,
+            // The schedule coordinate `t ∈ [0,1]` maps to the shifted sigma through the exponential
+            // time-shift (`mu = 0` ⇒ identity `t`). This is exactly the per-node shift `build_flow_sigmas`
+            // applies, so the `normal` scheduler over a shifted FlowModelSampling reproduces the engine's
+            // native `linspace(1, 1/N, N)`-through-shift schedule. Schedule construction always uses the
+            // Sigma convention (see [`Self::with_shift`]), so this is the only branch the schedulers hit.
+            TimestepConvention::Sigma => super::time_shift_exponential(self.mu, timestep),
+            // OneMinusSigma keeps the un-shifted timestep-inverse form (never the schedule map).
             TimestepConvention::OneMinusSigma => 1.0 - timestep,
         }
     }
@@ -360,6 +386,77 @@ mod tests {
         let z = FlowModelSampling::new(TimestepConvention::OneMinusSigma);
         assert_eq!(z.timestep(0.3), 0.7);
         assert_eq!(z.sigma(0.7), 0.3);
+    }
+
+    #[test]
+    fn flow_shift_only_touches_sigma_map_not_conditioning() {
+        // mu = 0 (`new`) is the identity: `sigma(t) == t` — the byte-exact pre-shift behaviour.
+        let plain = FlowModelSampling::new(TimestepConvention::Sigma);
+        for &t in &[0.05_f32, 0.3, 0.5, 0.8, 1.0] {
+            assert!(
+                (plain.sigma(t) - t).abs() < 1e-7,
+                "mu=0 must be identity at {t}"
+            );
+        }
+        // A shifted flow model maps the schedule coordinate through the exponential time-shift, which is
+        // exactly the diffusers static-shift `shift·t/(1+(shift−1)·t)` with `shift = exp(mu)`.
+        let mu = 3.0_f32.ln();
+        let shifted = FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+        for &t in &[0.1_f32, 0.25, 0.5, 0.75, 0.9] {
+            let want = 3.0 * t / (1.0 + (3.0 - 1.0) * t); // shift = 3.0
+            assert!(
+                (shifted.sigma(t) - want).abs() < 1e-6,
+                "shift map at {t}: got {} want {want}",
+                shifted.sigma(t)
+            );
+        }
+        // The model conditioning (`timestep`) is unchanged by the shift — only the schedule map moves.
+        assert_eq!(shifted.timestep(0.7), 0.7);
+        assert_eq!(shifted.denoised_coeffs(0.7), (1.0, -0.7));
+        assert_eq!(shifted.input_scale(0.7), 1.0);
+    }
+
+    #[test]
+    fn curated_scheduler_over_shifted_flow_is_valid_and_materially_shifted() {
+        // The scheduler-axis guarantee: building a curated `normal`/`sgm_uniform` schedule over a
+        // SHIFTED FlowModelSampling produces a valid descending-to-zero schedule that is MATERIALLY
+        // different from the unshifted one — i.e. the engine's `mu` flows through `schedule_sigmas` and
+        // actually bends the schedule (without it a high-shift model would get a near-linear σ ramp and
+        // be starved of high-noise steps). It is NOT meant to reproduce the engine's native schedule
+        // byte-for-byte — ComfyUI's `normal` floors σ_min at `1/num_timesteps`, not `1/steps`, so it is a
+        // distinct (alternative) schedule; the native default stays byte-exact via the `None` path.
+        use crate::sampling::{schedule_sigmas, Scheduler};
+        let mu = 3.0_f32.ln(); // shift = 3.0
+        let steps = 8;
+        let shifted = FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+        let plain = FlowModelSampling::new(TimestepConvention::Sigma);
+        for sched in [Scheduler::Normal, Scheduler::SgmUniform, Scheduler::Simple] {
+            let s = schedule_sigmas(sched, &shifted, steps);
+            assert!(s.len() >= 2);
+            assert_eq!(*s.last().unwrap(), 0.0, "{} trailing 0", sched.name());
+            assert!(
+                s.windows(2).all(|w| w[0] >= w[1]),
+                "{} not descending: {s:?}",
+                sched.name()
+            );
+            assert!(
+                s[..s.len() - 1].iter().all(|&v| v > 0.0),
+                "{} has a non-positive interior node: {s:?}",
+                sched.name()
+            );
+            // The shift moved the schedule vs the unshifted build.
+            let u = schedule_sigmas(sched, &plain, steps);
+            let gap = s
+                .iter()
+                .zip(&u)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                gap > 0.02,
+                "{} shift had no effect (gap {gap})",
+                sched.name()
+            );
+        }
     }
 
     #[test]

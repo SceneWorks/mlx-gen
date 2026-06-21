@@ -80,8 +80,9 @@ pub use runtime::{
     WeightsSource,
 };
 pub use sampler::{
-    curated_sampler_names, curated_scheduler_names, run_flow_sampler, AlphaSchedule,
-    DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxLatentOps, TcdSampler,
+    curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, run_flow_sampler,
+    AlphaSchedule, DiffusionSampler, FlowMatchSampler, LcmSampler, LightningSampler, MlxLatentOps,
+    TcdSampler,
 };
 pub use scheduler::FlowMatchEuler;
 pub use tiling::{TilingConfig, VaeTiling};

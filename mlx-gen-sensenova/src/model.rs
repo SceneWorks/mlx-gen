@@ -85,6 +85,14 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_lora: false,
             supports_lokr: false,
             supported_quants: &[Quant::Q4, Quant::Q8],
+            // Bespoke-by-architecture (epic 7114, sc-7120, task 7185): SenseNova-U1 is NOT routed through
+            // the unified curated-sampler framework. Its denoise threads each step through an
+            // autoregressive backbone with a per-step-mutated `KvCache` (`predict_v` appends to the cache;
+            // `cache.len()` feeds the RoPE/position build), shared between the cond/uncond passes. The
+            // multistep/2nd-order solvers (heun = 2 evals/step; dpmpp_2m / uni_pc reuse prior-step state)
+            // would append to the cache multiple times per step and desync the AR positions → corrupt
+            // output. It is also x0-prediction over a clean-fraction timestep grid (not noise-fraction σ).
+            // Its native shifted-Euler loop is its only valid sampler. See `t2i::denoise`/`it2i_denoise`.
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: 256,

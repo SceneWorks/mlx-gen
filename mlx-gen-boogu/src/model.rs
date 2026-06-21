@@ -13,9 +13,10 @@
 
 use mlx_gen::gen_core;
 use mlx_gen::{
-    default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
+    WeightsSource,
 };
 
 use crate::pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
@@ -64,8 +65,11 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: Vec::new(),
             supports_lora: false,
             supports_lokr: false,
-            samplers: Vec::new(),
-            schedulers: Vec::new(),
+            // Base/Edit are rectified-flow Euler over a static-shift (`mu = 1.15`) schedule, routed
+            // through the unified curated-sampler framework (epic 7114). Turbo overrides these to empty
+            // (its DMD distillation sampler is not an ODE — see `descriptor_turbo`).
+            samplers: curated_sampler_names(),
+            schedulers: curated_scheduler_names(),
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,
@@ -87,6 +91,12 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
     d.capabilities.supports_guidance = false;
+    // The Turbo student is a DMD distillation sampler (predict clean estimate → renoise to the next
+    // clean-fraction sigma with fresh noise), NOT a rectified-flow ODE — the curated ODE solvers
+    // (Euler/Heun/DPM++/…) and the σ-schedule menu do not apply, so it advertises neither. The DMD loop
+    // (`generate_turbo`) is its fixed, distilled sampler.
+    d.capabilities.samplers = Vec::new();
+    d.capabilities.schedulers = Vec::new();
     d
 }
 
@@ -224,6 +234,8 @@ impl Boogu {
                     seed: base_seed.wrapping_add(n as u64),
                     condition_on_image: true,
                     use_input_images_4_neg_instruct: false,
+                    sampler: req.sampler.clone(),
+                    scheduler: req.scheduler.clone(),
                 };
                 let img = self.pipeline.generate_edit_with_progress(
                     reference,
@@ -244,6 +256,8 @@ impl Boogu {
                     steps,
                     text_guidance_scale: guidance,
                     seed: base_seed.wrapping_add(n as u64),
+                    sampler: req.sampler.clone(),
+                    scheduler: req.scheduler.clone(),
                 };
                 let img = self.pipeline.generate_with_progress(
                     &req.prompt,

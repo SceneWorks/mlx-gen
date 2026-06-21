@@ -53,6 +53,7 @@ fn opts_1k(seed: u64) -> GenerateOptions {
         steps: 4,
         text_guidance_scale: 4.0,
         seed,
+        ..Default::default()
     }
 }
 
@@ -66,6 +67,7 @@ fn warmup(pipe: &BooguPipeline) {
                 steps: 2,
                 text_guidance_scale: 4.0,
                 seed: 0,
+                ..Default::default()
             },
         )
         .expect("warmup generate");
@@ -162,6 +164,7 @@ fn profile_edit_q4() {
         seed: 0,
         condition_on_image: true,
         use_input_images_4_neg_instruct: false,
+        ..Default::default()
     };
     // Warmup also forces the lazy vision-tower load (f32) so the transient peak reflects it.
     let _ = pipe

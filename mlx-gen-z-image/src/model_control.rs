@@ -17,9 +17,10 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
-    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
+    Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -56,7 +57,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: true,
             // Curated unified-framework integrator menu (epic 7114 P3), as the base turbo variant.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
+            // Curated scheduler menu (epic 7114), as the base turbo variant — static-shift default.
+            schedulers: curated_scheduler_names(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -196,8 +198,15 @@ impl ZImageTurboControl {
             cap.as_dtype(Dtype::Bfloat16)?
         };
 
-        // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once.
-        let scheduler = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+        // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An unset
+        // `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ over the shift.
+        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+            req.scheduler.as_deref(),
+            SCHEDULE_SHIFT.ln(),
+            steps,
+            &native.sigmas,
+        ));
 
         // The 33ch control context is constant across steps + the batch — build once. It stays **f32**
         // (the fork feeds it f32, which promotes the whole control branch to f32 — see the forward).

@@ -82,6 +82,7 @@ fn assemble_turnkey_loads() {
                 steps: 8,
                 text_guidance_scale: 4.0,
                 seed: 0,
+                ..Default::default()
             },
         )
         .expect("generate")

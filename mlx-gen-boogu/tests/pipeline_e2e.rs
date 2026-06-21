@@ -78,6 +78,7 @@ fn t2i_smoke() {
         steps: 28,
         text_guidance_scale: 4.0,
         seed: 0,
+        ..Default::default()
     };
     let img = pipe
         .generate("a red apple on a wooden table", &opts)
@@ -166,6 +167,7 @@ fn edit_smoke() {
                 steps: 24,
                 text_guidance_scale: 4.0,
                 seed: 0,
+                ..Default::default()
             },
         )
         .expect("generate reference")
@@ -190,6 +192,7 @@ fn edit_smoke() {
                 seed: 1,
                 condition_on_image: true,
                 use_input_images_4_neg_instruct: false,
+                ..Default::default()
             },
         )
         .expect("generate_edit (image-conditioned)");
@@ -212,6 +215,7 @@ fn edit_smoke() {
                 seed: 1,
                 condition_on_image: false,
                 use_input_images_4_neg_instruct: false,
+                ..Default::default()
             },
         )
         .expect("generate_edit (text-only)");

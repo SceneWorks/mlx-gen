@@ -17,7 +17,7 @@ use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
 use crate::image_encoder::FluxIpImageEncoder;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::loader;
-use crate::pipeline::{build_linear_sigmas, create_noise, unpack_latents};
+use crate::pipeline::{build_sigmas_with, create_noise, unpack_latents};
 use crate::text_encoder::FluxTextEncoders;
 use crate::transformer::FluxTransformer;
 
@@ -376,11 +376,14 @@ impl Flux1 {
         // latents (`create_noise` → f32) and the main residual stream stay f32; only the CLIP pooled
         // embedding + the time/text/guidance conditioning run bf16 (in the encoders / `TimeTextEmbed`).
         // So latents are NOT cast to bf16 — that would diverge from the fork.
-        let sigmas = build_linear_sigmas(
+        // Native `LinearScheduler` schedule is the byte-exact default (epic 7114 N1); a curated
+        // `req.scheduler` re-shapes σ over FLUX.1's own resolution-dependent mu (schnell: unshifted).
+        let sigmas = build_sigmas_with(
             steps,
             req.width,
             req.height,
             self.variant.requires_sigma_shift(),
+            req.scheduler.as_deref(),
         )?;
         // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
         // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
@@ -734,27 +737,29 @@ mod tests {
 
     #[test]
     fn validate_rejects_unadvertised_scheduler() {
-        // F-100: an unsupported scheduler was silently accepted before. Now rejected; the advertised
-        // "linear" still passes.
+        // F-100: an unsupported scheduler was silently accepted before. epic 7114 scheduler axis: the
+        // curated names ("karras", …) + the "linear" native alias now pass; an unknown name is rejected.
         let model = Flux1::new_for_tests(FluxVariant::Dev);
         let err = model
             .validate(&GenerationRequest {
                 prompt: "a red fox".into(),
                 guidance: Some(3.5),
-                scheduler: Some("karras".into()),
+                scheduler: Some("not_a_real_scheduler".into()),
                 ..Default::default()
             })
             .unwrap_err()
             .to_string();
         assert!(err.contains("unsupported scheduler"), "got: {err}");
-        model
-            .validate(&GenerationRequest {
-                prompt: "a red fox".into(),
-                guidance: Some(3.5),
-                scheduler: Some("linear".into()),
-                ..Default::default()
-            })
-            .unwrap();
+        for ok in ["linear", "karras", "sgm_uniform"] {
+            model
+                .validate(&GenerationRequest {
+                    prompt: "a red fox".into(),
+                    guidance: Some(3.5),
+                    scheduler: Some(ok.into()),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|e| panic!("{ok} should validate: {e}"));
+        }
     }
 
     #[test]

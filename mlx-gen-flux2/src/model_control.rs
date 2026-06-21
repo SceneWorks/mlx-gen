@@ -20,10 +20,10 @@
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, default_seed, gen_core, run_flow_sampler, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
-    TimestepConvention, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, run_flow_sampler,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress,
+    Quant, Result, TimestepConvention, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
@@ -32,7 +32,7 @@ use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request};
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
-    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule,
+    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule_with,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2ControlTransformer;
@@ -62,7 +62,12 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             // Curated unified-framework integrator menu (epic 7114 P3), as the base FLUX.2 path.
             samplers: curated_sampler_names(),
-            schedulers: vec!["flow_match_euler"],
+            // Curated scheduler menu (epic 7114), as the base FLUX.2 path — native default + curated.
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("flow_match_euler");
+                s
+            },
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -265,7 +270,7 @@ impl Flux2DevControl {
 
         let (prompt_embeds, text_ids) = self.encode(&req.prompt)?;
 
-        let sched = schedule(steps, req.width, req.height);
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref());
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);

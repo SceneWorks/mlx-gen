@@ -282,6 +282,45 @@ pub fn run_flow_sampler(
     Ok(out)
 }
 
+/// Resolve the descending flow sigma schedule for an engine, honoring a per-generation curated
+/// `scheduler` selection (epic 7114 scheduler axis, sc-7120). The engine-side counterpart to
+/// [`run_flow_sampler`]'s `sampler` knob: the *scheduler* picks the σ-schedule (where the steps land),
+/// the *sampler* picks the integrator (how each step advances).
+///
+/// - `scheduler_name`: the canonical curated scheduler name (`normal` / `simple` / `karras` /
+///   `exponential` / `sgm_uniform` / `beta` / `ddim_uniform`). `None`, an unknown name, or a native
+///   alias (e.g. `linear` / `flow_match_euler`) falls back to `native` (N3 — never hard-fail a
+///   generation over a scheduling knob; the engine's native schedule is the byte-exact default).
+/// - `mu`: the engine's time-shift (`mlx_gen::scheduler::compute_mu(image_seq_len, steps)` for the
+///   dynamic-shift models, `shift.ln()` for a static-shift model, `0.0` for an unshifted one). A curated
+///   schedule is built over a [`gen_core::sampling::FlowModelSampling`] carrying this `mu` so
+///   `normal` / `sgm_uniform` / … stay consistent with the engine's resolution-/config-dependent shift
+///   instead of degrading to a linear σ ramp (which would starve a high-shift model of high-noise steps).
+/// - `steps`: the denoise step count.
+/// - `native`: the engine's exact native schedule (length `steps + 1`, trailing `0.0`), returned
+///   verbatim on the default path so the per-engine N1 default-parity gate holds byte-for-byte.
+///
+/// Schedule construction is **convention-independent** — the σ schedule is the same noise-fraction ramp
+/// however the model consumes σ — so this always builds with [`TimestepConvention::Sigma`]; the engine's
+/// own conditioning convention (`Sigma` / `OneMinusSigma`) is applied separately by [`run_flow_sampler`].
+/// A curated scheduler may return a length other than `steps + 1` (`ddim_uniform` / `beta` re-stride),
+/// which simply changes the effective step count — the same behaviour ComfyUI / diffusers have.
+pub fn resolve_flow_schedule(
+    scheduler_name: Option<&str>,
+    mu: f32,
+    steps: usize,
+    native: &[f32],
+) -> Vec<f32> {
+    use gen_core::sampling::{schedule_sigmas, FlowModelSampling, Scheduler};
+    match scheduler_name.and_then(Scheduler::from_name) {
+        Some(sched) => {
+            let ms = FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+            schedule_sigmas(sched, &ms, steps)
+        }
+        None => native.to_vec(),
+    }
+}
+
 /// The curated unified-framework **sampler** menu (epic 7114 decision 2) as capability strings — every
 /// [`gen_core::sampling::Solver`] name, in menu order. A flow-match (or DDPM) engine advertises this
 /// in its [`gen_core::generator::Capabilities`] `samplers` list (plus any legacy alias it still

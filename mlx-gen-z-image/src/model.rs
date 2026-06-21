@@ -11,9 +11,10 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, default_seed, Capabilities, ConditioningKind, Error, FlowMatchEuler,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
+    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant,
+    Result, WeightsSource,
 };
 use mlx_rs::Dtype;
 
@@ -72,7 +73,9 @@ pub fn descriptor() -> ModelDescriptor {
             // Curated unified-framework integrator menu (epic 7114 P3). Turbo is guidance-distilled to
             // ~4 steps; an unset `req.sampler` is the curated Euler over the static-shift schedule.
             samplers: curated_sampler_names(),
-            schedulers: Vec::new(),
+            // Scheduler axis (epic 7114): the static-shift schedule is the byte-exact default (an unset
+            // `req.scheduler`); a curated name re-shapes the σ schedule over the same `shift=3.0`.
+            schedulers: curated_scheduler_names(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -204,8 +207,16 @@ impl ZImageTurbo {
         };
 
         // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and
-        // seed-independent — build it once. See SCHEDULE_SHIFT.
-        let scheduler = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+        // seed-independent — build it once. See SCHEDULE_SHIFT. An unset `req.scheduler` keeps this
+        // native schedule byte-exact (epic 7114 N1); a curated name re-shapes the σ schedule over the
+        // same `shift=3.0` (`mu = ln(3)`).
+        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+            req.scheduler.as_deref(),
+            SCHEDULE_SHIFT.ln(),
+            steps,
+            &native.sigmas,
+        ));
 
         // VAE-encode the init image once: the clean latents depend only on the init image + target
         // dims, not the per-image seed, so they're constant across the count loop (F-034). Only the

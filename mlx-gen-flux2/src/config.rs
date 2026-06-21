@@ -8,7 +8,8 @@
 //! intermediate sizes); everything else is shared.
 
 use mlx_gen::{
-    curated_sampler_names, Capabilities, ConditioningKind, Modality, ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
+    ModelDescriptor, Quant,
 };
 
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
@@ -187,7 +188,13 @@ impl Flux2Variant {
                 // Curated unified-framework integrator menu (epic 7114 P3). An unset `req.sampler` is
                 // the curated Euler over the resolution-shifted flow schedule.
                 samplers: curated_sampler_names(),
-                schedulers: vec!["flow_match_euler"],
+                // Curated scheduler menu (epic 7114). An unset `req.scheduler` (or the `flow_match_euler`
+                // alias) is the native empirical-mu schedule; a curated name re-shapes σ over the same mu.
+                schedulers: {
+                    let mut s = curated_scheduler_names();
+                    s.push("flow_match_euler");
+                    s
+                },
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
