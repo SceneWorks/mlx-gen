@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(c.v[0].1, c.vi[0].1);
         assert_eq!(c.v[1].1, c.vi[1].1);
         // nv == 1 stays equivalent to the prior single-video build (no regression); nv == 0 → empty.
-        let one = pf.build_combos(&[v0.clone()], &[]);
+        let one = pf.build_combos(std::slice::from_ref(&v0), &[]);
         assert_eq!(one.v.len(), 1);
         assert_eq!(one.v[0].1, one.vi[0].1);
         assert!(pf.build_combos(&[], &[]).v.is_empty());
