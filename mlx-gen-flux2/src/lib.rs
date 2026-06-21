@@ -68,8 +68,8 @@ pub use pipeline::{
 pub use pos_embed::Flux2PosEmbed;
 pub use text_encoder::{Qwen3TextEncoder, Qwen3TextEncoderConfig};
 pub use transformer::{
-    Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, Flux2TransformerConfig,
-    CONTROL_IN_DIM,
+    Flux2ControlBranch, Flux2ControlTransformer, Flux2ForwardInputs, Flux2Transformer,
+    Flux2TransformerConfig, CONTROL_IN_DIM,
 };
 pub use vae::Flux2Vae;
 pub use vision::{Mistral3Projector, PixtralVisionConfig, PixtralVisionTower};

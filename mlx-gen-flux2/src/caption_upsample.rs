@@ -58,6 +58,21 @@ const IMAGE_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 pub const DEFAULT_TEMPERATURE: f32 = 0.15;
 /// The reference `generate(max_new_tokens=512)`.
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 512;
+/// Hard ceiling on upsample decode length (F-012). Each decode step is a full ~32B forward over a
+/// growing KV cache, so a request-supplied `enhance_max_tokens` must be capped or a single upsample
+/// becomes an effectively unbounded job. 4× the 512 reference default leaves room for legitimately
+/// long rewrites while bounding the worst case to ~2048 forwards instead of billions.
+pub const MAX_NEW_TOKENS_CAP: usize = 2048;
+
+/// Resolve the decode length from the request's `enhance_max_tokens`: the reference default
+/// ([`DEFAULT_MAX_NEW_TOKENS`]) when unset, otherwise the requested value clamped to
+/// [`MAX_NEW_TOKENS_CAP`] (F-012). A request is never *rejected* for asking too much — the advisory
+/// knob is silently capped — so callers stay infallible.
+pub fn clamp_max_new_tokens(requested: Option<u32>) -> usize {
+    requested
+        .map(|m| (m as usize).min(MAX_NEW_TOKENS_CAP))
+        .unwrap_or(DEFAULT_MAX_NEW_TOKENS)
+}
 
 /// `SYSTEM_MESSAGE_UPSAMPLING_T2I` (diffusers `flux2/system_messages.py`), used when no reference
 /// images are present (pure T2I).
@@ -294,6 +309,22 @@ fn concatenate_horizontal(images: &[&Image]) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-012: `clamp_max_new_tokens` defaults when unset and caps the request to `MAX_NEW_TOKENS_CAP`.
+    #[test]
+    fn clamp_max_new_tokens_defaults_and_caps() {
+        assert_eq!(clamp_max_new_tokens(None), DEFAULT_MAX_NEW_TOKENS);
+        assert_eq!(clamp_max_new_tokens(Some(100)), 100);
+        assert_eq!(
+            clamp_max_new_tokens(Some(MAX_NEW_TOKENS_CAP as u32)),
+            MAX_NEW_TOKENS_CAP
+        );
+        assert_eq!(
+            clamp_max_new_tokens(Some(MAX_NEW_TOKENS_CAP as u32 + 1)),
+            MAX_NEW_TOKENS_CAP
+        );
+        assert_eq!(clamp_max_new_tokens(Some(u32::MAX)), MAX_NEW_TOKENS_CAP);
+    }
 
     #[test]
     fn expands_single_img_into_grid_with_breaks_and_end() {

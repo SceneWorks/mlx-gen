@@ -552,6 +552,23 @@ pub struct Flux2Transformer {
     time_channels: usize,
 }
 
+/// The conditioning inputs every [`Flux2Transformer`] forward shares, grouped so the four entry
+/// points (`forward` / `forward_with_cache` / `forward_with_mem` / `forward_with_control`) each carry
+/// one `&Flux2ForwardInputs` plus only their distinguishing extra (cache / mem / control) instead of
+/// 7-9 positional args — and so the two same-typed `&Array` id tensors are named at every call site
+/// (F-072). `hidden_states`: `[B, seq_img, in_channels]`; `encoder_hidden_states`: `[B, seq_txt,
+/// joint_attention_dim]`; `img_ids`/`txt_ids`: `[seq, 4]` (or `[1, seq, 4]`); `timestep` is the scaled
+/// sigma (×1000); `guidance` is the embedded-guidance scale (`Some` for dev, `None` for klein).
+#[derive(Clone, Copy)]
+pub struct Flux2ForwardInputs<'a> {
+    pub hidden_states: &'a Array,
+    pub encoder_hidden_states: &'a Array,
+    pub img_ids: &'a Array,
+    pub txt_ids: &'a Array,
+    pub timestep: f32,
+    pub guidance: Option<f32>,
+}
+
 impl Flux2Transformer {
     /// Load the transformer from a **dense** weight map (the parity-test + dense-snapshot path).
     pub fn from_weights(w: &Weights, cfg: &Flux2Config) -> Result<Self> {
@@ -697,7 +714,9 @@ impl Flux2Transformer {
 
     /// `hidden_states`: `[B, seq_img, in_channels]`; `encoder_hidden_states`: `[B, seq_txt,
     /// joint_attention_dim]`; `img_ids`/`txt_ids`: `[seq, 4]` (or `[1, seq, 4]`). `timestep` is the
-    /// scaled sigma (×1000). Returns the velocity `[B, seq_img, out_channels]`. Dense path: no cache.
+    /// scaled sigma (×1000). Returns the velocity `[B, seq_img, out_channels]`. Dense path: no cache,
+    /// no embedded guidance (klein). The richer entry points take a [`Flux2ForwardInputs`]:
+    /// [`Self::forward_with_cache`] / [`Self::forward_with_mem`] / [`Self::forward_with_control`].
     pub fn forward(
         &self,
         hidden_states: &Array,
@@ -706,101 +725,85 @@ impl Flux2Transformer {
         txt_ids: &Array,
         timestep: f32,
     ) -> Result<Array> {
-        self.forward_with_cache(
-            hidden_states,
-            encoder_hidden_states,
-            img_ids,
-            txt_ids,
-            timestep,
-            None,
-            None,
-        )
-    }
-
-    /// As [`Self::forward`], with the embedded-guidance scale (`Some` for dev, `None` for klein —
-    /// see [`temb`](Self::temb)) and an optional 9b-kv [`Flux2KvCache`] threaded through every
-    /// attention layer (the double + single stacks indexed independently from 0). On the
-    /// [`crate::kv_cache::CacheMode::Extract`] step the `img_ids` carry the reference tokens
-    /// (`[target, ref]`); on [`crate::kv_cache::CacheMode::Cached`] steps they carry `[target]`
-    /// only and the cached ref K/V are spliced back inside each attention.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_with_cache(
-        &self,
-        hidden_states: &Array,
-        encoder_hidden_states: &Array,
-        img_ids: &Array,
-        txt_ids: &Array,
-        timestep: f32,
-        guidance: Option<f32>,
-        cache: Option<&Flux2KvCache>,
-    ) -> Result<Array> {
         self.forward_inner(
             hidden_states,
             encoder_hidden_states,
             img_ids,
             txt_ids,
             timestep,
-            guidance,
+            None,
+            None,
+            None,
+            &MemoryConfig::OFF,
+        )
+    }
+
+    /// As [`Self::forward`] with an optional 9b-kv [`Flux2KvCache`] threaded through every attention
+    /// layer (the double + single stacks indexed independently from 0). On the
+    /// [`crate::kv_cache::CacheMode::Extract`] step the `img_ids` carry the reference tokens
+    /// (`[target, ref]`); on [`crate::kv_cache::CacheMode::Cached`] steps they carry `[target]` only
+    /// and the cached ref K/V are spliced back inside each attention. This is the **cache** entry
+    /// point — `cache` and `control` (see [`Self::forward_with_control`]) are mutually exclusive.
+    pub fn forward_with_cache(
+        &self,
+        inputs: &Flux2ForwardInputs,
+        cache: Option<&Flux2KvCache>,
+    ) -> Result<Array> {
+        self.forward_inner(
+            inputs.hidden_states,
+            inputs.encoder_hidden_states,
+            inputs.img_ids,
+            inputs.txt_ids,
+            inputs.timestep,
+            inputs.guidance,
             cache,
             None,
             &MemoryConfig::OFF,
         )
     }
 
-    /// As [`forward_with_cache`](Self::forward_with_cache), with an explicit [`MemoryConfig`] that
-    /// bounds the per-step activation high-water (sc-6266). The generate loop passes
-    /// [`MemoryConfig::LONG_SEQ`] only on the gated long-sequence multi-reference edit path; every
-    /// other path uses [`MemoryConfig::OFF`] (this method with `OFF` is byte-identical to
-    /// [`forward_with_cache`](Self::forward_with_cache)).
-    #[allow(clippy::too_many_arguments)]
+    /// As [`Self::forward_with_cache`], with an explicit [`MemoryConfig`] that bounds the per-step
+    /// activation high-water (sc-6266). The generate loop passes [`MemoryConfig::LONG_SEQ`] only on
+    /// the gated long-sequence multi-reference edit path; every other path uses [`MemoryConfig::OFF`]
+    /// (this method with `OFF` is byte-identical to [`Self::forward_with_cache`]).
     pub fn forward_with_mem(
         &self,
-        hidden_states: &Array,
-        encoder_hidden_states: &Array,
-        img_ids: &Array,
-        txt_ids: &Array,
-        timestep: f32,
-        guidance: Option<f32>,
+        inputs: &Flux2ForwardInputs,
         cache: Option<&Flux2KvCache>,
         mem: &MemoryConfig,
     ) -> Result<Array> {
         self.forward_inner(
-            hidden_states,
-            encoder_hidden_states,
-            img_ids,
-            txt_ids,
-            timestep,
-            guidance,
+            inputs.hidden_states,
+            inputs.encoder_hidden_states,
+            inputs.img_ids,
+            inputs.txt_ids,
+            inputs.timestep,
+            inputs.guidance,
             cache,
             None,
             mem,
         )
     }
 
-    /// FLUX.2-dev Fun-Controlnet-Union forward (sc-2292): [`forward_with_cache`](Self::forward_with_cache)
-    /// plus a VACE control branch. `control = (branch, control_context, scale)` — the branch's
-    /// per-block hints are computed once from the post-embedder image+caption streams and added to the
-    /// base image stream after each base double block in `branch.places`, scaled by `scale`. At
-    /// `scale = 0` the result is byte-identical to the base forward (the parity self-check). The
-    /// control path takes no KV cache (dev control is a single embedded-guidance forward).
-    #[allow(clippy::too_many_arguments)]
+    /// FLUX.2-dev Fun-Controlnet-Union forward (sc-2292): [`Self::forward_with_cache`] plus a VACE
+    /// control branch. `control = (branch, control_context, scale)` — the branch's per-block hints are
+    /// computed once from the post-embedder image+caption streams and added to the base image stream
+    /// after each base double block in `branch.places`, scaled by `scale`. At `scale = 0` the result
+    /// is byte-identical to the base forward (the parity self-check). This is the **control** entry
+    /// point — it takes no KV cache (`cache` XOR `control`; dev control is a single embedded-guidance
+    /// forward).
     pub fn forward_with_control(
         &self,
-        hidden_states: &Array,
-        encoder_hidden_states: &Array,
-        img_ids: &Array,
-        txt_ids: &Array,
-        timestep: f32,
-        guidance: Option<f32>,
+        inputs: &Flux2ForwardInputs,
         control: (&Flux2ControlBranch, &Array, f32),
     ) -> Result<Array> {
         self.forward_inner(
-            hidden_states,
-            encoder_hidden_states,
-            img_ids,
-            txt_ids,
-            timestep,
-            guidance,
+            inputs.hidden_states,
+            inputs.encoder_hidden_states,
+            inputs.img_ids,
+            inputs.txt_ids,
+            inputs.timestep,
+            inputs.guidance,
             None,
             Some(control),
             &MemoryConfig::OFF,
@@ -1138,12 +1141,14 @@ impl Flux2ControlTransformer {
         control_context_scale: f32,
     ) -> Result<Array> {
         self.base.forward_with_control(
-            hidden_states,
-            encoder_hidden_states,
-            img_ids,
-            txt_ids,
-            timestep,
-            guidance,
+            &Flux2ForwardInputs {
+                hidden_states,
+                encoder_hidden_states,
+                img_ids,
+                txt_ids,
+                timestep,
+                guidance,
+            },
             (&self.branch, control_context, control_context_scale),
         )
     }

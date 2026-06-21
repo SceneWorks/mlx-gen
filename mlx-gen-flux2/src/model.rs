@@ -34,7 +34,7 @@ use crate::pipeline::{
     prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule, timesteps_x1000,
 };
 use crate::text_encoder::Qwen3TextEncoder;
-use crate::transformer::Flux2Transformer;
+use crate::transformer::{Flux2ForwardInputs, Flux2Transformer};
 use crate::vae::Flux2Vae;
 use crate::vision::{Mistral3Projector, PixtralVisionTower};
 use crate::{loader, Flux2Config};
@@ -45,6 +45,58 @@ use crate::{loader, Flux2Config};
 /// multi-reference / high-resolution edits take the bounded-memory path; every shipped path (T2I,
 /// single-reference edit, strict pose, LoRA) stays on the byte-identical [`MemoryConfig::OFF`].
 const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
+
+/// Per-reference stride on the RoPE time axis (the fork's `prepare_reference_image_conditioning`):
+/// reference `i` is tagged at `t = REFERENCE_TIME_STRIDE * (i + 1)` (10, 20, 30, …) so each edit
+/// reference occupies its own time band, distinct from the target's `t = 0`. The stride must exceed a
+/// single reference's t-extent (1, since each ref is one packed grid at a fixed t) to avoid two refs
+/// colliding on the same time index; at the `MultiReference` capability cap (`max_count = 8`) the band
+/// tops out at `t = 80`, well inside the RoPE t-axis range. Named so the invariant is explicit rather
+/// than a bare `10 + 10*i`.
+const REFERENCE_TIME_STRIDE: i32 = 10;
+
+/// Sanitize model-generated text for a single-line, machine-parsed log record (the worker consumes
+/// the `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` prefix): replace every control/whitespace char (incl.
+/// embedded newlines that would split the record or forge a second prefix line) with a space, collapse
+/// runs, and length-cap to 512 chars. Only the logged copy is touched — never the prompt itself.
+fn sanitize_log_text(s: &str) -> String {
+    const CAP: usize = 512;
+    let collapsed: String = s
+        .chars()
+        .map(|c| {
+            if c.is_control() || c.is_whitespace() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.chars().count() > CAP {
+        let truncated: String = collapsed.chars().take(CAP).collect();
+        format!("{truncated}…")
+    } else {
+        collapsed
+    }
+}
+
+/// Walk the request conditioning for reference images (`Reference` + `MultiReference`), flattened in
+/// conditioning order then image order (the fork's flat `image_paths`). Shared by the edit and
+/// caption-upsample paths; the empty-check is the caller's (edit requires ≥1, upsample's T2I path
+/// tolerates none) (F-013/L-dedup).
+fn collect_reference_images(req: &GenerationRequest) -> Vec<&mlx_gen::media::Image> {
+    let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
+    for c in &req.conditioning {
+        match c {
+            mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
+            mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
+            _ => {}
+        }
+    }
+    refs
+}
 
 pub fn descriptor_klein_9b() -> ModelDescriptor {
     Flux2Variant::Klein9b.descriptor()
@@ -171,13 +223,27 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         descriptor: variant.descriptor(),
         variant,
         config: variant.config(),
-        tokenizer: Some(tokenizer),
-        text_encoder: Some(text_encoder),
-        transformer: Some(transformer),
-        vae: Some(vae),
+        parts: Some(Flux2Parts {
+            tokenizer,
+            text_encoder,
+            transformer,
+            vae,
+        }),
         vision_tower,
         projector,
     }))
+}
+
+/// The always-present core of a *loaded* FLUX.2 model. Held behind a single `Option` on [`Flux2`]
+/// (`Some` once weights are loaded, `None` only for the weightless validation-test instances) so
+/// "is the model loaded?" is one decision — distinct from the dev-only [`Flux2`] `vision_tower` /
+/// `projector` `Option`s, which encode the unrelated "dev variant vs klein" question. Untangling the
+/// two reasons a field used to be `Option` is the point of F-013.
+struct Flux2Parts {
+    tokenizer: TextTokenizer,
+    text_encoder: Qwen3TextEncoder,
+    transformer: Flux2Transformer,
+    vae: Flux2Vae,
 }
 
 /// The FLUX.2-klein generator.
@@ -185,10 +251,9 @@ pub struct Flux2 {
     descriptor: ModelDescriptor,
     variant: Flux2Variant,
     config: Flux2Config,
-    tokenizer: Option<TextTokenizer>,
-    text_encoder: Option<Qwen3TextEncoder>,
-    transformer: Option<Flux2Transformer>,
-    vae: Option<Flux2Vae>,
+    /// The loaded core (tokenizer / text-encoder / transformer / VAE). `None` only for the weightless
+    /// `new_for_tests` instances; the production load path always populates it.
+    parts: Option<Flux2Parts>,
     /// FLUX.2-dev caption upsampling (sc-6030): the Pixtral vision tower + Mistral3 projector that
     /// encode reference images for the image-conditioned (I2I) prompt rewrite. `None` for klein and
     /// the weightless test instances — caption upsampling is dev-only and gated on `enhance_prompt`.
@@ -197,21 +262,21 @@ pub struct Flux2 {
 }
 
 impl Flux2 {
-    /// Construct a weightless instance for validation tests.
+    /// Construct a weightless instance for validation tests (`parts: None`).
     pub fn new_for_tests(variant: Flux2Variant) -> Self {
         Self {
             descriptor: variant.descriptor(),
             variant,
             config: variant.config(),
-            tokenizer: None,
-            text_encoder: None,
-            transformer: None,
-            vae: None,
+            parts: None,
             vision_tower: None,
             projector: None,
         }
     }
 
+    /// Borrow the loaded core as the historical `(tokenizer, text_encoder, transformer, vae)` tuple.
+    /// One `Option` check now stands for "is the model loaded" (vs the former four), and the dev
+    /// extras (`vision_tower`/`projector`) are queried separately by `run_upsample` (F-013).
     fn parts(
         &self,
     ) -> Result<(
@@ -220,17 +285,11 @@ impl Flux2 {
         &Flux2Transformer,
         &Flux2Vae,
     )> {
-        let err = |what: &str| Error::Msg(format!("{}: {what} is not loaded", self.descriptor.id));
-        Ok((
-            self.tokenizer.as_ref().ok_or_else(|| err("tokenizer"))?,
-            self.text_encoder
-                .as_ref()
-                .ok_or_else(|| err("text encoder"))?,
-            self.transformer
-                .as_ref()
-                .ok_or_else(|| err("transformer"))?,
-            self.vae.as_ref().ok_or_else(|| err("VAE"))?,
-        ))
+        let p = self
+            .parts
+            .as_ref()
+            .ok_or_else(|| Error::Msg(format!("{}: model is not loaded", self.descriptor.id)))?;
+        Ok((&p.tokenizer, &p.text_encoder, &p.transformer, &p.vae))
     }
 
     /// Encode a prompt → `(prompt_embeds [1,512,joint], text_ids [1,512,4])`.
@@ -275,7 +334,7 @@ impl Flux2 {
             ids.push(prepare_grid_ids(
                 sh[2] as usize,
                 sh[3] as usize,
-                10 + 10 * i as i32,
+                REFERENCE_TIME_STRIDE * (i as i32 + 1),
             ));
         }
         let packed_refs: Vec<&Array> = packed.iter().collect();
@@ -289,19 +348,13 @@ impl Flux2 {
     /// Collect the ordered edit reference images from the request: a single `Reference`, a
     /// `MultiReference { images }` (N images, sc-2645), or several `Reference`s — flattened in
     /// conditioning order then image order (the fork passes a flat `image_paths` list). At least
-    /// one reference is required.
+    /// one reference is required (the empty-check is the edit caller's; the upsample T2I path uses the
+    /// shared [`collect_reference_images`] walk directly and tolerates none).
     fn collect_edit_references<'a>(
         &self,
         req: &'a GenerationRequest,
     ) -> Result<Vec<&'a mlx_gen::media::Image>> {
-        let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
-        for c in &req.conditioning {
-            match c {
-                mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
-                mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
-                _ => {}
-            }
-        }
+        let refs = collect_reference_images(req);
         if refs.is_empty() {
             return Err(Error::Msg(format!(
                 "{}: edit requires at least one reference image",
@@ -309,25 +362,6 @@ impl Flux2 {
             )));
         }
         Ok(refs)
-    }
-
-    /// Collect the reference images for caption upsampling (sc-6030): any `Reference` /
-    /// `MultiReference` images in the request, flattened in order. Empty ⇒ the text-only T2I rewrite.
-    /// Unlike [`collect_edit_references`](Self::collect_edit_references) this never errors on empty
-    /// (a T2I prompt rewrite is valid).
-    fn collect_upsample_references<'a>(
-        &self,
-        req: &'a GenerationRequest,
-    ) -> Vec<&'a mlx_gen::media::Image> {
-        let mut refs: Vec<&mlx_gen::media::Image> = Vec::new();
-        for c in &req.conditioning {
-            match c {
-                mlx_gen::Conditioning::Reference { image, .. } => refs.push(image),
-                mlx_gen::Conditioning::MultiReference { images } => refs.extend(images.iter()),
-                _ => {}
-            }
-        }
-        refs
     }
 
     /// FLUX.2-dev caption upsampling (sc-6030): rewrite the prompt with the Mistral3 multimodal LLM
@@ -342,7 +376,10 @@ impl Flux2 {
         }
         match self.run_upsample(req) {
             Ok(p) if !p.trim().is_empty() => {
-                eprintln!("ENHANCED_PROMPT:{p}");
+                // The log record is machine-parsed on the `ENHANCED_PROMPT:` prefix; sanitize the
+                // model-generated text so an embedded newline can't split the record or forge a
+                // second prefix line (the returned `p` itself is unchanged) (L-log-injection).
+                eprintln!("ENHANCED_PROMPT:{}", sanitize_log_text(&p));
                 p
             }
             Ok(_) => {
@@ -350,7 +387,7 @@ impl Flux2 {
                 req.prompt.clone()
             }
             Err(e) => {
-                eprintln!("ENHANCER_FALLBACK:{e}");
+                eprintln!("ENHANCER_FALLBACK:{}", sanitize_log_text(&e.to_string()));
                 req.prompt.clone()
             }
         }
@@ -362,14 +399,7 @@ impl Flux2 {
     fn run_upsample(&self, req: &GenerationRequest) -> Result<String> {
         let id = self.descriptor.id;
         let not_loaded = |what: &str| Error::Msg(format!("{id}: {what} is not loaded"));
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| not_loaded("tokenizer"))?;
-        let te = self
-            .text_encoder
-            .as_ref()
-            .ok_or_else(|| not_loaded("text encoder"))?;
+        let (tokenizer, te, _, _) = self.parts()?;
         let vision = self
             .vision_tower
             .as_ref()
@@ -378,14 +408,13 @@ impl Flux2 {
             .projector
             .as_ref()
             .ok_or_else(|| not_loaded("projector"))?;
-        let refs = self.collect_upsample_references(req);
+        let refs = collect_reference_images(req);
         let temperature = req
             .enhance_temperature
             .unwrap_or(caption_upsample::DEFAULT_TEMPERATURE);
-        let max_new_tokens = req
-            .enhance_max_tokens
-            .map(|m| m as usize)
-            .unwrap_or(caption_upsample::DEFAULT_MAX_NEW_TOKENS);
+        // Clamp the requested decode length to a hard ceiling (F-012): each step is a full ~32B forward
+        // over a growing KV cache, so an unclamped `enhance_max_tokens` is an effectively unbounded job.
+        let max_new_tokens = caption_upsample::clamp_max_new_tokens(req.enhance_max_tokens);
         let seed = req.seed.unwrap_or_else(default_seed);
         caption_upsample::upsample_prompt(
             tokenizer,
@@ -639,12 +668,14 @@ impl Flux2 {
                 _ => (latents.clone(), latent_ids.clone()),
             };
             let out = transformer.forward_with_mem(
-                &hidden,
-                embeds,
-                &img_ids,
-                ids,
-                ts,
-                embedded_guidance,
+                &Flux2ForwardInputs {
+                    hidden_states: &hidden,
+                    encoder_hidden_states: embeds,
+                    img_ids: &img_ids,
+                    txt_ids: ids,
+                    timestep: ts,
+                    guidance: embedded_guidance,
+                },
                 cache,
                 &mem,
             )?;
@@ -808,6 +839,24 @@ mod tests {
     };
     use mlx_gen::media::Image;
     use mlx_gen::Conditioning;
+
+    /// L-log-injection: sanitize collapses embedded newlines/control chars (no second prefix line) and
+    /// length-caps, so a model-generated rewrite can't break the machine-parsed `ENHANCED_PROMPT:` record.
+    #[test]
+    fn sanitize_log_text_collapses_and_caps() {
+        let dirty = "a\nb\tc\r\nENHANCED_PROMPT:forged";
+        let clean = sanitize_log_text(dirty);
+        assert!(!clean.contains('\n') && !clean.contains('\t') && !clean.contains('\r'));
+        assert_eq!(clean, "a b c ENHANCED_PROMPT:forged"); // newlines → spaces, but on ONE line
+        let long = "x".repeat(1000);
+        let capped = sanitize_log_text(&long);
+        assert!(
+            capped.chars().count() <= 513,
+            "capped to ~512 chars + ellipsis"
+        );
+        assert!(capped.ends_with('…'));
+        assert_eq!(sanitize_log_text("   "), "");
+    }
 
     #[test]
     fn validates_basic_txt2img_request() {

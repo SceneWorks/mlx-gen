@@ -17,7 +17,8 @@
 
 use mlx_gen::weights::Weights;
 use mlx_gen_flux2::{
-    prepare_grid_ids, prepare_text_ids, CacheMode, Flux2Config, Flux2KvCache, Flux2Transformer,
+    prepare_grid_ids, prepare_text_ids, CacheMode, Flux2Config, Flux2ForwardInputs, Flux2KvCache,
+    Flux2Transformer,
 };
 use mlx_rs::ops::{array_eq, concatenate_axis};
 use mlx_rs::Array;
@@ -108,7 +109,17 @@ impl Fixture {
         let img = concatenate_axis(&[&self.target, &self.ref_lat], 1).unwrap();
         let ids = concatenate_axis(&[&self.target_ids, &self.ref_ids], 1).unwrap();
         self.t
-            .forward_with_cache(&img, &self.txt, &ids, &self.txt_ids, TS, None, cache)
+            .forward_with_cache(
+                &Flux2ForwardInputs {
+                    hidden_states: &img,
+                    encoder_hidden_states: &self.txt,
+                    img_ids: &ids,
+                    txt_ids: &self.txt_ids,
+                    timestep: TS,
+                    guidance: None,
+                },
+                cache,
+            )
             .unwrap()
     }
 
@@ -116,12 +127,14 @@ impl Fixture {
     fn forward_cached(&self, cache: &Flux2KvCache) -> Array {
         self.t
             .forward_with_cache(
-                &self.target,
-                &self.txt,
-                &self.target_ids,
-                &self.txt_ids,
-                TS,
-                None,
+                &Flux2ForwardInputs {
+                    hidden_states: &self.target,
+                    encoder_hidden_states: &self.txt,
+                    img_ids: &self.target_ids,
+                    txt_ids: &self.txt_ids,
+                    timestep: TS,
+                    guidance: None,
+                },
                 Some(cache),
             )
             .unwrap()
@@ -223,12 +236,14 @@ fn cached_without_populated_cache_errors() {
     // No extract pass ran → the first cached attention layer finds an empty slot.
     let err =
         f.t.forward_with_cache(
-            &f.target,
-            &f.txt,
-            &f.target_ids,
-            &f.txt_ids,
-            TS,
-            None,
+            &Flux2ForwardInputs {
+                hidden_states: &f.target,
+                encoder_hidden_states: &f.txt,
+                img_ids: &f.target_ids,
+                txt_ids: &f.txt_ids,
+                timestep: TS,
+                guidance: None,
+            },
             Some(&cache),
         )
         .unwrap_err()

@@ -202,8 +202,12 @@ impl Generator for Flux1 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` (run inside the injector
-        // generate methods) has already confirmed at most one `Reference`; extract it here.
+        // Validate up front so an invalid request (bad dims/steps) fails fast, before the reference
+        // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
+        // would otherwise reject only after that work (L-validate-first).
+        self.validate(req)?;
+        // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
+        // `Reference`; extract it here.
         if let Some((image, strength)) = single_reference(req)? {
             let (encoder, adapter) = self.ip_adapter.as_ref().ok_or_else(|| {
                 Error::Msg(format!(
@@ -222,13 +226,9 @@ impl Generator for Flux1 {
                     // Match diffusers' Flux true-CFG IP: the negative branch conditions on a BLACK
                     // image (zeros), NOT "no IP" — `FluxPipeline` sets `negative_ip_adapter_image =
                     // np.zeros(...)` when unset. CFG then amplifies the reference-specific signal
-                    // (ref − blank), sharpening resemblance instead of the whole IP term.
-                    let black = Image {
-                        width: 64,
-                        height: 64,
-                        pixels: vec![0u8; 64 * 64 * 3],
-                    };
-                    let black_embeds = encoder.encode(&black)?;
+                    // (ref − blank), sharpening resemblance instead of the whole IP term. The size is
+                    // arbitrary (CLIP resizes to 224²), so `encode_black` names the zeros contract.
+                    let black_embeds = encoder.encode_black()?;
                     let neg = FluxIpInjector::new(adapter, &black_embeds, scale)?;
                     let neg_prompt = req.negative_prompt.as_deref().unwrap_or("");
                     self.generate_with_injector_cfg(

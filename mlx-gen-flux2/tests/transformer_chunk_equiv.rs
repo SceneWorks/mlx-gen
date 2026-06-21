@@ -19,7 +19,7 @@
 //! the multi-chunk + ragged-remainder paths on the fixture's 4-token image sequence.
 
 use mlx_gen::weights::Weights;
-use mlx_gen_flux2::{Flux2Config, Flux2Transformer, MemoryConfig};
+use mlx_gen_flux2::{Flux2Config, Flux2ForwardInputs, Flux2Transformer, MemoryConfig};
 use mlx_rs::{Array, Dtype};
 
 const FIXTURE: &str = concat!(
@@ -77,12 +77,14 @@ fn compare(a: &Array, b: &Array) -> (f32, f32) {
 
 fn forward_mem(t: &Flux2Transformer, w: &Weights, mem: &MemoryConfig) -> Array {
     t.forward_with_mem(
-        w.require("hidden").unwrap(),
-        w.require("encoder").unwrap(),
-        w.require("img_ids").unwrap(),
-        w.require("txt_ids").unwrap(),
-        500.0,
-        None,
+        &Flux2ForwardInputs {
+            hidden_states: w.require("hidden").unwrap(),
+            encoder_hidden_states: w.require("encoder").unwrap(),
+            img_ids: w.require("img_ids").unwrap(),
+            txt_ids: w.require("txt_ids").unwrap(),
+            timestep: 500.0,
+            guidance: None,
+        },
         None,
         mem,
     )
