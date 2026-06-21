@@ -22,11 +22,12 @@
 //! world, sc-2908 / sc-2909); the Qwen-specific Lightning sigma schedule is built in
 //! `mlx-gen-qwen-image` and wrapped in this same sampler (deduped in sc-2950).
 
-use mlx_rs::ops::{add, multiply};
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use gen_core::sampling::{
-    LcmPolicy, LightningPolicy, SamplerPolicy, StepCoeffs, StepDtype, TcdPolicy, TimestepConvention,
+    LatentOps, LcmPolicy, LightningPolicy, SamplerPolicy, StepCoeffs, StepDtype, TcdPolicy,
+    TimestepConvention,
 };
 
 use crate::array::scalar;
@@ -147,6 +148,64 @@ fn apply_step(
         acc = add(&acc, &multiply(&noise, scalar(c.a_noise))?)?;
     }
     Ok(acc)
+}
+
+// =================================================================================================
+// Unified framework backend (epic 7114 P2, sc-7118): the gen-core `LatentOps` impl over MLX `Array`.
+// =================================================================================================
+
+/// The mlx-gen backend impl of [`gen_core::sampling::LatentOps`] — the tensor primitives the unified
+/// curated samplers (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / LCM / DDIM, sc-7117) are
+/// written against. Carries the same byte-parity rules as the legacy [`apply_step`] so an engine's
+/// DEFAULT sampler stays bit-identical after it migrates onto the unified framework (the N1 gate):
+/// `scale(x, 1.0)` and `axpy(1.0, x, b, y) = x + y·b` elide the multiply-by-one, and `randn_like`
+/// reuses the seed-derived [`StepRng`] subkey so a stochastic sampler is deterministic per request
+/// seed regardless of global RNG draw order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MlxLatentOps;
+
+/// Lift a raw MLX op error into the backend-neutral [`gen_core::Error`] (the `LatentOps` trait is
+/// declared in gen-core, so its methods return `gen_core::Result`). Routes through the existing
+/// mlx-gen bridge: `Exception -> mlx_gen::Error -> gen_core::Error`.
+#[inline]
+fn ge<T>(r: std::result::Result<T, mlx_rs::error::Exception>) -> gen_core::Result<T> {
+    r.map_err(|e| crate::Error::from(e).into())
+}
+
+impl LatentOps for MlxLatentOps {
+    type Latent = Array;
+
+    fn scale(&self, x: &Array, scale: f32) -> gen_core::Result<Array> {
+        if scale == 1.0 {
+            return Ok(x.clone());
+        }
+        ge(multiply(x, scalar(scale)))
+    }
+
+    fn add(&self, a: &Array, b: &Array) -> gen_core::Result<Array> {
+        ge(add(a, b))
+    }
+
+    fn sub(&self, a: &Array, b: &Array) -> gen_core::Result<Array> {
+        ge(subtract(a, b))
+    }
+
+    fn axpy(&self, a: f32, x: &Array, b: f32, y: &Array) -> gen_core::Result<Array> {
+        // Byte-parity with apply_step's a_x==1 branch: emit `x + y·b` (multiply-by-one elided), so a
+        // migrated engine's default step is bit-identical to the legacy `flow_match_euler_step`.
+        let by = ge(multiply(y, scalar(b)))?;
+        if a == 1.0 {
+            return ge(add(x, &by));
+        }
+        let ax = ge(multiply(x, scalar(a)))?;
+        ge(add(&ax, &by))
+    }
+
+    fn randn_like(&self, x: &Array, seed: u64, step: usize) -> gen_core::Result<Array> {
+        // Reuse the legacy per-step subkey derivation (D6) — same trajectory determinism guarantees.
+        // `StepRng::normal` already returns `crate::Result`, which `?` lifts into `gen_core::Error`.
+        Ok(StepRng::new(seed).normal(x.shape(), step)?)
+    }
 }
 
 // =================================================================================================
@@ -523,6 +582,145 @@ mod tests {
         let got = scaled.as_slice::<f32>();
         for (a, b) in got.iter().zip([0.3_f32, -0.7, 1.1]) {
             assert!((a - b).abs() < 1e-7);
+        }
+    }
+
+    // --- Unified framework backend: MlxLatentOps (epic 7114 P2, sc-7118) ---------------------------
+
+    use gen_core::sampling::{
+        build_flow_sigmas, compute_mu, denoise, image_seq_len, Euler, FlowModelSampling, Sampler,
+    };
+    use mlx_rs::ops::eq;
+
+    fn arr(v: &[f32]) -> Array {
+        Array::from_slice(v, &[v.len() as i32])
+    }
+    fn arrays_eq(a: &Array, b: &Array) -> bool {
+        eq(a, b).unwrap().all(None).unwrap().item::<bool>()
+    }
+    /// A reference flow velocity model `v = 0.3·x + 0.1` over MLX (matches the gen-core byte-equiv).
+    fn stub_velocity(xin: &Array) -> Result<Array> {
+        Ok(add(&multiply(xin, scalar(0.3))?, scalar(0.1))?)
+    }
+
+    #[test]
+    fn mlx_latent_ops_scale_add_sub() {
+        let ops = MlxLatentOps;
+        let a = arr(&[1.0, 2.0, 3.0]);
+        let b = arr(&[0.5, -1.0, 4.0]);
+        assert!(arrays_eq(
+            &ops.scale(&a, 2.0).unwrap(),
+            &arr(&[2.0, 4.0, 6.0])
+        ));
+        // scale by 1.0 is a byte-identical clone (no kernel).
+        assert!(arrays_eq(&ops.scale(&a, 1.0).unwrap(), &a));
+        assert!(arrays_eq(&ops.add(&a, &b).unwrap(), &arr(&[1.5, 1.0, 7.0])));
+        assert!(arrays_eq(
+            &ops.sub(&a, &b).unwrap(),
+            &arr(&[0.5, 3.0, -1.0])
+        ));
+    }
+
+    #[test]
+    fn mlx_axpy_a1_is_byte_identical_to_legacy_branch() {
+        // axpy(1.0, x, b, y) must equal `x + y·b` exactly (the apply_step byte-parity branch).
+        let ops = MlxLatentOps;
+        let x = arr(&[0.3, -1.2, 2.5]);
+        let y = arr(&[0.7, 0.1, -0.4]);
+        let got = ops.axpy(1.0, &x, 0.25, &y).unwrap();
+        let want = add(&x, multiply(&y, scalar(0.25)).unwrap()).unwrap();
+        assert!(arrays_eq(&got, &want), "axpy a=1 not byte-identical");
+        // General a: 2·x + (−3)·y.
+        let got2 = ops.axpy(2.0, &x, -3.0, &y).unwrap();
+        let want2 = add(
+            multiply(&x, scalar(2.0)).unwrap(),
+            multiply(&y, scalar(-3.0)).unwrap(),
+        )
+        .unwrap();
+        assert!(arrays_eq(&got2, &want2));
+    }
+
+    #[test]
+    fn mlx_randn_like_is_deterministic_shaped_and_seed_keyed() {
+        let ops = MlxLatentOps;
+        let x = arr(&[0.0, 0.0, 0.0, 0.0, 0.0]);
+        let a = ops.randn_like(&x, 42, 0).unwrap();
+        assert_eq!(a.shape(), &[5]);
+        assert!(arrays_eq(&a, &ops.randn_like(&x, 42, 0).unwrap()));
+        assert!(!arrays_eq(&a, &ops.randn_like(&x, 42, 1).unwrap()));
+        assert!(!arrays_eq(&a, &ops.randn_like(&x, 43, 0).unwrap()));
+    }
+
+    #[test]
+    fn mlx_unified_euler_matches_legacy_flowmatch() {
+        // The N1 proof on the real backend: gen-core Euler over MlxLatentOps + a FLOW ModelSampling
+        // reproduces the legacy FlowMatchSampler trajectory (same stub velocity, same sigmas).
+        let ops = MlxLatentOps;
+        let sigmas = build_flow_sigmas(8, compute_mu(image_seq_len(1024, 1024), 8));
+        let x_init = arr(&[0.3, -1.1, 2.0, 0.05, -0.4, 1.7]);
+
+        // Legacy FlowMatchSampler path (the byte-parity apply_step).
+        let legacy_sampler = FlowMatchSampler::new(sigmas.clone());
+        let mut legacy = x_init.clone();
+        for i in 0..legacy_sampler.num_steps() {
+            let v = stub_velocity(&legacy).unwrap(); // c_in=1 -> model input = x
+            legacy = legacy_sampler.step(&v, &legacy, i).unwrap();
+        }
+
+        // Unified Euler over MlxLatentOps.
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let mut dn = |x: &Array, s: f32| {
+            denoise(&ops, &ms, x, s, |xin, _t| {
+                stub_velocity(xin).map_err(Into::into)
+            })
+        };
+        let unified = Euler
+            .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+            .unwrap();
+
+        let (lg, un) = (legacy.as_slice::<f32>(), unified.as_slice::<f32>());
+        let max = lg
+            .iter()
+            .zip(un)
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max < 1e-4,
+            "unified Euler diverged from legacy FlowMatch: {max:e}"
+        );
+    }
+
+    #[test]
+    fn mlx_drives_every_curated_solver_to_finite_output() {
+        // The P2 deliverable: every gen-core curated sampler runs end-to-end over mlx_rs::Array.
+        let ops = MlxLatentOps;
+        let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+        let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
+        let x_init = arr(&[0.2, -0.5, 1.0, 0.3]);
+        for name in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "lcm",
+            "ddim",
+        ] {
+            let sampler =
+                gen_core::sampling::sampler_by_name::<MlxLatentOps>(name).expect("known solver");
+            let mut dn = |x: &Array, s: f32| {
+                denoise(&ops, &ms, x, s, |xin, _t| {
+                    stub_velocity(xin).map_err(Into::into)
+                })
+            };
+            let out = sampler
+                .sample(&ops, &mut dn, x_init.clone(), &sigmas, 7)
+                .unwrap();
+            assert!(
+                out.as_slice::<f32>().iter().all(|v| v.is_finite()),
+                "{name} produced non-finite output"
+            );
         }
     }
 }
