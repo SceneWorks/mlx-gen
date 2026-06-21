@@ -16,7 +16,7 @@ use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use mlx_gen::array::host_i32;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::vision::grid::Grid;
 use super::vision::VisionTransformer;
@@ -57,8 +57,15 @@ impl QwenVisionLanguageEncoder {
         let spliced = self.splice(&embeds, input_ids, vision)?;
         let hidden = self.lm.forward_from_embeds(&spliced, attention_mask)?; // [b, s, hidden]
 
-        // Drop the leading template tokens (single un-padded sequence per row).
+        // Drop the leading template tokens (single un-padded sequence per row). Needs more than
+        // EDIT_DROP_IDX tokens or the index is empty and `take_axis` panics (F-020/L-A).
         let s = hidden.shape()[1];
+        if s <= Self::EDIT_DROP_IDX {
+            return Err(Error::Msg(format!(
+                "qwen VL encoder: prompt has {s} token(s), must exceed the {} dropped template tokens",
+                Self::EDIT_DROP_IDX
+            )));
+        }
         let idx: Vec<i32> = (Self::EDIT_DROP_IDX..s).collect();
         let idx = Array::from_slice(&idx, &[idx.len() as i32]);
         Ok(hidden.take_axis(&idx, 1)?)

@@ -240,8 +240,10 @@ pub fn trapezoidal_mask(
     ramp_right: i32,
     left_from_0: bool,
 ) -> Vec<f32> {
-    assert!(length > 0, "mask length must be positive");
-    let length = length as usize;
+    // Internal tiling invariant (tile extents are always positive); clamp keeps release builds safe
+    // without an abort, debug_assert documents the contract (F-020/L-A).
+    debug_assert!(length > 0, "mask length must be positive");
+    let length = length.max(1) as usize;
     let ramp_left = ramp_left.clamp(0, length as i32) as usize;
     let ramp_right = ramp_right.clamp(0, length as i32) as usize;
     let mut mask = vec![1.0f32; length];

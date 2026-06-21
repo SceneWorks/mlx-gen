@@ -357,7 +357,12 @@ impl Prodigy {
         // --- Pass 2: Adam step. denom uses the NEW d; dlr/weight-decay use the OLD d ---
         for (k, g) in grads.iter() {
             let Some(p) = params.get(k) else { continue };
-            let st = self.state.get(k).expect("state created in pass 1");
+            let st = self.state.get(k).ok_or_else(|| {
+                crate::Error::Msg(format!(
+                    "prodigy step: gradient key '{k}' has no pass-1 state (params and grads must \
+                     share identical keys)"
+                ))
+            })?;
             let denom = add(&st.exp_avg_sq.sqrt()?, c(d_new * eps))?;
             let mut np = p.clone();
             if self.weight_decay != 0.0 {

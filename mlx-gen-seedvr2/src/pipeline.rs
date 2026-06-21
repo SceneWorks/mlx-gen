@@ -235,7 +235,7 @@ impl Seedvr2Pipeline {
         let neg = self
             .neg_embed
             .as_ref()
-            .expect("neg-embed (use Seedvr2Pipeline::load)");
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?;
         let processed = self.preprocess(image, width, height, softness)?; // (1,3,H,W) in dtype
 
         let latent = self.encode(&processed)?;
@@ -284,7 +284,7 @@ impl Seedvr2Pipeline {
         let neg = self
             .neg_embed
             .as_ref()
-            .expect("neg-embed (use Seedvr2Pipeline::load)")
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
             .clone();
         let tile = video::plan_spatial_tile_px(self.weights_bytes, safe_gib);
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
@@ -464,7 +464,7 @@ impl Seedvr2Pipeline {
         let neg = self
             .neg_embed
             .as_ref()
-            .expect("neg-embed (use Seedvr2Pipeline::load)")
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
             .clone();
         let ts = Array::from_f32(TIMESTEP);
         let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(plan.len());
@@ -535,7 +535,7 @@ impl Seedvr2Pipeline {
         let neg = self
             .neg_embed
             .as_ref()
-            .expect("neg-embed (use Seedvr2Pipeline::load)")
+            .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
             .clone();
         let mut out = Vec::with_capacity(frames.len());
         for f in frames {

@@ -124,13 +124,16 @@ fn align_norm_crop_parity() {
 
         // (2) crop vs cv2.warpAffine (norm_crop 112² and the facexlib 512²)
         let (want_crop, _) = u8_tensor(&g, &format!("norm_crop.{i}"));
-        let crop = norm_crop(&img, ih, iw, &kps);
+        let crop = norm_crop(&img, ih, iw, &kps).unwrap();
         let (cd, cm) = diff(&crop, &want_crop);
         let frac = cd as f32 / want_crop.len() as f32;
         worst_max = worst_max.max(cm);
         worst_frac = worst_frac.max(frac);
         let (want_512, _) = u8_tensor(&g, &format!("align512.{i}"));
-        let (d512, _) = diff(&align::align_face_512(&img, ih, iw, &kps), &want_512);
+        let (d512, _) = diff(
+            &align::align_face_512(&img, ih, iw, &kps).unwrap(),
+            &want_512,
+        );
         worst_512 = worst_512.max(d512);
 
         // (3) alignment fidelity: ArcFace(our crop) vs ArcFace(cv2 crop) — isolates alignment.
@@ -209,7 +212,7 @@ fn end_to_end_detect_align_embed() {
             .iter()
             .min_by(|a, b| kps_l2(&a.kps, &want_kps).total_cmp(&kps_l2(&b.kps, &want_kps)))
             .unwrap();
-        let emb = embed(&arc, &norm_crop(&img, ih, iw, &det.kps));
+        let emb = embed(&arc, &norm_crop(&img, ih, iw, &det.kps).unwrap());
         let ref_cos = cosine(&emb, &vec_f32(&g, &format!("emb_ref.{i}")));
         let ort_cos = cosine(&emb, &vec_f32(&g, &format!("emb_onnx.{i}")));
         min_ref_cos = min_ref_cos.min(ref_cos);

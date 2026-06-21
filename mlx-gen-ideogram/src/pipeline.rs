@@ -427,10 +427,12 @@ impl Ideogram4Pipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
         let patch = PATCH * AE_SCALE;
-        assert!(
-            height.is_multiple_of(patch) && width.is_multiple_of(patch),
-            "height/width must be multiples of {patch}"
-        );
+        // Request-derived: reject as a typed error rather than abort the worker (F-020/L-A).
+        if !height.is_multiple_of(patch) || !width.is_multiple_of(patch) {
+            return Err(Error::Msg(format!(
+                "ideogram: height/width must be multiples of {patch} (got {height}x{width})"
+            )));
+        }
         let grid_h = (height / patch) as i32;
         let grid_w = (width / patch) as i32;
         let num_img = grid_h * grid_w;

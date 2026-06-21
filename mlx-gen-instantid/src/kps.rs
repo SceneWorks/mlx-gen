@@ -15,6 +15,7 @@
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::Image;
+use mlx_gen::{Error, Result};
 
 // The openpose limb stick width — shared with the body-pose renderer rather than redefined here, so
 // there's a single `STICKWIDTH` in the crate (F-086).
@@ -508,12 +509,13 @@ const COLORS: [[u8; 3]; 5] = [
 /// Render the InstantID kps control image: a `width × height` RGB [`Image`] from 5 landmarks
 /// `[left_eye, right_eye, nose, mouth_left, mouth_right]` (canvas-space pixel coords). Bit-exact to
 /// the vendored `draw_kps`.
-pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
-    assert!(
-        kps.len() >= 5,
-        "draw_kps needs 5 keypoints, got {}",
-        kps.len()
-    );
+pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Result<Image> {
+    if kps.len() < 5 {
+        return Err(Error::Msg(format!(
+            "draw_kps needs 5 keypoints, got {}",
+            kps.len()
+        )));
+    }
     let (w, h) = (width as i32, height as i32);
     let mut canvas = vec![0u8; (w as usize) * (h as usize) * 3];
 
@@ -544,11 +546,11 @@ pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
         circle_filled(&mut canvas, w, h, (x as i32, y as i32), 10, COLORS[idx]);
     }
 
-    Image {
+    Ok(Image {
         width,
         height,
         pixels: canvas,
-    }
+    })
 }
 
 /// Resize `image` keeping aspect (PIL LANCZOS) and center-pad onto a black `width × height` canvas —
@@ -557,8 +559,11 @@ pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Image {
 pub fn letterbox(image: &Image, width: u32, height: u32) -> Image {
     let (iw, ih) = (image.width, image.height);
     let ratio = (width as f64 / iw as f64).min(height as f64 / ih as f64);
-    let new_w = ((iw as f64 * ratio).round() as u32).max(1);
-    let new_h = ((ih as f64 * ratio).round() as u32).max(1);
+    // Clamp to the canvas: fp round-up of `i*ratio` could exceed width/height, underflowing the
+    // unsigned `width - new_w` / `height - new_h` offsets below (F-020 / L-A). `.min(..)` is inert
+    // whenever the resize already fits (the normal case), since then `new_w <= width`.
+    let new_w = ((iw as f64 * ratio).round() as u32).min(width).max(1);
+    let new_h = ((ih as f64 * ratio).round() as u32).min(height).max(1);
     let resized = resize_lanczos_u8(
         &image.pixels,
         ih as usize,

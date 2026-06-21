@@ -91,7 +91,7 @@ fn face_analysis_end_to_end() {
     println!("image {h}x{w}, insightface {n} faces");
 
     // (1) detector blob parity vs insightface
-    let (blob, det_scale) = detector_blob(&img, h, w);
+    let (blob, det_scale) = detector_blob(&img, h, w).unwrap();
     let bg = blob.try_as_slice::<f32>().unwrap();
     let wb = g.require("blob").unwrap().try_as_slice::<f32>().unwrap();
     let blob_max = bg

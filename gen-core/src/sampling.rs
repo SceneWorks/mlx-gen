@@ -234,7 +234,10 @@ impl FlowMatchPolicy {
     /// Build from a precomputed sigma schedule (length `num_steps + 1`, trailing `0.0`). Panics if
     /// fewer than two entries are supplied (a schedule needs at least one step + the terminal `0`).
     pub fn new(sigmas: Vec<f32>, conv: TimestepConvention) -> Self {
-        assert!(
+        // Internal invariant: the schedule helpers always build `sigmas` as `num_steps + 1` (>= 2);
+        // a `debug_assert` documents it without changing this pub constructor's signature (request-
+        // derived step counts are validated at the provider boundary, not here) (F-020/L-A).
+        debug_assert!(
             sigmas.len() >= 2,
             "FlowMatchPolicy needs sigmas of length num_steps+1 (>= 2), got {}",
             sigmas.len()

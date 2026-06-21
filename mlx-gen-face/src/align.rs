@@ -20,7 +20,7 @@
 //! Matching cv2's *fixed-point* arithmetic (not "a bilinear") is the same discipline that gives the
 //! PIL resampler ([`mlx_gen::image`]) pixel-parity — an `f64` warp drifts ±1 LSB at edges.
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 use mlx_rs::Array;
 
 /// insightface `arcface_dst` 112² template (L-eye, R-eye, nose, L-mouth, R-mouth).
@@ -208,15 +208,16 @@ pub fn warp_affine(
     out_h: usize,
     out_w: usize,
     border: [u8; 3],
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     // `src` is indexed as `(y·in_w + x)·3 + ch` with bounds from `in_h`/`in_w` only; a `(buf,h,w)`
-    // mismatch would otherwise index out of bounds deep in the sample loop. Check the contract at the
-    // entry so the failure is labeled here (F-081). Callers that decode their own buffers uphold it.
-    assert!(
-        src.len() >= in_h * in_w * 3,
-        "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
-        src.len()
-    );
+    // mismatch would otherwise index out of bounds deep in the sample loop. Reject the contract
+    // violation at the entry as a typed error (F-020/L-A). Callers that decode their own buffers uphold it.
+    if src.len() < in_h * in_w * 3 {
+        return Err(Error::Msg(format!(
+            "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+            src.len()
+        )));
+    }
     let im = forward.invert().0; // src_x = im0·x+im1·y+im2 ; src_y = im3·x+im4·y+im5
     let adelta: Vec<i64> = (0..out_w as i64)
         .map(|x| cv_round(im[0] * x as f64 * AB_SCALE))
@@ -258,18 +259,23 @@ pub fn warp_affine(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// insightface `norm_crop`: 5-pt kps → 112² aligned RGB `u8` crop (the ArcFace input image,
 /// `borderValue=0`). Feed [`to_arcface_input`] then [`crate::ArcFace::forward`].
-pub fn norm_crop(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Vec<u8> {
+pub fn norm_crop(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Result<Vec<u8>> {
     warp_affine(src, in_h, in_w, &estimate_norm(kps), 112, 112, [0, 0, 0])
 }
 
 /// facexlib `align_warp_face` equivalent: 5-pt kps → 512² aligned RGB `u8` crop against the FFHQ
 /// template (gray border). The EVA-CLIP / parsing crop for PuLID (tolerant path — see module docs).
-pub fn align_face_512(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Vec<u8> {
+pub fn align_face_512(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    kps: &[[f32; 2]; 5],
+) -> Result<Vec<u8>> {
     let m = estimate_similarity(kps, &FACEXLIB_DST_512);
     warp_affine(src, in_h, in_w, &m, 512, 512, FACEXLIB_BORDER_RGB)
 }
@@ -330,17 +336,19 @@ mod tests {
             *v = (i % 251) as u8;
         }
         let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let out = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
+        let out = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]).unwrap();
         assert_eq!(out, src, "identity warp must be lossless");
     }
 
     /// F-081: a `(buf, h, w)` mismatch (buffer too small for the claimed dims) is caught at the entry
     /// with a labeled message, not an opaque out-of-bounds index deep in the sample loop.
     #[test]
-    #[should_panic(expected = "too small for 8×8×3")]
     fn warp_affine_rejects_undersized_buffer() {
         let src = vec![0u8; 8 * 8 * 3 - 1]; // one byte short of 8×8×3
         let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let _ = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
+        let err = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too small for 8×8×3"), "got: {err}");
     }
 }

@@ -110,7 +110,11 @@ impl BooguTextEncoder {
         let img_idx: Vec<i32> = (0..s)
             .filter(|&i| ids[i as usize] == image_token_id)
             .collect();
-        let img_start = *img_idx.first().expect("no image tokens in input_ids");
+        let img_start = *img_idx.first().ok_or_else(|| {
+            mlx_gen::Error::Msg(format!(
+                "boogu image-conditioned encode: no image tokens (id {image_token_id}) in input_ids"
+            ))
+        })?;
         let img_end = img_start + img_idx.len() as i32;
 
         // Token embeddings, then splice the vision embeds at the image positions.

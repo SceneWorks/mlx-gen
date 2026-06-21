@@ -9,7 +9,7 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 pub(crate) use mlx_gen::image::{resize_bicubic_u8, resize_lanczos_u8};
 
@@ -76,6 +76,17 @@ impl QwenImageProcessor {
     }
 
     pub fn preprocess(&self, image: ImageInput) -> Result<ProcessedImage> {
+        // The pub re-exported processor indexes `data` as `h*w*3` below; reject a mismatched buffer
+        // up front (the registered edit path validates upstream, a direct caller does not) (F-020/L-A).
+        let expected = image.height * image.width * 3;
+        if image.data.len() != expected {
+            return Err(Error::Msg(format!(
+                "qwen image processor: input buffer {} bytes != {}x{}x3 ({expected})",
+                image.data.len(),
+                image.width,
+                image.height
+            )));
+        }
         let (rh, rw) = self.smart_resize(image.height, image.width);
 
         // Resize on the uint8 image (matching PIL), then convert to normalized f32 CHW.

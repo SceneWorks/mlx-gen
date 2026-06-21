@@ -11,7 +11,7 @@
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Image, Progress, Result};
+use mlx_gen::{AdapterSpec, CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
 
 use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise, denoise_control, denoise_ip,
@@ -26,6 +26,20 @@ use crate::tokenizer::KolorsTokenizer;
 
 /// VAE spatial downscale (latent is image/8 per side).
 pub const SPATIAL_SCALE: i32 = 8;
+
+/// Reject degenerate dimensions at the public struct-API boundary (F-020). The registered
+/// `KolorsGenerator::generate_impl` runs `validate_request` (multiple-of-8), but the `pub fn
+/// generate*`/`img2img` struct methods beneath it do not — a non-multiple-of-8 or non-positive
+/// dimension would otherwise silently produce a wrong latent shape (`width / SPATIAL_SCALE` truncates)
+/// or crash deep in an MLX op. Inert on every valid request (registry dims are always multiples of 8).
+fn validate_dims(height: i32, width: i32) -> Result<()> {
+    if height <= 0 || width <= 0 || height % SPATIAL_SCALE != 0 || width % SPATIAL_SCALE != 0 {
+        return Err(Error::Msg(format!(
+            "kolors: height and width must be positive multiples of {SPATIAL_SCALE} (got {height}x{width})"
+        )));
+    }
+    Ok(())
+}
 
 /// diffusers `KolorsImg2ImgPipeline` default `strength` (how much of the schedule to re-noise/denoise).
 pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
@@ -223,6 +237,7 @@ impl Kolors {
         height: i32,
         width: i32,
     ) -> Result<Image> {
+        validate_dims(height, width)?;
         random::seed(seed)?;
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
@@ -305,6 +320,7 @@ impl Kolors {
         height: i32,
         width: i32,
     ) -> Result<Image> {
+        validate_dims(height, width)?;
         // VAE-encode the init (no RNG: mean, not a sample) so the first global-RNG draw is the
         // add_noise noise — matching the reference's `prepare_latents` order.
         let init_latents = encode_init_latents(&self.vae, image, width as u32, height as u32)?;
@@ -410,6 +426,7 @@ impl Kolors {
         height: i32,
         width: i32,
     ) -> Result<Image> {
+        validate_dims(height, width)?;
         random::seed(seed)?;
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
@@ -603,6 +620,7 @@ impl Kolors {
         height: i32,
         width: i32,
     ) -> Result<Image> {
+        validate_dims(height, width)?;
         let ip_tokens = ip_encoder.tokens(reference_image)?;
         // VAE-encode the init (no RNG: mean) so the first global-RNG draw is the add_noise noise.
         let init_latents =
@@ -650,6 +668,7 @@ impl Kolors {
         height: i32,
         width: i32,
     ) -> Result<Image> {
+        validate_dims(height, width)?;
         let ip_tokens = ip_encoder.tokens(reference_image)?;
         random::seed(seed)?;
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
@@ -670,5 +689,28 @@ impl Kolors {
             &mut |_p| {},
         )?;
         self.decode(&latents)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-020: the struct-API dim guard rejects non-positive / non-multiple-of-8 dimensions (which the
+    /// registry validates but the `pub fn generate*` methods previously did not).
+    #[test]
+    fn validate_dims_rejects_degenerate_dimensions() {
+        assert!(validate_dims(1024, 768).is_ok());
+        assert!(validate_dims(8, 8).is_ok());
+        assert!(
+            validate_dims(513, 512).is_err(),
+            "513 is not a multiple of 8"
+        );
+        assert!(
+            validate_dims(512, 510).is_err(),
+            "510 is not a multiple of 8"
+        );
+        assert!(validate_dims(0, 512).is_err(), "0 is non-positive");
+        assert!(validate_dims(512, -8).is_err(), "negative width");
     }
 }

@@ -321,7 +321,7 @@ impl BooguPipeline {
         validate_multiple_of_16(reference.width, reference.height, "boogu")?;
 
         // Reference → clean VAE latent [1, 16, rH/8, rW/8].
-        let ref_pixels = image_to_pixels(reference);
+        let ref_pixels = image_to_pixels(reference)?;
         let ref_latent = self.vae.encode(&ref_pixels)?;
 
         // Condition encoding: edit instruction + CFG-negative (empty/drop) instruction. Both DiT
@@ -472,15 +472,26 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64) -> Result<Array> {
 
 /// Convert an RGB8 [`Image`] (NHWC, `[0, 255]`) into the VAE encoder's expected `[1, 3, H, W]` f32
 /// tensor in `[-1, 1]` — the inverse of [`decoded_to_image`]'s `x·0.5 + 0.5` denormalize.
-fn image_to_pixels(img: &Image) -> Array {
+fn image_to_pixels(img: &Image) -> Result<Array> {
     let (h, w) = (img.height as i32, img.width as i32);
+    // Reject a buffer that violates the `w·h·3` Image invariant before `Array::from_slice` panics on
+    // the shape mismatch — mirrors ideogram's `image_to_pixels` guard (pipeline.rs ~109) (F-020/L-A).
+    let expected = (img.height as usize) * (img.width as usize) * 3;
+    if img.pixels.len() != expected {
+        return Err(Error::Msg(format!(
+            "boogu: reference pixel buffer {} bytes != {}x{}x3 ({expected})",
+            img.pixels.len(),
+            img.width,
+            img.height
+        )));
+    }
     let f: Vec<f32> = img
         .pixels
         .iter()
         .map(|&p| (p as f32 / 255.0) * 2.0 - 1.0)
         .collect();
     let nhwc = Array::from_slice(&f, &[1, h, w, 3]);
-    nhwc.transpose_axes(&[0, 3, 1, 2]).expect("NHWC→NCHW")
+    Ok(nhwc.transpose_axes(&[0, 3, 1, 2])?)
 }
 
 /// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values

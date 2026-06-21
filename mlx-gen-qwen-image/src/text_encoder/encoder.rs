@@ -6,7 +6,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use super::{join, QwenEncoderLayer, TextRope};
 
@@ -112,6 +112,14 @@ impl QwenTextEncoder {
     pub fn encode(&self, input_ids: &Array, attention_mask: &Array) -> Result<Array> {
         let hidden = self.forward(input_ids, attention_mask)?;
         let s = hidden.shape()[1];
+        // Dropping the leading `drop_idx` template tokens needs at least that many; a shorter sequence
+        // would build an empty index and panic in `take_axis` (F-020/L-A).
+        if s <= self.drop_idx {
+            return Err(Error::Msg(format!(
+                "qwen text encoder: prompt has {s} token(s), must exceed the {} dropped template tokens",
+                self.drop_idx
+            )));
+        }
         let idx: Vec<i32> = (self.drop_idx..s).collect();
         let idx = Array::from_slice(&idx, &[idx.len() as i32]);
         Ok(hidden.take_axis(&idx, 1)?)

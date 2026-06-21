@@ -236,6 +236,8 @@ pub fn guided_velocity(
     // Weighted velocity sum for a list of (vel, weight) deltas: base + Σ w·(cur − prev).
     let chain = |terms: &[(&Array, f32)]| -> Result<Array> {
         // terms[0] is the base (weight ignored); each subsequent is (cur, weight) diffing the prev.
+        // Internal invariant: every call site passes >= 1 term (the base) (F-020/L-A).
+        debug_assert!(!terms.is_empty(), "chain needs at least the base term");
         let mut acc = terms[0].0.clone();
         for w in 1..terms.len() {
             let delta = subtract(terms[w].0, terms[w - 1].0)?;

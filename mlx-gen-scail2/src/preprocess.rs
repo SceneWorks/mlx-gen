@@ -44,10 +44,12 @@ pub fn extract_and_compress_mask_to_latent(mask: &Array, temporal_stride: usize)
     let t = mask.shape()[1];
     let h = mask.shape()[2];
     let w = mask.shape()[3];
-    assert!(
-        h % 8 == 0 && w % 8 == 0,
-        "scail2 mask: H,W must be divisible by 8 (got {h}x{w})"
-    );
+    // Request-derived mask dims: reject as a typed error rather than abort the worker (F-020/L-A).
+    if h % 8 != 0 || w % 8 != 0 {
+        return Err(mlx_gen::Error::Msg(format!(
+            "scail2 mask: H,W must be divisible by 8 (got {h}x{w})"
+        )));
+    }
 
     // (3, T, H, W) → (T, 3, H, W), threshold each channel to {0,1}.
     let m = f32(&mask.transpose_axes(&[1, 0, 2, 3])?)?;

@@ -376,7 +376,7 @@ impl InstantId {
         let face_tokens = self.face_tokens(embedding, cfg_on)?; // [B, 16, 2048]
 
         // kps control image (sc-3111) → IdentityNet ControlContext.
-        let kps_image = kps::draw_kps(req.width, req.height, kps);
+        let kps_image = kps::draw_kps(req.width, req.height, kps)?;
         let control_ctx = self.control_ctx(
             &self.identitynet,
             &kps_image,
@@ -571,7 +571,7 @@ impl InstantId {
         // IP zeroed, OpenPose boosted (the shared seed/prompt carry hair/wardrobe continuity).
         let (face_image, id_scale, op_scale, ip_scale) = match face_kps {
             Some(kps) => (
-                kps::draw_kps(side, side, kps),
+                kps::draw_kps(side, side, kps)?,
                 req.controlnet_scale,
                 req.openpose_scale,
                 req.ip_adapter_scale,
