@@ -554,8 +554,11 @@ impl Seedvr2Pipeline {
 
     /// Upscale one preprocessed frame `(1,3,1,H,W)` by spatial tiling: run the full encode → DiT →
     /// decode path on each overlapping `tile`-px tile (one-step Euler, same-seed noise) and feather-
-    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame. The accumulator is evaluated per tile
-    /// so only one tile's activations are resident at a time (the memory bound). Public for the gate.
+    /// blend the decoded tiles into a full `(1,3,1,H,W)` frame. The accumulator is evaluated per tile,
+    /// so the transient peak is **one tile's activations** plus the **two full-frame f32 accumulators**
+    /// (`acc` `(1,3,1,H,W)` + `wsum` `(1,1,1,H,W)`) held across the whole loop — i.e. the bound is
+    /// `max-tile working set + 4·H·W·f32` (the per-tile `eval` keeps tile activations from stacking,
+    /// but the two frame-sized buffers are resident throughout, sc-6894). Public for the gate.
     pub fn run_frame_tiled(
         &self,
         processed: &Array,

@@ -54,8 +54,22 @@ pub const SPATIAL_OVERLAP: i32 = 64;
 
 /// The safe peak-GB budget: this machine's MLX memory limit × [`SAFE_FRAC`]. Shared by the temporal
 /// chunk sizer and the spatial tile sizer.
+///
+/// A `0` limit means MLX has no device memory limit set (unset/unknown) — without a floor that would
+/// compute a `0` budget and silently route *every* job to the smallest tile (the slowest path) for no
+/// reason (sc-6894). Treat `0`/sub-1-GiB as unknown and fall back to a conservative default so sizing
+/// stays sane; a real (≥ 1 GiB) limit is used as-is.
 pub fn safe_budget_gib() -> f64 {
-    (get_memory_limit() as f64 / GIB) * SAFE_FRAC
+    /// Fallback budget when the MLX limit is unset (≈ a small Apple-Silicon tier — conservative, so
+    /// the sizer tiles more rather than risking OOM on an unknown machine).
+    const UNKNOWN_BUDGET_GIB: f64 = 8.0;
+    let lim_gib = get_memory_limit() as f64 / GIB;
+    let lim_gib = if lim_gib < 1.0 {
+        UNKNOWN_BUDGET_GIB
+    } else {
+        lim_gib
+    };
+    lim_gib * SAFE_FRAC
 }
 
 /// Round `t` up to a valid chunk length: a multiple of [`TEMPORAL_MULT`], floored at

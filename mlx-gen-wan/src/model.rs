@@ -16,7 +16,6 @@
 
 use std::path::PathBuf;
 
-use mlx_gen::tiling::TilingConfig;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     default_seed, gen_core, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
@@ -29,10 +28,10 @@ use mlx_rs::Array;
 use crate::adapters::{merge_wan_adapters, warn_skipped_adapters};
 use crate::config::{GuideScale, WanModelConfig};
 use crate::pipeline::{
-    align_dim, auto_tiling_budgeted, best_output_size, build_i2v_y, build_ti2v_keyframe_z,
-    build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames, decode_to_frames_22, denoise,
-    denoise_moe, denoise_ti2v, frames_to_images, latent_shape, preflight_denoise_memory_guard,
-    preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
+    align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, best_output_size, build_i2v_y,
+    build_ti2v_keyframe_z, build_ti2v_mask, build_ti2v_multi_mask, decode_to_frames,
+    decode_to_frames_22, denoise, denoise_moe, denoise_ti2v, frames_to_images, latent_shape,
+    preflight_denoise_memory_guard, preprocess_ti2v_image, seq_len, ti2v_blend_init, Expert,
 };
 use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
@@ -862,11 +861,13 @@ impl Wan14b {
 
         // --- Stage 3: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        // Auto-select VAE decode tiling from the actual decoded output dims (t_lat·4 frames after the
-        // non-causal decode); `None` for small outputs → single-pass. decode_to_frames re-checks
-        // `needs_tiling`.
+        // sc-6894 F-009 — memory-**budgeted** (catchable) z16 decode tiling from the decoded output
+        // dims (t_lat·4 frames after the non-causal decode), replacing the unbudgeted
+        // `TilingConfig::auto` that could pick an over-budget tile and OOM the largest-resident model.
+        // `Ok(None)` for small outputs → single-pass; an over-budget decode returns a catchable error
+        // here instead of a SIGKILL in the decode. decode_to_frames re-checks `needs_tiling`.
         let out_frames = lat[1] * cfg.vae_stride.0 as i32;
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
@@ -910,6 +911,11 @@ pub const MODEL_ID_I2V_14B: &str = "wan2_2_i2v_14b";
 /// files are already packed (ratio 1.0). The 14B MoE passes both expert files (both stay resident).
 /// A missing file → 0 bytes for that file, so the guard under-counts rather than spuriously firing —
 /// the real "snapshot incomplete" error then surfaces at the actual `Weights::from_file` load.
+///
+/// The two scaling arms are **mutually exclusive**, so the on-disk size is never double-discounted: a
+/// load is *either* a dense bf16 snapshot with `spec.quantize` set (the bf16 file size is scaled down
+/// by `ratio`) *or* a pre-packed Q4/Q8 snapshot with `quant == None` (the file is already the final
+/// packed size, `ratio == 1.0`) — never a packed file scaled by a quant ratio again.
 fn dit_resident_bytes(files: &[PathBuf], quant: Option<Quant>) -> u64 {
     let ratio = match quant.map(|q| q.bits()) {
         Some(4) => 0.30, // 4-bit affine: ~0.5 B/param + scales vs bf16 2 B/param

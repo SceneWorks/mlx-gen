@@ -20,11 +20,13 @@
 //! and the public `generate()`. Honors "divergence is not rounding": the parity test localizes any
 //! gap (per-stage latents + decoded frames) rather than writing it off.
 
+use mlx_rs::memory::get_memory_limit;
 use mlx_rs::ops::{add, broadcast_to, divide, maximum, minimum, multiply, subtract};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::AudioTrack;
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
 use mlx_gen::{CancelFlag, Error, Image, Result};
 
 use crate::audio_vae::AudioDecoder;
@@ -149,8 +151,23 @@ pub fn renoise(latents: &Array, noise: &Array, noise_scale: f32) -> Result<Array
 
 /// VAE-decode latents `(B, 128, F, H, W)` → `(F, H, W, 3)` uint8 frames. Reference order:
 /// squeeze batch → `(F, H, W, 3)` → `clip((x+1)/2, 0, 1)·255` → uint8.
+///
+/// sc-6894 F-004 — routes the (previously dead-in-production) [`LtxVideoVae::decode_tiled`] behind the
+/// shared memory-budgeted selector. The decoded output dims come from the latent geometry (LTX VAE:
+/// ×32 spatial, ×8 **causal** temporal ⇒ `out_f = 1 + (T_lat−1)·8`), so an over-budget decode returns
+/// a **catchable** error here instead of SIGKILLing the process inside a single-pass full-video decode.
+/// Small outputs select `None` → the original single-pass `decode` (byte-identical to before).
 pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array) -> Result<Array> {
-    to_uint8_frames(&vae.decode(latents)?)
+    let sh = latents.shape(); // (B, 128, T_lat, H_lat, W_lat)
+    let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
+    let out_f = 1 + (t_lat - 1) * TEMPORAL_SCALE as i32;
+    let out_h = h_lat * SPATIAL_SCALE as i32;
+    let out_w = w_lat * SPATIAL_SCALE as i32;
+    let decoded = match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
+        Some(cfg) => vae.decode_tiled(latents, &cfg)?,
+        None => vae.decode(latents)?,
+    };
+    to_uint8_frames(&decoded)
 }
 
 /// `(B=1, 3, F, H, W)` video in ~[-1, 1] → `(F, H, W, 3)` uint8. The reference clips `(x+1)/2` to
@@ -180,6 +197,124 @@ pub fn to_uint8_frames(video: &Array) -> Result<Array> {
     )?;
     let scaled = multiply(&clipped, &scalar(255.0).as_dtype(dt)?)?;
     contiguous(&scaled.as_dtype(Dtype::Uint8)?)
+}
+
+// --- sc-6894 F-004: LTX VAE decode budgeting ------------------------------------------------------
+//
+// [`LtxVideoVae::decode_tiled`] shipped parity-validated in sc-2679 S2b but was never wired into the
+// pipeline — every production decode ran a single-pass full-video decode with no OOM guard. These
+// route it through the shared `budgeted_plan` selector (gen-core) with an LTX cost model fit from the
+// real-weight `vae_decode_sweep.rs` anchors. The LTX VAE is causal in time (×8) and upsamples ×32
+// spatially, so its per-output-voxel decode working set differs from the Wan VAEs; the constants are
+// LTX-specific.
+
+/// **Fixed** decode floor (bytes): the resident decoder weights + base MLX working set, paid
+/// regardless of output/tile size. Unlike the Wan VAEs (whose per-voxel cost dwarfs any fixed term),
+/// the LTX decoder is light per output voxel (×32 spatial compression) so this ~2.5 GB floor
+/// dominates small/mid decodes — omitting it would force a no-fixed model to over-predict the
+/// max-size decode by ~140 % and tile pathologically. Fit from `vae_decode_sweep.rs` (5 single-pass
+/// points, intercept ~2.5 GB; rounded **up** to 3.3 for headroom — the model must never under-predict).
+const LTX_VAE_FIXED_BYTES: f64 = 3.3e9;
+/// Per-output-voxel cost of the LTX decode's full-output f32 accumulators (`output` [1,3,F,H,W] +
+/// `weights` [1,1,F,H,W]) — paid by every tiled plan. Isolated from the single-pass slope minus the
+/// 1024²×25 @512-px tiled anchor (~36 B/voxel); rounded **up** to 40.
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
+/// Per-tile-output-voxel cost of the LTX decoder working set (×32 spatial / ×8 causal-temporal
+/// upsample). Fit from the same anchors at ~287 B/voxel; rounded **up** to 300. (Far lighter per
+/// voxel than the Wan VAEs — the heavy ×32 upsample runs on a tiny latent.)
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 300.0;
+
+/// Candidate spatial tile sizes (output px, multiples of the LTX ×32 spatial scale, overlap 64).
+const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames (the causal decoder maps
+/// `tile_frames/8` latent frames per tile).
+const LTX_VAE_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 16), (48, 16), (24, 8)];
+
+/// Estimated concurrent GPU peak (GiB) of an LTX decode whose largest tile spans `tile_*` output
+/// voxels while assembling an `out_*` video. Pure (no global state) → unit-testable against the
+/// `vae_decode_sweep.rs` anchors. Single-pass is `tile_* == out_*`; a zero tile is the
+/// accumulator-only floor.
+fn estimated_ltx_decode_peak_gib(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+) -> f64 {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let out_voxels = (out_f * out_h * out_w) as f64;
+    let tile_voxels = (tile_f * tile_h * tile_w) as f64;
+    (LTX_VAE_FIXED_BYTES
+        + LTX_VAE_ACCUM_BYTES_PER_VOXEL * out_voxels
+        + LTX_VAE_TILE_BYTES_PER_OUT_VOXEL * tile_voxels)
+        / GIB
+}
+
+/// **Memory-budgeted** tiling for the LTX VAE decode (sc-6894 F-004): routes the shared
+/// [`budgeted_plan`] selector through the LTX cost model. Caller passes the **output** dims (the
+/// decoded video size). `Ok(None)` → a single-pass decode already fits; `Err` → a catchable
+/// over-budget signal returned before the decode (not a SIGKILL).
+pub fn auto_tiling_budgeted_ltx(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let budget_gib = get_memory_limit() as f64 / GIB;
+    plan_ltx_tiling(height, width, out_frames, budget_gib * 0.85)
+}
+
+/// Pure LTX tile selector behind [`auto_tiling_budgeted_ltx`] (the `safe_gib` ceiling is injected so it
+/// is unit-testable without touching the global memory limit). Supplies the LTX cost model + candidate
+/// grid to the shared [`budgeted_plan`].
+fn plan_ltx_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+) -> Result<Option<TilingConfig>> {
+    let candidates = TileCandidates {
+        spatial_px: &LTX_VAE_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &LTX_VAE_TEMPORAL_FR,
+    };
+    budgeted_plan(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        estimated_ltx_decode_peak_gib,
+    )
+    .map_err(|e| ltx_decode_budget_error(width, height, out_frames, e))
+}
+
+/// Map gen-core's neutral [`TilingBudgetError`] to an LTX-facing catchable decode error.
+fn ltx_decode_budget_error(
+    width: i32,
+    height: i32,
+    out_frames: i32,
+    e: TilingBudgetError,
+) -> Error {
+    match e {
+        TilingBudgetError::AccumulatorsExceedBudget {
+            projected_gib,
+            safe_gib,
+        } => Error::Msg(format!(
+            "ltx vae decode: assembling a {width}×{height}×{out_frames} video needs ~{projected_gib:.0} \
+             GB just for the output buffers, over this machine's ~{safe_gib:.0} GB safe budget. Reduce \
+             the resolution or frame count."
+        )),
+        TilingBudgetError::SmallestTileExceedsBudget {
+            projected_gib,
+            safe_gib,
+        } => Error::Msg(format!(
+            "ltx vae decode: a {width}×{height}×{out_frames} video peaks at ~{projected_gib:.0} GB even \
+             with the smallest tile, over this machine's ~{safe_gib:.0} GB safe budget. Reduce the \
+             resolution or frame count."
+        )),
+    }
 }
 
 /// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed on
@@ -965,5 +1100,78 @@ mod tests {
         // (x+1)/2 clip[0,1] ·255: -2→0, 0.2→153, 0.6→204, -1→0, 1→255, 2→255.
         let got = frames.as_slice::<u8>();
         assert_eq!(got, &[0, 153, 204, 0, 255, 255]);
+    }
+
+    // --- sc-6894 F-004: LTX VAE decode budgeting ------------------------------------------------
+
+    /// Re-derive an LTX plan's peak the way the selector sizes its largest tile.
+    fn ltx_chosen_peak(cfg: &TilingConfig, h: i64, w: i64, f: i64) -> f64 {
+        let tile_h = cfg.spatial.map(|s| (s.tile_px as i64).min(h)).unwrap_or(h);
+        let tile_w = cfg.spatial.map(|s| (s.tile_px as i64).min(w)).unwrap_or(w);
+        let tile_f = cfg
+            .temporal
+            .map(|t| (t.tile_frames as i64).min(f))
+            .unwrap_or(f);
+        estimated_ltx_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w)
+    }
+
+    #[test]
+    fn ltx_decode_peak_matches_sweep_anchors() {
+        // Real-weight anchors from `vae_decode_sweep.rs` (q8 decoder, 128 GB M-series). The model must
+        // be CONSERVATIVE (never below the measured peak — an under-shoot is an OOM) and within ~25 %.
+        // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_gib)
+        let anchors = [
+            (25, 512, 512, 25, 512, 512, 4.7561),      // single-pass
+            (25, 768, 768, 25, 768, 768, 6.8314),      // single-pass
+            (49, 512, 512, 49, 512, 512, 6.1914),      // single-pass (temporal scaling)
+            (25, 1024, 1024, 25, 1024, 1024, 10.3689), // single-pass
+            (25, 1280, 1280, 25, 1280, 1280, 14.9152), // single-pass (asymptotic slope)
+            (25, 1024, 1024, 25, 512, 512, 5.1525),    // tiled @512 px
+        ];
+        for (of, oh, ow, tf, th, tw, measured) in anchors {
+            let est = estimated_ltx_decode_peak_gib(of, oh, ow, tf, th, tw);
+            assert!(
+                est >= measured,
+                "ltx model {est:.2} GiB UNDER-shoots measured {measured} (OOM risk) for tile \
+                 [{tf},{th},{tw}] of [{of},{oh},{ow}]"
+            );
+            assert!(
+                est <= measured * 1.25,
+                "ltx model {est:.2} GiB over-conservative vs measured {measured} (>25 %)"
+            );
+        }
+    }
+
+    #[test]
+    fn ltx_tiling_single_pass_when_small() {
+        // A short, low-res LTX clip fits a single-pass decode → no tiling.
+        let plan = plan_ltx_tiling(256, 256, 25, 60.0).unwrap();
+        assert!(plan.is_none(), "small LTX clip should not tile: {plan:?}");
+    }
+
+    #[test]
+    fn ltx_tiling_bounds_moderate_res_peak() {
+        // 1280×1280×121: single-pass LTX would peak ~66 GB. On a 48 GiB machine the budgeted plan must
+        // tile and keep the recomputed peak under the safe budget (the bounded/catchable guarantee).
+        let safe = 48.0 * 0.85; // 40.8 GiB
+        let cfg = plan_ltx_tiling(1280, 1280, 121, safe)
+            .unwrap()
+            .expect("moderate-res LTX must tile");
+        let peak = ltx_chosen_peak(&cfg, 1280, 1280, 121);
+        assert!(
+            peak <= safe,
+            "ltx chosen peak {peak:.1} GiB over safe {safe:.1}"
+        );
+    }
+
+    #[test]
+    fn ltx_tiling_errors_when_unfittable() {
+        // 4K × 257 frames under an 8 GiB budget: the output accumulators (+ fixed floor) alone blow it
+        // → a catchable error before the decode, not a SIGKILL.
+        let err = plan_ltx_tiling(2160, 3840, 257, 8.0);
+        assert!(
+            err.is_err(),
+            "over-budget LTX decode must error, got {err:?}"
+        );
     }
 }

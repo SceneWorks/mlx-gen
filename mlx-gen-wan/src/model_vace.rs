@@ -34,11 +34,11 @@ use mlx_gen::{
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
-use mlx_gen::tiling::TilingConfig;
-
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
 use crate::config::{GuideScale, WanVaceConfig};
-use crate::pipeline::{align_dim, decode_to_frames, frames_to_images, preprocess_i2v_image};
+use crate::pipeline::{
+    align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
+};
 use crate::scheduler::SolverKind;
 use crate::text_encoder::{load_tokenizer, Umt5Encoder};
 use crate::vace::{
@@ -380,8 +380,10 @@ impl WanVace {
 
         // --- Stage 4: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        let out_frames = latents.shape()[1] * VAE_T as i32 - (VAE_T as i32 - 1);
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
+        // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
+        let out_frames = latents.shape()[1] * VAE_T as i32;
+        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
@@ -685,8 +687,10 @@ impl WanVaceFun {
 
         // --- Stage 4: z16 VAE decode → RGB8 frames ---
         on_progress(Progress::Decoding);
-        let out_frames = latents.shape()[1] * VAE_T as i32 - (VAE_T as i32 - 1);
-        let tiling = TilingConfig::auto(height as i32, width as i32, out_frames);
+        // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
+        // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
+        let out_frames = latents.shape()[1] * VAE_T as i32;
+        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;

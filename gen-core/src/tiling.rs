@@ -387,6 +387,170 @@ pub struct TilePlan {
     pub out_w: i32,
 }
 
+// --- Memory-budgeted tile selection (sc-6894) -----------------------------------------------------
+//
+// The geometry above answers "given a `TilingConfig`, what tiles?". This section answers the policy
+// question one level up: "given a memory budget, *which* `TilingConfig`?". It is the backend- and
+// VAE-neutral core of the budgeted selector first written for Wan's z48 vae22 decode (sc-4998) and
+// lifted here so every video VAE (LTX, Wan z16/z48) and **both** backends (mlx-gen on Metal,
+// candle-gen on CUDA) share one selector. The per-VAE/per-backend peak-cost constants and the budget
+// source (e.g. the MLX memory limit) stay in the caller — this layer holds **zero** such knowledge,
+// so it keeps gen-core's zero-tensor-dep / Linux-buildable invariant.
+
+/// A candidate tile-size grid for [`budgeted_plan`], in **output** units. Each VAE supplies its own —
+/// the sweet-spot tile sizes differ by decoder architecture (channel widths, resblock depth).
+#[derive(Clone, Copy, Debug)]
+pub struct TileCandidates<'a> {
+    /// Candidate spatial tile sizes (output px). Order is irrelevant — the selector keeps the
+    /// largest-volume tile that fits, regardless of position.
+    pub spatial_px: &'a [i32],
+    /// Spatial overlap (output px) stamped onto whichever spatial tile is chosen.
+    pub spatial_overlap_px: i32,
+    /// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames.
+    pub temporal: &'a [(i32, i32)],
+}
+
+/// Why [`budgeted_plan`] could not fit a decode within the safe budget even with tiling. Carries the
+/// numbers; the caller formats a model-specific message (gen-core stays free of model/backend wording
+/// and units the caller knows better — e.g. "wan z48 vae22 decode: …").
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TilingBudgetError {
+    /// The full-output accumulators alone (the assembled video the decode must hold) exceed the safe
+    /// budget — no tiling can help, since every plan pays this floor.
+    AccumulatorsExceedBudget { projected_gib: f64, safe_gib: f64 },
+    /// Even the smallest candidate tile peaks over the safe budget.
+    SmallestTileExceedsBudget { projected_gib: f64, safe_gib: f64 },
+}
+
+impl core::fmt::Display for TilingBudgetError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AccumulatorsExceedBudget {
+                projected_gib,
+                safe_gib,
+            } => write!(
+                f,
+                "video VAE decode: the output buffers alone need ~{projected_gib:.0} GB, over the \
+                 ~{safe_gib:.0} GB safe budget; reduce the resolution or frame count"
+            ),
+            Self::SmallestTileExceedsBudget {
+                projected_gib,
+                safe_gib,
+            } => write!(
+                f,
+                "video VAE decode: peaks at ~{projected_gib:.0} GB even with the smallest tile, over \
+                 the ~{safe_gib:.0} GB safe budget; reduce the resolution or frame count"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TilingBudgetError {}
+
+/// Pick the **memory-budgeted** tiling for a video VAE decode (the neutral core of sc-4998). Given the
+/// decoded **output** dims, a safe peak-GiB ceiling, a candidate tile grid, and a per-VAE `peak_cost`
+/// estimator, returns:
+///   • `Ok(None)`    — a single-pass decode already fits `safe_gib` (small/short video); the caller's
+///                     existing single-pass `decode` runs, so single-pass is reached **only** when safe.
+///   • `Ok(Some(c))` — tiling is required; `c` is the **largest** tile whose estimated peak ≤
+///                     `safe_gib` (largest ⇒ fewest tiles ⇒ least overlap-recompute ⇒ fastest within
+///                     budget).
+///   • `Err(..)`     — infeasible even tiled: a **catchable** signal so the caller errors *before* the
+///                     decode rather than letting the OS hard-kill the process (SIGKILL) or the GPU
+///                     command buffer abort mid-decode.
+///
+/// `peak_cost(out_f, out_h, out_w, tile_f, tile_h, tile_w)` returns the estimated concurrent GPU peak
+/// in GiB for a decode whose largest tile spans `tile_*` output voxels while assembling `out_*`. The
+/// single-pass case is `tile_* == out_*`; a **zero tile** `(out_f, out_h, out_w, 0, 0, 0)` must yield
+/// the accumulator-only floor (the unavoidable cost of holding the assembled output). The estimator
+/// owns every model/dtype constant, so this selector carries none.
+pub fn budgeted_plan(
+    out_height: i32,
+    out_width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+    candidates: TileCandidates<'_>,
+    peak_cost: impl Fn(i64, i64, i64, i64, i64, i64) -> f64,
+) -> Result<Option<TilingConfig>, TilingBudgetError> {
+    let (h, w, f) = (out_height as i64, out_width as i64, out_frames as i64);
+
+    // 1. Single-pass (the whole output as one tile) already fits → no tiling.
+    let single = peak_cost(f, h, w, f, h, w);
+    if single <= safe_gib {
+        return Ok(None);
+    }
+
+    // 2. The full-output accumulators are unavoidable (they hold the assembled video); if they alone
+    //    blow the budget no tiling can help — fail catchably rather than OOM mid-decode.
+    let accum = peak_cost(f, h, w, 0, 0, 0);
+    if accum >= safe_gib {
+        return Err(TilingBudgetError::AccumulatorsExceedBudget {
+            projected_gib: accum,
+            safe_gib,
+        });
+    }
+
+    // 3. Search candidate tiles; among those that fit, keep the one with the **largest** output
+    //    volume (fewest tiles → least overlap recompute). Candidate axes include the full dimension
+    //    (= "don't tile this axis"), so a spatial-only or temporal-only plan can win.
+    let max_sp = h.max(w) as i32;
+    let mut spatial: Vec<i32> = candidates
+        .spatial_px
+        .iter()
+        .copied()
+        .filter(|&s| s < max_sp)
+        .collect();
+    spatial.push(max_sp); // full spatial extent = no spatial tiling
+    let mut temporal: Vec<(i32, i32)> = candidates
+        .temporal
+        .iter()
+        .copied()
+        .filter(|&(t, _)| (t as i64) < f)
+        .collect();
+    temporal.push((f as i32, 0)); // full temporal extent = no temporal tiling
+
+    let mut best: Option<(i64, i32, i32, i32)> = None; // (tile_voxels, s, t, t_overlap)
+    let mut min_peak = single; // finite floor for the "smallest tile" error if nothing fits
+    for &s in &spatial {
+        let tile_h = (s as i64).min(h);
+        let tile_w = (s as i64).min(w);
+        for &(t, t_over) in &temporal {
+            let tile_f = (t as i64).min(f);
+            // Skip the single-pass cell (handled in step 1; it does not fit here by construction).
+            if tile_h == h && tile_w == w && tile_f == f {
+                continue;
+            }
+            let peak = peak_cost(f, h, w, tile_f, tile_h, tile_w);
+            min_peak = min_peak.min(peak);
+            if peak > safe_gib {
+                continue;
+            }
+            let voxels = tile_f * tile_h * tile_w;
+            if best.is_none_or(|(bv, ..)| voxels > bv) {
+                best = Some((voxels, s, t, t_over));
+            }
+        }
+    }
+
+    let Some((_, s, t, t_over)) = best else {
+        return Err(TilingBudgetError::SmallestTileExceedsBudget {
+            projected_gib: min_peak,
+            safe_gib,
+        });
+    };
+
+    // Only tile an axis whose chosen tile is actually smaller than the axis.
+    let spatial = ((s as i64) < max_sp as i64).then_some(SpatialTiling {
+        tile_px: s,
+        overlap_px: candidates.spatial_overlap_px,
+    });
+    let temporal = ((t as i64) < f).then_some(TemporalTiling {
+        tile_frames: t,
+        overlap_frames: t_over,
+    });
+    Ok(Some(TilingConfig { spatial, temporal }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +722,121 @@ mod tests {
                 "tile==overlap plan left a zero-weight gap"
             );
         }
+    }
+
+    // --- budgeted_plan (sc-6894) ------------------------------------------------------------------
+
+    // Synthetic linear peak model shaped like a real VAE's: `accum`·out_voxels (the output buffers,
+    // paid by every plan) + `tile`·tile_voxels (the per-tile decoder working set), both GiB/voxel.
+    fn lin_cost(accum: f64, tile: f64) -> impl Fn(i64, i64, i64, i64, i64, i64) -> f64 {
+        move |of, oh, ow, tf, th, tw| accum * (of * oh * ow) as f64 + tile * (tf * th * tw) as f64
+    }
+
+    const T_SPATIAL: [i32; 3] = [256, 192, 128];
+    const T_TEMPORAL: [(i32, i32); 2] = [(32, 8), (16, 4)];
+    fn t_cands() -> TileCandidates<'static> {
+        TileCandidates {
+            spatial_px: &T_SPATIAL,
+            spatial_overlap_px: 64,
+            temporal: &T_TEMPORAL,
+        }
+    }
+
+    /// Re-derive the chosen plan's peak the way the selector sizes its largest tile.
+    fn chosen_peak(
+        cfg: &TilingConfig,
+        h: i64,
+        w: i64,
+        f: i64,
+        cost: &impl Fn(i64, i64, i64, i64, i64, i64) -> f64,
+    ) -> f64 {
+        let tile_h = cfg.spatial.map(|s| (s.tile_px as i64).min(h)).unwrap_or(h);
+        let tile_w = cfg.spatial.map(|s| (s.tile_px as i64).min(w)).unwrap_or(w);
+        let tile_f = cfg
+            .temporal
+            .map(|t| (t.tile_frames as i64).min(f))
+            .unwrap_or(f);
+        cost(f, h, w, tile_f, tile_h, tile_w)
+    }
+
+    #[test]
+    fn budgeted_single_pass_when_it_fits() {
+        // A generous budget → the whole decode fits in one pass, no tiling.
+        let cost = lin_cost(4e-8, 4e-6);
+        let plan = budgeted_plan(512, 512, 64, 1_000.0, t_cands(), &cost).unwrap();
+        assert!(
+            plan.is_none(),
+            "should not tile under a huge budget: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn budgeted_tiles_and_stays_under_budget() {
+        // Single-pass blows the budget; the selector must return a tile whose recomputed peak is both
+        // ≤ the safe budget and strictly below the single-pass peak.
+        let cost = lin_cost(4e-8, 4e-6);
+        let (h, w, f) = (512, 512, 64);
+        let single = cost(f, h, w, f, h, w);
+        let safe = 20.0;
+        assert!(
+            single > safe,
+            "test precondition: single-pass must exceed budget"
+        );
+        let cfg = budgeted_plan(h as i32, w as i32, f as i32, safe, t_cands(), &cost)
+            .unwrap()
+            .expect("must tile when single-pass is over budget");
+        let peak = chosen_peak(&cfg, h, w, f, &cost);
+        assert!(peak <= safe, "chosen peak {peak:.2} over safe {safe}");
+        assert!(
+            peak < single,
+            "tiling must lower the peak ({peak:.2} vs {single:.2})"
+        );
+    }
+
+    #[test]
+    fn budgeted_errors_when_accumulators_alone_exceed_budget() {
+        // Absurd per-output-voxel accum cost: even a zero tile (the unavoidable output buffers) blows
+        // the budget, so no tiling can help → AccumulatorsExceedBudget.
+        let cost = lin_cost(1.0, 1e-3);
+        let err = budgeted_plan(512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
+        assert!(
+            matches!(err, TilingBudgetError::AccumulatorsExceedBudget { .. }),
+            "expected AccumulatorsExceedBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn budgeted_errors_when_even_smallest_tile_exceeds_budget() {
+        // Tiny accumulators (output fits) but an enormous per-tile-voxel cost: every candidate tile,
+        // even the smallest, peaks over budget → SmallestTileExceedsBudget (catchable, not OOM).
+        let cost = lin_cost(1e-9, 1e-3);
+        let err = budgeted_plan(512, 512, 64, 5.0, t_cands(), &cost).unwrap_err();
+        match err {
+            TilingBudgetError::SmallestTileExceedsBudget {
+                projected_gib,
+                safe_gib,
+            } => {
+                assert_eq!(safe_gib, 5.0);
+                assert!(projected_gib.is_finite() && projected_gib > 5.0);
+            }
+            other => panic!("expected SmallestTileExceedsBudget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn budgeted_picks_temporal_only_when_spatial_already_fits() {
+        // Output is small spatially (every candidate ≥ the full spatial extent, so spatial can't tile)
+        // but long in frames → the winning plan tiles only the temporal axis.
+        let cost = lin_cost(4e-8, 4e-6);
+        let cfg = budgeted_plan(128, 128, 200, 8.0, t_cands(), &cost)
+            .unwrap()
+            .expect("a 200-frame clip must tile");
+        assert!(
+            cfg.spatial.is_none(),
+            "spatial should stay un-tiled: {cfg:?}"
+        );
+        assert!(cfg.temporal.is_some(), "temporal axis must tile: {cfg:?}");
+        let peak = chosen_peak(&cfg, 128, 128, 200, &cost);
+        assert!(peak <= 8.0, "temporal-only peak {peak:.2} over budget");
     }
 }

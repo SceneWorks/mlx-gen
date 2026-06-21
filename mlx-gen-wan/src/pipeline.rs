@@ -19,7 +19,7 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, subtract};
 use mlx_rs::Array;
 
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
+use mlx_gen::tiling::{budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig};
 use mlx_gen::{CancelFlag, Error, Image, Result};
 
 use crate::scheduler::{make_scheduler, SolverKind};
@@ -205,6 +205,11 @@ const VAE22_TILE_BYTES_PER_OUT_VOXEL_BF16: f64 = 3400.0;
 /// the lighter per-tile coefficient (sc-5039). Pure (no global state) so it is unit-testable against
 /// the `wedge_sweep.rs` anchors. A single-pass decode is the special case `tile_* == out_*`; passing
 /// a zero tile yields the accumulator-only floor (the unavoidable cost of holding the output).
+///
+/// No explicit overflow guard: the voxel products are `i64`→`f64`, and the inputs are bounded upstream
+/// by the descriptor's `max_size` (1280 px long edge) and the generated frame count, so
+/// `out_f·out_h·out_w` stays ~10¹⁰ — many orders below `i64`/`f64` overflow. The model depends on those
+/// upstream caps rather than guarding here (sc-6894 Info).
 fn estimated_vae22_decode_peak_gib(
     out_f: i64,
     out_h: i64,
@@ -263,80 +268,137 @@ fn plan_vae22_tiling(
     safe_gib: f64,
     bf16: bool,
 ) -> Result<Option<TilingConfig>> {
-    let (h, w, f) = (height as i64, width as i64, out_frames as i64);
+    // The selector algorithm now lives in gen-core ([`budgeted_plan`], sc-6894) so the LTX and Wan
+    // z16 decodes share it. This wrapper supplies only the **vae22-specific** pieces: the candidate
+    // tile grid and the [`estimated_vae22_decode_peak_gib`] cost model (its constants were fit to the
+    // z48 `wedge_sweep.rs` anchors and are meaningless for any other VAE/backend, so they stay here),
+    // then maps the neutral over-budget signal back to the wan-specific message.
+    let candidates = TileCandidates {
+        spatial_px: &VAE22_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &VAE22_TEMPORAL_FR,
+    };
+    budgeted_plan(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        |of, oh, ow, tf, th, tw| estimated_vae22_decode_peak_gib(of, oh, ow, tf, th, tw, bf16),
+    )
+    .map_err(|e| wan_budget_error("z48 vae22", width, height, out_frames, e))
+}
 
-    // 1. Single-pass (the whole output as one tile) already fits → no tiling.
-    if estimated_vae22_decode_peak_gib(f, h, w, f, h, w, bf16) <= safe_gib {
-        return Ok(None);
-    }
-
-    // 2. The full-output accumulators are unavoidable (they hold the assembled video); if they alone
-    //    blow the budget no tiling can help — fail catchably rather than OOM mid-decode.
-    let accum_gib = estimated_vae22_decode_peak_gib(f, h, w, 0, 0, 0, bf16);
-    if accum_gib >= safe_gib {
-        return Err(Error::Msg(format!(
-            "wan z48 vae22 decode: assembling a {width}×{height}×{out_frames} video needs \
-             ~{accum_gib:.0} GB just for the output buffers, over this machine's ~{safe_gib:.0} GB \
+/// Map gen-core's neutral [`TilingBudgetError`] to a wan-facing message tagged with the VAE `label`
+/// (e.g. `"z48 vae22"`, `"z16 vae"`). Shared by the per-VAE budgeted-tiling wrappers so the catchable
+/// over-budget wording stays identical across them.
+fn wan_budget_error(
+    label: &str,
+    width: i32,
+    height: i32,
+    out_frames: i32,
+    e: TilingBudgetError,
+) -> Error {
+    match e {
+        TilingBudgetError::AccumulatorsExceedBudget {
+            projected_gib,
+            safe_gib,
+        } => Error::Msg(format!(
+            "wan {label} decode: assembling a {width}×{height}×{out_frames} video needs \
+             ~{projected_gib:.0} GB just for the output buffers, over this machine's ~{safe_gib:.0} GB \
              safe budget. Reduce the resolution or frame count."
-        )));
-    }
-
-    // 3. Search candidate tiles; among those that fit, keep the one with the **largest** output
-    //    volume (fewest tiles → least overlap recompute). Candidate axes include the full dimension
-    //    (= "don't tile this axis"), so a spatial-only or temporal-only plan can win.
-    let max_sp = h.max(w) as i32;
-    let mut spatial: Vec<i32> = VAE22_SPATIAL_PX
-        .into_iter()
-        .filter(|&s| s < max_sp)
-        .collect();
-    spatial.push(max_sp); // full spatial extent = no spatial tiling
-    let mut temporal: Vec<(i32, i32)> = VAE22_TEMPORAL_FR
-        .into_iter()
-        .filter(|&(t, _)| (t as i64) < f)
-        .collect();
-    temporal.push((f as i32, 0)); // full temporal extent = no temporal tiling
-
-    let mut best: Option<(i64, i32, i32, i32)> = None; // (tile_voxels, s, t, t_overlap)
-    for &s in &spatial {
-        let tile_h = (s as i64).min(h);
-        let tile_w = (s as i64).min(w);
-        for &(t, t_over) in &temporal {
-            let tile_f = (t as i64).min(f);
-            // Skip the single-pass cell (handled in step 1; it does not fit here by construction).
-            if tile_h == h && tile_w == w && tile_f == f {
-                continue;
-            }
-            let peak = estimated_vae22_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w, bf16);
-            if peak > safe_gib {
-                continue;
-            }
-            let voxels = tile_f * tile_h * tile_w;
-            if best.is_none_or(|(bv, ..)| voxels > bv) {
-                best = Some((voxels, s, t, t_over));
-            }
-        }
-    }
-
-    let Some((_, s, t, t_over)) = best else {
-        let min_peak =
-            estimated_vae22_decode_peak_gib(f, h, w, 32.min(f), 192.min(h), 192.min(w), bf16);
-        return Err(Error::Msg(format!(
-            "wan z48 vae22 decode: a {width}×{height}×{out_frames} video peaks at ~{min_peak:.0} GB \
+        )),
+        TilingBudgetError::SmallestTileExceedsBudget {
+            projected_gib,
+            safe_gib,
+        } => Error::Msg(format!(
+            "wan {label} decode: a {width}×{height}×{out_frames} video peaks at ~{projected_gib:.0} GB \
              even with the smallest tile, over this machine's ~{safe_gib:.0} GB safe budget. Reduce \
              the resolution or frame count."
-        )));
-    };
+        )),
+    }
+}
 
-    // Only tile an axis whose chosen tile is actually smaller than the axis.
-    let spatial = ((s as i64) < max_sp as i64).then_some(SpatialTiling {
-        tile_px: s,
-        overlap_px: 64,
-    });
-    let temporal = ((t as i64) < f).then_some(TemporalTiling {
-        tile_frames: t,
-        overlap_frames: t_over,
-    });
-    Ok(Some(TilingConfig { spatial, temporal }))
+// --- z16 Wan 2.1 VAE decode budgeting (sc-6894 F-009) ---------------------------------------------
+//
+// The 14B T2V/I2V + VACE decode paths previously used the unbudgeted px-threshold `TilingConfig::auto`
+// on the largest-resident models — the same OOM-prone selector the z48 path replaced (sc-4998). These
+// route the z16 decode through the shared `budgeted_plan` selector with a z16-specific cost model fit
+// from the real `vae16_decode_sweep.rs` anchors (the z16 decoder is non-causal time ×4, spatial ×8).
+
+/// Per-output-voxel cost of the z16 decode's full-output f32 accumulators (`output` [1,3,F,H,W] +
+/// `weights` [1,1,F,H,W]) — paid by every tiled plan. Isolated from the `vae16_decode_sweep.rs`
+/// anchors (128 GB M-series, f32): the 768²×16 single-pass peak (56.35 GB) minus the same output tiled
+/// @384 px (14.46 GB) pins this term at ~57 B/voxel; rounded **up** to 64 for headroom (the model must
+/// never under-predict — an under-shoot is an OOM, an over-shoot only tiles slightly more).
+const VAE16_ACCUM_BYTES_PER_VOXEL: f64 = 64.0;
+/// Per-tile-output-voxel cost of the z16 decoder working set (conv stack + ×8 spatial / ×4 temporal
+/// upsample). Fit from the same anchors at ~6355 B/voxel (≈1.7× the z48 `vae22`'s 3800 — the bigger
+/// spatial upsample); rounded **up** to 6500. z16 decodes f32 in production, so there is no bf16
+/// coefficient (unlike `vae22`, sc-5039).
+const VAE16_TILE_BYTES_PER_OUT_VOXEL: f64 = 6500.0;
+
+/// Candidate spatial tile sizes (output px, multiples of the z16 ×8 spatial scale, overlap 64).
+const VAE16_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
+/// Candidate temporal tiles `(tile_frames, overlap_frames)` in output frames.
+const VAE16_TEMPORAL_FR: [(i32, i32); 4] = [(96, 24), (64, 24), (48, 16), (32, 8)];
+
+/// Estimated concurrent GPU peak (GiB) of a z16 decode whose largest tile spans `tile_*` output voxels
+/// while assembling an `out_*` video. Pure (no global state) → unit-testable against the
+/// `vae16_decode_sweep.rs` anchors. Single-pass is the special case `tile_* == out_*`; a zero tile is
+/// the accumulator-only floor.
+fn estimated_z16_decode_peak_gib(
+    out_f: i64,
+    out_h: i64,
+    out_w: i64,
+    tile_f: i64,
+    tile_h: i64,
+    tile_w: i64,
+) -> f64 {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let out_voxels = (out_f * out_h * out_w) as f64;
+    let tile_voxels = (tile_f * tile_h * tile_w) as f64;
+    (VAE16_ACCUM_BYTES_PER_VOXEL * out_voxels + VAE16_TILE_BYTES_PER_OUT_VOXEL * tile_voxels) / GIB
+}
+
+/// **Memory-budgeted** tiling for the z16 Wan 2.1 VAE decode (sc-6894 F-009): the z16 analogue of
+/// [`auto_tiling_budgeted`], routing the shared [`budgeted_plan`] selector through the z16 cost model.
+/// Replaces the unbudgeted [`TilingConfig::auto`] on the 14B T2V/I2V + VACE decode paths. Caller passes
+/// the **output** dims (the decoded video size).
+pub fn auto_tiling_budgeted_z16(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+) -> Result<Option<TilingConfig>> {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let budget_gib = get_memory_limit() as f64 / GIB;
+    plan_z16_tiling(height, width, out_frames, budget_gib * 0.85)
+}
+
+/// Pure z16 tile selector behind [`auto_tiling_budgeted_z16`] (the `safe_gib` ceiling is injected so it
+/// is unit-testable without touching the global memory limit). Supplies the z16 cost model + candidate
+/// grid to the shared [`budgeted_plan`]; same `Ok(None)` / `Ok(Some)` / catchable-`Err` contract as
+/// [`plan_vae22_tiling`].
+fn plan_z16_tiling(
+    height: i32,
+    width: i32,
+    out_frames: i32,
+    safe_gib: f64,
+) -> Result<Option<TilingConfig>> {
+    let candidates = TileCandidates {
+        spatial_px: &VAE16_SPATIAL_PX,
+        spatial_overlap_px: 64,
+        temporal: &VAE16_TEMPORAL_FR,
+    };
+    budgeted_plan(
+        height,
+        width,
+        out_frames,
+        safe_gib,
+        candidates,
+        estimated_z16_decode_peak_gib,
+    )
+    .map_err(|e| wan_budget_error("z16 vae", width, height, out_frames, e))
 }
 
 /// Classifier-free guidance combine: `uncond + gs·(cond − uncond)`.
@@ -1146,6 +1208,78 @@ mod tests {
         // accumulators) cannot fit → a catchable error, not an OOM/abort.
         let err = plan_vae22_tiling(1088, 1920, 241, 8.0, false);
         assert!(err.is_err(), "over-budget decode must error, got {err:?}");
+    }
+
+    // --- sc-6894 F-009: z16 Wan 2.1 VAE decode budgeting ----------------------------------------
+
+    /// Re-derive a z16 plan's peak the way the selector sizes its largest tile.
+    fn z16_chosen_peak(cfg: &TilingConfig, h: i64, w: i64, f: i64) -> f64 {
+        let tile_h = cfg.spatial.map(|s| (s.tile_px as i64).min(h)).unwrap_or(h);
+        let tile_w = cfg.spatial.map(|s| (s.tile_px as i64).min(w)).unwrap_or(w);
+        let tile_f = cfg
+            .temporal
+            .map(|t| (t.tile_frames as i64).min(f))
+            .unwrap_or(f);
+        estimated_z16_decode_peak_gib(f, h, w, tile_f, tile_h, tile_w)
+    }
+
+    #[test]
+    fn z16_decode_peak_matches_sweep_anchors() {
+        // Real-weight anchors from `vae16_decode_sweep.rs` (128 GB M-series, f32). The model must be
+        // CONSERVATIVE (never below the measured peak — an under-shoot is an OOM) and within ~10 %.
+        // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_gib)
+        let anchors = [
+            (16, 512, 512, 16, 512, 512, 25.39),   // single-pass
+            (16, 768, 768, 16, 768, 768, 56.35),   // single-pass
+            (32, 512, 512, 32, 512, 512, 50.12),   // single-pass (temporal scaling == spatial)
+            (16, 768, 768, 16, 384, 384, 14.46),   // tiled @384 px
+            (16, 1024, 1024, 16, 512, 512, 25.66), // tiled @512 px
+        ];
+        for (of, oh, ow, tf, th, tw, measured) in anchors {
+            let est = estimated_z16_decode_peak_gib(of, oh, ow, tf, th, tw);
+            assert!(
+                est >= measured,
+                "z16 model {est:.2} GiB UNDER-shoots measured {measured} (OOM risk) for tile \
+                 [{tf},{th},{tw}] of [{of},{oh},{ow}]"
+            );
+            assert!(
+                est <= measured * 1.10,
+                "z16 model {est:.2} GiB over-conservative vs measured {measured} (>10 %)"
+            );
+        }
+    }
+
+    #[test]
+    fn z16_tiling_single_pass_when_small() {
+        // A short, low-res z16 clip fits a single-pass decode → no tiling.
+        let plan = plan_z16_tiling(256, 256, 16, 60.0).unwrap();
+        assert!(plan.is_none(), "small z16 clip should not tile: {plan:?}");
+    }
+
+    #[test]
+    fn z16_tiling_bounds_moderate_res_peak() {
+        // 1280×720×80 on a 64 GiB machine: single-pass z16 would peak ~450 GB. The budgeted plan must
+        // tile and keep the recomputed peak under the safe budget (the bounded/catchable guarantee).
+        let safe = 64.0 * 0.85; // 54.4 GiB
+        let cfg = plan_z16_tiling(720, 1280, 80, safe)
+            .unwrap()
+            .expect("moderate-res z16 must tile");
+        let peak = z16_chosen_peak(&cfg, 720, 1280, 80);
+        assert!(
+            peak <= safe,
+            "z16 chosen peak {peak:.1} GiB over safe {safe:.1}"
+        );
+    }
+
+    #[test]
+    fn z16_tiling_errors_when_unfittable() {
+        // 4K × 240 frames under an 8 GiB budget: the output accumulators alone blow it → a catchable
+        // error before the decode, not a SIGKILL.
+        let err = plan_z16_tiling(2160, 3840, 240, 8.0);
+        assert!(
+            err.is_err(),
+            "over-budget z16 decode must error, got {err:?}"
+        );
     }
 
     #[test]
