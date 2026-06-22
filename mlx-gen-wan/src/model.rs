@@ -40,17 +40,37 @@ use crate::vae::WanVae;
 use crate::vae22::Wan22Vae;
 
 /// The curated unified solvers (epic 7114, sc-7121) every Wan generator exposes ADDITIVELY beyond its
-/// native `unipc`/`euler`/`dpmpp2m` — the gen-core-only solvers, routed through `run_flow_sampler` over
-/// Wan's own flow-σ schedule ([`crate::pipeline::denoise_curated`] / [`denoise_moe_curated`]). Wan's
-/// native `unipc`/`dpmpp2m` are flow-SNR multistep solvers (`λ = log((1−σ)/σ)`) the gen-core VE-space
-/// `uni_pc`/`dpmpp_2m` (`λ = −ln σ`) do NOT reproduce, so those names are deliberately NOT duplicated
-/// (the native default stays byte-exact — the N1 default-parity gate).
+/// native solvers — the gen-core-only solvers, routed through `run_flow_sampler` over Wan's own flow-σ
+/// schedule ([`crate::pipeline::denoise_curated`] / [`denoise_moe_curated`]).
 const WAN_CURATED_SAMPLERS: [&str; 4] = ["euler_ancestral", "heun", "dpmpp_sde", "ddim"];
 
-/// Wan's full per-generation sampler menu: the native `scheduler.rs` solvers + the curated additions.
+/// Wan's native flow-SNR solvers ([`crate::scheduler::SolverKind`]), advertised under the curated
+/// gen-core vocabulary (epic 7114 sc-7296). `uni_pc`/`dpmpp_2m`/`euler` route to the NATIVE flow-SNR
+/// solver — NOT the gen-core VE-space `uni_pc`/`dpmpp_2m` (`λ = −ln σ`), which would not reproduce Wan's
+/// diffusers FLOW-SNR (`λ = log((1−σ)/σ)`) parity. Sampler names are family labels in this framework
+/// (cf. `euler` across prediction types), so Wan's native UniPC IS the `uni_pc` for Wan — the native
+/// math is unchanged (the byte-exact N1 default).
+const WAN_NATIVE_SAMPLERS: [&str; 3] = ["uni_pc", "euler", "dpmpp_2m"];
+
+/// Legacy sampler spellings (pre-sc-7296) kept advertised so old recipes still validate + reproduce;
+/// they map to the same native solvers via [`crate::scheduler::SolverKind::from_name`]. The SceneWorks
+/// manifest surfaces only the curated names.
+const WAN_LEGACY_SAMPLERS: [&str; 2] = ["unipc", "dpmpp2m"];
+
+/// Wan's full per-generation sampler menu: native solvers (curated vocabulary) + the curated gen-core
+/// fold-ins + the legacy aliases.
 fn wan_samplers() -> Vec<&'static str> {
-    let mut s = vec!["unipc", "euler", "dpmpp2m"];
+    let mut s = WAN_NATIVE_SAMPLERS.to_vec();
     s.extend(WAN_CURATED_SAMPLERS);
+    s.extend(WAN_LEGACY_SAMPLERS);
+    s
+}
+
+/// The native-only menu (curated vocabulary + legacy aliases, NO gen-core fold-ins) — for the VACE
+/// path, which advertises its native solvers without the `run_flow_sampler` fold-ins.
+pub(crate) fn wan_native_samplers() -> Vec<&'static str> {
+    let mut s = WAN_NATIVE_SAMPLERS.to_vec();
+    s.extend(WAN_LEGACY_SAMPLERS);
     s
 }
 

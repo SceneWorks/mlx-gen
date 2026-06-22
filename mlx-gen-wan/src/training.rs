@@ -104,7 +104,7 @@ fn render_wan_sample(
     steps: usize,
 ) -> Result<Image> {
     let init = random::normal::<f32>(latent_shape, None, None, Some(&random::key(seed)?))?;
-    let kind = SolverKind::from_name("unipc");
+    let kind = SolverKind::from_name("uni_pc");
     let ntt = cfg.num_train_timesteps;
     let shift = cfg.sample_shift;
     let latents = if experts.len() == 2 {

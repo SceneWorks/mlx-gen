@@ -140,6 +140,10 @@ fn wan_is_registered() {
     // via spec.quantize.
     assert!(d.capabilities.supports_lora);
     assert!(d.capabilities.supports_lokr);
+    // sc-7296: advertised under the curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`); the legacy
+    // `unipc`/`dpmpp2m` spellings stay advertised as aliases for old recipes.
+    assert!(d.capabilities.samplers.contains(&"uni_pc"));
+    assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
     assert!(d.capabilities.samplers.contains(&"unipc"));
     // epic 7114 (sc-7121): the curated unified solvers are advertised additively beside the native set.
     for s in ["euler_ancestral", "heun", "dpmpp_sde", "ddim"] {
@@ -255,6 +259,10 @@ fn wan_t2v_14b_is_registered() {
     // LoRA (sc-2683) + LoKr (sc-2393) in generate, per-expert merge.
     assert!(d.capabilities.supports_lora);
     assert!(d.capabilities.supports_lokr);
+    // sc-7296: advertised under the curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`); the legacy
+    // `unipc`/`dpmpp2m` spellings stay advertised as aliases for old recipes.
+    assert!(d.capabilities.samplers.contains(&"uni_pc"));
+    assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
     assert!(d.capabilities.samplers.contains(&"unipc"));
     // H/W align to patch×vae_stride = 16 for the z16 VAE (vs 32 for the 5B's z48).
     assert_eq!(d.capabilities.min_size, 16);
@@ -623,6 +631,10 @@ fn wan_vace_is_registered() {
         .capabilities
         .conditioning
         .contains(&ConditioningKind::Reference));
+    // sc-7296: advertised under the curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`); the legacy
+    // `unipc`/`dpmpp2m` spellings stay advertised as aliases for old recipes.
+    assert!(d.capabilities.samplers.contains(&"uni_pc"));
+    assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
     assert!(d.capabilities.samplers.contains(&"unipc"));
 }
 

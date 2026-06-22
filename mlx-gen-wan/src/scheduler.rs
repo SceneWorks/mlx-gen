@@ -26,12 +26,14 @@ pub enum SolverKind {
 }
 
 impl SolverKind {
-    /// Resolve a sampler name (CLI/string) to a solver; unknown names fall back to UniPC, matching
-    /// `generate_wan.py`'s default.
+    /// Resolve a sampler name (CLI/string) to a native solver. Accepts the curated gen-core vocabulary
+    /// (`uni_pc`/`dpmpp_2m`, epic 7114 sc-7296) and the legacy spellings (`unipc`/`dpmpp2m`/`dpm++`/…);
+    /// `uni_pc`/`unipc` and any unknown name fall back to UniPC, matching `generate_wan.py`'s default.
     pub fn from_name(name: &str) -> SolverKind {
         match name.to_ascii_lowercase().as_str() {
             "euler" => SolverKind::Euler,
-            "dpm++" | "dpmpp" | "dpmpp2m" | "dpm++2m" => SolverKind::Dpmpp2m,
+            "dpmpp_2m" | "dpmpp2m" | "dpm++" | "dpmpp" | "dpm++2m" => SolverKind::Dpmpp2m,
+            // `uni_pc` (curated) / `unipc` (legacy) and anything unknown → UniPC (the Wan default).
             _ => SolverKind::UniPC,
         }
     }
@@ -651,17 +653,23 @@ mod tests {
 
     #[test]
     fn from_name_maps_advertised_samplers_and_defaults_to_unipc() {
-        // F-021: the single sampler→solver mapping the production model entries now share. The
-        // advertised set (validate_request) is unipc/euler/dpmpp2m; an unset/unknown name → UniPC.
+        // F-021 / sc-7296: the single sampler→solver mapping the production model entries share. The
+        // advertised set (validate_request) is now the curated `uni_pc`/`euler`/`dpmpp_2m`, with the
+        // legacy `unipc`/`dpmpp2m` spellings kept as aliases; an unset/unknown name → UniPC.
         assert_eq!(SolverKind::from_name("euler"), SolverKind::Euler);
+        // Curated gen-core vocabulary (the advertised names since sc-7296).
+        assert_eq!(SolverKind::from_name("uni_pc"), SolverKind::UniPC);
+        assert_eq!(SolverKind::from_name("dpmpp_2m"), SolverKind::Dpmpp2m);
+        // Legacy spellings stay valid (old recipes).
+        assert_eq!(SolverKind::from_name("unipc"), SolverKind::UniPC);
         assert_eq!(SolverKind::from_name("dpmpp2m"), SolverKind::Dpmpp2m);
         assert_eq!(SolverKind::from_name("dpm++"), SolverKind::Dpmpp2m);
-        assert_eq!(SolverKind::from_name("unipc"), SolverKind::UniPC);
         assert_eq!(SolverKind::from_name(""), SolverKind::UniPC); // the unset-sampler sentinel
         assert_eq!(SolverKind::from_name("nope"), SolverKind::UniPC);
         // Case-insensitive (the model entries lower-case via the same path).
         assert_eq!(SolverKind::from_name("Euler"), SolverKind::Euler);
-        assert_eq!(SolverKind::from_name("DPM++"), SolverKind::Dpmpp2m);
+        assert_eq!(SolverKind::from_name("UNI_PC"), SolverKind::UniPC);
+        assert_eq!(SolverKind::from_name("DPMPP_2M"), SolverKind::Dpmpp2m);
     }
 
     #[test]

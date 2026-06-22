@@ -51,7 +51,7 @@ pub fn resolve_sampler_knobs(
 ) -> (usize, f32, SolverKind, u64) {
     let steps = req.steps.map(|s| s as usize).unwrap_or(steps_default);
     let shift = req.scheduler_shift.unwrap_or(shift_default);
-    let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("unipc"));
+    let kind = SolverKind::from_name(req.sampler.as_deref().unwrap_or("uni_pc"));
     let seed = req.seed.unwrap_or_else(default_seed);
     (steps, shift, kind, seed)
 }

@@ -91,7 +91,9 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // slices sc-2683 (LoRA) / sc-2393 (LoKr) on the diffusers host.
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["unipc", "euler", "dpmpp2m"],
+            // sc-7296: curated gen-core vocabulary (`uni_pc`/`dpmpp_2m`) routed to Wan's native solvers
+            // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
+            samplers: crate::model::wan_native_samplers(),
             schedulers: Vec::new(),
             min_size: 16,
             max_size: 1280,
