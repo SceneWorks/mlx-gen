@@ -79,7 +79,10 @@ fn curated_samplers_preserve_identity() {
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");
     let kps: Vec<(f32, f32)> = ref_face.kps.iter().map(|p| (p[0], p[1])).collect();
-    println!("[smoke] {size}x{size} steps={steps} | ref face det_score={:.3}", ref_face.det_score);
+    println!(
+        "[smoke] {size}x{size} steps={steps} | ref face det_score={:.3}",
+        ref_face.det_score
+    );
 
     // The ancestral default + a spread of curated solvers over the SAME dual conditioning. The default
     // (None ⇒ euler_ancestral) is the byte-exact baseline; the curated names exercise the new
