@@ -69,10 +69,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lora: true,
             supports_lokr: true,
             // `euler_discrete` is the native leading-Euler default; the rest are the unified curated
-            // solvers (epic 7114, sc-7121) — the additive k-diffusion path over `DiscreteModelSampling`
-            // for txt2img + img2img. Selecting one (or a non-`discrete` scheduler) routes to
-            // `Kolors::denoise_curated_latents`; the native default stays byte-exact. (The ControlNet /
-            // IP-Adapter combined-pose tier stays sampler-locked to `euler_discrete` — guarded below.)
+            // solvers (epic 7114, sc-7121) — the additive k-diffusion path over `DiscreteModelSampling`.
+            // Selecting one (or a non-`discrete` scheduler) routes to `Kolors::denoise_curated_latents`,
+            // which now covers EVERY mode incl. the conditioned sub-providers (ControlNet-pose,
+            // IP-Adapter, the combined pose tier — sc-7297, via `denoise_curated`'s control/ip support);
+            // the native default stays byte-exact.
             samplers: {
                 let mut s = vec![SAMPLER];
                 s.extend([
@@ -274,11 +275,14 @@ impl KolorsGenerator {
             ));
         }
 
-        // Curated unified-sampler path (epic 7114, sc-7121): a curated solver name (≠ the native
-        // `euler_discrete`) OR a non-`discrete` scheduler routes txt2img/img2img through the additive
-        // k-diffusion `Kolors::denoise_curated_latents`. The ControlNet / IP-Adapter combined-pose tier
-        // (sc-5012) is a tuned SceneWorks composite whose CFG-batched image tokens would desync under a
-        // multi-eval solver, so it stays sampler-locked to the native euler_discrete.
+        // Curated unified-sampler path (epic 7114, sc-7121 + sc-7297): a curated solver name (≠ the
+        // native `euler_discrete`) OR a non-`discrete` scheduler routes through the additive k-diffusion
+        // `Kolors::denoise_curated_latents`. This now covers EVERY mode — txt2img / img2img AND the
+        // conditioned sub-providers (ControlNet-pose, IP-Adapter, the combined pose tier sc-5012): the
+        // engine `denoise_curated` already threads ControlNet residuals + the IP-Adapter decoupled-attn
+        // tokens (it is the InstantID dual-conditioning path), so the conditioned modes ride the same
+        // solver rather than being sampler-locked. The native `euler_discrete` default stays byte-exact
+        // — the legacy `denoise_*_latents` assemblies are entered only when no curated knob is set (N1).
         let scheduler_curated = req
             .scheduler
             .as_deref()
@@ -290,13 +294,6 @@ impl KolorsGenerator {
             .map(|s| Solver::from_name(s).is_some() && s != SAMPLER)
             .unwrap_or(false);
         let use_curated = scheduler_curated || sampler_curated;
-        if use_curated && (ip_mode || control.is_some()) {
-            return Err(Error::Msg(
-                "kolors: curated samplers/schedulers apply to txt2img + img2img only; the ControlNet \
-                 / IP-Adapter combined-pose tier stays on the native euler_discrete"
-                    .into(),
-            ));
-        }
 
         // Conditioning is seed-independent — encode the prompts once and hand the (context, pooled)
         // tuples to the per-mode `Kolors::denoise_*_latents` methods, which assemble the CFG batch +
@@ -336,11 +333,39 @@ impl KolorsGenerator {
             // none, so the per-image output stays byte-identical to the struct API's RNG order.
             let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
 
-            // Curated unified path (txt2img / img2img): k-diffusion VE-σ sampling over the Kolors
-            // `DiscreteModelSampling`, additive alongside the native leading-Euler default.
+            // Curated unified path (every mode): k-diffusion VE-σ sampling over the Kolors
+            // `DiscreteModelSampling`, additive alongside the native leading-Euler default. Threads the
+            // SAME conditioning the bespoke dispatch builds — ControlNet residuals, IP-Adapter tokens,
+            // and the combined pose tier's img2img init — through `denoise_curated` (sc-7297).
             if use_curated {
-                let (init_opt, strength) = match img2img {
-                    Some((image, strength)) => (
+                // ControlNet branch (Some when a Control image was provided + a ControlNet loaded — both
+                // validated above) and the IP-Adapter tokens (Some in IP mode), passed straight through.
+                let control_arg = control.map(|(image, scale)| {
+                    (
+                        self.control.as_ref().expect("validated above"),
+                        image,
+                        scale,
+                    )
+                });
+                let ip_arg = ip.as_ref().map(|(tokens, scale)| (tokens, *scale));
+
+                // Init mirrors the bespoke dispatch's per-mode choice: the combined pose tier seeds
+                // img2img from the reference (== the IP image) at the strict-pose strength; plain
+                // img2img seeds from its reference; ControlNet-only / IP-only / txt2img seed raw
+                // `ε·σ_max` (no init).
+                let (init_opt, strength) = if control.is_some() && ip_mode {
+                    let (reference_image, _) = reference.expect("ip mode requires a reference");
+                    (
+                        Some(encode_init_latents(
+                            self.kolors.vae(),
+                            reference_image,
+                            w as u32,
+                            h as u32,
+                        )?),
+                        req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
+                    )
+                } else if let Some((image, strength)) = img2img {
+                    (
                         Some(encode_init_latents(
                             self.kolors.vae(),
                             image,
@@ -348,9 +373,11 @@ impl KolorsGenerator {
                             h as u32,
                         )?),
                         strength,
-                    ),
-                    None => (None, 0.0),
+                    )
+                } else {
+                    (None, 0.0)
                 };
+
                 let latents = self.kolors.denoise_curated_latents(
                     req.sampler.as_deref(),
                     req.scheduler.as_deref(),
@@ -364,6 +391,8 @@ impl KolorsGenerator {
                     seed,
                     h,
                     w,
+                    control_arg,
+                    ip_arg,
                     &req.cancel,
                     on_progress,
                 )?;

@@ -314,8 +314,16 @@ impl Kolors {
     ///
     /// `init_latents` is `Some` for img2img (the scaled VAE mean), `None` for txt2img. The latents live
     /// in raw k-diffusion σ-space: txt2img seeds `ε·σ_max`; img2img runs the strength-tail of the
-    /// schedule, seeded `x₀ + ε·σ_start`. The ControlNet / IP-Adapter combined-pose tier (sc-5012) is
-    /// NOT routed here — it stays on the tuned native euler_discrete (the registry guards it).
+    /// schedule, seeded `x₀ + ε·σ_start`.
+    ///
+    /// `control` / `ip_tokens` thread the conditioned sub-providers (sc-7297, epic 7114) through the
+    /// SAME curated solver — the engine `denoise_curated` already supports ControlNet residuals + the
+    /// IP-Adapter decoupled-attn tokens (it is the InstantID dual-conditioning path). `control` is
+    /// `(controlnet, control_image, control_scale)`: the pose ControlNet, raw-preprocessed +
+    /// CFG-batched here and run with its own `embed_cond`. `ip_tokens` is `([1,N,2048] image tokens,
+    /// ip_scale)`, CFG-batched with a zeros uncond row. The Kolors ControlNet cross-attends to the
+    /// **text** conditioning (`control_encoder = None` ⇒ `cn_enc = conditioning` in `denoise_curated`),
+    /// matching the bespoke `denoise_controlnet*_latents`. Both `None` ⇒ plain txt2img / img2img.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_curated_latents(
         &self,
@@ -331,10 +339,12 @@ impl Kolors {
         seed: u64,
         height: i32,
         width: i32,
+        control: Option<(&ControlNet, &Image, f32)>,
+        ip_tokens: Option<(&Array, f32)>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::{add, concatenate_axis, multiply};
+        use mlx_rs::ops::{add, concatenate_axis, multiply, zeros};
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
         // — the same `EulerDiscreteScheduler` config the native sampler interpolates, here as the
         // discrete `ModelSampling` the curated solvers integrate over (ε-prediction, σ_data = 1).
@@ -364,6 +374,36 @@ impl Kolors {
         let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
         let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
         let time_ids = kolors_time_ids(2, height, width);
+
+        // ControlNet branch: preprocess + CFG-batch the control image, then embed it once (the
+        // conditioning embedding is step-invariant, F-069) — exactly as `denoise_controlnet_latents`.
+        let controls: Vec<ControlContext> = match control {
+            Some((controlnet, control_image, scale)) => {
+                let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
+                let cimg = if cfg > 1.0 {
+                    concatenate_axis(&[&cimg, &cimg], 0)?
+                } else {
+                    cimg
+                };
+                vec![ControlContext {
+                    cond_embed: controlnet.embed_cond(&cimg)?,
+                    controlnet,
+                    scale,
+                }]
+            }
+            None => Vec::new(),
+        };
+
+        // IP-Adapter image tokens: CFG-batch with a zeros uncond row (the uncond gets no image
+        // conditioning) — exactly as `denoise_ip_latents`.
+        let ip_batched = match ip_tokens {
+            Some((tokens, scale)) => {
+                let zero = zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
+                Some((concatenate_axis(&[tokens, &zero], 0)?, scale))
+            }
+            None => None,
+        };
+
         denoise_curated(
             &self.unet,
             sampler_name,
@@ -377,8 +417,10 @@ impl Kolors {
             seed,
             cancel,
             on_progress,
-            &[],
-            None,
+            &controls,
+            ip_batched.as_ref().map(|(tokens, scale)| (tokens, *scale)),
+            // `control_encoder = None` ⇒ the Kolors ControlNet cross-attends to the text
+            // `conditioning` (its own `encoder_hid_proj`), matching the bespoke combined-pose path.
             None,
         )
     }
