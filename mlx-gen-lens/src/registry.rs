@@ -22,9 +22,9 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    default_seed, gen_core, Capabilities, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
-    WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, Capabilities, Error,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
+    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::pipeline::{GenerateOptions, LensPipeline, DEFAULT_DATE, VAE_SCALE_FACTOR};
@@ -71,8 +71,21 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // sc-3174: LoRA + LoKr merge into the DiT's joint-attention projections at load.
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["flow_match_euler"],
-            schedulers: vec!["flow_match"],
+            // epic 7114 sc-7305: advertise the curated sampler/scheduler menu (mirrors the candle Lens
+            // adoption) so the per-generation knobs route through the unified `Sampler<MlxLatentOps>` +
+            // `FlowModelSampling`. The legacy native aliases stay valid for old recipes; both N3-fall
+            // back to the default (`flow_match_euler` → euler, `flow_match` → the native empirical-μ
+            // schedule), so they never hard-fail a generation.
+            samplers: {
+                let mut s = curated_sampler_names();
+                s.push("flow_match_euler");
+                s
+            },
+            schedulers: {
+                let mut s = curated_scheduler_names();
+                s.push("flow_match");
+                s
+            },
             // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
             min_size: 256,
             max_size: 2080,
@@ -196,6 +209,10 @@ impl LensGenerator {
                 width: req.width,
                 num_steps: steps,
                 guidance_scale: guidance,
+                // epic 7114 sc-7305: per-generation curated sampler/scheduler (N3 fallback to default
+                // inside the unified framework; the worker also pre-normalizes unadvertised names).
+                sampler: req.sampler.as_deref(),
+                scheduler: req.scheduler.as_deref(),
                 seed,
                 date: DEFAULT_DATE,
                 // The local reasoner (sc-3176) is a standalone opt-in; the registry path leaves it off
@@ -285,6 +302,15 @@ mod tests {
             assert!(d.capabilities.supports_lokr);
             // sc-3172: encoder MoE experts quantize to Q4/Q8 at load.
             assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+            // sc-7305: the curated sampler/scheduler menu is advertised (the unified framework) with the
+            // legacy native aliases retained — both backends (mlx + candle) now expose the same menu.
+            assert!(d.capabilities.samplers.contains(&"euler"));
+            assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
+            assert!(d.capabilities.samplers.contains(&"uni_pc"));
+            assert!(d.capabilities.samplers.contains(&"flow_match_euler"));
+            assert!(d.capabilities.schedulers.contains(&"karras"));
+            assert!(d.capabilities.schedulers.contains(&"exponential"));
+            assert!(d.capabilities.schedulers.contains(&"flow_match"));
             // The defaults are exercised end-to-end in the e2e test; assert the constants here.
             let def = if id == MODEL_ID_TURBO {
                 TURBO_DEFAULTS

@@ -26,8 +26,12 @@
 use mlx_rs::ops::{concatenate_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Image, Quant, Result};
+use mlx_gen::{
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Image, Progress, Quant, Result,
+    TimestepConvention,
+};
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
 use crate::config::GptOssConfig;
@@ -57,6 +61,13 @@ pub struct GenerateOptions<'a> {
     pub width: u32,
     pub num_steps: usize,
     pub guidance_scale: f32,
+    /// Curated sampler name (epic 7114 sc-7305); `None` ⇒ the engine default `euler`, byte-equivalent
+    /// to the legacy flow-match loop (N1). The legacy `flow_match_euler` alias / any unknown name falls
+    /// back to `euler` (N3).
+    pub sampler: Option<&'a str>,
+    /// Curated scheduler name (epic 7114 sc-7305); `None` ⇒ the native empirical-μ flow-match schedule
+    /// (the byte-exact N1 default). The legacy `flow_match` alias / any unknown name falls back to it (N3).
+    pub scheduler: Option<&'a str>,
     pub seed: u64,
     /// Harmony-preamble `Current date:` (image-irrelevant for the encode path; the **reasoner** uses
     /// it for its own preamble — see [`DEFAULT_DATE`]).
@@ -202,8 +213,12 @@ impl LensPipeline {
         Ok((encoder_features, encoder_mask))
     }
 
-    /// The denoising loop over pre-encoded conditioning + an initial latent. Exposed for the e2e
-    /// parity gate (which injects the reference's initial latents to factor out cross-RNG noise).
+    /// The denoising loop over pre-encoded conditioning + an initial latent, on the engine **default**
+    /// sampler/scheduler (`euler` over the native empirical-μ flow-match schedule). Exposed for the e2e
+    /// parity gate (which injects the reference's initial latents to factor out cross-RNG noise). A thin
+    /// wrapper over [`denoise_with_sampler`](Self::denoise_with_sampler) forcing the default — `euler`
+    /// reproduces the legacy `FlowMatchEuler::step` loop within the N1 parity tolerance (the shared
+    /// `flow_match_euler_step` + gen-core keystone equivalence).
     ///
     /// - `encoder_features`: `num_text_layers × [2, S_txt, 2880]` (`[pos; neg]`).
     /// - `encoder_mask`: `[2, S_txt]` (`1` = valid).
@@ -223,19 +238,71 @@ impl LensPipeline {
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize, usize),
     ) -> Result<Array> {
-        let schedule = lens_schedule(num_steps, latent_h, latent_w);
-        let timesteps = schedule::timesteps(&schedule);
+        self.denoise_with_sampler(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            None, // default sampler — `euler` == the legacy flow-match loop
+            None, // native empirical-μ schedule
+            0,    // seed unused by the deterministic default; stochastic solvers key off it
+            cancel,
+            on_step,
+        )
+    }
 
-        let mut latents = init_latents.as_dtype(self.dtype)?;
-        for (i, &sigma) in timesteps.iter().enumerate() {
-            if cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            // Joint CFG batch: duplicate the latent (cond/uncond share the same x_t), one DiT call.
-            let hidden = concatenate_axis(&[&latents, &latents], 0)?; // [2, seq, 128]
-            let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(self.dtype)?;
+    /// The denoising loop routed through the unified curated-sampler framework (epic 7114 sc-7305): the
+    /// per-generation `sampler` (integration method) + `scheduler` (σ schedule) knobs. Lens is
+    /// rectified-flow (FLOW prediction) fed the **raw shifted sigma** as its timestep
+    /// ([`TimestepConvention::Sigma`]); each step's velocity is the norm-rescaled joint-CFG combination
+    /// (one DiT forward over `[pos; neg]`, [`schedule::cfg_rescale`]) — the body of the legacy loop, now
+    /// driven by the curated solver.
+    ///
+    /// - `sampler_name`: a curated solver name (`euler` / `heun` / `dpmpp_2m` / `uni_pc` / …). `None`,
+    ///   the legacy `flow_match_euler` alias, or any unknown name falls back to `euler` (N3) — the
+    ///   byte-equivalent default.
+    /// - `scheduler_name`: a curated scheduler name (`karras` / `exponential` / …). `None`, the legacy
+    ///   `flow_match` alias, or any unknown name returns the native schedule verbatim (the N1 byte-exact
+    ///   default).
+    /// - `seed`: drives the per-step noise of the stochastic solvers (`euler_ancestral` / `dpmpp_sde` /
+    ///   `lcm`); the deterministic solvers ignore it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
+        // The native Lens schedule is the byte-exact N1 default: empirical-μ flow-match sigmas (length
+        // num_steps + 1, trailing 0). A curated `scheduler_name` re-shapes σ over the SAME empirical μ
+        // (`compute_mu(seq_len, steps)`), so `karras` / `exponential` / … stay consistent with Lens's
+        // resolution-/step-dependent shift instead of degrading to a linear ramp; an unset / legacy /
+        // unknown name returns this native schedule verbatim.
+        let native = lens_schedule(num_steps, latent_h, latent_w).sigmas;
+        let mu = compute_mu(latent_h * latent_w, num_steps);
+        let sigmas = resolve_flow_schedule(scheduler_name, mu, num_steps, &native);
 
-            let noise = self.transformer.forward(
+        let dtype = self.dtype;
+        let transformer = &self.transformer;
+        // FLOW velocity field: the norm-rescaled joint-CFG combination over one DiT forward. Lens feeds
+        // the raw shifted sigma as the timestep directly (Sigma convention), matching the legacy loop.
+        let predict = |latents: &Array, sigma: f32| -> Result<Array> {
+            // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
+            let hidden = concatenate_axis(&[latents, latents], 0)?; // [2, seq, 128]
+            let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
+            let noise = transformer.forward(
                 &hidden,
                 encoder_features,
                 Some(encoder_mask),
@@ -244,19 +311,32 @@ impl LensPipeline {
                 latent_h,
                 latent_w,
             )?;
-
-            // chunk(2) → cond (the positive, batch 0), uncond (the negative, batch 1).
+            // chunk(2) → cond (positive, batch 0), uncond (negative, batch 1).
             let parts = split(&noise, 2, 0)?;
-            let noise_pred = cfg_rescale(&parts[0], &parts[1], guidance_scale)?;
+            cfg_rescale(&parts[0], &parts[1], guidance_scale)
+        };
 
-            latents = schedule.step(&latents, &noise_pred, i)?;
-            // Per-step eval so the cancel check above interrupts mid-render (sc-5522 / sc-5399):
-            // MLX is lazy, so without it the whole denoise is one un-cancellable graph run at
-            // decode. Output-neutral; matches the qwen/sdxl per-step eval.
-            latents.eval()?;
-            on_step(i + 1, num_steps);
-        }
-        Ok(latents)
+        // Adapt the framework's `Progress` callback to the pipeline's (completed, total) step callback.
+        let mut on_progress = |p: Progress| {
+            if let Progress::Step { current, total } = p {
+                on_step(current as usize, total as usize);
+            }
+        };
+
+        // Route through the unified curated-sampler framework (epic 7114 P3 seam): cancellation, the
+        // per-step `eval` (sc-5399 — bounds the lazy graph so a mid-render cancel lands within ~1 model
+        // eval), and progress are handled inside `run_flow_sampler`. `euler` reproduces the legacy
+        // `FlowMatchEuler::step` loop within the N1 parity tolerance.
+        run_flow_sampler(
+            sampler_name,
+            TimestepConvention::Sigma,
+            &sigmas,
+            init_latents.as_dtype(dtype)?,
+            seed,
+            cancel,
+            &mut on_progress,
+            predict,
+        )
     }
 
     /// Generate a single image (no cancellation / progress). Draws the initial latents from the
@@ -314,7 +394,7 @@ impl LensPipeline {
         mlx_rs::random::seed(opts.seed)?;
         let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
 
-        let latents = self.denoise(
+        let latents = self.denoise_with_sampler(
             &encoder_features,
             &encoder_mask,
             &init,
@@ -322,6 +402,9 @@ impl LensPipeline {
             latent_w,
             opts.num_steps,
             opts.guidance_scale,
+            opts.sampler,
+            opts.scheduler,
+            opts.seed,
             cancel,
             &mut |cur, _total| on_step(cur),
         )?;
