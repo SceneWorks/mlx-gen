@@ -134,13 +134,13 @@ impl Generator for Krea {
         _req: &GenerationRequest,
         _on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // Scaffold (sc-7567): the forward is not yet wired. Surface the deferred work explicitly with
-        // its tracking stories instead of returning a silent/empty result.
+        // The DiT forward is wired (sc-7568, `crate::transformer::Krea2Transformer`); the end-to-end
+        // generate still needs the text encoder, VAE, and sampler. Surface the remaining work
+        // explicitly with its tracking stories instead of returning a silent/empty result.
         Err(Error::Msg(format!(
-            "{KREA_2_TURBO_ID}: the DiT/TE/VAE forward + rectified-flow sampler are not yet wired — \
-             tracked by sc-7568 (12B single-stream DiT), sc-7569 (Qwen3-VL-4B text encoder), sc-7570 \
-             (VAE + sampler), sc-7571 (Turbo t2i e2e). This build is the provider scaffold + converter \
-             (sc-7567)."
+            "{KREA_2_TURBO_ID}: the 12B single-stream DiT forward is wired (sc-7568), but end-to-end \
+             generate awaits the Qwen3-VL-4B text encoder (sc-7569), the VAE + rectified-flow sampler \
+             (sc-7570), and the Turbo t2i pipeline (sc-7571)."
         ))
         .into())
     }
