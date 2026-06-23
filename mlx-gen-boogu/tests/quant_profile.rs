@@ -121,6 +121,8 @@ fn profile_turbo_q4() {
                 steps: 2,
                 seed: 0,
                 conditioning_sigma: 0.001,
+                sampler: None,
+                scheduler: None,
             },
         )
         .expect("warmup turbo");
@@ -136,6 +138,8 @@ fn profile_turbo_q4() {
                 steps: 4,
                 seed: 1,
                 conditioning_sigma: 0.001,
+                sampler: None,
+                scheduler: None,
             },
         )
         .expect("generate turbo 1K");

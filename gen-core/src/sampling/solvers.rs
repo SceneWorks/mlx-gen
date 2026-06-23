@@ -65,6 +65,7 @@ impl<L: LatentOps> Sampler<L> for EulerAncestral {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -102,6 +103,7 @@ impl<L: LatentOps> Sampler<L> for Heun {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -145,6 +147,7 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -206,6 +209,7 @@ impl<L: LatentOps> Sampler<L> for DpmppSde {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -274,6 +278,7 @@ impl<L: LatentOps> Sampler<L> for UniPc {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -336,6 +341,7 @@ impl<L: LatentOps> Sampler<L> for Lcm {
     fn sample(
         &self,
         ops: &L,
+        ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -347,7 +353,12 @@ impl<L: LatentOps> Sampler<L> for Lcm {
             let s_next = sigmas[i + 1];
             if s_next > 0.0 {
                 let noise = ops.randn_like(&x, seed, i)?;
-                x = ops.axpy(1.0, &x, s_next, &noise)?;
+                // Re-noise through the model's own noise_scaling (ComfyUI `sample_lcm`): `x = k_x0·x0 +
+                // k_noise·noise`. VE/EDM/DDPM keep x0 at full scale (k_x0 = 1, k_noise = σ); FLOW uses the
+                // convex blend (k_x0 = 1−σ, k_noise = σ) so a flow-distilled student is re-noised in its
+                // training regime instead of the OOD VE form (sc-7491).
+                let (k_noise, k_x0) = ms.noise_scaling_coeffs(s_next);
+                x = ops.axpy(k_x0, &x, k_noise, &noise)?;
             }
         }
         Ok(x)
@@ -367,6 +378,7 @@ impl<L: LatentOps> Sampler<L> for Ddim {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -499,7 +511,7 @@ mod tests {
         let x_init = vec![0.3_f32, -1.1, 2.0, 0.05];
         let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
         let got = solver
-            .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 0)
             .unwrap();
         // Exact: x_init − v·σ_0.
         let want: Vec<f32> = x_init
@@ -548,7 +560,7 @@ mod tests {
                 })
             };
             solver
-                .sample(&ops, &mut dn, x_init.clone(), &sigmas, seed)
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, seed)
                 .unwrap()
         };
         for solver in [
@@ -577,11 +589,11 @@ mod tests {
         };
         let mut dn_e = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, &mut model);
         let euler = Euler
-            .sample(&ops, &mut dn_e, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn_e, x_init.clone(), &sigmas, 0)
             .unwrap();
         let mut dn_d = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, &mut model);
         let ddim = Ddim
-            .sample(&ops, &mut dn_d, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn_d, x_init.clone(), &sigmas, 0)
             .unwrap();
         assert_close(&euler, &ddim, 1e-5, "ddim_vs_euler");
     }
@@ -600,13 +612,13 @@ mod tests {
         let mut dn_e =
             |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |xin, t| Ok(model(xin, t)));
         let euler = Euler
-            .sample(&ops, &mut dn_e, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn_e, x_init.clone(), &sigmas, 0)
             .unwrap();
         for solver in [&Heun as &dyn Sampler<CpuLatentOps>, &Dpmpp2m, &UniPc] {
             let mut dn =
                 |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |xin, t| Ok(model(xin, t)));
             let out = solver
-                .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 0)
                 .unwrap();
             assert!(out.iter().all(|v| v.is_finite()));
             assert_close(&out, &euler, 0.5, "2nd-order near euler");

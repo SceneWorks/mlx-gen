@@ -30,6 +30,10 @@ pub trait Sampler<L: LatentOps> {
     /// Integrate `x` from `sigmas[0]` down to `sigmas[last]` (the schedule carries a trailing `0.0`).
     ///
     /// - `ops`: backend tensor ops.
+    /// - `ms`: the engine's prediction-type + noise-schedule contract. Most solvers ignore it (the
+    ///   `denoise` closure already folds it in); the consistency re-noise (`lcm`) reads
+    ///   [`super::ModelSampling::noise_scaling_coeffs`] so its between-step re-noise matches the model's
+    ///   convention (the flow convex blend vs the VE additive form).
     /// - `denoise`: `denoise(x, σ) -> x0`; called at least once per step.
     /// - `x`: starting latents (already at `sigmas[0]`).
     /// - `sigmas`: descending schedule, length `num_steps + 1`, trailing `0.0`.
@@ -37,6 +41,7 @@ pub trait Sampler<L: LatentOps> {
     fn sample(
         &self,
         ops: &L,
+        ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         x: L::Latent,
         sigmas: &[f32],
@@ -76,6 +81,7 @@ impl<L: LatentOps> Sampler<L> for Euler {
     fn sample(
         &self,
         ops: &L,
+        _ms: &dyn super::ModelSampling,
         denoise: &mut DenoiseFn<'_, L>,
         mut x: L::Latent,
         sigmas: &[f32],
@@ -147,7 +153,9 @@ mod tests {
         let v = vec![0.7_f32, -0.2];
         let x = vec![0.3_f32, 1.0];
         let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
-        let got = Euler.sample(&ops, &mut dn, x.clone(), &sigmas, 0).unwrap();
+        let got = Euler
+            .sample(&ops, &ms, &mut dn, x.clone(), &sigmas, 0)
+            .unwrap();
         // Expected: x + v·(0.5−0.8) = x − 0.3·v.
         for ((g, &xi), &vi) in got.iter().zip(&x).zip(&v) {
             assert!((g - (xi + vi * (0.5 - 0.8))).abs() < 1e-5, "got {g}");
@@ -163,7 +171,9 @@ mod tests {
         let v = vec![0.4_f32, 0.4];
         let x = vec![0.2_f32, -0.6];
         let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
-        let got = Euler.sample(&ops, &mut dn, x.clone(), &sigmas, 0).unwrap();
+        let got = Euler
+            .sample(&ops, &ms, &mut dn, x.clone(), &sigmas, 0)
+            .unwrap();
         // x0 at σ=0.5 = x − 0.5·v.
         for ((g, &xi), &vi) in got.iter().zip(&x).zip(&v) {
             assert!((g - (xi - 0.5 * vi)).abs() < 1e-5, "got {g}");
@@ -201,7 +211,7 @@ mod tests {
         let mut dn =
             |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |xin, _t| Ok(stub_velocity(xin)));
         let unified = Euler
-            .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 0)
             .unwrap();
 
         assert_eq!(legacy.len(), unified.len());
@@ -225,7 +235,7 @@ mod tests {
         let v = vec![0.5_f32];
         let mut dn = |xx: &Vec<f32>, s: f32| denoise(&ops, &ms, xx, s, |_xin, _t| Ok(v.clone()));
         let out = sampler
-            .sample(&ops, &mut dn, vec![0.1_f32], &[0.6_f32, 0.0], 0)
+            .sample(&ops, &ms, &mut dn, vec![0.1_f32], &[0.6_f32, 0.0], 0)
             .unwrap();
         assert_eq!(out.len(), 1);
     }

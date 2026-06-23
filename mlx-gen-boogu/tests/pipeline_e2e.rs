@@ -238,6 +238,8 @@ fn turbo_smoke() {
         steps: 4,
         seed: 0,
         conditioning_sigma: 0.001,
+        sampler: None,
+        scheduler: None,
     };
     let img = pipe
         .generate_turbo("a red apple on a wooden table", &opts)

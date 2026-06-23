@@ -56,6 +56,17 @@ pub trait ModelSampling {
     /// `calculate_denoised(sigma, model_output, model_input)`.
     fn denoised_coeffs(&self, sigma: f32) -> (f32, f32);
 
+    /// `(k_noise, k_x0)` for the consistency re-noise step (the `lcm` solver jumps to `x0` then
+    /// re-noises to the next sigma): `x = k_noise·noise + k_x0·x0`. Mirrors ComfyUI's
+    /// `model_sampling.noise_scaling(sigma, noise, x0)`. The default is the VE / EDM / DDPM form
+    /// `x0 + σ·noise` (`(σ, 1.0)`, ComfyUI `ModelSamplingDiscrete`/`ContinuousEDM`); FLOW overrides it
+    /// to the convex interpolation `σ·noise + (1−σ)·x0`. Feeding a flow model the VE form (x0 at full
+    /// scale) is out-of-distribution — the reason the curated `lcm` blurred on the flow-distilled Boogu
+    /// Turbo student until this hook existed (sc-7491).
+    fn noise_scaling_coeffs(&self, sigma: f32) -> (f32, f32) {
+        (sigma, 1.0)
+    }
+
     /// The conditioning value the model embeds at `sigma` (what the time-embedding consumes).
     fn timestep(&self, sigma: f32) -> f32;
 
@@ -181,6 +192,12 @@ impl ModelSampling for FlowModelSampling {
     fn denoised_coeffs(&self, sigma: f32) -> (f32, f32) {
         // x0 = 1·x + (−σ)·v.
         (1.0, -sigma)
+    }
+    fn noise_scaling_coeffs(&self, sigma: f32) -> (f32, f32) {
+        // Flow forward interpolation x_σ = σ·noise + (1−σ)·x0 (ComfyUI `ModelSamplingFlux`/`CONST`
+        // `noise_scaling`), NOT the VE default x0 + σ·noise. This is exactly the Boogu Turbo DMD loop's
+        // native renoise, so `lcm` over a FLOW model reproduces the distilled student's training regime.
+        (sigma, 1.0 - sigma)
     }
     fn timestep(&self, sigma: f32) -> f32 {
         // The model conditioning is the post-shift sigma (FLUX/Qwen/Chroma) or `1 − σ` (Z-Image): the
@@ -372,6 +389,22 @@ mod tests {
 
     fn sdxl_sched() -> AlphaSchedule {
         AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap()
+    }
+
+    #[test]
+    fn flow_renoise_is_convex_blend_vs_ve_default() {
+        // FLOW re-noise is the convex interpolation σ·noise + (1−σ)·x0 (ComfyUI noise_scaling),
+        // whereas the EPS/EDM default keeps x0 at full scale (x0 + σ·noise). The `lcm` solver's blur on
+        // a flow-distilled student traced to using the VE form on a flow model (sc-7491).
+        let flow = FlowModelSampling::new(TimestepConvention::Sigma);
+        assert_eq!(flow.noise_scaling_coeffs(0.3), (0.3, 0.7));
+        assert_eq!(flow.noise_scaling_coeffs(1.0), (1.0, 0.0));
+        let eps = DiscreteModelSampling::sdxl(&sdxl_sched());
+        assert_eq!(eps.noise_scaling_coeffs(0.3), (0.3, 1.0)); // VE default unchanged
+        assert_eq!(
+            EdmModelSampling::svd().noise_scaling_coeffs(5.0),
+            (5.0, 1.0)
+        );
     }
 
     #[test]

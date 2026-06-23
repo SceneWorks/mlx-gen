@@ -70,6 +70,8 @@ fn assemble_turnkey_loads() {
                 steps: 4,
                 seed: 0,
                 conditioning_sigma: 0.001,
+                sampler: None,
+                scheduler: None,
             },
         )
         .expect("turbo generate")

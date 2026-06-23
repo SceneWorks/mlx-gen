@@ -270,7 +270,7 @@ pub fn run_curated_sampler(
     };
 
     let out = sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .sample(&ops, ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(crate::Error::from)?;
     // Force the final step's advancement (never seen by the callback, which evals only inputs).
     mlx_rs::transforms::eval([&out])?;
@@ -412,7 +412,7 @@ pub fn run_av_curated_sampler(
     };
 
     let out = sampler
-        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .sample(&ops, &ms, &mut denoise_fn, latents, sigmas, seed)
         .map_err(crate::Error::from)?;
     mlx_rs::transforms::eval([&out.video, &out.audio])?;
     Ok(out)
@@ -963,7 +963,7 @@ mod tests {
             })
         };
         let unified = Euler
-            .sample(&ops, &mut dn, x_init.clone(), &sigmas, 0)
+            .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 0)
             .unwrap();
 
         let (lg, un) = (legacy.as_slice::<f32>(), unified.as_slice::<f32>());
@@ -1003,7 +1003,7 @@ mod tests {
                 })
             };
             let out = sampler
-                .sample(&ops, &mut dn, x_init.clone(), &sigmas, 7)
+                .sample(&ops, &ms, &mut dn, x_init.clone(), &sigmas, 7)
                 .unwrap();
             assert!(
                 out.as_slice::<f32>().iter().all(|v| v.is_finite()),

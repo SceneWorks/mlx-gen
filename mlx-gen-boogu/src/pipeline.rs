@@ -81,6 +81,15 @@ pub struct TurboOptions {
     pub seed: u64,
     /// DMD conditioning sigma — the first (lowest) sigma in the schedule.
     pub conditioning_sigma: f32,
+    /// Curated unified-framework integrator (epic 7114). `None` is the native DMD student loop
+    /// (predict → flow-renoise with fresh noise), the byte-exact default. A curated name routes the
+    /// few-step denoise through [`run_flow_sampler`] over the DMD σ grid instead — the experimental
+    /// Turbo sampler axis (sc-7491): the DMD x0 estimate is identical, only the renoise
+    /// differs (curated `lcm`/ancestral re-noise VE-additively, the deterministic solvers integrate).
+    /// See sc-7491 for the real-weight survey behind the advertised subset.
+    pub sampler: Option<String>,
+    /// Curated unified-framework scheduler (epic 7114). `None` keeps the native DMD σ grid byte-exact.
+    pub scheduler: Option<String>,
 }
 
 impl Default for TurboOptions {
@@ -91,6 +100,8 @@ impl Default for TurboOptions {
             steps: 4,
             seed: 0,
             conditioning_sigma: 0.001,
+            sampler: None,
+            scheduler: None,
         }
     }
 }
@@ -277,6 +288,38 @@ impl BooguPipeline {
 
         let (ids, mask) = self.tok.encode_t2i(prompt)?;
         let cond = self.te.last_hidden(&ids, &mask)?;
+
+        // Curated sampler axis (epic 7114 sc-7297): a selected sampler/scheduler routes the few-step
+        // denoise through the unified framework over the DMD σ grid. The DMD x0 estimate is identical
+        // to the native loop (`x0 = x + (1−c)·v`, the OneMinusSigma flow denoise with the velocity
+        // negated); only the renoise convention differs (the curated solver re-noises, the native loop
+        // flow-blends). Unset (the default) is the native DMD student loop, byte-exact below.
+        if opts.sampler.is_some() || opts.scheduler.is_some() {
+            let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+            let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
+            // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
+            // scheduler re-shape over the same σ span.
+            let sigmas = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
+            let lat = run_flow_sampler(
+                opts.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                lat,
+                opts.seed,
+                cancel,
+                on_progress,
+                |x, timestep| {
+                    let t = Array::from_slice(&[timestep], &[1]);
+                    let v = self.dit.forward(x, &t, &cond, &mask)?;
+                    Ok(multiply(
+                        &v.as_dtype(Dtype::Float32)?,
+                        Array::from_f32(-1.0),
+                    )?)
+                },
+            )?;
+            on_progress(Progress::Decoding);
+            return self.decode_latents(&lat);
+        }
 
         let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
@@ -542,12 +585,27 @@ fn image_to_pixels(img: &Image) -> Result<Array> {
 }
 
 /// DMD sigma schedule: `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps` ascending values
-/// from `conditioning_sigma` toward (but excluding) `1.0`.
+/// from `conditioning_sigma` toward (but excluding) `1.0`. These are **clean-fraction** sigmas.
 fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     let span = 1.0 - conditioning_sigma;
     (0..steps)
         .map(|k| conditioning_sigma + span * (k as f32) / (steps as f32))
         .collect()
+}
+
+/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
+/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
+/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
+/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
+/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
+/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
+fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
+    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
+        .iter()
+        .map(|&c| 1.0 - c)
+        .collect();
+    s.push(0.0);
+    s
 }
 
 /// The Base/Edit static-shift `mu` — `lin_mu(SEQ_LEN) = 1.15` for the saturated `seq_len = 4096` (the

@@ -84,6 +84,17 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// The curated samplers the Turbo DMD student stays coherent under (real-weight survey, sc-7491). The
+/// student was distilled against a **stochastic** (re-noised) trajectory — predict the clean estimate,
+/// then renoise to the next level with fresh noise — so the curated *stochastic* solvers match its
+/// training regime and render at native quality. `lcm` is the closest match (it IS the consistency
+/// predict→renoise loop, like ComfyUI's `lcm`/`sgm_uniform` combo), once `lcm` re-noises through the
+/// FLOW `noise_scaling` convex blend rather than the VE additive form (the gen-core sc-7491 fix). The
+/// deterministic ODE solvers (`euler`/`ddim`/`heun`/`dpmpp_2m`/`uni_pc`) feed the few-step student
+/// out-of-regime latents (background artifacts), so they stay off the menu; the native DMD loop
+/// (`req.sampler == None`) stays the byte-exact default.
+const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
+
 /// Boogu **Turbo** identity + capabilities. Same surface as [`descriptor`] except it is **CFG-free**
 /// — the DMD student distilled the guided velocity into the weights, so `guidance` is not offered
 /// (no unconditional branch). Few-step ([`DEFAULT_TURBO_STEPS`]).
@@ -91,12 +102,14 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
     d.capabilities.supports_guidance = false;
-    // The Turbo student is a DMD distillation sampler (predict clean estimate → renoise to the next
-    // clean-fraction sigma with fresh noise), NOT a rectified-flow ODE — the curated ODE solvers
-    // (Euler/Heun/DPM++/…) and the σ-schedule menu do not apply, so it advertises neither. The DMD loop
-    // (`generate_turbo`) is its fixed, distilled sampler.
-    d.capabilities.samplers = Vec::new();
-    d.capabilities.schedulers = Vec::new();
+    // The Turbo student is a DMD distillation sampler (predict clean estimate → flow-renoise with fresh
+    // noise). Its native loop (`generate_turbo`, `req.sampler == None`) stays the byte-exact default; a
+    // real-weight survey (sc-7491) showed the curated *stochastic* solvers ([`TURBO_SAMPLERS`]) — `lcm`
+    // most of all — match its re-noised regime and render at native quality over the curated σ schedules
+    // (the ComfyUI `lcm`/`sgm_uniform` combo), so the sampler AND scheduler axes are both selectable. The
+    // deterministic ODE solvers degrade on the few-step student (out-of-regime) and are not advertised.
+    d.capabilities.samplers = TURBO_SAMPLERS.to_vec();
+    d.capabilities.schedulers = curated_scheduler_names();
     d
 }
 
@@ -211,6 +224,8 @@ impl Boogu {
                     steps,
                     seed: base_seed.wrapping_add(n as u64),
                     conditioning_sigma: DEFAULT_TURBO_SIGMA,
+                    sampler: req.sampler.clone(),
+                    scheduler: req.scheduler.clone(),
                 };
                 let img = self.pipeline.generate_turbo_with_progress(
                     &req.prompt,
@@ -404,6 +419,53 @@ mod tests {
             t.capabilities.supported_quants,
             b.capabilities.supported_quants
         );
+    }
+
+    #[test]
+    fn descriptor_turbo_advertises_the_stochastic_sampler_subset_and_scheduler_axis() {
+        let (b, t) = (descriptor(), descriptor_turbo());
+        // Turbo exposes the DMD-compatible stochastic samplers (incl. flow-aware `lcm`), a strict subset
+        // of the Base sampler menu, plus the full curated scheduler axis (the ComfyUI lcm/sgm_uniform).
+        assert_eq!(
+            t.capabilities.samplers,
+            vec!["lcm", "euler_ancestral", "dpmpp_sde"]
+        );
+        assert_eq!(t.capabilities.schedulers, b.capabilities.schedulers);
+        assert!(t.capabilities.schedulers.contains(&"sgm_uniform"));
+        for s in &t.capabilities.samplers {
+            assert!(
+                b.capabilities.samplers.contains(s),
+                "turbo sampler {s:?} must be a subset of the Base curated menu"
+            );
+        }
+        // The deterministic ODE solvers degrade on the few-step student and are NOT advertised.
+        for excluded in ["euler", "ddim", "heun", "dpmpp_2m", "uni_pc"] {
+            assert!(!t.capabilities.samplers.contains(&excluded));
+        }
+    }
+
+    #[test]
+    fn turbo_validate_gates_to_the_advertised_sampler_subset() {
+        let d = descriptor_turbo();
+        // Advertised stochastic samplers are accepted, optionally with a curated scheduler
+        // (the ComfyUI lcm/sgm_uniform combo).
+        for s in ["lcm", "euler_ancestral", "dpmpp_sde"] {
+            let r = GenerationRequest {
+                sampler: Some(s.into()),
+                scheduler: Some("sgm_uniform".into()),
+                ..req(512, 512)
+            };
+            assert!(
+                validate_request(&d, &r).is_ok(),
+                "turbo should accept {s}+sgm_uniform"
+            );
+        }
+        // An unadvertised sampler (degraded on the few-step student) is rejected before any work.
+        let bad = GenerationRequest {
+            sampler: Some("dpmpp_2m".into()),
+            ..req(512, 512)
+        };
+        assert!(validate_request(&d, &bad).is_err());
     }
 
     #[test]
