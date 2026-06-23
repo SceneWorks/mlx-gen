@@ -3,11 +3,12 @@
 //! registry under id `"krea_2_turbo"`. Linking this crate is all the worker needs to resolve the
 //! model by id.
 //!
-//! **Scaffold status (sc-7567):** this slice lands the provider crate, the `krea_2_turbo` registration,
-//! the architecture-validated [`load`], and the offline Q4/Q8 converter ([`crate::convert`]). The
-//! DiT/TE/VAE forward + rectified-flow sampler are NOT yet wired — they land in their dedicated P1
-//! stories (sc-7568 DiT, sc-7569 Qwen3-VL-4B TE, sc-7570 VAE + sampler, sc-7571 Turbo t2i e2e). Until
-//! then [`Krea::generate`] returns an explicit error naming those stories rather than a silent stub.
+//! **Status (P1):** the provider crate, the `krea_2_turbo` registration, the architecture-validated
+//! [`load`], and the offline Q4/Q8 converter ([`crate::convert`]) landed in sc-7567; the DiT forward in
+//! sc-7568 ([`crate::transformer`]), the Qwen3-VL-4B text encoder in sc-7569 ([`crate::text_encoder`]),
+//! and the VAE + rectified-flow sampler in sc-7570 ([`crate::vae`] / [`crate::schedule`]). The
+//! remaining slice is the end-to-end Turbo t2i pipeline that drives them (sc-7571); until it lands
+//! [`Krea::generate`] returns an explicit error naming it rather than a silent stub.
 
 use mlx_gen::gen_core;
 use mlx_gen::{
@@ -134,13 +135,15 @@ impl Generator for Krea {
         _req: &GenerationRequest,
         _on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // The DiT forward is wired (sc-7568, `crate::transformer::Krea2Transformer`); the end-to-end
-        // generate still needs the text encoder, VAE, and sampler. Surface the remaining work
-        // explicitly with its tracking stories instead of returning a silent/empty result.
+        // The building blocks are all wired — the 12B single-stream DiT (sc-7568,
+        // `crate::transformer::Krea2Transformer`), the Qwen3-VL-4B text encoder (sc-7569,
+        // `crate::text_encoder`), and the VAE + rectified-flow sampler (sc-7570, `crate::vae` /
+        // `crate::schedule`) — but the end-to-end Turbo t2i pipeline that drives them (sc-7571) is not
+        // yet assembled. Surface that explicitly instead of returning a silent/empty result.
         Err(Error::Msg(format!(
-            "{KREA_2_TURBO_ID}: the 12B single-stream DiT forward is wired (sc-7568), but end-to-end \
-             generate awaits the Qwen3-VL-4B text encoder (sc-7569), the VAE + rectified-flow sampler \
-             (sc-7570), and the Turbo t2i pipeline (sc-7571)."
+            "{KREA_2_TURBO_ID}: the DiT (sc-7568), Qwen3-VL-4B text encoder (sc-7569), and VAE + \
+             rectified-flow sampler (sc-7570) are wired, but the end-to-end Turbo t2i pipeline that \
+             drives them (sc-7571) is not yet assembled."
         ))
         .into())
     }

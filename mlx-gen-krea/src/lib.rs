@@ -23,22 +23,29 @@
 //!   fixes mu 1.15 / 8 steps / CFG 0.
 //!
 //! ## Slice plan (epic 7565 P1)
-//! This crate is built incrementally. **This commit (sc-7567)** lands the provider scaffold, the
-//! `krea_2_turbo` registration, the architecture-validated [`model::load`], and the offline Q4/Q8
-//! converter ([`convert`]). The forward + sampler land in their dedicated stories: the single-stream
-//! DiT (sc-7568, reusing `mlx-gen-boogu`'s 3-axis-RoPE single-stream + refiner blocks), the Qwen3-VL-4B
-//! text encoder + layer-stack (sc-7569, reusing `mlx-gen-ideogram`'s encoder), the VAE + rectified-flow
-//! sampler (sc-7570), and the Turbo t2i e2e (sc-7571). Until then [`model::Krea::generate`] returns an
-//! explicit error naming those stories.
+//! This crate is built incrementally. The provider scaffold, the `krea_2_turbo` registration, the
+//! architecture-validated [`model::load`], and the offline Q4/Q8 converter ([`convert`]) landed in
+//! sc-7567; the single-stream DiT in sc-7568 ([`transformer`], reusing `mlx-gen-boogu`'s 3-axis-RoPE
+//! single-stream + refiner blocks); the Qwen3-VL-4B text encoder + layer-stack in sc-7569
+//! ([`text_encoder`], reusing `mlx-gen-ideogram`'s encoder); and the VAE + rectified-flow sampler in
+//! sc-7570 ([`vae`], reusing `mlx-gen-qwen-image`'s `QwenVae`; [`schedule`], the exponential-mu
+//! flow-match schedule over the core [`mlx_gen::FlowMatchSampler`]). The remaining slice is the Turbo
+//! t2i e2e (sc-7571); until it lands [`model::Krea::generate`] returns an explicit error naming it.
 
 pub mod config;
 pub mod convert;
 pub mod model;
 mod quant;
+pub mod schedule;
 pub mod text_encoder;
 pub mod transformer;
+pub mod vae;
 
 pub use config::Krea2Config;
 pub use model::{descriptor, load, Krea, KREA_2_TURBO_ID};
+pub use schedule::{
+    dynamic_sampler, krea_sigmas, turbo_sampler, turbo_sigmas, TURBO_MU, TURBO_STEPS,
+};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use transformer::Krea2Transformer;
+pub use vae::{load_vae, QwenVae};

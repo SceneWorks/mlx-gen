@@ -10,6 +10,10 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
+# Krea 2's VAE is the **Qwen-Image** `AutoencoderKLQwenImage` (the published `vae/config.json` declares
+# `_name_or_path = "Qwen/Qwen-Image"`); reuse `QwenVae` + its diffusers→internal key remap wholesale
+# rather than re-port the causal-Conv3d VAE (the boogu→z-image / kolors→sdxl provider-reuse precedent).
+mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry
