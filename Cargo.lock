@@ -703,7 +703,7 @@ version = "0.0.0"
 dependencies = [
  "inventory",
  "mlx-gen",
- "pmetal-mlx-rs",
+ "mlx-llm",
  "sceneworks-gen-core-testkit",
 ]
 
@@ -881,6 +881,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "mlx-llm"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/mlx-llm?rev=29e382bd6a3800accf0bac5daf5d8eb61e1a2adf#29e382bd6a3800accf0bac5daf5d8eb61e1a2adf"
+dependencies = [
+ "core-llm",
+ "half",
+ "inventory",
+ "pmetal-mlx-rs",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,23 +1,31 @@
-//! JoyCaption provider registration and image-to-text caption path.
+//! JoyCaption captioner registration, served by the mlx-llm JoyCaption VLM provider.
+//!
+//! The model — SigLIP vision tower + LLaVA projector + image splice + Llama-3.1 decode + the LLaVA
+//! chat-input format — lives in [`mlx-llm`](https://github.com/SceneWorks/mlx-llm) as the
+//! `mlx-joycaption` [`core_llm::TextLlm`] vision provider (story 7157). This crate is the thin
+//! consumer seam (story 7265): it keeps the SceneWorks caption **product policy** (caption types /
+//! length templates / capability bounds, in [`mlx_gen::caption::joycaption`]) and adapts the
+//! backend-neutral [`gen_core::Captioner`] contract the worker calls onto the unified engine —
+//! building the prompt text + image request and streaming the provider's tokens back.
 
-use mlx_gen::caption::joycaption::language::{
-    expand_joycaption_image_tokens, input_arrays_from_ids, splice_image_features, LlamaConfig,
-    LlamaDecoder, LlavaProjector,
-};
-use mlx_gen::caption::joycaption::vision::{
-    joycaption_vision_features, SiglipImageProcessor, SiglipVisionConfig, SiglipVisionTower,
-};
-use mlx_gen::caption::joycaption::{
-    self, decode_generated, encode_chat_prompt, load_tokenizer_from_spec, IMAGE_TOKEN_ID,
-    JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID,
+use mlx_gen::caption::joycaption::{self, JOY_CAPTION_FAMILY, JOY_CAPTION_MODEL_ID};
+use mlx_gen::gen_core::{
+    core_llm::{
+        self, Content, ImageRef, LoadSpec as CoreLoadSpec, Message, ModelRequirements, Role,
+        Sampling, StreamEvent, TextLlm, TextLlmRequest,
+    },
+    Error, Result,
 };
 use mlx_gen::runtime::Precision;
-use mlx_gen::weights::Weights;
 use mlx_gen::{
-    gen_core, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, CaptionerRegistration,
-    Error, LoadSpec, Progress, Result, WeightsSource,
+    CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
+    CaptionerRegistration, LoadSpec, Progress, WeightsSource,
 };
-use mlx_rs::Array;
+
+// Force-link the mlx-llm engine so the `mlx-joycaption` provider's `inventory::submit!` into
+// core-llm's registry survives the linker — this crate resolves the provider through
+// `core_llm::load_for_model` and never names another mlx-llm symbol.
+use mlx_llm as _;
 
 pub fn descriptor() -> CaptionerDescriptor {
     CaptionerDescriptor {
@@ -39,26 +47,27 @@ pub fn load_joycaption(spec: &LoadSpec) -> Result<JoyCaption> {
         WeightsSource::Dir(root) => root,
         WeightsSource::File(_) => {
             return Err(Error::Msg(
-                "joycaption expects a Hugging Face snapshot directory with tokenizer.json and \
-                 sharded .safetensors, not a single .safetensors file"
+                "joycaption expects a Hugging Face snapshot directory with config.json, \
+                 tokenizer.json, and sharded .safetensors, not a single .safetensors file"
                     .to_owned(),
             ))
         }
     };
 
-    let tokenizer = load_tokenizer_from_spec(spec)?;
-    let weights = Weights::from_dir(root)?;
+    // Model-first resolution: the `mlx-joycaption` vision provider's weightless `can_load` claims the
+    // LLaVA snapshot; `with_vision()` disambiguates it from the text-only `mlx-llama` provider.
+    let provider = core_llm::load_for_model_with(
+        &CoreLoadSpec {
+            source: root.to_string_lossy().into_owned(),
+            quantize: None,
+        },
+        &ModelRequirements::default().with_vision(),
+    )
+    .map_err(map_core_err)?;
+
     Ok(JoyCaption {
         descriptor: descriptor(),
-        tokenizer,
-        image_processor: SiglipImageProcessor::default(),
-        vision: SiglipVisionTower::from_weights(
-            &weights,
-            "vision_tower.vision_model",
-            SiglipVisionConfig::default(),
-        )?,
-        projector: LlavaProjector::from_weights(&weights, "multi_modal_projector")?,
-        llama: LlamaDecoder::from_weights(&weights, "language_model", LlamaConfig::default())?,
+        provider,
     })
 }
 
@@ -93,37 +102,11 @@ fn validate_load_spec(spec: &LoadSpec) -> Result<()> {
     Ok(())
 }
 
+/// The JoyCaption captioner: a thin adapter from the [`gen_core::Captioner`] contract onto the
+/// mlx-llm `mlx-joycaption` vision provider.
 pub struct JoyCaption {
     descriptor: CaptionerDescriptor,
-    tokenizer: mlx_gen::tokenizer::TextTokenizer,
-    image_processor: SiglipImageProcessor,
-    vision: SiglipVisionTower,
-    projector: LlavaProjector,
-    llama: LlamaDecoder,
-}
-
-impl JoyCaption {
-    fn prompt_embeds(&self, req: &CaptionRequest) -> Result<(Vec<i32>, Array)> {
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-
-        let pixels = self.image_processor.preprocess(&req.image)?;
-        let vision_output = self.vision.forward(&pixels)?;
-        let vision_features = joycaption_vision_features(&vision_output)?;
-        let projected = self.projector.forward(&vision_features)?;
-
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-
-        let ids = encode_chat_prompt(&self.tokenizer, &req.prompt)?;
-        let ids = expand_joycaption_image_tokens(&ids);
-        let (input_ids, _) = input_arrays_from_ids(&ids);
-        let embeds = self.llama.embed(&input_ids)?;
-        let spliced = splice_image_features(&embeds, &input_ids, &projected, IMAGE_TOKEN_ID)?;
-        Ok((ids, spliced))
-    }
+    provider: Box<dyn TextLlm>,
 }
 
 fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
@@ -139,7 +122,7 @@ impl Captioner for JoyCaption {
         &self.descriptor
     }
 
-    fn validate(&self, req: &CaptionRequest) -> gen_core::Result<()> {
+    fn validate(&self, req: &CaptionRequest) -> Result<()> {
         let req = normalized_request(req);
         self.descriptor
             .capabilities
@@ -150,65 +133,102 @@ impl Captioner for JoyCaption {
         &self,
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<CaptionOutput> {
-        self.caption_impl(req, on_progress).map_err(Into::into)
-    }
-}
-
-impl JoyCaption {
-    /// The rich-`Result` body behind [`Captioner::caption`]. Kept on the crate's own
-    /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
-    /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
-    fn caption_impl(
-        &self,
-        req: &CaptionRequest,
-        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CaptionOutput> {
         let req = normalized_request(req);
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, &req)?;
+        // Contract: an already-cancelled request errors before inference (the typed cancellation the
+        // conformance suite checks).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
-        let (ids, embeds) = self.prompt_embeds(&req)?;
+        // One user turn carrying the image + the (product-policy) prompt text. The model's default
+        // system prompt + LLaVA chat-input format are applied inside the provider, so the consumer
+        // passes plain text and an image and nothing model-specific.
+        let image = ImageRef::new(req.image.width, req.image.height, req.image.pixels.clone())
+            .map_err(Error::Msg)?;
+        let user = Message {
+            role: Role::User,
+            content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
+            thinking: None,
+        };
+
+        // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it by
+        // mirroring on each streamed token so the provider's next-step cancel check trips promptly.
+        let core_cancel = core_llm::CancelFlag::new();
+        let request = TextLlmRequest {
+            messages: vec![user],
+            sampling: Sampling {
+                temperature: req.sampling.temperature,
+                top_p: req.sampling.top_p,
+                // CaptionSampling exposes no top-k; disabled (0) matches the prior engine sampler.
+                top_k: 0,
+                repetition_penalty: req.sampling.repetition_penalty,
+                repetition_context: req.sampling.repetition_context,
+            },
+            max_new_tokens: req.sampling.max_new_tokens,
+            seed: req.sampling.seed,
+            cancel: core_cancel.clone(),
+            ..Default::default()
+        };
+
         on_progress(Progress::Step {
             current: 1,
             total: 2,
         });
 
-        let generation =
-            self.llama
-                .generate_from_embeds(&ids, &embeds, req.sampling, &req.cancel)?;
+        let gen_cancel = req.cancel.clone();
+        let bridge_cancel = core_cancel;
+        let mut on_event = move |ev: StreamEvent| {
+            if let StreamEvent::Token { .. } = ev {
+                if gen_cancel.is_cancelled() {
+                    bridge_cancel.cancel();
+                }
+            }
+        };
+        let out = self
+            .provider
+            .generate(&request, &mut on_event)
+            .map_err(map_core_err)?;
+
         on_progress(Progress::Step {
             current: 2,
             total: 2,
         });
 
-        let token_ids = generation
-            .token_ids
-            .iter()
-            .map(|&id| {
-                u32::try_from(id).map_err(|_| {
-                    Error::Msg(format!("joycaption: generated negative token id {id}"))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let text = decode_generated(&self.tokenizer, &token_ids)?;
         Ok(CaptionOutput {
-            text,
-            generated_tokens: Some(token_ids.len() as u32),
-            finish_reason: Some(generation.finish_reason),
+            text: out.text.trim().to_owned(),
+            generated_tokens: Some(out.usage.generated_tokens),
+            finish_reason: out.finish_reason.map(map_finish),
         })
     }
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Captioner>> {
-    load(spec).map_err(Into::into)
+/// Map a core-llm engine error onto the gen-core captioner error, preserving the **typed**
+/// cancellation the contract (and the conformance suite) require.
+fn map_core_err(e: core_llm::Error) -> Error {
+    match e {
+        core_llm::Error::Canceled => Error::Canceled,
+        other => Error::Msg(other.to_string()),
+    }
+}
+
+fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
+    match f {
+        // JoyCaption stops on an EOS/stop token or exhausts its token budget; it ships no content
+        // filter, so that arm is unreachable but kept total (treated as a model-initiated stop).
+        core_llm::FinishReason::Stop | core_llm::FinishReason::ContentFilter => {
+            CaptionFinishReason::StopToken
+        }
+        core_llm::FinishReason::Length => CaptionFinishReason::MaxTokens,
+        core_llm::FinishReason::Cancelled => CaptionFinishReason::Cancelled,
+    }
 }
 
 inventory::submit! {
-    CaptionerRegistration { descriptor, load: load_registered }
+    CaptionerRegistration { descriptor, load }
 }
 
 #[cfg(test)]

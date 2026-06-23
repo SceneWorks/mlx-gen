@@ -11,7 +11,7 @@
 //! `generate(do_sample=True, temperature=0.15, max_new_tokens=512)` → decode the new tokens. The
 //! Mistral language tower is the **same packed-Q4 [`Qwen3TextEncoder`]** the T2I path uses (no second
 //! copy); only the final norm + LM head are extra (loaded by `load_generation_head`). Multimodal
-//! splice reuses the proven `mlx_gen::caption::joycaption` helpers.
+//! splice reuses the shared `mlx_gen::mllm::splice_image_features` helper.
 //!
 //! Pixel preprocessing matches the reference up to the resample kernel and a small rounding choice:
 //! references are horizontally concatenated (white bg, center), area-capped to 768², and resized to
@@ -22,9 +22,9 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::caption::joycaption::language::splice_image_features;
 use mlx_gen::image::resize_lanczos_u8;
 use mlx_gen::media::Image;
+use mlx_gen::mllm::splice_image_features;
 use mlx_gen::runtime::CancelFlag;
 use mlx_gen::{Error, Result};
 

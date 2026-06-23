@@ -25,6 +25,7 @@ pub mod adapters;
 pub mod array;
 pub mod error;
 pub mod img2img;
+pub mod mllm;
 pub mod nn;
 pub mod quant;
 pub mod sampler;

@@ -1,51 +1,17 @@
-//! JoyCaption prompt, chat-template, and tokenizer helpers.
+//! JoyCaption caption **product policy**.
 //!
-//! This module ports the request-facing text path before the model provider exists: SceneWorks'
-//! caption prompt map, the model's LLaVA/Llama chat wrapper, and tokenizer loading from a cached
-//! Hugging Face snapshot. Vision preprocessing, image-token embedding splice, and generation live
-//! in sibling JoyCaption modules.
-
-use std::path::Path;
+//! The JoyCaption model (SigLIP vision tower + LLaVA projector + image splice + Llama-3.1 decode +
+//! the model's LLaVA chat-input format) lives in the unified LLM engine
+//! ([`mlx-llm`](https://github.com/SceneWorks/mlx-llm)) as the `mlx-joycaption`
+//! `core_llm::TextLlm` vision provider. This module keeps only the SceneWorks-side caption product
+//! surface — the caption-type/length prompt templates, the advertised capability bounds, and the
+//! trigger-word post-processing — that a consumer uses to build the prompt text before calling the
+//! engine (epic 7153, sc-7265). It contains no model-specific code.
 
 use crate::caption::{CaptionCapabilities, CaptionOptions};
-use crate::runtime::{LoadSpec, WeightsSource};
-use crate::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use crate::{Error, Result};
-
-pub mod language;
-pub mod vision;
-
-/// Join a weight-key `prefix` and `leaf` with a `.` (no leading dot when `prefix` is empty) — the
-/// `tree_flatten`-style key builder shared by the JoyCaption language + vision submodules (F-014).
-pub(super) fn join(prefix: &str, leaf: &str) -> String {
-    if prefix.is_empty() {
-        leaf.to_owned()
-    } else {
-        format!("{prefix}.{leaf}")
-    }
-}
 
 pub const JOY_CAPTION_MODEL_ID: &str = "fancyfeast/llama-joycaption-beta-one-hf-llava";
 pub const JOY_CAPTION_FAMILY: &str = "joycaption";
-
-pub const SYSTEM_PROMPT: &str = "You are a helpful image captioner.";
-pub const DEFAULT_DATE_STRING: &str = "26 July 2024";
-pub const CUTTING_KNOWLEDGE_DATE: &str = "December 2023";
-
-pub const BEGIN_OF_TEXT_TOKEN_ID: i32 = 128000;
-pub const END_OF_TEXT_TOKEN_ID: i32 = 128001;
-pub const START_HEADER_TOKEN_ID: i32 = 128006;
-pub const END_HEADER_TOKEN_ID: i32 = 128007;
-pub const EOM_TOKEN_ID: i32 = 128008;
-pub const EOT_TOKEN_ID: i32 = 128009;
-pub const PAD_TOKEN_ID: i32 = 128004;
-pub const IMAGE_TOKEN_ID: i32 = 128077;
-pub const IMAGE_SEQ_LENGTH: usize = 729;
-pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 4096;
-
-pub const IMAGE_TOKEN: &str = "<|reserved_special_token_69|>";
-pub const IMAGE_START_TOKEN: &str = "<|reserved_special_token_70|>";
-pub const IMAGE_END_TOKEN: &str = "<|reserved_special_token_71|>";
 
 pub const JOY_NAME_OPTION: &str =
     "If there is a person/character in the image you must refer to them as {name}.";
@@ -226,71 +192,6 @@ pub fn apply_trigger_words(caption: &str, trigger_words: &[String]) -> String {
     parts.join(", ")
 }
 
-pub fn build_chat_text(prompt: &str) -> String {
-    build_chat_text_with_system(prompt, SYSTEM_PROMPT, DEFAULT_DATE_STRING, true)
-}
-
-pub fn build_chat_text_with_system(
-    prompt: &str,
-    system_prompt: &str,
-    date_string: &str,
-    add_generation_prompt: bool,
-) -> String {
-    let user_prompt = prompt.replace(IMAGE_TOKEN, "");
-    let user_prompt = user_prompt.trim_start();
-    let mut text = format!(
-        "<|start_header_id|>system<|end_header_id|>\n\n\
-         Cutting Knowledge Date: {CUTTING_KNOWLEDGE_DATE}\n\
-         Today Date: {date_string}\n\n\
-         {system_prompt}<|eot_id|>\
-         <|start_header_id|>user<|end_header_id|>\n\n\
-         {IMAGE_START_TOKEN}{IMAGE_TOKEN}{IMAGE_END_TOKEN}{user_prompt}<|eot_id|>"
-    );
-    if add_generation_prompt {
-        text.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    }
-    text
-}
-
-pub fn tokenizer_config(max_length: usize) -> TokenizerConfig {
-    TokenizerConfig {
-        max_length,
-        pad_token_id: PAD_TOKEN_ID,
-        chat_template: ChatTemplate::None,
-        pad_to_max_length: false,
-    }
-}
-
-pub fn load_tokenizer(root: impl AsRef<Path>) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(
-        root.as_ref().join("tokenizer.json"),
-        tokenizer_config(DEFAULT_MAX_CONTEXT_TOKENS),
-    )
-    .map_err(Into::into)
-}
-
-pub fn load_tokenizer_from_spec(spec: &LoadSpec) -> Result<TextTokenizer> {
-    match &spec.weights {
-        WeightsSource::Dir(root) => load_tokenizer(root),
-        WeightsSource::File(_) => Err(Error::Msg(
-            "joycaption: tokenizer loading requires a snapshot directory".to_owned(),
-        )),
-    }
-}
-
-pub fn encode_chat_prompt(tokenizer: &TextTokenizer, prompt: &str) -> Result<Vec<i32>> {
-    tokenizer
-        .encode_ids(&build_chat_text(prompt), false)
-        .map_err(Into::into)
-}
-
-pub fn decode_generated(tokenizer: &TextTokenizer, ids: &[u32]) -> Result<String> {
-    tokenizer
-        .decode(ids, true)
-        .map(|text| text.trim().to_owned())
-        .map_err(Into::into)
-}
-
 fn templates_for(caption_type: &str) -> &'static [&'static str; 3] {
     PROMPT_TEMPLATES
         .iter()
@@ -309,9 +210,6 @@ fn name_or_placeholder(options: &CaptionOptions) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::PathBuf;
-
     use super::*;
 
     fn options(kind: &str, length: &str) -> CaptionOptions {
@@ -374,29 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn chat_template_matches_single_turn_hf_shape() {
-        let text = build_chat_text("Write a caption.");
-        assert_eq!(
-            text,
-            "<|start_header_id|>system<|end_header_id|>\n\n\
-             Cutting Knowledge Date: December 2023\n\
-             Today Date: 26 July 2024\n\n\
-             You are a helpful image captioner.<|eot_id|>\
-             <|start_header_id|>user<|end_header_id|>\n\n\
-             <|reserved_special_token_70|><|reserved_special_token_69|><|reserved_special_token_71|>Write a caption.<|eot_id|>\
-             <|start_header_id|>assistant<|end_header_id|>\n\n"
-        );
-    }
-
-    #[test]
-    fn chat_template_strips_user_image_token_and_left_space() {
-        let text = build_chat_text("  <|reserved_special_token_69|>  Describe.");
-        assert!(text.contains(
-            "<|reserved_special_token_70|><|reserved_special_token_69|><|reserved_special_token_71|>Describe."
-        ));
-    }
-
-    #[test]
     fn trigger_words_are_prepended_only_when_missing() {
         let trigger_words = vec!["mika_token".to_owned(), "hat".to_owned()];
         assert_eq!(
@@ -407,24 +282,5 @@ mod tests {
             apply_trigger_words("   ", &trigger_words),
             "mika_token, hat"
         );
-    }
-
-    #[test]
-    fn load_tokenizer_from_file_spec_errors() {
-        let spec = LoadSpec::new(WeightsSource::File(PathBuf::from("model.safetensors")));
-        assert!(load_tokenizer_from_spec(&spec).is_err());
-    }
-
-    #[test]
-    #[ignore = "needs the JoyCaption snapshot; set MLX_GEN_JOYCAPTION_SNAPSHOT"]
-    fn tokenizer_encodes_image_marker_from_snapshot() {
-        let root =
-            env::var("MLX_GEN_JOYCAPTION_SNAPSHOT").expect("set MLX_GEN_JOYCAPTION_SNAPSHOT");
-        let tokenizer = load_tokenizer(root).expect("tokenizer loads");
-        let ids = encode_chat_prompt(&tokenizer, "Write a caption.").expect("prompt encodes");
-        assert!(ids.contains(&IMAGE_TOKEN_ID));
-        assert!(ids.contains(&START_HEADER_TOKEN_ID));
-        assert!(ids.contains(&END_HEADER_TOKEN_ID));
-        assert!(ids.contains(&EOT_TOKEN_ID));
     }
 }

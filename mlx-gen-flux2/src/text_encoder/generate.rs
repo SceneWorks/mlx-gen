@@ -5,8 +5,8 @@
 //! `prompt_embeds` (a single bidirectional forward) also drives the caption-upsampling
 //! `generate()` loop (a KV-cached causal decode). This module holds the two pieces that are
 //! independent of the encoder's private state; the decode/generate methods themselves live on
-//! `Qwen3TextEncoder` in `encoder.rs` (they need its layers + lm_head). Mirrors the proven
-//! `mlx_gen::caption::joycaption::language` / `mlx-gen-prompt-refine` decoders.
+//! `Qwen3TextEncoder` in `encoder.rs` (they need its layers + lm_head). The sampler shape mirrors
+//! the proven decoders that have since moved to the unified `mlx-llm` LLM engine.
 
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};

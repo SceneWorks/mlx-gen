@@ -10,8 +10,12 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
-# Must match the core crate's MLX binding exactly (shared `Array` type).
-mlx-rs = { workspace = true }
+# The unified LLM engine: serves the JoyCaption VLM as the `mlx-joycaption` core-llm provider that
+# this shim now consumes through the contract (sc-7265). Pinned to the SAME rev the SceneWorks worker
+# pins so cargo unifies ONE mlx-llm — one `Array`, one `core-llm` — across the worker dependency
+# graph (the worker also depends on mlx-llm directly for prompt-refine). Both mlx-gen and mlx-llm
+# build the identical pmetal `mlx-rs`, so there is a single MLX build and one `Array` type.
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "29e382bd6a3800accf0bac5daf5d8eb61e1a2adf" }
 # Link-time self-registration into mlx-gen's captioner registry.
 inventory = { workspace = true }
 
