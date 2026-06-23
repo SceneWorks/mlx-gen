@@ -3,12 +3,12 @@
 //! registry under id `"krea_2_turbo"`. Linking this crate is all the worker needs to resolve the
 //! model by id.
 //!
-//! **Status (P1):** the provider crate, the `krea_2_turbo` registration, the architecture-validated
-//! [`load`], and the offline Q4/Q8 converter ([`crate::convert`]) landed in sc-7567; the DiT forward in
-//! sc-7568 ([`crate::transformer`]), the Qwen3-VL-4B text encoder in sc-7569 ([`crate::text_encoder`]),
-//! and the VAE + rectified-flow sampler in sc-7570 ([`crate::vae`] / [`crate::schedule`]). The
-//! remaining slice is the end-to-end Turbo t2i pipeline that drives them (sc-7571); until it lands
-//! [`Krea::generate`] returns an explicit error naming it rather than a silent stub.
+//! **Status (P1 complete):** the provider crate + `krea_2_turbo` registration + architecture-validated
+//! [`load`] + offline Q4/Q8 converter ([`crate::convert`]) landed in sc-7567; the DiT forward in
+//! sc-7568 ([`crate::transformer`]); the Qwen3-VL-4B text encoder in sc-7569 ([`crate::text_encoder`]);
+//! the VAE + rectified-flow sampler in sc-7570 ([`crate::vae`] / [`crate::schedule`]); and the
+//! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
+//! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
 use mlx_gen::gen_core;
 use mlx_gen::{
@@ -17,7 +17,7 @@ use mlx_gen::{
     Precision, Progress, Quant, Result, WeightsSource,
 };
 
-use crate::config::Krea2Config;
+use crate::pipeline::{KreaPipeline, TurboOptions};
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
@@ -32,9 +32,8 @@ const RES_MAX: u32 = 2048;
 const RES_MULTIPLE: u32 = 16;
 
 /// Turbo defaults: the TDM-distilled few-step student renders CFG-free at 8 steps (reference
-/// `is_distilled` + `guidance_scale 0`). Consumed by the forward (`req.steps.unwrap_or(DEFAULT_STEPS)`,
-/// sc-7568+); the manifest `default_steps` mirrors this (sc-7572).
-#[allow(dead_code)]
+/// `is_distilled` + `guidance_scale 0`). Consumed by `generate` (`req.steps.unwrap_or(DEFAULT_STEPS)`);
+/// the manifest `default_steps` mirrors this (sc-7572).
 const DEFAULT_STEPS: u32 = 8;
 
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
@@ -78,14 +77,11 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded Krea generator: the cached descriptor + the architecture-validated DiT config + the
-/// snapshot root (the forward pipeline assembles from these in sc-7568+).
+/// A loaded Krea 2 Turbo generator: the cached descriptor + the assembled Turbo pipeline (tokenizer +
+/// Qwen3-VL-4B condition encoder + single-stream DiT + Qwen-Image VAE).
 pub struct Krea {
     descriptor: ModelDescriptor,
-    #[allow(dead_code)] // consumed by the forward pipeline (sc-7568+).
-    config: Krea2Config,
-    #[allow(dead_code)] // consumed by the forward pipeline (sc-7568+).
-    root: std::path::PathBuf,
+    pipeline: KreaPipeline,
 }
 
 /// Load a Krea generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`] pointing
@@ -113,11 +109,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             )))
         }
     };
-    let config = Krea2Config::from_snapshot(root)?;
+    // Assemble the full Turbo pipeline (tokenizer + TE + DiT + VAE); auto-detects a packed Q4/Q8
+    // turnkey vs a dense bf16 snapshot. `spec.quantize` then quantizes the dense base in place (a no-op
+    // on an already-packed snapshot — `AdaptableLinear::quantize` skips quantized bases).
+    let mut pipeline = KreaPipeline::from_snapshot(root)?;
+    if let Some(q) = spec.quantize {
+        pipeline.quantize(q.bits())?;
+    }
     Ok(Box::new(Krea {
         descriptor: descriptor(),
-        config,
-        root: root.clone(),
+        pipeline,
     }))
 }
 
@@ -132,20 +133,45 @@ impl Generator for Krea {
 
     fn generate(
         &self,
-        _req: &GenerationRequest,
-        _on_progress: &mut dyn FnMut(Progress),
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
-        // The building blocks are all wired — the 12B single-stream DiT (sc-7568,
-        // `crate::transformer::Krea2Transformer`), the Qwen3-VL-4B text encoder (sc-7569,
-        // `crate::text_encoder`), and the VAE + rectified-flow sampler (sc-7570, `crate::vae` /
-        // `crate::schedule`) — but the end-to-end Turbo t2i pipeline that drives them (sc-7571) is not
-        // yet assembled. Surface that explicitly instead of returning a silent/empty result.
-        Err(Error::Msg(format!(
-            "{KREA_2_TURBO_ID}: the DiT (sc-7568), Qwen3-VL-4B text encoder (sc-7569), and VAE + \
-             rectified-flow sampler (sc-7570) are wired, but the end-to-end Turbo t2i pipeline that \
-             drives them (sc-7571) is not yet assembled."
-        ))
-        .into())
+        self.generate_impl(req, on_progress).map_err(Into::into)
+    }
+}
+
+impl Krea {
+    /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
+    /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
+    /// bridges the tail into [`gen_core::Error`]. Renders `req.count` CFG-free Turbo images, one per
+    /// seed (`seed + n`, mirroring the reference per-prompt seeding).
+    fn generate_impl(
+        &self,
+        req: &GenerationRequest,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        validate_request(&self.descriptor, req)?;
+        let base_seed = req.seed.unwrap_or(0);
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        let mut images = Vec::with_capacity(req.count as usize);
+        for n in 0..req.count {
+            let opts = TurboOptions {
+                width: req.width,
+                height: req.height,
+                steps,
+                seed: base_seed.wrapping_add(n as u64),
+                sampler: req.sampler.clone(),
+                scheduler: req.scheduler.clone(),
+            };
+            let img = self.pipeline.generate_turbo_with_progress(
+                &req.prompt,
+                &opts,
+                &req.cancel,
+                on_progress,
+            )?;
+            images.push(img);
+        }
+        Ok(GenerationOutput::Images(images))
     }
 }
 
@@ -262,12 +288,19 @@ mod tests {
         for q in [Quant::Q4, Quant::Q8] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into())).with_quant(q);
             let e = load(&spec).err().expect("error").to_string();
-            // The quant is accepted (not the failure); the missing config.json is.
+            // The quant is accepted (not the failure); the missing snapshot (the pipeline assembly
+            // hits the absent tokenizer/config first) is.
             assert!(
                 !e.contains("not supported"),
                 "quant should be accepted: {e}"
             );
-            assert!(e.contains("config.json") || e.contains("read"), "got: {e}");
+            assert!(
+                e.contains("No such file")
+                    || e.contains("config.json")
+                    || e.contains("tokenizer")
+                    || e.contains("read"),
+                "expected a missing-snapshot error, got: {e}"
+            );
         }
     }
 

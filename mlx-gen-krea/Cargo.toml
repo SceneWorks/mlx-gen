@@ -22,3 +22,11 @@ mlx-rs = { workspace = true }
 inventory = { workspace = true }
 # Parse the diffusers `transformer/config.json` + `model_index.json` (architecture + quant manifest).
 serde_json = "1"
+
+[dev-dependencies]
+# Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7571); mirrors the other families.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed
+# cancellation / seed determinism / registry round-trip) — Krea runs the real engine through it on the
+# macos-mlx lane, the sc-4481 standard every shipped family meets. Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }

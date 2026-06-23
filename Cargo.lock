@@ -722,10 +722,12 @@ dependencies = [
 name = "mlx-gen-krea"
 version = "0.0.0"
 dependencies = [
+ "image",
  "inventory",
  "mlx-gen",
  "mlx-gen-qwen-image",
  "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
  "serde_json",
 ]
 
