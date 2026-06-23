@@ -182,7 +182,7 @@ fn edit_smoke() {
     // Faithful image-conditioned edit (E7b-3 default).
     let edited = pipe
         .generate_edit(
-            &ref_img,
+            &[&ref_img],
             instruction,
             &EditOptions {
                 height: 512,
@@ -205,7 +205,7 @@ fn edit_smoke() {
     // Text-only baseline (E7 path) for A/B comparison — same seed/instruction, no vision tower.
     let edited_text_only = pipe
         .generate_edit(
-            &ref_img,
+            &[&ref_img],
             instruction,
             &EditOptions {
                 height: 512,

@@ -88,11 +88,10 @@ impl BooguTextEncoder {
         Ok(rms_norm(&hidden, &self.final_norm, self.eps)?)
     }
 
-    /// Image-conditioned forward (Edit / E7b-2). Splices `image_embeds` (`[n, 4096]`, the vision
-    /// tower's merged output) into the token embeddings at the `image_token_id` positions, runs the
-    /// 36 decoder layers under the 3-D **interleaved MRoPE**, and injects the 3 `deepstack` features
-    /// (`[n, 4096]` each) at the image positions after layers 0/1/2 — mirroring `Qwen3VLTextModel`.
-    /// `grid_thw` is the image's patch grid `[t, h, w]`. `b = 1`.
+    /// Single-reference image-conditioned forward (Edit) — a thin wrapper over
+    /// [`Self::last_hidden_with_images`] for one reference image (`grid_thw`, `image_embeds`
+    /// `[n, 4096]`, and its 3 `deepstack` features). Kept for single-reference call sites and the
+    /// component-parity harness.
     pub fn last_hidden_with_image(
         &self,
         input_ids: &Array,
@@ -102,43 +101,94 @@ impl BooguTextEncoder {
         grid_thw: [i32; 3],
         image_token_id: i32,
     ) -> Result<Array> {
+        self.last_hidden_with_images(
+            input_ids,
+            attention_mask,
+            std::slice::from_ref(image_embeds),
+            std::slice::from_ref(&deepstack.to_vec()),
+            std::slice::from_ref(&grid_thw),
+            image_token_id,
+        )
+    }
+
+    /// Multi-reference image-conditioned forward (Edit). Splices each reference's `image_embeds[k]`
+    /// (`[n_k, 4096]`, the vision tower's merged output) into the token embeddings at the k-th
+    /// contiguous `image_token_id` block (in input-id order), runs the 36 decoder layers under the
+    /// 3-D **interleaved MRoPE** (each image's grid advancing the shared position counter), and injects
+    /// each reference's `deepstack[k]` features at its image block after layers 0/1/2 — mirroring
+    /// `Qwen3VLTextModel` with multiple `<|image_pad|>` blocks. `grids[k]` is image k's patch grid
+    /// `[t, h, w]`. `b = 1`. The block order must match the reference order (the chat template emits
+    /// the references' vision blocks before the instruction, in order).
+    pub fn last_hidden_with_images(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+        image_token_id: i32,
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         let ids = host_i32(input_ids)?;
 
-        // Image-token block (contiguous, single reference).
-        let img_idx: Vec<i32> = (0..s)
-            .filter(|&i| ids[i as usize] == image_token_id)
-            .collect();
-        let img_start = *img_idx.first().ok_or_else(|| {
-            mlx_gen::Error::Msg(format!(
-                "boogu image-conditioned encode: no image tokens (id {image_token_id}) in input_ids"
-            ))
-        })?;
-        let img_end = img_start + img_idx.len() as i32;
+        // Contiguous `<|image_pad|>` blocks, in order; block k carries reference k.
+        let blocks = image_blocks(&ids, image_token_id);
+        if blocks.len() != image_embeds.len() {
+            return Err(mlx_gen::Error::Msg(format!(
+                "boogu image-conditioned encode: {} image-token blocks in input_ids but {} reference embeds",
+                blocks.len(),
+                image_embeds.len()
+            )));
+        }
 
-        // Token embeddings, then splice the vision embeds at the image positions.
+        // Token embeddings, then splice each reference's vision embeds at its block. Each replacement
+        // is the same length as the block it replaces, so earlier splices don't shift later indices.
         let mut hidden = self.embed_tokens.forward(input_ids)?;
         let dt = hidden.dtype();
-        let img = image_embeds.expand_dims(0)?.as_dtype(dt)?; // [1, n, 4096]
-        hidden = replace_seq(&hidden, &img, img_start, img_end, s)?;
+        for (k, &(start, len)) in blocks.iter().enumerate() {
+            let img = image_embeds[k].expand_dims(0)?.as_dtype(dt)?; // [1, n_k, 4096]
+            hidden = replace_seq(&hidden, &img, start, start + len, s)?;
+        }
 
-        // 3-D interleaved MRoPE + causal mask.
-        let (pt, ph, pw) = mrope_positions(&ids, image_token_id, grid_thw[1], grid_thw[2]);
+        // 3-D interleaved MRoPE (per-image grids) + causal mask.
+        let (pt, ph, pw) = mrope_positions(&ids, image_token_id, grids);
         let (cos, sin) = mrope_cos_sin(&pt, &ph, &pw, self.head_dim, self.rope_theta, dt)?;
         let mask = build_mask(attention_mask, b, s)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-            // Deepstack: add the layer-i feature at the image positions (LM layers 0/1/2).
-            if i < deepstack.len() {
-                let ds = deepstack[i].expand_dims(0)?.as_dtype(dt)?; // [1, n, 4096]
-                let mid = add(&slice_seq(&hidden, img_start, img_end)?, &ds)?;
-                hidden = replace_seq(&hidden, &mid, img_start, img_end, s)?;
+            // Deepstack: after LM layers 0/1/2, add each reference's layer-i feature at its block.
+            for (k, &(start, len)) in blocks.iter().enumerate() {
+                if i < deepstack[k].len() {
+                    let ds = deepstack[k][i].expand_dims(0)?.as_dtype(dt)?; // [1, n_k, 4096]
+                    let mid = add(&slice_seq(&hidden, start, start + len)?, &ds)?;
+                    hidden = replace_seq(&hidden, &mid, start, start + len, s)?;
+                }
             }
         }
         Ok(rms_norm(&hidden, &self.final_norm, self.eps)?)
     }
+}
+
+/// Contiguous runs of `image_token_id` in `ids`, returned as `(start, len)` in input-id order. Each
+/// run is one reference image's `<|image_pad|>` block.
+fn image_blocks(ids: &[i32], image_token_id: i32) -> Vec<(i32, i32)> {
+    let mut blocks = Vec::new();
+    let mut i = 0i32;
+    let n = ids.len() as i32;
+    while i < n {
+        if ids[i as usize] == image_token_id {
+            let start = i;
+            while i < n && ids[i as usize] == image_token_id {
+                i += 1;
+            }
+            blocks.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+    blocks
 }
 
 /// Slice `[b, s, d]` along the sequence axis (axis 1) to `[start, end)`.
@@ -155,21 +205,23 @@ fn replace_seq(x: &Array, repl: &Array, start: i32, end: i32, s: i32) -> Result<
 }
 
 /// 3-D MRoPE positions per token (mirrors `get_rope_index` + `get_vision_position_ids`): text tokens
-/// advance `(i, i, i)`; an image block (at offset `cur`) gets `t = cur`, `h = cur + row`,
-/// `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then `cur += max(h, w) / merge`.
+/// advance `(i, i, i)`; the k-th image block (at running offset `cur`) takes `grids[k] = [t, h, w]`,
+/// gets `t = cur`, `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then
+/// advances `cur += max(h, w) / merge`. Multiple image blocks consume `grids` in order.
 fn mrope_positions(
     ids: &[i32],
     image_token_id: i32,
-    grid_h: i32,
-    grid_w: i32,
+    grids: &[[i32; 3]],
 ) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
-    let (llm_h, llm_w) = (grid_h / SPATIAL_MERGE, grid_w / SPATIAL_MERGE);
-    let step = grid_h.max(grid_w) / SPATIAL_MERGE;
     let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
     let mut cur = 0i32;
     let mut i = 0usize;
+    let mut img_k = 0usize;
     while i < ids.len() {
         if ids[i] == image_token_id {
+            let g = grids[img_k];
+            let (llm_h, llm_w) = (g[1] / SPATIAL_MERGE, g[2] / SPATIAL_MERGE);
+            let step = g[1].max(g[2]) / SPATIAL_MERGE;
             for idx in 0..(llm_h * llm_w) {
                 pt.push(cur);
                 ph.push(cur + idx / llm_w);
@@ -177,6 +229,7 @@ fn mrope_positions(
             }
             cur += step;
             i += (llm_h * llm_w) as usize;
+            img_k += 1;
         } else {
             pt.push(cur);
             ph.push(cur);

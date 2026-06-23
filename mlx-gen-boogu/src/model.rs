@@ -37,6 +37,9 @@ const RES_MIN: u32 = 256;
 const RES_MAX: u32 = 2048;
 /// Patch(2)·ae_scale(8) = 16 — `patchify` requires dims divisible by this.
 const RES_MULTIPLE: u32 = 16;
+/// Maximum reference images the Edit lane accepts — the DiT's `image_index_embedding` row count (the
+/// OmniGen2-lineage `[5, hidden]` parameter supports up to 5 distinct reference index slots).
+const MAX_EDIT_REFERENCES: usize = 5;
 
 /// Base/Edit default steps + guidance (the reference `__call__`: 50-step true-CFG, guidance 4.0).
 const DEFAULT_STEPS: u32 = 50;
@@ -113,13 +116,17 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     d
 }
 
-/// Boogu **Edit** identity + capabilities. Same true-CFG surface as [`descriptor`] plus a single
-/// img2img/instruction-edit source [`ConditioningKind::Reference`]: the source image is read by the
-/// Qwen3-VL vision tower (semantic edit) and VAE-encoded into the DiT's spatial reference latent.
+/// Boogu **Edit** identity + capabilities. Same true-CFG surface as [`descriptor`] plus one or more
+/// img2img/instruction-edit source images ([`ConditioningKind::Reference`] for a single source, or
+/// [`ConditioningKind::MultiReference`] for up to [`MAX_EDIT_REFERENCES`]): each source is read by the
+/// Qwen3-VL vision tower (semantic edit) and VAE-encoded into the DiT's spatial reference sequence.
 pub fn descriptor_edit() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_EDIT_ID;
-    d.capabilities.conditioning = vec![ConditioningKind::Reference];
+    d.capabilities.conditioning = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
     d
 }
 
@@ -236,8 +243,9 @@ impl Boogu {
                 images.push(img);
             }
         } else if self.descriptor.id == BOOGU_IMAGE_EDIT_ID {
-            // The source image arrives as the single `Reference`; the prompt is the edit instruction.
-            let reference = resolve_edit_reference(req)?;
+            // The source images arrive as `Reference`/`MultiReference`; the prompt is the edit
+            // instruction. One or more references (max 5), each fed to the vision tower + DiT.
+            let references = resolve_edit_references(req)?;
             let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
             let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
             for n in 0..req.count {
@@ -253,7 +261,7 @@ impl Boogu {
                     scheduler: req.scheduler.clone(),
                 };
                 let img = self.pipeline.generate_edit_with_progress(
-                    reference,
+                    &references,
                     &req.prompt,
                     &opts,
                     &req.cancel,
@@ -288,24 +296,32 @@ impl Boogu {
     }
 }
 
-/// The single img2img/instruction-edit source [`Conditioning::Reference`] image. More than one
-/// reference, or none, is an error (the Edit path needs exactly one source).
-fn resolve_edit_reference(req: &GenerationRequest) -> Result<&Image> {
-    let mut source: Option<&Image> = None;
+/// The img2img/instruction-edit source images, in order — collected from both
+/// [`Conditioning::Reference`] (single) and [`Conditioning::MultiReference`] (multi). At least one and
+/// at most [`MAX_EDIT_REFERENCES`] (the DiT's `image_index_embedding` row count) is required; zero or
+/// more than the cap is an error.
+fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
+    let mut refs: Vec<&Image> = Vec::new();
     for c in &req.conditioning {
-        if let Conditioning::Reference { image, .. } = c {
-            if source.is_some() {
-                return Err(Error::Msg(
-                    "boogu_image_edit: only one reference (source) image is supported for edit"
-                        .into(),
-                ));
-            }
-            source = Some(image);
+        match c {
+            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::MultiReference { images } => refs.extend(images.iter()),
+            _ => {} // the capability floor already rejects other conditioning kinds.
         }
     }
-    source.ok_or_else(|| {
-        Error::Msg("boogu_image_edit: an instruction edit requires a source reference image".into())
-    })
+    if refs.is_empty() {
+        return Err(Error::Msg(
+            "boogu_image_edit: an instruction edit requires at least one source reference image"
+                .into(),
+        ));
+    }
+    if refs.len() > MAX_EDIT_REFERENCES {
+        return Err(Error::Msg(format!(
+            "boogu_image_edit: at most {MAX_EDIT_REFERENCES} reference images are supported (got {})",
+            refs.len()
+        )));
+    }
+    Ok(refs)
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -327,19 +343,10 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    // The Edit variant needs exactly one source reference; the floor already rejects a reference on
-    // Base/Turbo (their `conditioning` surface is empty).
+    // The Edit variant needs 1..=5 source references; the floor already rejects any
+    // Reference/MultiReference on Base/Turbo (their `conditioning` surface is empty).
     if id == BOOGU_IMAGE_EDIT_ID {
-        let refs = req
-            .conditioning
-            .iter()
-            .filter(|c| matches!(c, Conditioning::Reference { .. }))
-            .count();
-        if refs != 1 {
-            return Err(Error::Msg(format!(
-                "{id}: instruction edit requires exactly one source reference image (got {refs})"
-            )));
-        }
+        resolve_edit_references(req)?;
     }
     Ok(())
 }
@@ -473,10 +480,15 @@ mod tests {
         let d = descriptor_edit();
         assert_eq!(d.id, "boogu_image_edit");
         assert!(d.capabilities.supports_guidance);
+        // Edit advertises both single- and multi-reference conditioning.
         assert!(d
             .capabilities
             .conditioning
             .contains(&ConditioningKind::Reference));
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::MultiReference));
         assert!(!d
             .capabilities
             .conditioning
@@ -543,10 +555,10 @@ mod tests {
     }
 
     #[test]
-    fn edit_requires_exactly_one_reference() {
+    fn edit_reference_count() {
         // No reference → error.
         assert!(validate_request(&descriptor_edit(), &req(512, 512)).is_err());
-        // One reference → ok.
+        // A single `Reference` → ok.
         let one = GenerationRequest {
             conditioning: vec![Conditioning::Reference {
                 image: img(512, 512),
@@ -555,8 +567,8 @@ mod tests {
             ..req(512, 512)
         };
         assert!(validate_request(&descriptor_edit(), &one).is_ok());
-        assert!(resolve_edit_reference(&one).is_ok());
-        // Two references → error.
+        assert_eq!(resolve_edit_references(&one).unwrap().len(), 1);
+        // Two references (now supported, up to 5) → ok.
         let two = GenerationRequest {
             conditioning: vec![
                 Conditioning::Reference {
@@ -570,8 +582,26 @@ mod tests {
             ],
             ..req(512, 512)
         };
-        assert!(validate_request(&descriptor_edit(), &two).is_err());
-        assert!(resolve_edit_reference(&two).is_err());
+        assert!(validate_request(&descriptor_edit(), &two).is_ok());
+        assert_eq!(resolve_edit_references(&two).unwrap().len(), 2);
+        // A `MultiReference` with the max 5 images → ok.
+        let five = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: (0..5).map(|_| img(512, 512)).collect(),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&descriptor_edit(), &five).is_ok());
+        assert_eq!(resolve_edit_references(&five).unwrap().len(), 5);
+        // Six references → error (past the `image_index_embedding` cap).
+        let six = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: (0..6).map(|_| img(512, 512)).collect(),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&descriptor_edit(), &six).is_err());
+        assert!(resolve_edit_references(&six).is_err());
     }
 
     #[test]

@@ -172,13 +172,13 @@ fn profile_edit_q4() {
     };
     // Warmup also forces the lazy vision-tower load (f32) so the transient peak reflects it.
     let _ = pipe
-        .generate_edit(&reference, "warmup", &edit_opts(256, 256, 2))
+        .generate_edit(&[&reference], "warmup", &edit_opts(256, 256, 2))
         .expect("warmup edit");
     let transient = get_peak_memory();
     let resident = get_active_memory();
     reset_peak_memory();
     let _ = pipe
-        .generate_edit(&reference, "make it green", &edit_opts(1024, 1024, 4))
+        .generate_edit(&[&reference], "make it green", &edit_opts(1024, 1024, 4))
         .expect("generate edit 1K");
     report("Edit Q4", transient, resident, get_peak_memory());
 }

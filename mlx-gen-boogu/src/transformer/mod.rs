@@ -1,10 +1,11 @@
 //! The Boogu mixed single/double-stream DiT (`BooguImageTransformer2DModel`) forward.
 //!
 //! Two entry points share one inner path: [`BooguTransformer::forward`] (text-to-image) and
-//! [`BooguTransformer::forward_edit`] (single-reference text+image-to-image). Edit VAE-encodes a
-//! reference image, patch-embeds it through `ref_image_patch_embedder` + `image_index_embedding`,
-//! refines it in `ref_image_refiner`, and prepends those tokens — `[ref; noise]` — to the image
-//! sequence (with the noise positions shifted by `max(ref_h, ref_w)` in the unified RoPE).
+//! [`BooguTransformer::forward_edit`] (text+image-to-image with one or more reference images). Edit
+//! VAE-encodes each reference image, patch-embeds it through `ref_image_patch_embedder` + its own
+//! `image_index_embedding[i]` row, refines each independently in `ref_image_refiner`, and prepends
+//! those tokens — `[ref₀; …; ref_{N-1}; noise]` — to the image sequence (with each reference and the
+//! noise positions shifted by the cumulative `max(ref_h, ref_w)` in the unified RoPE).
 //!
 //! Text-to-image flow (the reference-image blocks stay dormant):
 //! ```text
@@ -121,37 +122,39 @@ impl BooguTransformer {
         instruction_hidden: &Array,
         instruction_mask: &Array,
     ) -> Result<Array> {
-        self.forward_inner(latent, None, timestep, instruction_hidden, instruction_mask)
+        self.forward_inner(latent, &[], timestep, instruction_hidden, instruction_mask)
     }
 
-    /// Edit (single-reference text+image-to-image) velocity prediction. Identical to [`Self::forward`]
-    /// but with a clean reference latent `ref_latent` (`[1, 16, rH, rW]`, the VAE-encoded reference)
-    /// packed — after its own `ref_image_patch_embedder` + `image_index_embedding` + `ref_image_refiner`
-    /// — *before* the noise tokens in the combined image sequence the DiT denoises against.
+    /// Edit (text+image-to-image) velocity prediction with **one or more** reference images. Identical
+    /// to [`Self::forward`] but with `ref_latents` (each `[1, 16, rH, rW]`, a VAE-encoded reference)
+    /// packed — each through `ref_image_patch_embedder` + its own `image_index_embedding[i]` row +
+    /// `ref_image_refiner` — *before* the noise tokens in the combined image sequence
+    /// (`[ref₀; …; ref_{N-1}; noise]`). An empty slice is exactly [`Self::forward`] (text-to-image).
+    /// The Boogu DiT supports up to 5 references (the `image_index_embedding` row count).
     pub fn forward_edit(
         &self,
         latent: &Array,
-        ref_latent: &Array,
+        ref_latents: &[Array],
         timestep: &Array,
         instruction_hidden: &Array,
         instruction_mask: &Array,
     ) -> Result<Array> {
         self.forward_inner(
             latent,
-            Some(ref_latent),
+            ref_latents,
             timestep,
             instruction_hidden,
             instruction_mask,
         )
     }
 
-    /// Shared T2I / edit forward. With `ref_latent = None` this is the exact text-to-image path
-    /// (no reference block, `combined_image == image`); with `Some(_)` it prepends the refined
+    /// Shared T2I / edit forward. With an empty `ref_latents` this is the exact text-to-image path
+    /// (no reference block, `combined_image == image`); with one or more it prepends the refined
     /// reference-image tokens and shifts the noise positions per the OmniGen2 unified RoPE.
     fn forward_inner(
         &self,
         latent: &Array,
-        ref_latent: Option<&Array>,
+        ref_latents: &[Array],
         timestep: &Array,
         instruction_hidden: &Array,
         instruction_mask: &Array,
@@ -181,39 +184,42 @@ impl BooguTransformer {
         // Patchify the noise latent → target image tokens.
         let img = self.x_embedder.forward(&patchify(&latent, p)?)?; // [1, img_len, 3360]
 
-        // Reference image (Edit): patch-embed + add the per-image index embedding (single ref ⇒ 0).
-        let (ref_tokens, rope) = match ref_latent {
-            Some(rl) => {
-                let rl = rl.as_dtype(dt)?;
-                let (rht, rwt) = (rl.shape()[2] / p, rl.shape()[3] / p);
-                let ref_t = self.ref_image_patch_embedder.forward(&patchify(&rl, p)?)?; // [1, ref_len, 3360]
-                let idx0 = self
-                    .image_index_embedding
-                    .take_axis(Array::from_slice(&[0], &[1]), 0)?
-                    .as_dtype(dt)?
-                    .reshape(&[1, 1, self.cfg.hidden_size as i32])?;
-                let ref_t = mlx_rs::ops::add(&ref_t, &idx0)?;
-                let rope = RopeTables::build_edit(
-                    cap_len as usize,
-                    rht as usize,
-                    rwt as usize,
-                    ht as usize,
-                    wt as usize,
-                    self.cfg.axes_dim_rope[0],
-                    self.cfg.rope_theta,
-                );
-                (Some(ref_t), rope)
-            }
-            None => (
-                None,
-                RopeTables::build_t2i(
-                    cap_len as usize,
-                    ht as usize,
-                    wt as usize,
-                    self.cfg.axes_dim_rope[0],
-                    self.cfg.rope_theta,
-                ),
-            ),
+        // Reference images (Edit): patch-embed each + add its per-image index embedding row. The j-th
+        // reference's tokens get `image_index_embedding[j]` (OmniGen2 lineage; max 5 references). The
+        // patch grids drive the multi-image RoPE; an empty `ref_latents` is the text-to-image path.
+        let mut ref_tokens: Vec<(Array, usize)> = Vec::with_capacity(ref_latents.len());
+        let mut ref_grids: Vec<(usize, usize)> = Vec::with_capacity(ref_latents.len());
+        for (j, rl) in ref_latents.iter().enumerate() {
+            let rl = rl.as_dtype(dt)?;
+            let (rht, rwt) = (rl.shape()[2] / p, rl.shape()[3] / p);
+            let ref_t = self.ref_image_patch_embedder.forward(&patchify(&rl, p)?)?; // [1, ref_len, 3360]
+            let idx = self
+                .image_index_embedding
+                .take_axis(Array::from_slice(&[j as i32], &[1]), 0)?
+                .as_dtype(dt)?
+                .reshape(&[1, 1, self.cfg.hidden_size as i32])?;
+            let ref_t = mlx_rs::ops::add(&ref_t, &idx)?;
+            ref_tokens.push((ref_t, (rht * rwt) as usize));
+            ref_grids.push((rht as usize, rwt as usize));
+        }
+
+        let rope = if ref_grids.is_empty() {
+            RopeTables::build_t2i(
+                cap_len as usize,
+                ht as usize,
+                wt as usize,
+                self.cfg.axes_dim_rope[0],
+                self.cfg.rope_theta,
+            )
+        } else {
+            RopeTables::build_edit(
+                cap_len as usize,
+                &ref_grids,
+                ht as usize,
+                wt as usize,
+                self.cfg.axes_dim_rope[0],
+                self.cfg.rope_theta,
+            )
         };
 
         let (text_cos, text_sin) = rope.text()?;
@@ -233,17 +239,26 @@ impl BooguTransformer {
             img = blk.forward(&img, &noise_cos, &noise_sin, &temb)?;
         }
 
-        // Reference refinement, then prepend the refined reference tokens to form the combined
-        // image sequence `[ref; noise]` (Edit). T2I leaves the combined sequence as the noise tokens.
-        let mut img = match ref_tokens {
-            Some(mut ref_t) => {
-                let (ref_cos, ref_sin) = rope.ref_image()?;
+        // Reference refinement: refine EACH reference independently — its own RoPE sub-slice, no
+        // cross-image attention (the OmniGen2 batched `ref_image_refiner` masks each reference to
+        // itself). Then prepend the refined references to the noise tokens to form the combined image
+        // sequence `[ref₀; …; ref_{N-1}; noise]` (Edit). T2I leaves the sequence as the noise tokens.
+        let mut img = if ref_tokens.is_empty() {
+            img
+        } else {
+            let mut combined: Vec<Array> = Vec::with_capacity(ref_tokens.len() + 1);
+            let mut local = 0usize;
+            for (mut ref_t, ref_len) in ref_tokens {
+                let (ref_cos, ref_sin) = rope.ref_image_slice(local, ref_len)?;
                 for blk in &self.ref_image_refiner {
                     ref_t = blk.forward(&ref_t, &ref_cos, &ref_sin, &temb)?;
                 }
-                concatenate_axis(&[&ref_t, &img], 1)?
+                combined.push(ref_t);
+                local += ref_len;
             }
-            None => img,
+            combined.push(img);
+            let refs: Vec<&Array> = combined.iter().collect();
+            concatenate_axis(&refs, 1)?
         };
 
         // Dual-stream blocks (joint instruct↔combined-image attn + combined-image self-attn).
