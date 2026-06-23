@@ -3,6 +3,7 @@
 //! tower, sc-7569) loads through here so the load path can't drift from [`crate::convert`]'s packer.
 
 use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::nn::TokenEmbedding;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -18,4 +19,10 @@ pub(crate) const GROUP_SIZE: i32 = 64;
 /// the pre-quantized snapshot identically.
 pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear> {
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
+}
+
+/// Load `{base}` as a [`TokenEmbedding`] at the Krea [`GROUP_SIZE`] — packed when `{base}.scales` is
+/// present, else dense. The Qwen3-VL text-encoder token table (sc-7569).
+pub(crate) fn embedding(w: &Weights, base: &str) -> Result<TokenEmbedding> {
+    mlx_gen::quant::embedding(w, base, GROUP_SIZE)
 }

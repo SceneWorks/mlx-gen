@@ -35,8 +35,10 @@ pub mod config;
 pub mod convert;
 pub mod model;
 mod quant;
+pub mod text_encoder;
 pub mod transformer;
 
 pub use config::Krea2Config;
 pub use model::{descriptor, load, Krea, KREA_2_TURBO_ID};
+pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use transformer::Krea2Transformer;
