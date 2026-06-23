@@ -1,0 +1,20 @@
+[package]
+name = "mlx-gen-krea"
+version = "0.0.0"
+edition = "2021"
+description = "Krea 2 (Turbo T2I inference / Raw LoRA-training base) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "krea-2", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry
+# (`model.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when the worker
+# force-links this crate.
+inventory = { workspace = true }
+# Parse the diffusers `transformer/config.json` + `model_index.json` (architecture + quant manifest).
+serde_json = "1"
