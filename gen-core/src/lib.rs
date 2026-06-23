@@ -21,6 +21,7 @@ pub mod media;
 pub mod registry;
 pub mod runtime;
 pub mod sampling;
+pub mod text_embed;
 pub mod textllm;
 pub mod tiling;
 pub mod tokenizer;
@@ -43,8 +44,9 @@ pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
 pub use registry::{
-    load, load_captioner, load_image_embedder, load_transform, CaptionerRegistration,
-    ImageEmbedderRegistration, ModelRegistration, TransformRegistration,
+    load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
+    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, TextEmbedderRegistration,
+    TransformRegistration,
 };
 pub use registry::{load_textllm, TextLlmRegistration};
 pub use registry::{load_trainer, TrainerRegistration};
@@ -52,6 +54,7 @@ pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
     WeightsSource,
 };
+pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use textllm::{
     TextLlm, TextLlmCapabilities, TextLlmConstraint, TextLlmDescriptor, TextLlmFinishReason,
     TextLlmOutput, TextLlmRequest, TextLlmSampling,

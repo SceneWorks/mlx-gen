@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use mlx_gen::gen_core::runtime::{LoadSpec, WeightsSource};
 use mlx_gen::media::Image;
-use mlx_gen_clip::load;
+use mlx_gen_clip::{load, load_text};
 
 fn snapshot() -> PathBuf {
     PathBuf::from(
@@ -72,5 +72,41 @@ fn embeds_real_images_with_sane_cosine_geometry() {
     println!(
         "clip ok: dim={}, red·red={self_cos:.5}, red·blue={cross_cos:.5}",
         red.len()
+    );
+}
+
+#[test]
+#[ignore = "loads openai/clip-vit-large-patch14 (~1.7GB); set CLIP_VIT_L_SNAPSHOT"]
+fn text_and_image_embeds_rank_matching_colours_higher() {
+    let spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+    let image_embedder = load(&spec).expect("load clip image embedder");
+    let text_embedder = load_text(&spec).expect("load clip text embedder");
+
+    let red = image_embedder.embed(&solid(64, 64, [220, 30, 30])).unwrap();
+    let blue = image_embedder.embed(&solid(64, 64, [30, 30, 220])).unwrap();
+    let red_text = text_embedder.embed_text("a red square").unwrap();
+    let blue_text = text_embedder.embed_text("a blue square").unwrap();
+
+    assert_eq!(red_text.len(), 768);
+    assert_eq!(blue_text.len(), 768);
+    assert!(red_text.iter().all(|v| v.is_finite()) && red_text.iter().any(|&v| v != 0.0));
+    assert!(blue_text.iter().all(|v| v.is_finite()) && blue_text.iter().any(|&v| v != 0.0));
+
+    let red_text_red = cosine(&red_text, &red);
+    let red_text_blue = cosine(&red_text, &blue);
+    let blue_text_blue = cosine(&blue_text, &blue);
+    let blue_text_red = cosine(&blue_text, &red);
+
+    assert!(
+        red_text_red > red_text_blue,
+        "red text should rank red image higher ({red_text_red:.5} <= {red_text_blue:.5})"
+    );
+    assert!(
+        blue_text_blue > blue_text_red,
+        "blue text should rank blue image higher ({blue_text_blue:.5} <= {blue_text_red:.5})"
+    );
+    println!(
+        "clip text/image ok: red_text·red={red_text_red:.5}, red_text·blue={red_text_blue:.5}, \
+         blue_text·blue={blue_text_blue:.5}, blue_text·red={blue_text_red:.5}"
     );
 }

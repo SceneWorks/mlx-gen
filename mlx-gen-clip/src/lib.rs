@@ -16,19 +16,29 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::matmul;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::registry::ImageEmbedderRegistration;
+use mlx_gen::gen_core::registry::{ImageEmbedderRegistration, TextEmbedderRegistration};
 use mlx_gen::gen_core::runtime::{LoadSpec, WeightsSource};
-use mlx_gen::gen_core::{ImageEmbedder, ImageEmbedderDescriptor, Result as GenResult};
+use mlx_gen::gen_core::{
+    ImageEmbedder, ImageEmbedderDescriptor, Result as GenResult, TextEmbedder,
+    TextEmbedderDescriptor,
+};
 use mlx_gen::media::Image;
+use mlx_gen::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
-use mlx_gen_sdxl::{preprocess_clip_image, ClipVisionEncoder, VisionConfig};
+use mlx_gen_sdxl::{
+    preprocess_clip_image, ClipTextConfig, ClipTextEncoder, ClipVisionEncoder, VisionConfig,
+};
 
 /// CLIP LN epsilon (matches the body + diffusers `layer_norm_eps`).
 const LN_EPS: f32 = 1e-5;
 
 /// The provider id used to load this embedder (`load_image_embedder("clip_vit_l14", …)`).
 pub const MODEL_ID: &str = "clip_vit_l14";
+/// The provider id used to load the matching CLIP text embedder.
+pub const TEXT_MODEL_ID: &str = "clip_vit_l14_text";
+const CLIP_MAX_LENGTH: usize = 77;
+const CLIP_EOS_ID: i32 = 49407;
 
 static DESCRIPTOR: ImageEmbedderDescriptor = ImageEmbedderDescriptor {
     id: MODEL_ID,
@@ -39,9 +49,23 @@ static DESCRIPTOR: ImageEmbedderDescriptor = ImageEmbedderDescriptor {
     mac_only: true,
 };
 
+static TEXT_DESCRIPTOR: TextEmbedderDescriptor = TextEmbedderDescriptor {
+    id: TEXT_MODEL_ID,
+    family: "text-embed",
+    backend: "mlx",
+    embedding_dim: 768,
+    space: "clip-vit-l14",
+    mac_only: true,
+};
+
 /// The descriptor for the registry (constructible without loading weights).
 pub fn descriptor() -> ImageEmbedderDescriptor {
     DESCRIPTOR.clone()
+}
+
+/// The text-embedder descriptor for the registry (constructible without loading weights).
+pub fn text_descriptor() -> TextEmbedderDescriptor {
+    TEXT_DESCRIPTOR.clone()
 }
 
 /// CLIP ViT-L/14 image embedder: the `mlx-gen-sdxl` ViT body + the `CLIPVisionModelWithProjection`
@@ -108,6 +132,66 @@ impl ImageEmbedder for ClipImageEmbedder {
     }
 }
 
+/// CLIP ViT-L/14 text embedder: the `mlx-gen-sdxl` CLIP-L text body + the
+/// `CLIPTextModelWithProjection` pooled `text_projection` head.
+pub struct ClipTextEmbedder {
+    encoder: ClipTextEncoder,
+    tokenizer: TextTokenizer,
+}
+
+impl ClipTextEmbedder {
+    /// Load from an `openai/clip-vit-large-patch14` checkpoint dir: `text_model.*`,
+    /// top-level `text_projection.weight`, and `tokenizer.json`.
+    pub fn from_weights_dir(root: &std::path::Path) -> Result<Self> {
+        let weights = Weights::from_dir(root)?;
+        let tokenizer = TextTokenizer::from_file(
+            root.join("tokenizer.json"),
+            TokenizerConfig {
+                max_length: CLIP_MAX_LENGTH,
+                pad_token_id: CLIP_EOS_ID,
+                chat_template: ChatTemplate::None,
+                pad_to_max_length: true,
+            },
+        )?;
+        Ok(Self {
+            encoder: ClipTextEncoder::from_weights(&weights, "text_model", &clip_text_config())?,
+            tokenizer,
+        })
+    }
+
+    /// `text` → projected CLIP `text_embeds` `[1, 768]` as f32. The SDXL encoder's projected path
+    /// applies `text_projection.weight` to the pooled EOS hidden state.
+    pub fn text_embeds(&self, text: &str) -> Result<Array> {
+        let tokens = self.tokenizer.tokenize(text)?;
+        let (input_ids, _) = mlx_gen::tokenizer::to_arrays(&tokens);
+        let output = self.encoder.forward(&input_ids)?;
+        Ok(output.pooled.as_dtype(Dtype::Float32)?)
+    }
+
+    fn embed_text_internal(&self, text: &str) -> Result<Vec<f32>> {
+        let embeds = self.text_embeds(text)?; // [1, 768]
+        let flat = embeds.reshape(&[-1])?;
+        flat.eval()?;
+        Ok(flat.as_slice::<f32>().to_vec())
+    }
+}
+
+impl TextEmbedder for ClipTextEmbedder {
+    fn descriptor(&self) -> &TextEmbedderDescriptor {
+        &TEXT_DESCRIPTOR
+    }
+
+    fn embed_text(&self, text: &str) -> GenResult<Vec<f32>> {
+        self.embed_text_internal(text).map_err(Into::into)
+    }
+}
+
+fn clip_text_config() -> ClipTextConfig {
+    let mut cfg = ClipTextConfig::sdxl_te1();
+    cfg.projection_dim = Some(768);
+    cfg
+}
+
 /// Load the embedder from a weights directory (the `openai/clip-vit-large-patch14` snapshot).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
     let root = match &spec.weights {
@@ -122,13 +206,34 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
     Ok(Box::new(ClipImageEmbedder::from_weights(&weights)?))
 }
 
+/// Load the text embedder from a weights directory (the `openai/clip-vit-large-patch14` snapshot).
+pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
+    let root = match &spec.weights {
+        WeightsSource::Dir(root) => root,
+        _ => {
+            return Err(Error::Msg(
+                "clip_vit_l14_text requires a weights directory (WeightsSource::Dir)".into(),
+            ))
+        }
+    };
+    Ok(Box::new(ClipTextEmbedder::from_weights_dir(root)?))
+}
+
 /// Registry adapter: bridge the crate's rich `Result` into the backend-neutral `gen_core::Result`.
 fn load_registered(spec: &LoadSpec) -> GenResult<Box<dyn ImageEmbedder>> {
     load(spec).map_err(Into::into)
 }
 
+fn load_text_registered(spec: &LoadSpec) -> GenResult<Box<dyn TextEmbedder>> {
+    load_text(spec).map_err(Into::into)
+}
+
 inventory::submit! {
     ImageEmbedderRegistration { descriptor, load: load_registered }
+}
+
+inventory::submit! {
+    TextEmbedderRegistration { descriptor: text_descriptor, load: load_text_registered }
 }
 
 #[cfg(test)]
@@ -166,6 +271,29 @@ mod tests {
         assert!(
             !format!("{err}").contains("no image embedder registered"),
             "embedder should be discovered by id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn text_descriptor_advertises_clip_vit_l14_joint_space() {
+        let d = text_descriptor();
+        assert_eq!(d.id, "clip_vit_l14_text");
+        assert_eq!(d.family, "text-embed");
+        assert_eq!(d.embedding_dim, 768);
+        assert_eq!(d.space, "clip-vit-l14");
+        assert_eq!(d.backend, "mlx");
+        assert!(d.mac_only);
+    }
+
+    #[test]
+    fn text_registered_and_discoverable_by_id() {
+        let spec = LoadSpec::new(WeightsSource::File(std::path::PathBuf::from("x")));
+        let err = mlx_gen::gen_core::load_text_embedder(TEXT_MODEL_ID, &spec)
+            .err()
+            .expect("bogus weights should fail to load");
+        assert!(
+            !format!("{err}").contains("no text embedder registered"),
+            "text embedder should be discovered by id, got: {err}"
         );
     }
 }

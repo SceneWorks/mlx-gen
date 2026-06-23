@@ -10,6 +10,7 @@ use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{Generator, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::runtime::LoadSpec;
+use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::textllm::{TextLlm, TextLlmDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
@@ -59,6 +60,15 @@ pub struct ImageEmbedderRegistration {
 
 inventory::collect!(ImageEmbedderRegistration);
 
+/// A text-embedder provider's registration (parallel to [`ImageEmbedderRegistration`]). Used by the
+/// worker's `dataset_analysis` job for caption/image alignment in CLIP's joint space.
+pub struct TextEmbedderRegistration {
+    pub descriptor: fn() -> TextEmbedderDescriptor,
+    pub load: fn(&LoadSpec) -> Result<Box<dyn TextEmbedder>>,
+}
+
+inventory::collect!(TextEmbedderRegistration);
+
 /// A text-LLM provider's registration (parallel to [`ModelRegistration`]).
 pub struct TextLlmRegistration {
     pub descriptor: fn() -> TextLlmDescriptor,
@@ -90,6 +100,11 @@ pub fn captioners() -> impl Iterator<Item = &'static CaptionerRegistration> {
 /// All registered image embedders (one per linked provider crate).
 pub fn image_embedders() -> impl Iterator<Item = &'static ImageEmbedderRegistration> {
     inventory::iter::<ImageEmbedderRegistration>.into_iter()
+}
+
+/// All registered text embedders (one per linked provider crate).
+pub fn text_embedders() -> impl Iterator<Item = &'static TextEmbedderRegistration> {
+    inventory::iter::<TextEmbedderRegistration>.into_iter()
 }
 
 /// All registered text-LLM providers (one per linked provider crate that supports text generation).
@@ -165,6 +180,19 @@ pub fn load_image_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn ImageEmb
     (reg.load)(spec)
 }
 
+/// Load a text embedder by id (e.g. `"clip_vit_l14_text"`).
+pub fn load_text_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
+    let mut matches = text_embedders().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
+        .ok_or_else(|| Error::Msg(format!("no text embedder registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate text embedder id '{id}' registered (first-wins shadows the rest)"
+    );
+    (reg.load)(spec)
+}
+
 /// Load a text-LLM provider by id (e.g. `"prompt_refine"`).
 pub fn load_textllm(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextLlm>> {
     let mut matches = textllms().filter(|r| (r.descriptor)().id == id);
@@ -189,6 +217,7 @@ mod tests {
     };
     use crate::media::Image;
     use crate::runtime::{Progress, WeightsSource};
+    use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
     use crate::textllm::{
         TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest,
     };
@@ -326,6 +355,68 @@ mod tests {
     #[test]
     fn dummy_captioner_appears_in_iteration() {
         assert!(captioners().any(|r| (r.descriptor)().id == "dummy_test_captioner"));
+    }
+
+    struct DummyTextEmbedder {
+        desc: TextEmbedderDescriptor,
+    }
+
+    impl TextEmbedder for DummyTextEmbedder {
+        fn descriptor(&self) -> &TextEmbedderDescriptor {
+            &self.desc
+        }
+
+        fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+            Ok(vec![text.len() as f32, 1.0])
+        }
+    }
+
+    fn dummy_text_embedder_descriptor() -> TextEmbedderDescriptor {
+        TextEmbedderDescriptor {
+            id: "dummy_test_text_embedder",
+            family: "test",
+            backend: "mlx",
+            embedding_dim: 2,
+            space: "test-space",
+            mac_only: true,
+        }
+    }
+
+    fn dummy_text_embedder_load(_spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
+        Ok(Box::new(DummyTextEmbedder {
+            desc: dummy_text_embedder_descriptor(),
+        }))
+    }
+
+    inventory::submit! {
+        TextEmbedderRegistration {
+            descriptor: dummy_text_embedder_descriptor,
+            load: dummy_text_embedder_load,
+        }
+    }
+
+    #[test]
+    fn text_embedder_registry_resolves_by_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let e = load_text_embedder("dummy_test_text_embedder", &spec)
+            .expect("dummy text embedder is registered");
+        assert_eq!(e.descriptor().id, "dummy_test_text_embedder");
+        assert_eq!(e.embed_text("clip").unwrap(), vec![4.0, 1.0]);
+        assert_eq!(
+            e.embed_text_batch(&["a", "abcd"]).unwrap(),
+            vec![vec![1.0, 1.0], vec![4.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn unknown_text_embedder_id_errors() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(load_text_embedder("no_such_text_embedder", &spec).is_err());
+    }
+
+    #[test]
+    fn dummy_text_embedder_appears_in_iteration() {
+        assert!(text_embedders().any(|r| (r.descriptor)().id == "dummy_test_text_embedder"));
     }
 
     struct DummyTextLlm {
