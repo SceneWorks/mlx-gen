@@ -20,7 +20,9 @@
 pub mod block;
 pub mod rope;
 
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::ops::{concatenate_axis, cos, divide, exp, multiply, sin, split, sum};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::array::scalar;
@@ -31,7 +33,8 @@ use mlx_gen::Result;
 use crate::config::Krea2Config;
 use crate::quant::lin;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
+use mlx_gen::train::lora::LoraParams;
 use rope::RopeTables;
 
 /// The Krea 2 single-stream DiT.
@@ -130,6 +133,118 @@ impl Krea2Transformer {
         context: &Array,
         mask: Option<&Array>,
     ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, context, mask)?;
+        let mut combined = j.combined.clone();
+        for blk in &self.blocks {
+            combined = blk.forward(&combined, &j.tvec, &j.rcos, &j.rsin)?;
+        }
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// Velocity prediction with **per-single-stream-block gradient checkpointing** (sc-7577, training
+    /// only). Numerically identical to [`forward`](Self::forward), but each of the `num_layers` blocks
+    /// runs inside an `mlx::checkpoint` segment whose explicit inputs are the joint hidden state plus
+    /// that block's trainable LoRA factors — so the backward recomputes the block instead of retaining
+    /// its activations (bounding the first-step working set), while gradients still flow to the LoRA
+    /// params. The pre-block embedders / text-fusion and the final layer run normally (any LoRA on them
+    /// is installed on `self` by the caller and trains through ordinary autograd).
+    ///
+    /// `params` is the live trainable factor map; `block_local_targets[i]` lists the adapter-routable
+    /// LOCAL paths (e.g. `"attn.to_q"`) trained on single-stream block `i`, in the order their factors
+    /// are threaded as checkpoint inputs. Blocks with no trained targets still run checkpointed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_blocks_checkpointed(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+        params: &LoraParams,
+        block_local_targets: &[Vec<String>],
+        alpha: f32,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, context, mask)?;
+        let mut combined = j.combined.clone();
+        for (i, blk) in self.blocks.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
+            // recompute runs after this frame is gone. `set_adapters` inside the closure replaces
+            // whatever the clone carried with the explicit-input LoRA, so any caller-installed block
+            // adapters are moot here.
+            let mut b = blk.clone();
+            let locals = block_local_targets.get(i).cloned().unwrap_or_default();
+            let tvec = j.tvec.clone();
+            let rcos = j.rcos.clone();
+            let rsin = j.rsin.clone();
+
+            // Threaded inputs: [hidden, a_0, b_0, a_1, b_1, …] (raw `[r,in]`/`[out,r]` factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(1 + 2 * locals.len());
+            inputs.push(combined.clone());
+            for local in &locals {
+                let ak = format!("transformer_blocks.{i}.{local}.lora_a");
+                let bk = format!("transformer_blocks.{i}.{local}.lora_b");
+                inputs.push(
+                    params
+                        .get(ak.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {ak}")))?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(bk.as_str())
+                        .ok_or_else(|| mlx_gen::Error::Msg(format!("LoRA param missing: {bk}")))?
+                        .clone(),
+                );
+            }
+
+            let alpha_c = alpha;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
+                // scale = 1)` `install_training_lora` applies, so the checkpointed block forward is
+                // numerically identical to the installed-adapter path and grads route to `inp`.
+                // Dtype-following on the hidden state (bf16 training): the f32 factors join the bf16
+                // stream so the adapted Linear stays bf16; no-op in f32. Grads flow back through astype.
+                let dt = inp[0].dtype();
+                for (k, local) in locals.iter().enumerate() {
+                    let a = inp[1 + 2 * k].t().as_dtype(dt)?; // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let bb = inp[2 + 2 * k]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?
+                        .as_dtype(dt)?;
+                    let segs: Vec<&str> = local.split('.').collect();
+                    b.adaptable_mut(&segs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!("checkpoint LoRA target not found: {local}"))
+                        })?
+                        .set_adapters(vec![Adapter::Lora {
+                            a,
+                            b: bb,
+                            scale: 1.0,
+                        }]);
+                }
+                let out = b
+                    .forward(&inp[0], &tvec, &rcos, &rsin)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![out])
+            });
+            combined = seg(&inputs)?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("krea: checkpoint block produced no output".into())
+            })?;
+        }
+        self.finalize(&combined, &j.t, &j)
+    }
+
+    /// The step-invariant + value-dependent embed/fuse preamble shared by [`forward`](Self::forward)
+    /// and [`forward_with_blocks_checkpointed`](Self::forward_with_blocks_checkpointed): image patch
+    /// embed, timestep + shared modulation, text-fusion + text-in projection, the joint `[ctx; img]`
+    /// sequence, and the joint RoPE tables. Returns everything the block stack + final layer consume.
+    fn joint_inputs(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        context: &Array,
+        mask: Option<&Array>,
+    ) -> Result<JointInputs> {
         let cfg = &self.cfg;
         let p = cfg.patch_size as i32;
         let dt = self.dtype;
@@ -164,8 +279,8 @@ impl Krea2Transformer {
             .txt_in_l2
             .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
 
-        // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
-        let mut combined = concatenate_axis(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
+        // Fuse to the joint sequence and build the joint RoPE.
+        let combined = concatenate_axis(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
         let rope = RopeTables::build_t2i(
             cap_len as usize,
             ht as usize,
@@ -174,14 +289,75 @@ impl Krea2Transformer {
             cfg.rope_theta as f64,
         );
         let (rcos, rsin) = rope.joint();
-        for blk in &self.blocks {
-            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
-        }
+        Ok(JointInputs {
+            combined,
+            t,
+            tvec,
+            rcos,
+            rsin,
+            cap_len,
+            img_len,
+            ht,
+            wt,
+            latent_ch,
+            p,
+        })
+    }
 
-        // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
-        let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
-        let img_out = slice_axis1(&out, cap_len, cap_len + img_len)?;
-        unpatchify(&img_out, ht, wt, p, latent_ch)
+    /// Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
+    fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
+        let out = self.final_layer(combined, t)?; // [b, cap+img_len, in_channels]
+        let img_out = slice_axis1(&out, j.cap_len, j.cap_len + j.img_len)?;
+        unpatchify(&img_out, j.ht, j.wt, j.p, j.latent_ch)
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on every single-stream + text-fusion block (sc-7577,
+    /// training only). Numerically identical to the retained backward; the trainer turns it OFF when
+    /// whole-block checkpointing is on (the block recompute already covers attention). Inference never
+    /// calls it (attention stays the un-checkpointed fused SDPA).
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+        self.text_fusion.set_sdpa_checkpoint(on);
+    }
+
+    /// The DiT's current compute dtype (probed from `img_in.bias`, set at load from the snapshot).
+    pub fn compute_dtype(&self) -> Dtype {
+        self.dtype
+    }
+
+    /// Number of single-stream `transformer_blocks` (`num_layers`) — the trainer's gradient-checkpoint
+    /// bookkeeping indexes per block.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Cast the whole DiT to the training compute `dtype` in place (sc-7577). The `RmsScale` norms
+    /// always reduce in f32 (kept precise); everything else — embedders, modulation, text-fusion,
+    /// single-stream blocks, final layer, scale-shift tables — is cast. Destructive for a narrowing
+    /// cast (f32→bf16); reload for f32. Inference never calls this.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for l in [
+            &mut self.img_in,
+            &mut self.time_embed_l1,
+            &mut self.time_embed_l2,
+            &mut self.time_mod_proj,
+            &mut self.txt_in_l1,
+            &mut self.txt_in_l2,
+            &mut self.final_linear,
+        ] {
+            l.cast_weights(dtype)?;
+        }
+        self.text_fusion.cast_weights(dtype)?;
+        for b in &mut self.blocks {
+            b.cast_weights(dtype)?;
+        }
+        if self.final_sstable.dtype() != dtype {
+            self.final_sstable = self.final_sstable.as_dtype(dtype)?;
+        }
+        self.dtype = dtype;
+        Ok(())
     }
 
     /// Reference `LastLayer`: `SimpleModulation(t) = t + scale_shift_table` → `(scale, shift)`;
@@ -209,6 +385,62 @@ impl Krea2Transformer {
             b.quantize(bits)?;
         }
         Ok(())
+    }
+}
+
+/// The embed/fuse preamble outputs shared by the dense and checkpointed forwards: the joint hidden
+/// state, the timestep embedding `t`, the shared modulation `tvec`, the joint RoPE tables, and the
+/// patchify/slice geometry the final layer needs.
+struct JointInputs {
+    combined: Array,
+    t: Array,
+    tvec: Array,
+    rcos: Array,
+    rsin: Array,
+    cap_len: i32,
+    img_len: i32,
+    ht: i32,
+    wt: i32,
+    latent_ch: i32,
+    p: i32,
+}
+
+/// LoRA/LoKr target routing for the Krea single-stream DiT (sc-7577 trainer / sc-7578 inference apply):
+/// the per-block attention + FFN of the `transformer_blocks` and the `text_fusion` aggregator, plus the
+/// global projections (`img_in`, `txt_in.linear_{1,2}`, `time_embed.linear_{1,2}`, `time_mod_proj`,
+/// `final_layer.linear`). Adapter files address modules by their diffusers (trained-file) path; this
+/// routes those paths to the module tree. The default training target set is the single-stream block
+/// attention (`to_q`/`to_k`/`to_v`/`to_out.0`).
+impl AdaptableHost for Krea2Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["text_fusion", rest @ ..] => self.text_fusion.adaptable_mut(rest),
+            ["img_in"] => Some(&mut self.img_in),
+            ["txt_in", "linear_1"] => Some(&mut self.txt_in_l1),
+            ["txt_in", "linear_2"] => Some(&mut self.txt_in_l2),
+            ["time_embed", "linear_1"] => Some(&mut self.time_embed_l1),
+            ["time_embed", "linear_2"] => Some(&mut self.time_embed_l2),
+            ["time_mod_proj"] => Some(&mut self.time_mod_proj),
+            ["final_layer", "linear"] => Some(&mut self.final_linear),
+            _ => None,
+        }
+    }
+
+    /// Enumerate the per-block adapter targets (single-stream `transformer_blocks` + the `text_fusion`
+    /// aggregator). The global projections stay reachable via [`adaptable_mut`](Self::adaptable_mut)
+    /// but are excluded here — they are not part of the default training surface, and the suffix-match
+    /// the trainer applies (`to_q`/…) would not select them anyway.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), b));
+        }
+        out.extend(prefixed_paths("text_fusion", &self.text_fusion));
+        out
     }
 }
 

@@ -7,11 +7,13 @@
 //! norms. Attention adds a `to_gate` projection: the post-attention output is multiplied by
 //! `sigmoid(to_gate(x))` before `to_out`. Block gates (`pregate`/`postgate`) are raw (no activation).
 
+use mlx_rs::error::Result as MlxResult;
 use mlx_rs::fast::{rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{add, multiply, sigmoid, split};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear};
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
@@ -29,6 +31,7 @@ fn plus1(a: &Array) -> Result<Array> {
 /// Reference `RMSNorm`: `F.rms_norm(x.float(), weight = scale.float() + 1.0)` then cast back. The
 /// stored param is the raw `scale` (centered at 0); we pre-fold the `+1` into an f32 weight at load and
 /// always reduce in f32 (the reference upcasts), preserving the input dtype on the way out.
+#[derive(Clone)]
 pub struct RmsScale {
     weight: Array, // f32, = scale + 1
     eps: f32,
@@ -51,6 +54,7 @@ impl RmsScale {
 }
 
 // ── Sigmoid-gated GQA attention (reference `Attention`) ─────────────────────────────────────
+#[derive(Clone)]
 pub struct GatedAttention {
     q: AdaptableLinear,
     k: AdaptableLinear,
@@ -63,6 +67,14 @@ pub struct GatedAttention {
     kv_heads: i32,
     head_dim: i32,
     scale: f32,
+    /// SDPA-segment gradient checkpointing (sc-7577, training only; the z-image / Lens pattern). When
+    /// `true`, the fused `scaled_dot_product_attention` runs inside an `mlx::checkpoint` so its backward
+    /// recomputes the attention rather than retaining the `[heads, s, s]` probability matrix (the
+    /// dominant seq² term; MLX decomposes the fused SDPA to naive attention for the backward).
+    /// Numerically identical; off in every inference path (default `false`), set by the trainer via
+    /// [`Self::set_sdpa_checkpoint`] — which turns it OFF when whole-block checkpointing already covers
+    /// the recompute.
+    sdpa_checkpoint: bool,
 }
 
 impl GatedAttention {
@@ -86,7 +98,28 @@ impl GatedAttention {
             kv_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
+            sdpa_checkpoint: false,
         })
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing (sc-7577, training only). See the field docs.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.sdpa_checkpoint = on;
+    }
+
+    /// Cast the projection weights to the training compute `dtype` in place (sc-7577). The `RmsScale`
+    /// q/k norms stay f32 (they always reduce in f32). Inference never calls this.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for p in [
+            &mut self.q,
+            &mut self.k,
+            &mut self.v,
+            &mut self.gate,
+            &mut self.o,
+        ] {
+            p.cast_weights(dtype)?;
+        }
+        Ok(())
     }
 
     /// `x`: `[b, s, hidden]`. `rope`: `Some((cos, sin))` (`[1, s, head_dim/2]`) for the single-stream
@@ -122,10 +155,25 @@ impl GatedAttention {
         let k = repeat_kv(&k, groups)?;
         let v = repeat_kv(&v, groups)?;
 
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3])?; // [b, heads, s, hd]
         let k = k.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?;
+        // SDPA — optionally inside an `mlx::checkpoint` segment (training memory hardening): the
+        // backward recomputes the attention rather than retaining the seq² probability matrix.
+        // Numerically identical to the retained path; off in inference.
+        let o = if self.sdpa_checkpoint {
+            let scale = self.scale;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                Ok(vec![scaled_dot_product_attention(
+                    &inp[0], &inp[1], &inp[2], scale, None, None,
+                )?])
+            });
+            seg(&[q, k, v])?.into_iter().next().ok_or_else(|| {
+                mlx_gen::Error::Msg("krea: SDPA checkpoint produced no output".into())
+            })?
+        } else {
+            scaled_dot_product_attention(&q, &k, &v, self.scale, None, None)?
+        };
         let o = o
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[b, s, self.heads * self.head_dim])?;
@@ -149,7 +197,30 @@ impl GatedAttention {
     }
 }
 
+/// LoRA/LoKr target routing for the gated attention (sc-7577 / sc-7578): the diffusers leaf names
+/// `to_q`/`to_k`/`to_v`/`to_gate`/`to_out.0` (the trained-file naming an applied Krea LoRA uses).
+impl AdaptableHost for GatedAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.q),
+            ["to_k"] => Some(&mut self.k),
+            ["to_v"] => Some(&mut self.v),
+            ["to_gate"] => Some(&mut self.gate),
+            ["to_out", "0"] => Some(&mut self.o),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["to_q", "to_k", "to_v", "to_gate", "to_out.0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
+
 // ── SwiGLU feed-forward (reference `SwiGLU`: `down(silu(gate(x)) * up(x))`) ──────────────────
+#[derive(Clone)]
 pub struct SwiGlu {
     gate: AdaptableLinear,
     up: AdaptableLinear,
@@ -175,6 +246,33 @@ impl SwiGlu {
         self.up.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         self.down.quantize(bits, Some(crate::quant::GROUP_SIZE))?;
         Ok(())
+    }
+
+    /// Cast the projection weights to the training compute `dtype` in place (sc-7577).
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.gate.cast_weights(dtype)?;
+        self.up.cast_weights(dtype)?;
+        self.down.cast_weights(dtype)?;
+        Ok(())
+    }
+}
+
+/// LoRA/LoKr target routing for the SwiGLU FFN (sc-7577 / sc-7578): leaves `gate`/`up`/`down`.
+impl AdaptableHost for SwiGlu {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["gate"] => Some(&mut self.gate),
+            ["up"] => Some(&mut self.up),
+            ["down"] => Some(&mut self.down),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["gate", "up", "down"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
@@ -220,6 +318,32 @@ impl TextFusionBlock {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
     }
+
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn.set_sdpa_checkpoint(on);
+    }
+
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.attn.cast_weights(dtype)?;
+        self.mlp.cast_weights(dtype)
+    }
+}
+
+/// LoRA target routing for a text-fusion block: `attn.{…}` / `ff.{…}` (sc-7577 / sc-7578).
+impl AdaptableHost for TextFusionBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.mlp.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("ff", &self.mlp));
+        out
+    }
 }
 
 // ── DoubleSharedModulation single-stream block (reference `SingleStreamBlock`) ──────────────
@@ -227,6 +351,7 @@ impl TextFusionBlock {
 /// postshift, postgate)`; then
 /// `x += pregate · attn((1+prescale)·prenorm(x) + preshift)` and
 /// `x += postgate · mlp((1+postscale)·postnorm(x) + postshift)`. Gates are raw (no activation).
+#[derive(Clone)]
 pub struct SingleStreamBlock {
     scale_shift_table: Array, // [1, 1, 6·hidden]
     prenorm: RmsScale,
@@ -292,6 +417,36 @@ impl SingleStreamBlock {
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
         self.attn.quantize(bits)?;
         self.mlp.quantize(bits)
+    }
+
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn.set_sdpa_checkpoint(on);
+    }
+
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        if self.scale_shift_table.dtype() != dtype {
+            self.scale_shift_table = self.scale_shift_table.as_dtype(dtype)?;
+        }
+        self.attn.cast_weights(dtype)?;
+        self.mlp.cast_weights(dtype)
+    }
+}
+
+/// LoRA target routing for a single-stream block: `attn.{…}` / `ff.{…}` (sc-7577 / sc-7578) — the
+/// trainable attention + FFN projections. The `scale_shift_table` / norms are not adapter targets.
+impl AdaptableHost for SingleStreamBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.mlp.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        out.extend(prefixed_paths("ff", &self.mlp));
+        out
     }
 }
 
@@ -372,5 +527,55 @@ impl TextFusionTransformer {
             b.quantize(bits)?;
         }
         Ok(())
+    }
+
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.layerwise {
+            b.set_sdpa_checkpoint(on);
+        }
+        for b in &mut self.refiner {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for b in &mut self.layerwise {
+            b.cast_weights(dtype)?;
+        }
+        self.projector.cast_weights(dtype)?;
+        for b in &mut self.refiner {
+            b.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+}
+
+/// LoRA target routing for the text-fusion aggregator (sc-7577 / sc-7578): the per-block attention +
+/// FFN of the `layerwise_blocks` / `refiner_blocks`, plus the `projector` collapse linear.
+impl AdaptableHost for TextFusionTransformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["layerwise_blocks", n, rest @ ..] => self
+                .layerwise
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["refiner_blocks", n, rest @ ..] => self
+                .refiner
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["projector"] => Some(&mut self.projector),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.layerwise.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("layerwise_blocks.{i}"), b));
+        }
+        for (i, b) in self.refiner.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("refiner_blocks.{i}"), b));
+        }
+        out
     }
 }

@@ -41,6 +41,7 @@ pub mod pipeline;
 mod quant;
 pub mod schedule;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
@@ -52,5 +53,6 @@ pub use schedule::{
     dynamic_sampler, krea_sigmas, turbo_sampler, turbo_sigmas, TURBO_MU, TURBO_STEPS,
 };
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
+pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae};
