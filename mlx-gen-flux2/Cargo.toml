@@ -14,6 +14,11 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 inventory = { workspace = true }
+# The shared on-device decode primitives (KV cache + sampler). The caption-upsampling decode loop
+# (sc-6030) consumes mlx-llm's `ContiguousKvCache` + `sample` instead of a hand-rolled copy (sc-7160).
+# Pin must equal every other mlx-llm pin in the worker graph (mlx-gen-joycaption + the worker) so
+# cargo unifies ONE mlx-llm — one `Array`, one `core-llm`. See mlx-gen-joycaption/Cargo.toml.
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "29e382bd6a3800accf0bac5daf5d8eb61e1a2adf" }
 # Read safetensors JSON headers (keys + shapes only) for the single-file→diffusers converter's
 # base-validation guard (sc-3136). Already in the workspace lock tree (via `tokenizers`).
 serde_json = "1"

@@ -12,9 +12,10 @@ use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
-use super::generate::Qwen3KvCache;
+use mlx_llm::primitives::{ContiguousKvCache, KvCache};
+
 use super::{join, lin};
 use crate::config::Flux2Quant;
 
@@ -140,7 +141,7 @@ impl Qwen3Attention {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        cache: &mut Qwen3KvCache,
+        cache: &mut ContiguousKvCache,
         layer_idx: usize,
     ) -> Result<Array> {
         let sh = x.shape();
@@ -171,7 +172,11 @@ impl Qwen3Attention {
         let q = apply_rope(&q, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
         let k = apply_rope(&k, cos, sin)?.transpose_axes(&[0, 2, 1, 3])?;
         let v = v.transpose_axes(&[0, 2, 1, 3])?;
-        let (k_all, v_all) = cache.append(layer_idx, k, v)?;
+        // Shared growing-concat KV cache (sc-7160). `update` is the persisting append: it concats this
+        // step's K/V onto the layer's prior cache along the sequence axis and returns the full K/V.
+        let (k_all, v_all) = cache
+            .update(layer_idx, &k, &v)
+            .map_err(|e| Error::Msg(e.to_string()))?;
 
         let groups = self.num_heads / self.num_kv_heads;
         let k_all = repeat_kv_cache(&k_all, groups)?;

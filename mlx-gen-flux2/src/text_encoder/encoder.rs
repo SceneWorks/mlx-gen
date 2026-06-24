@@ -13,7 +13,9 @@ use mlx_gen::runtime::CancelFlag;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
-use super::generate::{sample_token, Qwen3KvCache, SplitMix64, UpsampleSampling};
+use mlx_llm::primitives::{sample, ContiguousKvCache, SamplingParams, SplitMix64};
+
+use super::generate::UpsampleSampling;
 use super::{join, lin, Qwen3DecoderLayer, TextRope};
 use crate::config::Flux2Quant;
 
@@ -243,7 +245,7 @@ impl Qwen3TextEncoder {
     pub(crate) fn decode_logits_from_embeds(
         &self,
         input_embeds: &Array,
-        cache: &mut Qwen3KvCache,
+        cache: &mut ContiguousKvCache,
         offset: i32,
     ) -> Result<Array> {
         let norm = self.norm.as_ref().ok_or_else(gen_head_missing)?;
@@ -269,7 +271,7 @@ impl Qwen3TextEncoder {
     pub(crate) fn decode_logits(
         &self,
         input_ids: &Array,
-        cache: &mut Qwen3KvCache,
+        cache: &mut ContiguousKvCache,
         offset: i32,
     ) -> Result<Array> {
         let embeds = self.embed(input_ids)?;
@@ -299,9 +301,20 @@ impl Qwen3TextEncoder {
             return Err(gen_head_missing());
         }
         let prompt_len = sh[1];
-        let mut cache = Qwen3KvCache::new(self.layers.len());
+        let mut cache = ContiguousKvCache::new(self.layers.len());
         let mut rng = SplitMix64::new(sampling.seed);
         let mut generated: Vec<i32> = Vec::new();
+
+        // The FLUX.2 caption-upsample reference uses plain temperature/top-p sampling: no top-k, no
+        // repetition penalty. `temperature <= 0` greedy-argmaxes (lowest-index ties), matching the
+        // prior hand-rolled sampler exactly (sc-7160).
+        let params = SamplingParams {
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            top_k: 0,
+            repetition_penalty: 1.0,
+            repetition_context: 0,
+        };
 
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -313,7 +326,8 @@ impl Qwen3TextEncoder {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
-            let next = sample_token(&logits, &sampling, &mut rng)?;
+            let next = sample(&logits, &[], &params, &mut rng, None)
+                .map_err(|e| Error::Msg(e.to_string()))?;
             if next == eos_token {
                 break;
             }

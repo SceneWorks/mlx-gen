@@ -72,7 +72,7 @@ impl Qwen3DecoderLayer {
         x: &Array,
         cos: &Array,
         sin: &Array,
-        cache: &mut super::generate::Qwen3KvCache,
+        cache: &mut mlx_llm::primitives::ContiguousKvCache,
         layer_idx: usize,
     ) -> Result<Array> {
         let normed = rms_norm(x, &self.input_ln, self.eps)?;
