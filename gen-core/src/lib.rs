@@ -22,7 +22,6 @@ pub mod registry;
 pub mod runtime;
 pub mod sampling;
 pub mod text_embed;
-pub mod textllm;
 pub mod tiling;
 pub mod tokenizer;
 pub mod train;
@@ -48,17 +47,12 @@ pub use registry::{
     CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, TextEmbedderRegistration,
     TransformRegistration,
 };
-pub use registry::{load_textllm, TextLlmRegistration};
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
     WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
-pub use textllm::{
-    TextLlm, TextLlmCapabilities, TextLlmConstraint, TextLlmDescriptor, TextLlmFinishReason,
-    TextLlmOutput, TextLlmRequest, TextLlmSampling,
-};
 pub use tiling::{TilingConfig, VaeTiling};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
@@ -67,10 +61,11 @@ pub use tiling::{TilingConfig, VaeTiling};
 // `core_llm::TextLlm` engine (and `core_llm::load_for_model` model-first resolution) through this one
 // path, with no separate core-llm pin. core-llm is itself tensor-free, preserving gen-core's invariant.
 //
-// This re-export is purely ADDITIVE: the legacy `gen_core::TextLlm` contract above stays in place
-// during the cutover so the existing provider crates keep building. As each provider migrates onto
-// `core_llm::TextLlm` (sc-7158 / sc-7404 / sc-7265), the legacy contract is retired — the closing step
-// of sc-7189.
+// `core_llm::TextLlm` is now the SOLE text-LLM contract: the legacy `gen_core::TextLlm` trait + its
+// `load_textllm`/`TextLlmRegistration` registry plumbing were removed in sc-7189 Phase 3 once every
+// provider had migrated (prompt-refine mac sc-7158 / candle sc-7404; JoyCaption sc-7265 / candle
+// sc-7692). All text-LLM serving — including model-first resolution via `core_llm::load_for_model` —
+// goes through this path.
 pub use ::core_llm;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
