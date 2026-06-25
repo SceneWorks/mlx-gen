@@ -6,9 +6,10 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
-    WeightsSource,
+    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
@@ -27,6 +28,11 @@ const DEFAULT_IP_SCALE: f32 = 0.7;
 /// `true_cfg` clamp range for the IP-Adapter dev path (SceneWorks default 4.0).
 const TRUE_CFG_MIN: f32 = 1.0;
 const TRUE_CFG_MAX: f32 = 10.0;
+
+/// PiD backbone (latent-space) tag for FLUX.1 (epic 7840, sc-7846). Resolves to the `flux` 16-ch
+/// student in `mlx_gen_pid::registry`; used only at load time to build the [`PidEngine`]. Shared by
+/// both FLUX.1 variants (dev + schnell) — they share the FLUX.1 VAE latent space.
+pub const PID_BACKBONE: &str = "flux";
 
 pub fn descriptor_schnell() -> ModelDescriptor {
     descriptor_for(FluxVariant::Schnell)
@@ -105,6 +111,15 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
+    // Optional PiD decoder overlay (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a PiD
+    // student, so the final decode can route through `mlx_gen_pid` when `req.use_pid` is set. Loaded
+    // only when the spec carries `pid`; the plain txt2img/IP-Adapter paths are unaffected when absent.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
+
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
@@ -114,6 +129,7 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         transformer: Some(transformer),
         vae: Some(vae),
         ip_adapter,
+        pid,
     })
 }
 
@@ -129,6 +145,10 @@ pub struct Flux1 {
     /// (sc-3623). `Some` only when a `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference`
     /// request errors loudly when this is `None`.
     ip_adapter: Option<(FluxIpImageEncoder, FluxIpAdapter)>,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`, swapping the native FLUX.1
+    /// VAE for a 4× PiD decode at the `run_denoise` decode call site.
+    pid: Option<PidEngine>,
 }
 
 impl Flux1 {
@@ -142,6 +162,7 @@ impl Flux1 {
             transformer: None,
             vae: None,
             ip_adapter: None,
+            pid: None,
         }
     }
 
@@ -359,6 +380,17 @@ impl Flux1 {
         self.validate(req)?;
         let vae = self.vae()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
+        // PiD decode overlay (epic 7840, sc-7846): when `use_pid` is set AND a PiD overlay was loaded,
+        // decode (and 4× super-resolve) the final latent through PiD instead of the native VAE; errors
+        // loudly if `use_pid` was requested without a loaded overlay (no silent VAE fallback). `None` →
+        // the native VAE, the byte-exact default. One decoder is shared across the `count` loop (same
+        // prompt → same caption embeddings); per-image variation comes from the per-seed denoised latent.
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        let decoder: &dyn LatentDecoder = match &pid_decoder {
+            Some(d) => d,
+            None => vae,
+        };
         // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
         // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
         // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
@@ -418,7 +450,7 @@ impl Flux1 {
             )?;
             on_progress(Progress::Decoding);
             let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+            let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
             images.push(decoded_to_image(&decoded)?);
         }
         Ok(GenerationOutput::Images(images))

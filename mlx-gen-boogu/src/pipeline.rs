@@ -16,7 +16,7 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Progress, Result,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, LatentDecoder, Progress, Result,
     TimestepConvention,
 };
 
@@ -179,7 +179,7 @@ impl BooguPipeline {
     /// Generate one RGB image from a text prompt. Convenience wrapper over
     /// [`Self::generate_with_progress`] with no cancellation and a no-op progress sink.
     pub fn generate(&self, prompt: &str, opts: &GenerateOptions) -> Result<Image> {
-        self.generate_with_progress(prompt, opts, &CancelFlag::new(), &mut |_| {})
+        self.generate_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
     }
 
     /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
@@ -194,6 +194,7 @@ impl BooguPipeline {
         &self,
         prompt: &str,
         opts: &GenerateOptions,
+        decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -261,7 +262,7 @@ impl BooguPipeline {
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat)
+        self.decode_latents(&lat, decoder)
     }
 
     /// Generate one RGB image via the **Turbo** DMD student few-step sampler (Boogu-Image-0.1-Turbo).
@@ -272,7 +273,7 @@ impl BooguPipeline {
     /// last) renoise to the next level `x = (1 − sigma_next)·noise + sigma_next·x` with fresh noise.
     /// Same DiT/TE/VAE as Base — only the sampler differs — so load this from a Turbo snapshot.
     pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
-        self.generate_turbo_with_progress(prompt, opts, &CancelFlag::new(), &mut |_| {})
+        self.generate_turbo_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
     }
 
     /// [`Self::generate_turbo`] with [`Progress`] streaming and per-step cooperative cancellation
@@ -281,6 +282,7 @@ impl BooguPipeline {
         &self,
         prompt: &str,
         opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -318,7 +320,7 @@ impl BooguPipeline {
                 },
             )?;
             on_progress(Progress::Decoding);
-            return self.decode_latents(&lat);
+            return self.decode_latents(&lat, decoder);
         }
 
         let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
@@ -356,7 +358,7 @@ impl BooguPipeline {
         }
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat)
+        self.decode_latents(&lat, decoder)
     }
 
     /// Generate one RGB image via the **Edit** path: VAE-encode a reference image into a clean
@@ -390,6 +392,7 @@ impl BooguPipeline {
             references,
             instruction,
             opts,
+            None,
             &CancelFlag::new(),
             &mut |_| {},
         )
@@ -409,6 +412,7 @@ impl BooguPipeline {
             std::slice::from_ref(reference),
             instruction,
             opts,
+            None,
             cancel,
             on_progress,
         )
@@ -425,6 +429,7 @@ impl BooguPipeline {
         references: &[Image],
         instruction: &str,
         opts: &EditOptions,
+        decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -517,7 +522,7 @@ impl BooguPipeline {
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat)
+        self.decode_latents(&lat, decoder)
     }
 
     /// Image-conditioned instruction features for the edit path: preprocess each reference, run the
@@ -581,10 +586,13 @@ impl BooguPipeline {
         Ok(())
     }
 
-    /// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
-    /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed.
-    fn decode_latents(&self, lat: &Array) -> Result<Image> {
-        let decoded = self.vae.decode(lat)?.as_dtype(Dtype::Float32)?; // [1,3,1,H,W]
+    /// VAE-decode (or PiD-decode) a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
+    /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed; PiD
+    /// consumes that same normalized latent and additionally 4× super-resolves. `decoder` is `Some` only
+    /// when the request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else native VAE.
+    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
+        let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
+        let decoded = decoder.decode(lat)?.as_dtype(Dtype::Float32)?; // VAE [1,3,1,H,W]; PiD [1,3,4H,4W]
         decoded_to_image(&decoded)
     }
 

@@ -13,9 +13,10 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
 use crate::pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
 
@@ -26,6 +27,11 @@ pub const BOOGU_IMAGE_ID: &str = "boogu_image";
 pub const BOOGU_IMAGE_TURBO_ID: &str = "boogu_image_turbo";
 /// Registry id for the instruction image-edit variant.
 pub const BOOGU_IMAGE_EDIT_ID: &str = "boogu_image_edit";
+
+/// PiD backbone (latent-space) tag for Boogu (epic 7840, sc-7846). All three Boogu variants use the
+/// FLUX.1 16-ch VAE (the shared `mlx_gen_z_image::vae::Vae`), so they reuse the `flux` PiD student.
+/// Used only at load time to build the [`PidEngine`].
+pub const PID_BACKBONE: &str = "flux";
 
 /// Max images per request (the image-model standard, shared with the other MLX families).
 const MAX_COUNT: u32 = 8;
@@ -135,6 +141,10 @@ pub fn descriptor_edit() -> ModelDescriptor {
 pub struct Boogu {
     descriptor: ModelDescriptor,
     pipeline: BooguPipeline,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid` and threaded into the
+    /// pipeline's decode tail. Shared across all three Boogu variants (FLUX.1 VAE latent space).
+    pid: Option<PidEngine>,
 }
 
 /// Load a Boogu generator from a [`LoadSpec`] under the given `descriptor`. `spec.weights` must be a
@@ -169,9 +179,18 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
     if let Some(q) = spec.quantize {
         pipeline.quantize(q.bits())?;
     }
+    // Optional PiD decoder overlay (epic 7840, sc-7846): Boogu's FLUX.1 16-ch VAE latent space has a
+    // PiD student (the `flux` backbone), so the final decode can route through `mlx_gen_pid` when
+    // `req.use_pid` is set. Loaded only when the spec carries `pid`; native VAE decode otherwise.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(Boogu {
         descriptor,
         pipeline,
+        pid,
     }))
 }
 
@@ -207,6 +226,11 @@ impl Boogu {
         validate_request(&self.descriptor, req)?;
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
+        // PiD decode overlay (epic 7840, sc-7846): resolve once; `Some` only when `use_pid` is set AND a
+        // PiD overlay was loaded (errors loudly if requested without one), else `None` → the native VAE.
+        // Shared across the `count` loop and all three variant paths (same prompt → same caption).
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
         let mut images = Vec::with_capacity(req.count as usize);
 
         if self.descriptor.id == BOOGU_IMAGE_TURBO_ID {
@@ -224,6 +248,7 @@ impl Boogu {
                 let img = self.pipeline.generate_turbo_with_progress(
                     &req.prompt,
                     &opts,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &req.cancel,
                     on_progress,
                 )?;
@@ -253,6 +278,7 @@ impl Boogu {
                     &references,
                     &req.prompt,
                     &opts,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &req.cancel,
                     on_progress,
                 )?;
@@ -274,6 +300,7 @@ impl Boogu {
                 let img = self.pipeline.generate_with_progress(
                     &req.prompt,
                     &opts,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &req.cancel,
                     on_progress,
                 )?;

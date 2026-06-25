@@ -21,15 +21,15 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
     Precision, Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::PidEngine;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
 use crate::control_transformer::QwenControlNet;
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
-    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_pid_decoder,
-    resolve_run_params, PID_BACKBONE,
+    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params,
+    PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;

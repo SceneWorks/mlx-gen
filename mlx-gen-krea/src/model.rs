@@ -15,8 +15,8 @@ use mlx_gen::{
     GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
     Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::PidEngine;
-use mlx_gen_qwen_image::pipeline::{resolve_pid_decoder, PID_BACKBONE};
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 
 use crate::pipeline::{KreaPipeline, TurboOptions};
 

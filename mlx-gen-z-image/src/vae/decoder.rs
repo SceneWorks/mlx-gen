@@ -11,7 +11,7 @@ use super::mid_block::UNetMidBlock;
 use super::up_decoder_block::UpDecoderBlock;
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{Error, LatentDecoder, Result};
 
 /// Per-up-block `(num_resnet_layers, add_upsample)`.
 #[derive(Debug, Clone)]
@@ -182,5 +182,18 @@ impl Vae {
 
     pub fn decoder(&self) -> &Decoder {
         &self.decoder
+    }
+}
+
+/// The native decoder for the Flux1 / Z-Image latent space (the behavior-preserving default of the PiD
+/// decode seam, sc-7844). This `Vae` is reused verbatim by every crate in that latent space — Z-Image,
+/// FLUX.1, Boogu, Chroma — so this single impl makes all of them PiD-swappable (sc-7846). Delegates to
+/// the inherent [`Vae::decode`], which accepts the 4-D `(B, C, H, W)` normalized latent the engines
+/// hand the seam (it re-adds the singleton frame axis on output). A PiD decoder for this same latent
+/// space (`mlx-gen-pid`, sc-7843) implements the same trait, so a generation can swap between them at
+/// the decode call site.
+impl LatentDecoder for Vae {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        Vae::decode(self, latents)
     }
 }

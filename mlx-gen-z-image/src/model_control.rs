@@ -229,8 +229,13 @@ impl ZImageTurboControl {
         // difference is the `denoise_control_with_progress` step threading the f32 control context +
         // scale (the mixed-precision dtype flow, sc-2720, is preserved inside the closure).
         let sampler_name = req.sampler.as_deref();
+        // The Fun-ControlNet variant is outside the PiD decode scope of sc-7846 (which targets the base
+        // `z_image_turbo` / FLUX.1 / Boogu / Chroma generators); pass `None` so it keeps the native VAE
+        // decode unchanged. Wiring PiD onto the control path would need a `pid` field here and is a
+        // separate follow-on (epic 7840) if/when the control variant should super-resolve.
         let images = pipeline::render_batch(
             &self.vae,
+            None,
             &scheduler,
             clean.as_ref(),
             start_step,

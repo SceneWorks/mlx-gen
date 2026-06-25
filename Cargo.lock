@@ -617,6 +617,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -631,6 +632,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "mlx-gen-flux",
+ "mlx-gen-pid",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
 ]
@@ -660,6 +662,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
@@ -895,6 +898,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
 ]

@@ -12,9 +12,10 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    Result, WeightsSource,
 };
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_rs::Dtype;
 
 use crate::loader;
@@ -49,6 +50,11 @@ pub(crate) const SCHEDULE_SHIFT: f32 = 3.0;
 
 /// Registry id for Z-Image-turbo (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "z_image_turbo";
+
+/// PiD backbone (latent-space) tag for Z-Image (epic 7840, sc-7846). Z-Image ships Flux1-dev's 16-ch
+/// VAE, so it reuses the `flux` PiD student — the `mlx_gen_pid::registry` `zimage-turbo` alias resolves
+/// to exactly that checkpoint/space. Used only at load time to build the [`PidEngine`].
+pub const PID_BACKBONE: &str = "zimage-turbo";
 
 /// Z-Image-turbo's identity + capabilities — constructible without loading weights (registry
 /// introspection). Values are conservative-but-real; sampler/scheduler lists fill in with the
@@ -93,6 +99,10 @@ pub struct ZImageTurbo {
     text_encoder: TextEncoder,
     transformer: ZImageTransformer,
     vae: Vae,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`. Z-Image shares Flux1's VAE
+    /// latent space, so it reuses the `flux` PiD student via the `zimage-turbo` registry alias.
+    pid: Option<PidEngine>,
 }
 
 /// Construct a [`ZImageTurbo`] from a [`LoadSpec`].
@@ -143,12 +153,21 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if !spec.adapters.is_empty() {
         crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
     }
+    // Optional PiD decoder overlay (epic 7840, sc-7846): Z-Image is the Flux1 latent space, so it
+    // reuses the `flux` PiD student (the `zimage-turbo` registry alias). Loaded only when the spec
+    // carries `pid`; the native VAE decode path is untouched otherwise.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(ZImageTurbo {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
         text_encoder,
         transformer,
         vae,
+        pid,
     }))
 }
 
@@ -219,8 +238,13 @@ impl ZImageTurbo {
         // Per-image batch render shared with the control variant (F-035); the base branch's only
         // difference is the plain `denoise_with_progress` step.
         let sampler_name = req.sampler.as_deref();
+        // PiD decode overlay (epic 7840, sc-7846): mint a σ=0 clean-latent decoder when `use_pid` is set
+        // AND a PiD overlay was loaded, else `None` → the native VAE. Errors loudly if `use_pid` was
+        // requested without a loaded overlay (no silent VAE fallback).
+        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, MODEL_ID)?;
         let images = pipeline::render_batch(
             &self.vae,
+            pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
             &scheduler,
             clean.as_ref(),
             start_step,

@@ -105,7 +105,7 @@ fn run_image_parity(variant: ChromaVariant, repo: &str, fixture: &str, guidance:
         )
         .unwrap();
     let fl_l2 = rel_l2(&final_latents, g.require("final_latents").unwrap());
-    let img = model.decode(&final_latents, W, H).unwrap();
+    let img = model.decode(&final_latents, W, H, None).unwrap();
     let f8 = image_px_fraction(&img, g.require("image").unwrap(), 8.0);
     eprintln!("[{repo}] final rel-L2 = {fl_l2:.4}  image px>8 = {f8:.4}");
     assert!(
@@ -363,7 +363,7 @@ fn chroma_flash_heun_path_gated() {
         "Heun diverged from Euler — not a coherent refinement; rel-L2 {d}"
     );
     // And it must still decode to a real image (catches a non-finite Heun latent at the VAE boundary).
-    let img = model.decode(&heun, W, H).unwrap();
+    let img = model.decode(&heun, W, H, None).unwrap();
     assert_eq!(img.pixels.len(), (W * H * 3) as usize);
     assert!(
         img.pixels.iter().any(|&p| p != img.pixels[0]),

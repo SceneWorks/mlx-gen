@@ -14,6 +14,10 @@ mlx-gen = { path = ".." }
 mlx-gen-flux = { path = "../mlx-gen-flux" }
 # The shared VAE type returned by the flux VAE loader.
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7846): Chroma reuses the FLUX.1 16-ch VAE
+# (`mlx_gen_flux::load_vae`), so the decode can route through `mlx_gen_pid::PidDecoder` (the `flux`
+# student) when `req.use_pid` is set. `mlx-gen-pid` depends only on core, so it's acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.

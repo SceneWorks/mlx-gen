@@ -21,6 +21,10 @@ serde_json = "1"
 # Boogu's VAE is the FLUX.1 16-ch `AutoencoderKL`, byte-identical to the VAE `mlx-gen-flux` reuses
 # from here — so we reuse the same `Vae`/`VaeDecoderConfig::default_z_image` rather than re-port it.
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7846): Boogu shares the FLUX.1 16-ch VAE latent
+# space, so the final decode can route through `mlx_gen_pid::PidDecoder` (the `flux` student) when
+# `req.use_pid` is set. `mlx-gen-pid` depends only on core (no dep on this crate), so it's acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Qwen3-VL vision-tower image preprocessing (smart-resize) for the Edit path; also saves e2e renders.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 

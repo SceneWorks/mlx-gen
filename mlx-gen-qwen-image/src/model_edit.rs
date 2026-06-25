@@ -18,7 +18,7 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
     Precision, Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::PidEngine;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
@@ -27,7 +27,7 @@ use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, qwen_schedulers,
-    resolve_pid_decoder, resolve_run_params, PID_BACKBONE,
+    resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;

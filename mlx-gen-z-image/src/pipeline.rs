@@ -13,7 +13,7 @@ pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preproces
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
-    Progress, Result, TimestepConvention,
+    LatentDecoder, Progress, Result, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{random, Array, Dtype};
@@ -285,6 +285,7 @@ pub(crate) fn resolve_reference<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_batch(
     vae: &Vae,
+    pid_decoder: Option<&dyn LatentDecoder>,
     scheduler: &FlowMatchEuler,
     clean: Option<&Array>,
     start_step: usize,
@@ -323,11 +324,14 @@ pub(crate) fn render_batch(
         let latents = denoise(latents, seed, on_progress)?;
 
         on_progress(Progress::Decoding);
-        // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode.
+        // [16,1,H,W] -> [1,16,H,W]; route the unpacked 4-D latent through the selected decoder. The
+        // native VAE accepts the 4-D latent directly (it re-adds the singleton frame axis on output),
+        // so this is byte-identical to the prior `[1,16,1,H,W]` reshape — the 5-D→4-D squeeze inside
+        // `Vae::decode` was a no-op view. PiD requires 4-D. `pid_decoder` is `Some` only when the
+        // request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else the native VAE.
         let unpacked = unpack_latents(&latents)?;
-        let sh = unpacked.shape();
-        let latent5 = unpacked.reshape(&[sh[0], sh[1], 1, sh[2], sh[3]])?;
-        let decoded = vae.decode(&latent5)?.as_dtype(Dtype::Float32)?;
+        let decoder: &dyn LatentDecoder = pid_decoder.unwrap_or(vae);
+        let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
         images.push(decoded_to_image(&decoded)?);
     }
     Ok(images)

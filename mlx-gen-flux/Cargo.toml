@@ -11,6 +11,10 @@ categories = ["science"]
 [dependencies]
 mlx-gen = { path = ".." }
 mlx-gen-z-image = { path = "../mlx-gen-z-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a
+# PiD student, so `run_denoise` routes the final decode through `mlx_gen_pid::PidDecoder` when
+# `req.use_pid` is set. `mlx-gen-pid` depends only on core (no dep on this crate), so it's acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Reuse the CLIP ViT vision tower + CLIP image preprocessing for the XLabs IP-Adapter image
 # encoder (sc-3622). Same reuse pattern as mlx-gen-svd → mlx-gen-sdxl; no dependency cycle
 # (sdxl does not depend on flux).

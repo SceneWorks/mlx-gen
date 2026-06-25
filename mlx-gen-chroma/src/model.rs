@@ -14,10 +14,11 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result,
-    TimestepConvention, WeightsSource,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, Precision,
+    Progress, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
@@ -84,6 +85,15 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     // sc-3842). No-op when empty; any unmatched target errors loudly (never silently dropped).
     crate::adapters::apply_chroma_adapters(&mut transformer, &spec.adapters)?;
 
+    // Optional PiD decoder overlay (epic 7840, sc-7846): Chroma's FLUX.1 16-ch VAE latent space has a
+    // PiD student (the `flux` backbone), so the final decode can route through `mlx_gen_pid` when
+    // `req.use_pid` is set. Loaded only when the spec carries `pid`; native VAE decode otherwise.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
+
     Ok(Chroma {
         descriptor: variant.descriptor(),
         variant,
@@ -91,6 +101,7 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
         t5: Some(t5),
         transformer: Some(transformer),
         vae: Some(vae),
+        pid,
     })
 }
 
@@ -114,7 +125,17 @@ pub struct Chroma {
     t5: Option<T5TextEncoder>,
     transformer: Option<ChromaTransformer>,
     vae: Option<Vae>,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`. Chroma reuses the FLUX.1
+    /// 16-ch VAE (`mlx_gen_flux::load_vae`), so it shares the `flux` PiD student.
+    pid: Option<PidEngine>,
 }
+
+/// PiD backbone (latent-space) tag for Chroma (epic 7840, sc-7846). Chroma is a FLUX.1-schnell
+/// derivative whose VAE is loaded by `mlx_gen_flux::load_vae` (byte-identical FLUX.1 16-ch
+/// `AutoencoderKL`, scale 0.3611 / shift 0.1159), so it resolves to the `flux` PiD student. Used only
+/// at load time to build the [`PidEngine`]; shared by all three Chroma variants (hd/base/flash).
+pub const PID_BACKBONE: &str = "flux";
 
 /// FluxPosEmbed image position ids `[h2·w2, 3]` (axis 1 = row, axis 2 = col), row-major over the
 /// packed `(height/16, width/16)` grid — diffusers `_prepare_latent_image_ids`.
@@ -386,11 +407,25 @@ impl Chroma {
         )
     }
 
-    /// Unpack + VAE-decode a packed latent `[1, Si, 64]` → an [`Image`].
-    pub fn decode(&self, latents: &Array, width: u32, height: u32) -> Result<Image> {
+    /// Unpack + decode a packed latent `[1, Si, 64]` → an [`Image`]. `decoder` overrides the native
+    /// FLUX.1 VAE when `Some` — a PiD super-resolving decode (epic 7840, sc-7846) that consumes the
+    /// same normalized latent and 4× upscales; `None` is the byte-exact VAE default.
+    pub fn decode(
+        &self,
+        latents: &Array,
+        width: u32,
+        height: u32,
+        decoder: Option<&dyn LatentDecoder>,
+    ) -> Result<Image> {
         let (_, _, _, vae) = self.parts()?;
         let unpacked = unpack_latents(latents, width, height)?;
-        let decoded = vae.decode(&unpacked)?.as_dtype(mlx_rs::Dtype::Float32)?;
+        let decoder: &dyn LatentDecoder = match decoder {
+            Some(d) => d,
+            None => vae,
+        };
+        let decoded = decoder
+            .decode(&unpacked)?
+            .as_dtype(mlx_rs::Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 }
@@ -440,6 +475,11 @@ impl Chroma {
             .unwrap_or_else(|| self.variant.default_true_cfg());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
+        // PiD decode overlay (epic 7840, sc-7846): Chroma shares the FLUX.1 VAE latent space (the `flux`
+        // student), so the decode can route through PiD when `use_pid` is set + an overlay was loaded;
+        // errors loudly if requested without one. `None` → the native VAE. Shared across the count loop.
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -465,7 +505,12 @@ impl Chroma {
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
-            images.push(self.decode(&final_latents, req.width, req.height)?);
+            images.push(self.decode(
+                &final_latents,
+                req.width,
+                req.height,
+                pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
+            )?);
         }
         Ok(GenerationOutput::Images(images))
     }
@@ -494,6 +539,7 @@ mod tests {
             t5: None,
             transformer: None,
             vae: None,
+            pid: None,
         }
     }
 

@@ -16,13 +16,13 @@ use mlx_gen::{
     Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::PidEngine;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
 use crate::loader;
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
     encode_init_latents, encode_prompt, init_time_step, negative_or_fallback, qwen_samplers,
-    qwen_schedulers, resolve_pid_decoder, resolve_run_params, LIGHTNING_SAMPLER, PID_BACKBONE,
+    qwen_schedulers, resolve_run_params, LIGHTNING_SAMPLER, PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
