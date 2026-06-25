@@ -7,16 +7,19 @@
 //! confirmed on the real `stabilityai/stable-diffusion-3.5-large` / `-large-turbo` weights during
 //! the spike (sc-7850).
 //!
-//! ## Slice status: **E1** (sc-7860) + **E2** (sc-7861) + **E4** (sc-7863) — converter + config + triple-TE + VAE
+//! ## Slice status: **E1** (sc-7860) + **E2** (sc-7861) + **E4** (sc-7863) + **M1** (sc-7867) — converter + config + triple-TE + VAE + Medium converter
 //!
 //! This crate currently ships:
 //!
-//! * [`config`] — the dimension-parametric SD3.5-Large / Large-Turbo MMDiT arch constants and the
+//! * [`config`] — the dimension-parametric SD3.5 MMDiT arch constants ([`config::Sd3Arch::large`]
+//!   for Large / Large-Turbo and [`config::Sd3Arch::medium`] for the Medium **MMDiT-X**) and the
 //!   registry descriptors.
 //! * [`convert`] — the diffusers `SD3Transformer2DModel` → MLX weight converter (a 1:1 rename over
 //!   the validated key set, plus offline Q4/Q8 pre-quantization) and the **architecture
 //!   validation** (an exhaustive, shape-checked expected-tensor table asserted against a converted
-//!   or on-disk tensor set).
+//!   or on-disk tensor set). The same converter/validator serve Medium's MMDiT-X layout — the first
+//!   13 blocks' `attn2` dual-attention tensors + the extended 9-chunk `norm1` AdaLN — driven by
+//!   [`config::Sd3Arch::medium`] (real-weight confirmed, 909 transformer tensors).
 //! * [`text`] — the **triple text-encoder aggregator** (E2). REUSES the existing SDXL CLIP encoder
 //!   (CLIP-L + CLIP-G / OpenCLIP-bigG) and the FLUX T5-XXL encoder unchanged, and combines their
 //!   outputs into SD3.5 conditioning — `pooled` `[B, 2048]` and `context` `[B, 333, 4096]` — exactly
@@ -38,12 +41,17 @@ pub mod text;
 pub mod vae;
 
 pub use config::{
-    Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_TURBO, DEFAULT_HEIGHT,
-    DEFAULT_SAMPLER, DEFAULT_STEPS_LARGE, DEFAULT_STEPS_TURBO, DEFAULT_WIDTH,
-    LARGE_CAPTION_PROJECTION_DIM, LARGE_HEAD_DIM, LARGE_HIDDEN, LARGE_IN_CHANNELS,
-    LARGE_JOINT_ATTENTION_DIM, LARGE_NUM_HEADS, LARGE_NUM_LAYERS, LARGE_OUT_CHANNELS,
-    LARGE_PATCH_SIZE, LARGE_POOLED_PROJECTION_DIM, LARGE_POS_EMBED_LEN, LARGE_POS_EMBED_MAX_SIZE,
-    LARGE_TIME_PROJ_DIM, RMS_EPS, SD3_5_LARGE_ID, SD3_5_LARGE_TURBO_ID,
+    Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,
+    DEFAULT_HEIGHT, DEFAULT_SAMPLER, DEFAULT_STEPS_LARGE, DEFAULT_STEPS_MEDIUM,
+    DEFAULT_STEPS_TURBO, DEFAULT_WIDTH, LARGE_CAPTION_PROJECTION_DIM, LARGE_HEAD_DIM, LARGE_HIDDEN,
+    LARGE_IN_CHANNELS, LARGE_JOINT_ATTENTION_DIM, LARGE_NUM_HEADS, LARGE_NUM_LAYERS,
+    LARGE_OUT_CHANNELS, LARGE_PATCH_SIZE, LARGE_POOLED_PROJECTION_DIM, LARGE_POS_EMBED_LEN,
+    LARGE_POS_EMBED_MAX_SIZE, LARGE_TIME_PROJ_DIM, MEDIUM_CAPTION_PROJECTION_DIM,
+    MEDIUM_DUAL_ATTENTION_LAYERS, MEDIUM_HEAD_DIM, MEDIUM_HIDDEN, MEDIUM_IN_CHANNELS,
+    MEDIUM_JOINT_ATTENTION_DIM, MEDIUM_NUM_HEADS, MEDIUM_NUM_LAYERS, MEDIUM_OUT_CHANNELS,
+    MEDIUM_PATCH_SIZE, MEDIUM_POOLED_PROJECTION_DIM, MEDIUM_POS_EMBED_LEN,
+    MEDIUM_POS_EMBED_MAX_SIZE, MEDIUM_TIME_PROJ_DIM, RMS_EPS, SD3_5_LARGE_ID, SD3_5_LARGE_TURBO_ID,
+    SD3_5_MEDIUM_ID,
 };
 pub use convert::{
     build_target_state_dict, expected_tensor_count, expected_transformer_tensors, quantize_sd3_dir,
