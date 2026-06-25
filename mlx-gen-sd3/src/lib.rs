@@ -38,14 +38,24 @@
 //!   block), and the AdaLN-continuous output head → unpatchify. REUSES flux2's joint-attention
 //!   `process_qkv`/double-stream pattern with the SD3 deltas (no RoPE, all-double topology, GELU).
 //!
-//! The model/loader/pipeline wiring (**E5+**) and native LoRA training (**T1–T4**) are separate epic
-//! stories and are intentionally NOT implemented here. No `Generator` is registered yet.
+//! * [`loader`] / [`pipeline`] / [`model`] (E5, sc-7864) — the SD3.5-**Large** text-to-image vertical:
+//!   the snapshot-layout loader (reusing the SDXL CLIP encoder ×2 + FLUX T5 + Z-Image VAE), the
+//!   flow-match-Euler (static shift 3.0) + true-CFG sampling pipeline, and the [`model::Sd3Large`]
+//!   [`Generator`](mlx_gen::Generator) registered under engine id **`sd3_5_large`**.
+//!
+//! Turbo (E6), Medium (M3), and native LoRA training (T1–T4) are separate epic stories and are NOT
+//! implemented here. Only the Large generator is registered.
 
 pub mod config;
 pub mod convert;
+pub mod loader;
+pub mod model;
+pub mod pipeline;
 pub mod text;
 pub mod transformer;
 pub mod vae;
+
+pub use model::{Sd3Large, MODEL_ID};
 
 pub use config::{
     Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,
