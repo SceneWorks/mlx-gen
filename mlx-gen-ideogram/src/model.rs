@@ -11,11 +11,10 @@
 //! (sc-5989); a precision override and LoRA adapters are rejected rather than silently ignored.
 
 use mlx_gen::array::host_i32;
-use mlx_gen::gen_core;
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -193,23 +192,10 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Ideogram4 {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Ideogram4 {
+    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    generate: generate_impl,
+});
 
 impl Ideogram4 {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -385,28 +371,18 @@ fn array_to_image(img: &Array) -> Result<Image> {
     })
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-
-/// Registry adapter for the turbo variant (issue #488) — registered under `ideogram_4_turbo`.
-fn load_turbo_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_turbo(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_turbo, load: load_turbo_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The turbo variant
+// (issue #488) registers under `ideogram_4_turbo`.
+mlx_gen::register_generators! {
+    descriptor => load,
+    descriptor_turbo => load_turbo,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core;
 
     fn caps() -> Capabilities {
         descriptor().capabilities

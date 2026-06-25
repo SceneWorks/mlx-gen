@@ -29,8 +29,8 @@ use mlx_rs::Array;
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::{
     default_seed, gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::NeoChatConfig;
@@ -357,23 +357,13 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
     divide(&chw, Array::from_f32(255.0)).map_err(Error::from)
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-/// Registry adapter for the 8-step distilled variant (sc-3192).
-fn load_fast_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_fast(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_fast, load: load_fast_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The 8-step
+// distilled variant (sc-3192) registers under `descriptor_fast`. `impl Generator` stays
+// hand-written because `validate` attributes rejections to the per-variant descriptor id (F-143).
+mlx_gen::register_generators! {
+    descriptor => load,
+    descriptor_fast => load_fast,
 }
 
 #[cfg(test)]

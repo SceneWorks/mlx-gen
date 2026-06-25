@@ -65,8 +65,8 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, LoadSpec, Modality, NetworkType, Precision, Progress,
-    Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainerRegistration,
-    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
+    Result, TimestepConvention, TrainOptimizer, Trainer, TrainerDescriptor, TrainingConfig,
+    TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -196,15 +196,9 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-/// Registry adapter: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic 3720);
-/// bridge the crate's rich-`Result` [`load_trainer`] into it.
-fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
-    load_trainer(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer_registered }
-}
+// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
+// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_trainer! { trainer_descriptor => load_trainer }
 
 /// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
 /// `-`/space → `_`) so validation accepts exactly the spellings the run would.

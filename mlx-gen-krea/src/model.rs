@@ -10,11 +10,10 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
-use mlx_gen::gen_core;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
+    Result, WeightsSource,
 };
 
 use crate::pipeline::{KreaPipeline, TurboOptions};
@@ -124,23 +123,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Krea {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Krea {
+    validate: |s, req| validate_request(&s.descriptor, req),
+    generate: generate_impl,
+});
 
 impl Krea {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -199,19 +185,14 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`]; bridge the crate's rich-`Result` loader into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core;
     use mlx_gen::{AdapterKind, AdapterSpec};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
