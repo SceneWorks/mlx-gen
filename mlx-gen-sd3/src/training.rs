@@ -95,6 +95,15 @@ use crate::transformer::Sd3Transformer;
 /// (and the arch-identical Large-Turbo) inference — the family-match cross-apply, no base-model gating.
 pub const SD3_5_LARGE_TRAINER_ID: &str = crate::config::SD3_5_LARGE_ID;
 
+/// Registry id for the SD3.5-**Medium** LoRA-training base (the `stabilityai/stable-diffusion-3.5-medium`
+/// MMDiT-X — 24 blocks, hidden 1536, dual-attention `attn2` on the first 13 blocks). A distinct, smaller
+/// transformer arch (NOT the Large 38-block plain MMDiT) → its own registered trainer. The trained
+/// adapter records `baseModel: sd3_5_medium` and applies back at `sd3_5_medium` inference (family-match,
+/// no base-model gating). The trainer **body is identical** to Large's — the `attn2` dual-attention
+/// targets are enumerated by the arch-driven [`AdaptableHost`], so the only Medium-specific code is
+/// loading the Medium arch (T4 sc-7885).
+pub const SD3_5_MEDIUM_TRAINER_ID: &str = crate::config::SD3_5_MEDIUM_ID;
+
 /// The LoKr delta-reconstruction dtype, matching the inference loader so a trained LoKr round-trips
 /// through the apply path. bf16 — the family compute dtype.
 const LOKR_DTYPE: Dtype = Dtype::Bfloat16;
@@ -182,9 +191,14 @@ pub struct Sd3LoraTrainer {
     dtype: Dtype,
 }
 
-fn trainer_descriptor() -> TrainerDescriptor {
+/// The trainer descriptor for `variant` (Large or Medium — the two LoRA-training bases). Both expose
+/// the identical LoRA/LoKr image-training capability surface; they differ only in the registry id (and,
+/// at load, the MMDiT-X arch the Medium variant carries). Large-Turbo is NOT a training base — it is the
+/// distilled inference variant of the Large arch, and a Large-trained adapter applies to it by
+/// family-match.
+fn trainer_descriptor_for(variant: Sd3Variant) -> TrainerDescriptor {
     TrainerDescriptor {
-        id: SD3_5_LARGE_TRAINER_ID,
+        id: variant.id(),
         family: "sd3",
         backend: "mlx",
         modality: Modality::Image,
@@ -193,11 +207,24 @@ fn trainer_descriptor() -> TrainerDescriptor {
     }
 }
 
-/// Construct the trainer from a `stabilityai/stable-diffusion-3.5-large` snapshot directory (the
-/// diffusers multi-component tree). The MMDiT is loaded **dense** (the adapter host); the encoders are
-/// Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate); the snapshot ships
-/// bf16, so f32 widens it via [`Sd3Transformer::cast_weights`] and bf16 casts the dense load.
-pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+/// The SD3.5-Large trainer descriptor (the default base; preserves the historical helper name).
+fn trainer_descriptor() -> TrainerDescriptor {
+    trainer_descriptor_for(Sd3Variant::Large)
+}
+
+/// The SD3.5-Medium (MMDiT-X) trainer descriptor.
+fn medium_trainer_descriptor() -> TrainerDescriptor {
+    trainer_descriptor_for(Sd3Variant::Medium)
+}
+
+/// Construct a SD3.5 trainer for `variant` from a snapshot directory (the diffusers multi-component
+/// tree). The MMDiT is loaded **dense** (the adapter host) with the variant's arch — Large's 38-block
+/// plain MMDiT or Medium's 24-block MMDiT-X (dual-attention `attn2` on the first 13 blocks); the
+/// encoders are Q8. `spec.precision` selects the compute dtype (bf16 default / f32 tight-gate); the
+/// snapshot ships bf16, so f32 widens it via [`Sd3Transformer::cast_weights`] and bf16 casts the dense
+/// load. The train loop is variant-agnostic — the `attn2` targets are enumerated by the arch-driven
+/// [`AdaptableHost`], so Medium is covered without a train-loop delta (T4 sc-7885).
+pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Trainer>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
@@ -212,7 +239,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
         Precision::Bf16 => Dtype::Bfloat16,
         Precision::Fp32 => Dtype::Float32,
     };
-    let arch = Sd3Variant::Large.arch();
+    let arch = variant.arch();
     let clip_tokenizer = loader::load_clip_tokenizer(&root)?;
     let t5_tokenizer = loader::load_t5_tokenizer(&root)?;
     let mut encoders = loader::load_text_encoders(&root)?;
@@ -223,7 +250,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }
     let vae = loader::load_vae(&root)?;
     Ok(Box::new(Sd3LoraTrainer {
-        descriptor: trainer_descriptor(),
+        descriptor: trainer_descriptor_for(variant),
         clip_tokenizer,
         t5_tokenizer,
         encoders: Some(encoders),
@@ -233,9 +260,25 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
+/// Construct the SD3.5-**Large** trainer (the default base). See [`load_trainer_for`].
+pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    load_trainer_for(spec, Sd3Variant::Large)
+}
+
+/// Construct the SD3.5-**Medium** (MMDiT-X) trainer. The body is identical to Large's — only the loaded
+/// arch differs (24-block MMDiT-X, dual-attention `attn2` on blocks 0..12), and the dual-attention
+/// targets are picked up by the arch-driven [`AdaptableHost`]. See [`load_trainer_for`] (T4 sc-7885).
+pub fn load_trainer_medium(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+    load_trainer_for(spec, Sd3Variant::Medium)
+}
+
 // Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
-// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_trainer! { trainer_descriptor => load_trainer }
+// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`. Both
+// LoRA-training bases register here — Large (plain MMDiT) and Medium (MMDiT-X dual-attention).
+mlx_gen::register_trainer! {
+    trainer_descriptor => load_trainer,
+    medium_trainer_descriptor => load_trainer_medium,
+}
 
 /// Normalize a free-form config string the way the trainer's own parsers do (trim, lowercase,
 /// `-`/space → `_`) so validation accepts exactly the spellings the run would.
@@ -923,6 +966,37 @@ mod tests {
     }
 
     #[test]
+    fn medium_descriptor_is_the_medium_base_id() {
+        // T4 (sc-7885): the Medium (MMDiT-X) trainer is a distinct registered base — same capability
+        // surface as Large, different id. Large-Turbo is NOT a training base (it shares Large's arch).
+        let d = medium_trainer_descriptor();
+        assert_eq!(d.id, "sd3_5_medium");
+        assert_eq!(d.family, "sd3");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        assert!(d.supports_lora && d.supports_lokr);
+        // The two training bases are distinct ids.
+        assert_ne!(d.id, trainer_descriptor().id);
+    }
+
+    #[test]
+    fn both_training_bases_reachable_via_registry() {
+        // T4: both the Large and Medium trainers self-register at link time (multi-arm
+        // `register_trainer!`). The Medium id must resolve to a registered trainer.
+        let ids: Vec<&str> = gen_core::registry::trainers()
+            .map(|r| (r.descriptor)().id)
+            .collect();
+        assert!(
+            ids.contains(&SD3_5_LARGE_TRAINER_ID),
+            "large trainer id not registered (ids: {ids:?})"
+        );
+        assert!(
+            ids.contains(&SD3_5_MEDIUM_TRAINER_ID),
+            "medium trainer id not registered (ids: {ids:?})"
+        );
+    }
+
+    #[test]
     fn validate_rejects_empty_dataset_and_zero_rank_steps() {
         let mut r = req_with(base_config());
         r.items.clear();
@@ -1174,6 +1248,23 @@ mod real_weight_repro {
             .find(|p| p.is_dir() && p.join("transformer").is_dir())
     }
 
+    /// The `stabilityai/stable-diffusion-3.5-medium` snapshot (the `SD3_MEDIUM_DIR` override, else the
+    /// newest HF-cache snapshot with a `transformer/` tree). T4 (sc-7885).
+    fn medium_snapshot() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("SD3_MEDIUM_DIR") {
+            return Some(PathBuf::from(p));
+        }
+        let home = std::env::var("HOME").ok()?;
+        let snaps = PathBuf::from(home).join(
+            ".cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-medium/snapshots",
+        );
+        std::fs::read_dir(&snaps)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.join("transformer").is_dir())
+    }
+
     /// The real MMDiT's default target surface resolves to the joint-block attention only: 38 blocks ×
     /// {to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj} = 266, plus to_add_out on all but the
     /// final context_pre_only block = 37 → 303 targets, none on globals.
@@ -1192,6 +1283,51 @@ mod real_weight_repro {
         assert!(paths.iter().any(|p| p.ends_with(".attn.add_q_proj")));
         // The final context_pre_only block has no to_add_out.
         assert!(!paths.contains(&format!("transformer_blocks.{}.attn.to_add_out", n - 1)));
+    }
+
+    /// T4 (sc-7885) — the real Medium MMDiT-X default target surface resolves to the joint-block
+    /// attention PLUS the dual-attention `attn2` on the first 13 blocks: 24 joint blocks ×
+    /// {to_q,to_k,to_v,to_out.0,add_q_proj,add_k_proj,add_v_proj} = 168, plus to_add_out on all but
+    /// the final context_pre_only block (23), plus attn2's {to_q,to_k,to_v,to_out.0} on the 13 dual
+    /// blocks (52). The 9-chunk SD35AdaLayerNormZeroX norm1 is NOT a target (modulation producer).
+    #[test]
+    #[ignore = "needs real stabilityai/stable-diffusion-3.5-medium weights; run as its own process"]
+    fn medium_default_targets_include_attn2_on_dual_blocks() {
+        let root = medium_snapshot().expect("sd3.5-medium snapshot (HF cache or SD3_MEDIUM_DIR)");
+        let dit = loader::load_transformer(&root, &Sd3Variant::Medium.arch()).unwrap();
+        assert_eq!(dit.num_blocks(), 24, "Medium has 24 joint blocks");
+        let cfg = TrainingConfig::default();
+        let paths = resolve_target_paths(&dit, &cfg);
+
+        // attn2 on every dual block (0..=12), all four locals; never on the plain blocks (13..23).
+        for i in 0..13usize {
+            for local in ["to_q", "to_k", "to_v", "to_out.0"] {
+                assert!(
+                    paths.contains(&format!("transformer_blocks.{i}.attn2.{local}")),
+                    "dual block {i} attn2.{local} must be a default target"
+                );
+            }
+        }
+        for i in 13..24usize {
+            assert!(
+                !paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!("transformer_blocks.{i}.attn2."))),
+                "plain block {i} must have NO attn2 target"
+            );
+        }
+        // norm1 (the modulation producer) is never targeted.
+        assert!(!paths.iter().any(|p| p.contains(".norm1")));
+
+        // Count: 24 joint blocks × 7 + 23 to_add_out + 13 dual blocks × 4 attn2 = 168 + 23 + 52 = 243.
+        let expected = 24 * 7 + 23 + 13 * 4;
+        assert_eq!(
+            paths.len(),
+            expected,
+            "Medium default-target count {expected}"
+        );
+        let attn2_count = paths.iter().filter(|p| p.contains(".attn2.")).count();
+        assert_eq!(attn2_count, 52, "13 dual blocks × 4 attn2 locals");
     }
 
     /// Whole-block gradient checkpointing must not change the math: the checkpointed forward+grads must
@@ -1421,6 +1557,170 @@ mod real_weight_repro {
             .save(&png)
             .unwrap();
         eprintln!("[sc-7883 smoke] wrote {}", png.display());
+        assert!(
+            mean > 5.0 && mean < 250.0,
+            "render mean luminance sane (coherent)"
+        );
+        assert!(
+            var > 1.0,
+            "render has real variance (not a flat/degenerate frame)"
+        );
+    }
+
+    /// T4 (sc-7885) — END-TO-END Medium (MMDiT-X) TRAINING SMOKE + ROUND-TRIP (the T4 acceptance
+    /// proof): train a tiny LoRA (few steps, small rank, bf16 + gradient checkpointing) on a tiny
+    /// synthetic dataset through the real [`Sd3LoraTrainer`] loaded for **Medium** (24-block MMDiT-X,
+    /// dual-attention `attn2` on the first 13 blocks). The default target set captures `attn2` (the
+    /// arch-driven AdaptableHost). Save the adapter, then RELOAD it via
+    /// [`crate::adapters::apply_sd3_adapters`] at `sd3_5_medium` generation and render — confirming the
+    /// Medium-trained adapter (incl. the dual-attention modules) loads, applies, and produces a
+    /// coherent image. Memory-friendly: Medium is 2.5B, far under the Large budget.
+    #[test]
+    #[ignore = "needs real stabilityai/stable-diffusion-3.5-medium weights + Metal; run as its own process"]
+    fn medium_training_smoke_round_trip() {
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec, LoadSpec, WeightsSource};
+        use mlx_gen::{GenerationOutput, GenerationRequest, NetworkType, TrainingItem};
+
+        let root = medium_snapshot().expect("sd3.5-medium snapshot (HF cache or SD3_MEDIUM_DIR)");
+        let tmp = std::env::temp_dir().join(format!("sd3_t4_medium_smoke_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // --- tiny synthetic dataset: 2 solid-color 256² PNGs with captions ---
+        let mk_png = |path: &std::path::Path, rgb: [u8; 3]| {
+            let mut img = image::RgbImage::new(256, 256);
+            for px in img.pixels_mut() {
+                *px = image::Rgb(rgb);
+            }
+            img.save(path).unwrap();
+        };
+        let img_a = tmp.join("a.png");
+        let img_b = tmp.join("b.png");
+        mk_png(&img_a, [200, 40, 40]);
+        mk_png(&img_b, [40, 60, 200]);
+        let items = vec![
+            TrainingItem {
+                image_path: img_a.clone(),
+                caption: "sks a solid crimson swatch".into(),
+            },
+            TrainingItem {
+                image_path: img_b.clone(),
+                caption: "sks a solid cobalt swatch".into(),
+            },
+        ];
+
+        // --- train via the MEDIUM trainer (bf16 + gradient checkpointing; tiny rank/steps at 256²) ---
+        let mut trainer = load_trainer_medium(&LoadSpec::new(WeightsSource::Dir(root.clone())))
+            .expect("load sd3 MEDIUM trainer");
+        assert_eq!(
+            trainer.descriptor().id,
+            SD3_5_MEDIUM_TRAINER_ID,
+            "trainer is the Medium base"
+        );
+        let cfg = TrainingConfig {
+            rank: 4,
+            alpha: 4.0,
+            learning_rate: 1e-4,
+            steps: 6,
+            resolution: 256,
+            save_every: 0,
+            seed: 7,
+            network_type: NetworkType::Lora,
+            gradient_checkpointing: true,
+            train_dtype: "bf16".into(),
+            timestep_type: "logit_normal".into(),
+            ..Default::default()
+        };
+        let adapter_path = tmp.join("sd3_medium_smoke_lora.safetensors");
+        let req = TrainingRequest {
+            items,
+            config: cfg,
+            output_dir: tmp.clone(),
+            file_name: "sd3_medium_smoke_lora.safetensors".into(),
+            trigger_words: vec!["sks".into()],
+            cancel: mlx_gen::CancelFlag::new(),
+        };
+        let mut losses: Vec<f32> = Vec::new();
+        let out = trainer
+            .train(&req, &mut |p| {
+                if let TrainingProgress::Training { step, loss, .. } = p {
+                    eprintln!("[sc-7885 medium smoke] step {step} loss {loss:.5}");
+                    losses.push(loss);
+                }
+            })
+            .expect("medium training run");
+        eprintln!(
+            "[sc-7885 medium smoke] TRAINED: steps={} final_loss={:.5} adapter={}",
+            out.steps,
+            out.final_loss,
+            out.adapter_path.display()
+        );
+        assert!(out.adapter_path.exists(), "adapter file written");
+        assert_eq!(out.steps, 6, "ran all steps");
+        assert!(
+            out.final_loss.is_finite() && out.final_loss > 0.0,
+            "finite loss"
+        );
+
+        // Confirm the trained adapter ACTUALLY carries attn2 (dual-attention) factors — the T4 proof
+        // that the Medium dual-attention modules were trained, not just the joint attention.
+        let trained = mlx_gen::weights::Weights::from_file(&adapter_path)
+            .expect("load the trained Medium adapter back");
+        let has_attn2 = trained.keys().any(|k| k.contains(".attn2."));
+        assert!(
+            has_attn2,
+            "the Medium-trained adapter must contain attn2 (dual-attention) factors"
+        );
+        eprintln!(
+            "[sc-7885 medium smoke] adapter has attn2 factors: {has_attn2} (total tensors: {})",
+            trained.keys().count()
+        );
+
+        // Drop the trainer (frees the resident MMDiT) before loading the inference model.
+        drop(trainer);
+        mlx_rs::memory::clear_cache();
+
+        // --- round-trip: reload the trained adapter at sd3_5_medium generation ---
+        let spec = LoadSpec::new(WeightsSource::Dir(root))
+            .with_quant(mlx_gen::Quant::Q8)
+            .with_adapters(vec![AdapterSpec::new(
+                adapter_path.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
+        let model =
+            crate::model::load_medium(&spec).expect("load sd3_5_medium WITH the trained adapter");
+        let gen_req = GenerationRequest {
+            prompt: "sks a solid crimson swatch".into(),
+            width: 512,
+            height: 512,
+            steps: Some(8),
+            seed: Some(1),
+            count: 1,
+            ..Default::default()
+        };
+        let gout = model
+            .generate(&gen_req, &mut |_| {})
+            .expect("generate WITH the reloaded Medium adapter");
+        let img = match gout {
+            GenerationOutput::Images(mut v) => v.remove(0),
+            _ => panic!("expected an image"),
+        };
+        assert_eq!((img.width, img.height), (512, 512));
+        let n = img.pixels.len() as f64;
+        let mean = img.pixels.iter().map(|&b| b as f64).sum::<f64>() / n;
+        let var = img
+            .pixels
+            .iter()
+            .map(|&b| (b as f64 - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        eprintln!("[sc-7885 medium smoke] ROUND-TRIP render mean={mean:.1} var={var:.1}");
+        let png = tmp.join("sd3_medium_smoke_render.png");
+        image::RgbImage::from_raw(img.width, img.height, img.pixels.clone())
+            .unwrap()
+            .save(&png)
+            .unwrap();
+        eprintln!("[sc-7885 medium smoke] wrote {}", png.display());
         assert!(
             mean > 5.0 && mean < 250.0,
             "render mean luminance sane (coherent)"

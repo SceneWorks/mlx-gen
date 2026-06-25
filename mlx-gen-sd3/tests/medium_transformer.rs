@@ -28,6 +28,7 @@
 //!     `context`, `pooled`, `timestep`, `out`) and asserts cosine ≥ 0.99. Gated because no
 //!     torch/diffusers env is present in this workspace (see the PR / FOLLOW_UPS).
 
+use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::weights::Weights;
 use mlx_gen_sd3::config::Sd3Arch;
 use mlx_gen_sd3::convert::expected_transformer_tensors;
@@ -221,6 +222,114 @@ fn missing_attn2_tensor_surfaces_as_error_not_panic() {
         w2.insert(k.to_string(), w.get(k).unwrap().clone());
     }
     assert!(Sd3Transformer::from_weights(&w2, &arch).is_err());
+}
+
+// ----------------------------------------------------------------------------------------------
+// T4 (sc-7885) — Medium MMDiT-X LoRA-training target coverage (no weights).
+//
+// The SD3.5-Medium trainer reuses the Large train loop verbatim; the ONLY Medium-specific behavior is
+// that the arch-driven `AdaptableHost::adaptable_paths` enumerates the dual-attention `attn2` modules
+// on the dual blocks (and NOT on the plain blocks). The trainer's default-target resolution suffix-
+// matches `to_q`/`to_k`/`to_v`/`to_out.0` against this path set, so `attn2` is picked up automatically
+// for Medium. These tests pin that enumeration (the contract the trainer depends on) directly on a
+// synthetic MMDiT-X — no weights, runs by default.
+// ----------------------------------------------------------------------------------------------
+
+/// Local LoRA target suffixes within an `attn2` (image-stream-only self-attention): the trainer's
+/// DEFAULT target set (`to_q`/`to_k`/`to_v`/`to_out.0`) all land here; `attn2` has NO `add_*`/
+/// `to_add_out` (those are the joint-attention text stream only).
+const ATTN2_LOCALS: [&str; 4] = ["to_q", "to_k", "to_v", "to_out.0"];
+
+#[test]
+fn medium_adaptable_paths_target_attn2_on_dual_blocks_only() {
+    // Use the REAL Medium arch shape but at the tiny widths is irrelevant — the *enumeration* is a
+    // pure function of `num_layers` + `dual_attention_layers`, so build a synthetic transformer with
+    // exactly Medium's block topology (24 layers, dual 0..=12) at tiny widths to keep it weightless.
+    let arch = Sd3Arch {
+        num_layers: 24,
+        dual_attention_layers: 13,
+        ..tiny_mmdit_x_arch()
+    };
+    let w = synthetic_transformer(&arch);
+    let model = Sd3Transformer::from_weights(&w, &arch).unwrap();
+    let paths = AdaptableHost::adaptable_paths(&model);
+
+    // (a) attn2 IS targeted on every dual block (0..=12) for all four locals.
+    for i in 0..arch.dual_attention_layers {
+        for local in ATTN2_LOCALS {
+            let want = format!("transformer_blocks.{i}.attn2.{local}");
+            assert!(
+                paths.contains(&want),
+                "dual block {i} must expose attn2 target {want}"
+            );
+        }
+    }
+    // (b) attn2 is NOT present on the plain blocks (13..23).
+    for i in arch.dual_attention_layers..arch.num_layers {
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.starts_with(&format!("transformer_blocks.{i}.attn2."))),
+            "plain block {i} must NOT expose any attn2 target"
+        );
+    }
+    // (c) The joint attention `attn` IS present on EVERY block (both dual and plain), incl. the text
+    // stream `add_*` — the 9-chunk SD35AdaLayerNormZeroX `norm1` is a modulation producer and is NOT
+    // a target (no `norm1` path is emitted).
+    for i in 0..arch.num_layers {
+        assert!(
+            paths.contains(&format!("transformer_blocks.{i}.attn.to_q")),
+            "block {i} must expose joint attn.to_q"
+        );
+    }
+    assert!(
+        !paths.iter().any(|p| p.contains(".norm1")),
+        "norm1 (AdaLN modulation producer) must never be a LoRA target"
+    );
+
+    // (d) Sane total count. Per block the joint attn enumerates 7 (to_q/to_k/to_v/to_out.0 +
+    // add_q/add_k/add_v) on all blocks + to_add_out on all but the final context_pre_only block, plus
+    // ff (2) on all + ff_context (2) on all but the final block; the 13 dual blocks ADD attn2 (4 each).
+    let n = arch.num_layers; // 24
+    let dual = arch.dual_attention_layers; // 13
+    let joint_attn = n * 7 + (n - 1); // 168 + 23 = 191
+    let ff = n * 2 + (n - 1) * 2; // 48 + 46 = 94
+    let attn2 = dual * 4; // 52
+    let expected = joint_attn + ff + attn2;
+    assert_eq!(
+        paths.len(),
+        expected,
+        "Medium adaptable-path count: joint_attn {joint_attn} + ff {ff} + attn2 {attn2} = {expected}"
+    );
+    // And the attn2 contribution is exactly 13 dual blocks worth.
+    let attn2_count = paths.iter().filter(|p| p.contains(".attn2.")).count();
+    assert_eq!(
+        attn2_count,
+        dual * 4,
+        "13 dual blocks × 4 attn2 locals = 52"
+    );
+}
+
+#[test]
+fn large_arch_has_no_attn2_targets() {
+    // The plain-MMDiT (Large) arch must enumerate ZERO attn2 targets — the dual-attention surface is
+    // Medium-only. (Confirms T4's delta is purely additive and does not leak into Large.)
+    let arch = Sd3Arch {
+        num_layers: 6,
+        dual_attention_layers: 0,
+        ..tiny_mmdit_x_arch()
+    };
+    let w = synthetic_transformer(&arch);
+    let model = Sd3Transformer::from_weights(&w, &arch).unwrap();
+    let paths = AdaptableHost::adaptable_paths(&model);
+    assert!(
+        !paths.iter().any(|p| p.contains(".attn2.")),
+        "a plain-MMDiT arch must expose no attn2 targets"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with(".attn.to_q")),
+        "plain arch still exposes the joint attn"
+    );
 }
 
 // ----------------------------------------------------------------------------------------------
