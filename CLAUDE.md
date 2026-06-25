@@ -13,7 +13,7 @@ Read `ARCHITECTURE.md` (design stance) and `docs/MODEL_ARCHITECTURE.md` (the `Ge
 - **`mlx-gen`** (root `src/`) — THE CORE: shared `nn` primitives, `adapters` (LoRA/LoKr `AdaptableLinear`), `weights`, `quant`, `sampler`/`scheduler`, `image`, `tokenizer`, `train` kernels. Re-exports `gen-core` at the historical `mlx_gen::…` paths. **No model-specific code.**
 - **`gen-core`** — backend-neutral contract layer (epic 3720) with **zero tensor deps**: the `Generator`/`Trainer`/`Captioner`/`Transform`/`TextLlm` traits, request/output/conditioning/progress/cancel/error types, the link-time registry, and pure host-side policy math (tokenization, PIL-compatible resize, tiling, LR schedule). Numeric types restricted to `f32`/`f64`/`Vec<f32>`/`&[u8]` — never an `Array`. Builds/tests on Linux.
 - **`gen-core-testkit`** — conformance suite (also zero tensor deps); family crates dev-depend on it to run their real model through cancel/progress/seed/capabilities checks.
-- **`mlx-gen-<family>`** (~24 crates) — provider crates: `-z-image`, `-flux`, `-flux2`, `-chroma`, `-qwen-image`, `-sdxl`, `-kolors`, `-sensenova`, `-wan`, `-ltx`, `-svd`, `-seedvr2`, `-pulid`, `-instantid`, `-face`, `-joycaption`, `-sam2`, `-sam3`, `-bernini`, `-scail2`, `-lens`, `-boogu`, `-ideogram`, `-prompt-refine`. Each depends **only on `mlx-gen`** and self-registers via `inventory`.
+- **`mlx-gen-<family>`** (~24 crates) — provider crates: `-z-image`, `-flux`, `-flux2`, `-chroma`, `-qwen-image`, `-sdxl`, `-kolors`, `-sensenova`, `-wan`, `-ltx`, `-svd`, `-seedvr2`, `-pulid`, `-instantid`, `-face`, `-joycaption`, `-sam2`, `-sam3`, `-bernini`, `-scail2`, `-lens`, `-boogu`, `-ideogram`, `-prompt-refine`. Most depend **only on `mlx-gen`** and self-register a model via `inventory`. Exceptions to keep straight: a few reuse a sibling family crate rather than building on core alone — `-kolors` and `-instantid` build on `-sdxl`; `-pulid` is **FLUX-family** (builds on `-flux`, NOT `-sdxl`); both identity crates also use `-face`. And `-instantid` is a **struct API** (`InstantId`/`InstantIdRequest`, composing SDXL UNet/ControlNet/Resampler parts) — it does **not** `inventory::submit!` a registered `Generator`.
 
 ## Build / lint / test
 
@@ -29,7 +29,7 @@ cargo test -p mlx-gen-z-image some_test_name    # one test by name
 ```
 
 - **`RUST_TEST_THREADS=1` is forced** via `.cargo/config.toml` (`force = true`). MLX's shared default Metal device is **not thread-safe** and SIGSEGVs under cargo's parallel harness. Do not remove this or run tests with `--test-threads`.
-- Workspace types are shared across crates — when changing a public type in `mlx-gen` core or a crate reused by others (e.g. SDXL types reused by kolors/instantid/pulid), lint/test with `--workspace`, not crate-scoped, or you'll discover the break in CI.
+- Workspace types are shared across crates — when changing a public type in `mlx-gen` core or a crate reused by others (e.g. SDXL types reused by kolors/instantid; FLUX types reused by pulid), lint/test with `--workspace`, not crate-scoped, or you'll discover the break in CI.
 - `mlx-sys` builds MLX from source via cmake (~5 min, cached) and needs full Xcode + the Metal Toolchain. Apple-Silicon only.
 
 ### Real-weight tests vs default tests

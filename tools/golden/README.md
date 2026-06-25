@@ -99,7 +99,7 @@ HF_HUB_OFFLINE=1 PYTHONPATH=. /private/tmp/pulidenv/bin/python /path/to/mlx-gen/
 | `idformer_golden.safetensors` | `dump_idformer_golden.py` | `mlx-gen-pulid/tests/idformer_parity.rs` | **IDFormer perceiver-resampler (sc-3071).** f32 `pulid_encoder.*` weights (from `pulid_flux_v0.9.1.safetensors`) + deterministic `id_cond` [1,1280] + 5 EVA hidden states → `id_embedding` [1,32,2048]. cos 1.000000 / mean-rel 1.3e-3 (bf16 0.999999). |
 | `pulid_ca_golden.safetensors` | `dump_pulid_ca_golden.py` | `mlx-gen-pulid/tests/pulid_ca_parity.rs` | **PerceiverAttentionCA ×20 + injection schedule (sc-3072).** f32 `pulid_ca.{0..19}.*` weights + `id_embedding` [1,32,2048] + `img` [1,64,3072] + per-module outputs at ca indices {0,9,10,19}. Driving these through the `PulidCa` injector validates the CA math (cos ~1.0) and the double→single ca_idx schedule (double i→ca[i/2], single i→ca[10+i/4]) in one shot. |
 | _(reuses goldens above)_ | — | `mlx-gen-pulid/tests/pulid_flux_e2e.rs` | **PuLID-FLUX e2e (sc-3074).** No new golden: reuses `eva_clip_golden` (EVA, prefix `w`) + `scrfd_10g`/`arcface_iresnet100`/`bisenet_parsing`/`face_align_goldens` (face stack + reference face), with FLUX.1-dev from the HF cache and `pulid_flux_v0.9.1.safetensors` from `guozinan/PuLID`. Validates id_weight=0 == plain-FLUX bit-identical, id injection changes the render, and ArcFace identity cosine (0.68 @ 20-step/512²; sc-2012 baseline ≈0.80). Heavy — loads the full stack. |
-### InstantID (`mlx-gen-sdxl`, epic 3109)
+### InstantID (`mlx-gen-instantid`, consumes `mlx-gen-sdxl`, epic 3109)
 
 | golden | dump script | consumed by | notes |
 |---|---|---|---|
