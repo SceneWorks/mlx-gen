@@ -316,6 +316,85 @@ mod tests {
 
     crate::register_trainer! { dummy_trainer_descriptor => dummy_trainer_load }
 
+    // Multi-arm fixtures: a single `register_generators!` / `register_trainer!` invocation with two
+    // `desc => load` arms exercises the `,+` repetition that single-arm callers never reach. This is
+    // the path the provider migration sweep (sc-7780) leans on for multi-variant crates like boogu.
+    fn dummy_multi_gen_a_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_multi_gen_a",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    fn dummy_multi_gen_b_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_multi_gen_b",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        }
+    }
+
+    fn dummy_multi_gen_a_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyGen {
+            desc: dummy_multi_gen_a_descriptor(),
+        }))
+    }
+
+    fn dummy_multi_gen_b_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyGen {
+            desc: dummy_multi_gen_b_descriptor(),
+        }))
+    }
+
+    crate::register_generators! {
+        dummy_multi_gen_a_descriptor => dummy_multi_gen_a_load,
+        dummy_multi_gen_b_descriptor => dummy_multi_gen_b_load,
+    }
+
+    fn dummy_multi_trainer_a_descriptor() -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "dummy_multi_trainer_a",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+        }
+    }
+
+    fn dummy_multi_trainer_b_descriptor() -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "dummy_multi_trainer_b",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+        }
+    }
+
+    fn dummy_multi_trainer_a_load(_spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+        Ok(Box::new(DummyTrainer {
+            desc: dummy_multi_trainer_a_descriptor(),
+        }))
+    }
+
+    fn dummy_multi_trainer_b_load(_spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
+        Ok(Box::new(DummyTrainer {
+            desc: dummy_multi_trainer_b_descriptor(),
+        }))
+    }
+
+    crate::register_trainer! {
+        dummy_multi_trainer_a_descriptor => dummy_multi_trainer_a_load,
+        dummy_multi_trainer_b_descriptor => dummy_multi_trainer_b_load,
+    }
+
     struct DummyCaptioner {
         desc: CaptionerDescriptor,
     }
@@ -406,6 +485,24 @@ mod tests {
         let t = load_trainer("dummy_test_trainer", &spec).expect("dummy trainer is registered");
         assert_eq!(t.descriptor().id, "dummy_test_trainer");
         assert!(trainers().any(|r| (r.descriptor)().id == "dummy_test_trainer"));
+    }
+
+    #[test]
+    fn multi_arm_register_generators_registers_each() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["dummy_multi_gen_a", "dummy_multi_gen_b"] {
+            let g = load(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            assert_eq!(g.descriptor().id, id);
+        }
+    }
+
+    #[test]
+    fn multi_arm_register_trainer_registers_each() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        for id in ["dummy_multi_trainer_a", "dummy_multi_trainer_b"] {
+            let t = load_trainer(id, &spec).unwrap_or_else(|_| panic!("{id} is registered"));
+            assert_eq!(t.descriptor().id, id);
+        }
     }
 
     #[test]

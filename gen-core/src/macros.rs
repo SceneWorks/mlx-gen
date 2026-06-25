@@ -13,16 +13,18 @@ macro_rules! register_generators {
     };
 }
 
-/// Register one trainer descriptor and loader with the link-time registry.
+/// Register one or more trainer descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_trainer {
-    ( $desc:path => $load:path $(,)? ) => {
-        $crate::inventory::submit! {
-            $crate::registry::TrainerRegistration {
-                descriptor: $desc,
-                load: |spec| $load(spec).map_err(::core::convert::Into::into),
+    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+        $(
+            $crate::inventory::submit! {
+                $crate::registry::TrainerRegistration {
+                    descriptor: $desc,
+                    load: |spec| $load(spec).map_err(::core::convert::Into::into),
+                }
             }
-        }
+        )+
     };
 }
 
