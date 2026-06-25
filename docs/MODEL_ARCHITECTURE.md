@@ -320,6 +320,14 @@ contract still takes a `String` prompt.
 **Out of scope — torch/diffusers, NOT MLX-native (stay in the Python worker):** InstantID, Kolors,
 PuLID-FLUX, SenseNova-U1, Chroma, SDXL-diffusers, FLUX.1-dev (diffusers path).
 
+> **Superseded — since ported.** This captured the epic-3720 contract-design scope at the time. The
+> project later expanded scope and **InstantID, Kolors, PuLID-FLUX, SenseNova-U1, and Chroma are now
+> MLX-native provider crates** — `mlx-gen-instantid` (epic 3109), `mlx-gen-kolors` (epic 3090),
+> `mlx-gen-pulid` (epic 3069, FLUX-family), `mlx-gen-sensenova` (epic 3180), `mlx-gen-chroma`
+> (epic 3531), all merged. Only the **diffusers/torch variants** (SDXL-diffusers, FLUX.1-dev-diffusers)
+> remain in the Python worker; their MLX-native siblings `mlx-gen-sdxl` and `mlx-gen-flux` are in
+> `mlx-gen` (see the table above).
+
 ### 8.2 Findings & verdict
 
 **The `Generator` / `Transform` / `Conditioning` contract holds across the entire MLX-native
@@ -358,6 +366,9 @@ scope.** Concretely:
 - `GenerationRequest` / `TransformRequest` are single **`Default`-able structs** (no builders).
 - **Scope: MLX-native models only.** Torch/diffusers models (InstantID, Kolors, PuLID, SenseNova,
   Chroma, SDXL-diffusers, FLUX.1-dev) are out of `mlx-gen` and stay in the Python worker (§8.1).
+  *(Superseded — since ported: InstantID/Kolors/PuLID-FLUX/SenseNova-U1/Chroma are now MLX-native
+  provider crates — epics 3109/3090/3069/3180/3531, all merged. Only the diffusers/torch variants
+  SDXL-diffusers + FLUX.1-dev-diffusers remain worker-side; see the §8.1 note.)*
 - **Contract validated** by the §8 fitment pass: all image generators + SeedVR2 fit as-is.
 - **Migration order (Michael):** split out **`mlx-gen-z-image`** first, then **`mlx-gen-qwen-image`**,
   then build the others. (Extract shared `nn` → `mlx-gen` core as part of the z-image split.)
