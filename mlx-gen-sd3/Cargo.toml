@@ -10,6 +10,12 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
+# E2 (sc-7861) REUSES sibling encoder crates — SD3.5 ships no net-new text encoder:
+#   * mlx-gen-sdxl: the CLIP text encoder, loaded twice (CLIP-L `text_encoder` + CLIP-G/OpenCLIP
+#     bigG `text_encoder_2`). SD3's CLIP-L config differs only by gaining a 768 text projection.
+#   * mlx-gen-flux: the T5-XXL encoder (`text_encoder_3`), identical to FLUX's T5.
+mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+mlx-gen-flux = { path = "../mlx-gen-flux" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry (wired by the later E5 model story).
