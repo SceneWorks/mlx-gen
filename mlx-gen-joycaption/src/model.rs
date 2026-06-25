@@ -153,6 +153,9 @@ impl Captioner for JoyCaption {
             role: Role::User,
             content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
             thinking: None,
+            // sc-7898 mlx-llm bump: core_llm::Message gained `tool_calls` (Qwen3.6 tool-calling);
+            // a caption turn carries none.
+            tool_calls: Vec::new(),
         };
 
         // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it by
