@@ -231,6 +231,114 @@ fn validate_arch_reports_missing_extra_and_bad_shape() {
     assert!(err.contains("1 shape mismatch"), "err: {err}");
 }
 
+// --- E7 (sc-7866): pre-quantized-on-disk round trip --------------------------------------------
+
+/// Build a `transformer/` dir on disk holding the dense synthetic tensor set for `arch` (sharded as a
+/// single file + a `config.json`), the input the offline pre-quantizer consumes.
+fn write_dense_transformer_dir(arch: &Sd3Arch) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "mlx_gen_sd3_e7_dense_{}",
+        expected_tensor_count(arch)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let entries: Vec<(String, Array)> = expected_transformer_tensors(arch)
+        .into_iter()
+        .map(|e| {
+            let dims: Vec<i32> = e.shape.iter().map(|&d| d as i32).collect();
+            (e.key, Array::ones::<f32>(&dims).unwrap())
+        })
+        .collect();
+    Array::save_safetensors(
+        entries.iter().map(|(k, v)| (k.as_str(), v)),
+        None::<&HashMap<String, String>>,
+        dir.join("diffusion_pytorch_model.safetensors"),
+    )
+    .unwrap();
+    // A minimal source config so the quantizer's manifest-writer has something to copy.
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{"_class_name":"SD3Transformer2DModel"}"#,
+    )
+    .unwrap();
+    dir
+}
+
+/// The offline pre-quantizer ([`quantize_sd3_dir`]) must (a) produce a loadable on-disk Q4/Q8 artifact
+/// (the `weight`/`scales`/`biases` packed triple per Linear) that (b) the loader auto-detects as
+/// packed — the consume side of the pre-quantized-on-disk path. Drives both Q8 and Q4 over a tiny
+/// synthetic Large-family arch (no real weights), validating the round trip without Metal/HF.
+#[test]
+fn prequantized_on_disk_round_trips_and_loads_packed() {
+    use mlx_gen::weights::Weights;
+    use mlx_gen_sd3::{quantize_sd3_dir, Sd3Transformer};
+
+    // Quantization is group-wise at group_size 64, so every Linear's in-dim must be a multiple of 64
+    // and >= 64 to actually pack (the `quantize_map` shape guard keeps smaller ones dense). `tiny_arch`
+    // (hidden 8) is below that floor, so use a quant-sized arch: head_dim 64, 1 head ⇒ hidden 64, with
+    // all the projection in-dims (hidden, 4·hidden, joint, pooled, time_proj) a multiple of 64.
+    let arch = Sd3Arch {
+        num_layers: 3, // exercises the context_pre_only final block
+        head_dim: 64,
+        num_heads: 1,
+        patch_size: 2,
+        in_channels: 16,
+        out_channels: 16,
+        joint_attention_dim: 128,
+        pooled_projection_dim: 64,
+        caption_projection_dim: 64, // == hidden
+        pos_embed_max_size: 3,
+        time_proj_dim: 64,
+        dual_attention_layers: 0,
+    };
+    let src = write_dense_transformer_dir(&arch);
+
+    for bits in [8, 4] {
+        let dst = std::env::temp_dir().join(format!("mlx_gen_sd3_e7_q{bits}"));
+        std::fs::remove_dir_all(&dst).ok();
+        quantize_sd3_dir(&arch, &src, &dst, bits, 64).unwrap();
+
+        // (a) The packed artifact + manifest exist on disk.
+        let packed = dst.join("diffusion_pytorch_model.safetensors");
+        assert!(
+            packed.exists(),
+            "Q{bits}: no packed safetensors at {packed:?}"
+        );
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dst.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(cfg["quantization"]["bits"], bits, "Q{bits}: manifest bits");
+        assert_eq!(
+            cfg["quantization"]["group_size"], 64,
+            "Q{bits}: manifest group_size"
+        );
+
+        // The packed tensor set carries the `.scales`/`.biases` triple for the Linears and keeps the
+        // qk-RMSNorms + pos_embed dense (no `.scales`).
+        let w = Weights::from_dir(&dst).unwrap();
+        assert!(
+            w.get("transformer_blocks.0.attn.to_q.scales").is_some(),
+            "Q{bits}: a Linear must be packed (have .scales)"
+        );
+        assert!(
+            w.get("transformer_blocks.0.attn.norm_q.scales").is_none(),
+            "Q{bits}: qk-RMSNorm must stay dense (no .scales)"
+        );
+        assert!(
+            w.get("pos_embed.pos_embed.scales").is_none(),
+            "Q{bits}: the learned pos_embed table must stay dense (no .scales)"
+        );
+
+        // (b) The loader auto-detects the packed checkpoint and builds the transformer — the
+        // pre-quantized-on-disk consume path. (`from_dir` succeeding over the packed set IS the proof
+        // the auto-detect `lin` consumed the triple; a dense loader would error on the u32 codes.)
+        let t = Sd3Transformer::from_dir(&dst, &arch).expect("load pre-quantized transformer");
+        assert_eq!(t.arch().num_layers, arch.num_layers);
+
+        std::fs::remove_dir_all(&dst).ok();
+    }
+    std::fs::remove_dir_all(&src).ok();
+}
+
 #[test]
 fn safetensors_header_reads_shapes_without_body() {
     use std::io::Write;
