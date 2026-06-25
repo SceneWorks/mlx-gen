@@ -1150,10 +1150,13 @@ impl Sd3Transformer {
         &self.arch
     }
 
-    /// The transformer's compute dtype, probed from the dense `context_embedder` weight. `f32` for
-    /// the inference default (or any quantized base); `bf16` after [`cast_weights`](Self::cast_weights)
-    /// in training. The top-level [`forward`](Self::forward) follows this so inference stays f32-exact
-    /// while bf16 training runs the heavy matmuls in bf16.
+    /// The transformer's loaded base-weight dtype, probed from the dense `context_embedder` weight:
+    /// `bf16` for an SD3.5-large checkpoint on disk (and after [`cast_weights`](Self::cast_weights)
+    /// to bf16 in training), `f32` for an f32 load, `f32` for any quantized base (the packed weight
+    /// has no logical activation dtype). The trainer uses it to detect whether a
+    /// [`cast_weights`](Self::cast_weights) is needed to reach its train dtype; it is NOT the
+    /// inference activation dtype. Inference always runs f32 activations regardless of this — see
+    /// [`forward`](Self::forward).
     pub fn compute_dtype(&self) -> Dtype {
         self.context_embedder
             .weight_dtype()
@@ -1199,8 +1202,16 @@ impl Sd3Transformer {
     ///   * `timestep` `[B]` (the continuous flow-match timestep, **σ·1000** diffusers scale).
     ///
     /// Returns `[B, out_channels, H, W]` (the predicted velocity/noise latent), always cast back to
-    /// **f32** so the caller's sampler / loss math is dtype-stable. Inference runs the body f32; bf16
-    /// training (after [`cast_weights`](Self::cast_weights)) runs the heavy matmuls in bf16.
+    /// **f32** so the caller's sampler / loss math is dtype-stable.
+    ///
+    /// INFERENCE entry point: the body runs **f32 activations unconditionally**, independent of the
+    /// loaded base-weight dtype. SD3.5-large dense weights are bf16 on disk (and quant keeps a packed
+    /// base), but casting the activations to f32 promotes every base matmul to f32, so dense AND
+    /// quantized inference are f32-exact — exactly the path every E5/E6/M3 real-weight smoke validated.
+    /// The activation dtype must NOT follow the base weight dtype here. The bf16 training path goes
+    /// through [`forward_with`](Self::forward_with) /
+    /// [`forward_with_blocks_checkpointed`](Self::forward_with_blocks_checkpointed), which drive the
+    /// compute dtype explicitly.
     pub fn forward(
         &self,
         latent: &Array,
@@ -1208,7 +1219,26 @@ impl Sd3Transformer {
         pooled: &Array,
         timestep: &Array,
     ) -> Result<Array> {
-        let dt = self.compute_dtype();
+        // f32-exact inference: do NOT follow the base weight dtype (see method docs). The training
+        // seam is the only caller that runs the body in bf16, via `forward_with`.
+        self.forward_with(latent, context, pooled, timestep, Dtype::Float32)
+    }
+
+    /// MMDiT forward at an explicitly-chosen compute `dtype` — the shared body behind
+    /// [`forward`](Self::forward) (which always passes `f32`) and the training non-checkpointed path
+    /// (which passes the bf16 train dtype). Driving the dtype as a parameter — rather than probing the
+    /// base weight via [`compute_dtype`](Self::compute_dtype) — keeps inference f32-exact regardless of
+    /// the on-disk weight dtype while letting bf16 training run the heavy matmuls in bf16 (mirrors how
+    /// Krea / z-image separate inference vs training compute dtype). Returns the velocity cast back to
+    /// f32. See [`forward`](Self::forward) for the input/output shapes.
+    pub fn forward_with(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        dt: Dtype,
+    ) -> Result<Array> {
         let latent = latent.as_dtype(dt)?;
         let context = context.as_dtype(dt)?;
 
@@ -1242,8 +1272,10 @@ impl Sd3Transformer {
     /// its activations (bounding the first-step working set for the 8.1B Large), while gradients still
     /// flow to the LoRA params. `block_local_targets[i]` lists the adapter-routable LOCAL paths (e.g.
     /// `"attn.to_q"`) trained on block `i`, in the order their factors are threaded as checkpoint
-    /// inputs. Blocks with no trained targets still run checkpointed (hidden-only). Numerically
-    /// identical to [`forward`](Self::forward).
+    /// inputs. Blocks with no trained targets still run checkpointed (hidden-only). Training-only:
+    /// `dt` is the explicitly-chosen compute dtype (the bf16 train dtype, or f32) — driven as a
+    /// parameter for the same reason as [`forward_with`](Self::forward_with), never probed from the
+    /// base weight. Numerically identical to [`forward_with`](Self::forward_with) at the same `dt`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with_blocks_checkpointed(
         &self,
@@ -1254,8 +1286,8 @@ impl Sd3Transformer {
         params: &LoraParams,
         block_local_targets: &[Vec<String>],
         alpha: f32,
+        dt: Dtype,
     ) -> Result<Array> {
-        let dt = self.compute_dtype();
         let latent = latent.as_dtype(dt)?;
         let context = context.as_dtype(dt)?;
 

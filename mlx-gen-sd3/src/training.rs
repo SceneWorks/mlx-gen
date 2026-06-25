@@ -858,14 +858,17 @@ fn compute_loss_grads(
         // through ordinary autograd; on the checkpointed path the joint-block adapters installed here
         // are replaced inside each checkpoint segment by the explicit-input factors.
         adapter.install_as(transformer, &p, alpha, rank, lora_dtype, LOKR_DTYPE)?;
+        // Training drives the compute dtype EXPLICITLY (`dtype` = the bf16 train dtype, or f32). The
+        // inference `forward` is f32-pinned and must not be used here; both training paths take the
+        // explicit-dtype seam so bf16 training runs the heavy matmuls in bf16.
         let v = match checkpoint_blocks {
             Some(locals) => transformer
                 .forward_with_blocks_checkpointed(
-                    &x_t, &context, &pooled, &timestep, &p, locals, alpha,
+                    &x_t, &context, &pooled, &timestep, &p, locals, alpha, dtype,
                 )
                 .map_err(|e| Exception::custom(e.to_string()))?,
             None => transformer
-                .forward(&x_t, &context, &pooled, &timestep)
+                .forward_with(&x_t, &context, &pooled, &timestep, dtype)
                 .map_err(|e| Exception::custom(e.to_string()))?,
         };
         let diff = subtract(&v, &target)?;
