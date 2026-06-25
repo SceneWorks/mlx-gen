@@ -1,4 +1,5 @@
-//! Stable Diffusion 3.5 **MMDiT-Large** forward pass — the SD3.5 **E3** slice (sc-7862).
+//! Stable Diffusion 3.5 **MMDiT** forward pass — the SD3.5 **E3** (Large, sc-7862) +
+//! **M2** (Medium MMDiT-X dual-attention, sc-7868) slices.
 //!
 //! This is the genuinely novel core of the native SD3.5 port: the `SD3Transformer2DModel` forward.
 //! It is a faithful mirror of diffusers `SD3Transformer2DModel` / `JointTransformerBlock`, built by
@@ -21,6 +22,31 @@
 //!   * **GELU-approx FFN** (diffusers `FeedForward(activation_fn="gelu-approximate")`), NOT SwiGLU.
 //!   * Output: `norm_out` (AdaLayerNormContinuous from the time/text embed) + `proj_out` →
 //!     unpatchify → `[B, 16, H/8, W/8]` noise prediction.
+//!
+//! ## SD3.5-Medium MMDiT-X (M2, sc-7868)
+//!
+//! Medium is an **MMDiT-X** (24 blocks, hidden 1536). Its FIRST 13 blocks
+//! (`dual_attention_layers = [0..=12]`, real-weight confirmed sc-7850/M1) carry a SECOND,
+//! image-stream-only self-attention `attn2` ALONGSIDE the joint attention, plus an EXTENDED 9-chunk
+//! `norm1` AdaLN (diffusers `SD35AdaLayerNormZeroX`). The remaining 11 blocks (13..23) are plain
+//! joint blocks; block 23 is `context_pre_only` exactly as in Large.
+//!
+//! The genuinely novel forward delta is the dual-attention block, a faithful mirror of diffusers
+//! `JointTransformerBlock.forward(use_dual_attention=True)`:
+//!   * `norm1` = `SD35AdaLayerNormZeroX`: `silu(emb) → linear[9·hidden]` chunked in EXACTLY the order
+//!     `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2,
+//!     gate_msa2)`. The msa chunks modulate the joint-attention image normed tokens; the msa2 chunks
+//!     modulate a SEPARATE normed copy of the image tokens fed to `attn2`.
+//!   * `attn2` = plain image-stream self-attention (`to_q`/`to_k`/`to_v`/`to_out.0` + `norm_q`/`norm_k`
+//!     qk-RMSNorm; NO joint concat, NO text projections) — reuses the same `process_qkv`/`attention`
+//!     ops as the joint attention.
+//!   * Residual combination (diffusers order): `hidden = hidden + gate_msa·attn_joint_img`, THEN
+//!     `hidden = hidden + gate_msa2·attn2_out`, THEN the MLP modulates the doubly-updated `hidden`
+//!     with `(shift_mlp, scale_mlp)` and gates with `gate_mlp`. The text stream is the plain joint
+//!     update (AdaLN-zero `norm1_context`), unchanged from E3.
+//!
+//! [`Sd3Transformer`] is now arch-driven: `Sd3Arch::large()` builds the all-plain Large/Turbo MMDiT
+//! and `Sd3Arch::medium()` builds the MMDiT-X (dual blocks gated by `arch.is_dual_attention_block`).
 //!
 //! Tensor keys are the diffusers `SD3Transformer2DModel` names exactly (E1's converter is a 1:1
 //! identity rename, [`crate::convert`]), so a converted/quantized checkpoint loads unchanged.
@@ -231,6 +257,70 @@ impl JointAttention {
 }
 
 // ----------------------------------------------------------------------------------------------
+// MMDiT-X second attention (`attn2`) — image-stream-only self-attention.
+// ----------------------------------------------------------------------------------------------
+
+/// The MMDiT-X dual-attention `attn2`: a plain image-stream self-attention (NO joint concat, NO text
+/// projections). Mirrors diffusers `Attention(cross_attention_dim=None, qk_norm="rms_norm", eps=1e-6)`
+/// — `to_q`/`to_k`/`to_v`/`to_out.0` + per-head `norm_q`/`norm_k` RMSNorm, reusing the same
+/// [`process_qkv`]/[`attention`] ops as the joint attention's image side (no RoPE).
+struct SelfAttention {
+    to_q: AdaptableLinear,
+    to_k: AdaptableLinear,
+    to_v: AdaptableLinear,
+    to_out: AdaptableLinear,
+    norm_q: Array,
+    norm_k: Array,
+    heads: i32,
+    head_dim: i32,
+}
+
+impl SelfAttention {
+    fn from_weights(w: &Weights, prefix: &str, heads: i32, head_dim: i32) -> Result<Self> {
+        let g = |n: &str| w.require(&format!("{prefix}.{n}.weight")).cloned();
+        let l = |n: &str| lin(w, &format!("{prefix}.{n}"));
+        Ok(Self {
+            to_q: l("to_q")?,
+            to_k: l("to_k")?,
+            to_v: l("to_v")?,
+            to_out: l("to_out.0")?,
+            norm_q: g("norm_q")?,
+            norm_k: g("norm_k")?,
+            heads,
+            head_dim,
+        })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        for p in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+        ] {
+            p.quantize(bits, None)?;
+        }
+        Ok(())
+    }
+
+    /// Image-stream self-attention over `x [B,S,H·D]` → `[B,S,H·D]`.
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let (q, k, v) = process_qkv(
+            x,
+            &self.to_q,
+            &self.to_k,
+            &self.to_v,
+            &self.norm_q,
+            &self.norm_k,
+            self.heads,
+            self.head_dim,
+        )?;
+        let o = attention(&q, &k, &v, self.head_dim)?;
+        self.to_out.forward(&o)
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
 // FeedForward (GELU-approx).
 // ----------------------------------------------------------------------------------------------
 
@@ -301,6 +391,58 @@ impl AdaLnZero {
     }
 }
 
+/// `SD35AdaLayerNormZeroX` (MMDiT-X dual-attention `norm1`): `silu(emb) → linear[9·hidden]` chunked
+/// into the diffusers order `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp,
+/// shift_msa2, scale_msa2, gate_msa2)`. The first 6 are the AdaLN-zero modulation for the joint
+/// attention + MLP (identical role to [`AdaLnZero`]); the last 3 are shift/scale/gate for the second
+/// (`attn2`) attention branch. Real-weight confirmed: dual blocks' `norm1.linear` is `[9·hidden, hidden]`.
+struct AdaLnZeroX {
+    linear: AdaptableLinear,
+}
+
+/// The 9 `SD35AdaLayerNormZeroX` modulation tensors, each `[B, 1, hidden]`:
+/// `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2, gate_msa2)`.
+type ZeroXMod = (
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+    Array,
+);
+
+impl AdaLnZeroX {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            linear: lin(w, &format!("{prefix}.linear"))?,
+        })
+    }
+
+    fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.linear.quantize(bits, None)
+    }
+
+    fn forward(&self, emb: &Array) -> Result<ZeroXMod> {
+        let e = self.linear.forward(&silu(emb)?)?; // [B, 9·hidden]
+        let parts = split(&e, 9, -1)?;
+        let u = |a: &Array| -> Result<Array> { Ok(a.expand_dims(1)?) }; // [B, hidden] -> [B, 1, hidden]
+        Ok((
+            u(&parts[0])?,
+            u(&parts[1])?,
+            u(&parts[2])?,
+            u(&parts[3])?,
+            u(&parts[4])?,
+            u(&parts[5])?,
+            u(&parts[6])?,
+            u(&parts[7])?,
+            u(&parts[8])?,
+        ))
+    }
+}
+
 /// AdaLayerNormContinuous: `silu(emb) → linear → [scale, shift]`, each `[B, hidden]`. Used by the
 /// final block's `norm1_context` (`context_pre_only`) and the model-level `norm_out`.
 ///
@@ -355,13 +497,23 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 // ----------------------------------------------------------------------------------------------
 
 struct JointBlock {
-    norm1: AdaLnZero,
+    /// Plain block: AdaLN-zero (6 chunks). MMDiT-X dual block: `SD35AdaLayerNormZeroX` (9 chunks).
+    norm1: ImageNorm,
     /// Non-final: AdaLN-zero (6 chunks). Final (`context_pre_only`): AdaLN-continuous (2 chunks).
     norm1_context: ContextNorm,
     attn: JointAttention,
+    /// MMDiT-X second (image-stream-only) self-attention — present only on dual-attention blocks.
+    attn2: Option<SelfAttention>,
     ff: FeedForward,
     /// Absent on the final `context_pre_only` block.
     ff_context: Option<FeedForward>,
+}
+
+/// The image-stream `norm1`: AdaLN-zero (plain joint block) or the extended `SD35AdaLayerNormZeroX`
+/// (MMDiT-X dual-attention block, paired with `attn2`).
+enum ImageNorm {
+    Zero(AdaLnZero),
+    ZeroX(AdaLnZeroX),
 }
 
 enum ContextNorm {
@@ -374,11 +526,18 @@ impl JointBlock {
         w: &Weights,
         idx: usize,
         is_last: bool,
+        is_dual: bool,
         heads: i32,
         head_dim: i32,
     ) -> Result<Self> {
         let p = format!("transformer_blocks.{idx}");
-        let norm1 = AdaLnZero::from_weights(w, &format!("{p}.norm1"))?;
+        // Image-stream norm1: extended 9-chunk SD35AdaLayerNormZeroX on dual-attention blocks,
+        // plain 6-chunk AdaLN-zero otherwise.
+        let norm1 = if is_dual {
+            ImageNorm::ZeroX(AdaLnZeroX::from_weights(w, &format!("{p}.norm1"))?)
+        } else {
+            ImageNorm::Zero(AdaLnZero::from_weights(w, &format!("{p}.norm1"))?)
+        };
         let norm1_context = if is_last {
             ContextNorm::Continuous(AdaLnContinuous::from_weights(
                 w,
@@ -391,6 +550,16 @@ impl JointBlock {
             norm1,
             norm1_context,
             attn: JointAttention::from_weights(w, &format!("{p}.attn"), heads, head_dim, is_last)?,
+            attn2: if is_dual {
+                Some(SelfAttention::from_weights(
+                    w,
+                    &format!("{p}.attn2"),
+                    heads,
+                    head_dim,
+                )?)
+            } else {
+                None
+            },
             ff: FeedForward::from_weights(w, &format!("{p}.ff"))?,
             ff_context: if is_last {
                 None
@@ -401,12 +570,18 @@ impl JointBlock {
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.norm1.quantize(bits)?;
+        match &mut self.norm1 {
+            ImageNorm::Zero(z) => z.quantize(bits)?,
+            ImageNorm::ZeroX(z) => z.quantize(bits)?,
+        }
         match &mut self.norm1_context {
             ContextNorm::Zero(z) => z.quantize(bits)?,
             ContextNorm::Continuous(c) => c.quantize(bits)?,
         }
         self.attn.quantize(bits)?;
+        if let Some(a2) = self.attn2.as_mut() {
+            a2.quantize(bits)?;
+        }
         self.ff.quantize(bits)?;
         if let Some(ff) = self.ff_context.as_mut() {
             ff.quantize(bits)?;
@@ -419,9 +594,51 @@ impl JointBlock {
     /// (`context_pre_only`: the text stream is read-only after attention). Faithful mirror of
     /// diffusers `JointTransformerBlock.forward`.
     fn forward(&self, img: &Array, txt: &Array, temb: &Array) -> Result<(Array, Array)> {
-        let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) =
-            self.norm1.forward(temb)?;
+        // Image-stream norm1: plain AdaLN-zero (6 chunks) OR SD35AdaLayerNormZeroX (9 chunks). In the
+        // dual case the extra (norm_img2, gate_msa2) drive the second `attn2` self-attention branch.
+        let (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, dual_mod) =
+            match &self.norm1 {
+                ImageNorm::Zero(zero) => {
+                    let (s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp) = zero.forward(temb)?;
+                    (s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp, None)
+                }
+                ImageNorm::ZeroX(zerox) => {
+                    let (s_msa, sc_msa, g_msa, s_mlp, sc_mlp, g_mlp, s_msa2, sc_msa2, g_msa2) =
+                        zerox.forward(temb)?;
+                    // norm_img2 = norm(img)·(1+scale_msa2) + shift_msa2 (diffusers SD35AdaLayerNormZeroX).
+                    let norm_img2 = modulated_layer_norm(img, &s_msa2, &sc_msa2)?;
+                    (
+                        s_msa,
+                        sc_msa,
+                        g_msa,
+                        s_mlp,
+                        sc_mlp,
+                        g_mlp,
+                        Some((norm_img2, g_msa2)),
+                    )
+                }
+            };
         let norm_img = modulated_layer_norm(img, &shift_msa, &scale_msa)?;
+
+        // A dual-attention block must carry `attn2` (and vice versa) — guard the wiring invariant.
+        if dual_mod.is_some() != self.attn2.is_some() {
+            return Err(Error::Msg(
+                "sd3 MMDiT-X block: norm1 (9-chunk) and attn2 presence must agree".into(),
+            ));
+        }
+
+        // Applies the joint-attn image residual, then (if dual) the attn2 residual, then the MLP —
+        // matching diffusers `JointTransformerBlock.forward` residual ORDER exactly.
+        let finish_image = |img_attn: &Array| -> Result<Array> {
+            let mut img = gated(img, &gate_msa, img_attn)?;
+            if let (Some((norm_img2, gate_msa2)), Some(attn2)) = (&dual_mod, &self.attn2) {
+                let attn2_out = attn2.forward(norm_img2)?;
+                img = gated(&img, gate_msa2, &attn2_out)?;
+            }
+            let norm_img_mlp = modulated_layer_norm(&img, &shift_mlp, &scale_mlp)?;
+            let img_ff = self.ff.forward(&norm_img_mlp)?;
+            gated(&img, &gate_mlp, &img_ff)
+        };
 
         match &self.norm1_context {
             // ---- non-final block: full joint update of both streams --------------------------
@@ -435,10 +652,7 @@ impl JointBlock {
                     Error::Msg("sd3 non-final block: missing text attention output".into())
                 })?;
 
-                let mut img = gated(img, &gate_msa, &img_attn)?;
-                let norm_img2 = modulated_layer_norm(&img, &shift_mlp, &scale_mlp)?;
-                let img_ff = self.ff.forward(&norm_img2)?;
-                img = gated(&img, &gate_mlp, &img_ff)?;
+                let img = finish_image(&img_attn)?;
 
                 let mut txt = gated(txt, &c_gate_msa, &txt_attn)?;
                 let norm_txt2 = modulated_layer_norm(&txt, &c_shift_mlp, &c_scale_mlp)?;
@@ -458,10 +672,7 @@ impl JointBlock {
 
                 let (img_attn, _txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
 
-                let mut img = gated(img, &gate_msa, &img_attn)?;
-                let norm_img2 = modulated_layer_norm(&img, &shift_mlp, &scale_mlp)?;
-                let img_ff = self.ff.forward(&norm_img2)?;
-                img = gated(&img, &gate_mlp, &img_ff)?;
+                let img = finish_image(&img_attn)?;
 
                 // Text stream is read-only after this block — return it untouched.
                 Ok((img, txt.clone()))
@@ -608,7 +819,10 @@ impl TimeTextEmbed {
 // The MMDiT-Large transformer.
 // ----------------------------------------------------------------------------------------------
 
-/// SD3.5-Large / Large-Turbo `SD3Transformer2DModel`.
+/// SD3.5 `SD3Transformer2DModel` — arch-driven across variants: `Sd3Arch::large()` builds the
+/// all-plain Large / Large-Turbo MMDiT (38 joint blocks, no `attn2`), and `Sd3Arch::medium()` builds
+/// the MMDiT-X (24 blocks; the leading `dual_attention_layers` blocks carry `attn2` + the 9-chunk
+/// `norm1`). Block topology is selected per-index by [`Sd3Arch::is_dual_attention_block`].
 pub struct Sd3Transformer {
     arch: Sd3Arch,
     patch_embed: PatchEmbed,
@@ -629,7 +843,10 @@ impl Sd3Transformer {
         let mut blocks = Vec::with_capacity(arch.num_layers);
         for i in 0..arch.num_layers {
             let is_last = i + 1 == arch.num_layers;
-            blocks.push(JointBlock::from_weights(w, i, is_last, heads, head_dim)?);
+            let is_dual = arch.is_dual_attention_block(i);
+            blocks.push(JointBlock::from_weights(
+                w, i, is_last, is_dual, heads, head_dim,
+            )?);
         }
         Ok(Self {
             arch: *arch,
@@ -691,7 +908,7 @@ impl Sd3Transformer {
         // 3. project the joint context to hidden width.
         let mut txt = self.context_embedder.forward(&context)?;
 
-        // 4. 38 joint blocks.
+        // 4. joint blocks (Large: 38 plain; Medium MMDiT-X: 13 dual-attention + 11 plain).
         for block in &self.blocks {
             let (i, t) = block.forward(&img, &txt, &temb)?;
             img = i;
@@ -829,5 +1046,85 @@ mod tests {
             differs,
             "test cannot distinguish correct from swapped scale/shift"
         );
+    }
+
+    /// Build an [`AdaLnZeroX`] whose 9·hidden projection is a pure bias (zero weight) so `forward`
+    /// returns exactly the bias, chunked in the diffusers `SD35AdaLayerNormZeroX` order. Lets us pin
+    /// the chunk LABELLING (which 1536-slice is which of shift_msa…gate_msa2) with known values.
+    fn ada_ln_zero_x_pure_bias(hidden: i32, chunk_vals: &[[f32; 1]; 9]) -> AdaLnZeroX {
+        let mut w = Weights::empty();
+        let emb_dim = hidden;
+        w.insert(
+            "norm.linear.weight",
+            Array::zeros::<f32>(&[9 * hidden, emb_dim]).unwrap(),
+        );
+        // Each of the 9 chunks is a constant vector of length `hidden`.
+        let mut bias = Vec::with_capacity(9 * hidden as usize);
+        for c in chunk_vals {
+            for _ in 0..hidden {
+                bias.push(c[0]);
+            }
+        }
+        w.insert("norm.linear.bias", Array::from_slice(&bias, &[9 * hidden]));
+        AdaLnZeroX::from_weights(&w, "norm").unwrap()
+    }
+
+    /// Guards the diffusers `SD35AdaLayerNormZeroX` 9-chunk ORDER:
+    /// `(shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2,
+    /// gate_msa2)`. Getting this order wrong — e.g. swapping the msa2 triple with the mlp triple —
+    /// would silently mis-modulate the `attn2` branch (the #1 M2 parity risk). Each chunk gets a
+    /// distinct constant so any permutation is caught.
+    #[test]
+    fn ada_ln_zero_x_chunk_order_matches_diffusers() {
+        let hidden = 3;
+        // 9 distinct constants, one per chunk, in diffusers order.
+        let vals = [
+            [1.0f32], // shift_msa
+            [2.0],    // scale_msa
+            [3.0],    // gate_msa
+            [4.0],    // shift_mlp
+            [5.0],    // scale_mlp
+            [6.0],    // gate_mlp
+            [7.0],    // shift_msa2
+            [8.0],    // scale_msa2
+            [9.0],    // gate_msa2
+        ];
+        let ada = ada_ln_zero_x_pure_bias(hidden, &vals);
+        let emb = Array::from_slice(&[0.1f32, -0.2, 0.3], &[1, hidden]);
+        let (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+            shift_msa2,
+            scale_msa2,
+            gate_msa2,
+        ) = ada.forward(&emb).unwrap();
+        let outs = [
+            &shift_msa,
+            &scale_msa,
+            &gate_msa,
+            &shift_mlp,
+            &scale_mlp,
+            &gate_mlp,
+            &shift_msa2,
+            &scale_msa2,
+            &gate_msa2,
+        ];
+        eval(outs.iter().copied()).unwrap();
+        for (i, o) in outs.iter().enumerate() {
+            // each is [1, 1, hidden] all equal to vals[i].
+            assert_eq!(o.shape(), &[1, 1, hidden]);
+            let v: Vec<f32> = o.as_slice::<f32>().to_vec();
+            for x in v {
+                assert!(
+                    (x - vals[i][0]).abs() < 1e-4,
+                    "chunk {i} = {x} expected {} (9-chunk order regression)",
+                    vals[i][0]
+                );
+            }
+        }
     }
 }
