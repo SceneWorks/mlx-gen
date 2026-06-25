@@ -230,7 +230,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
             &mut |_| {},
         )
         .unwrap();
-        let img = decode_image(&mlx_gen_sdxl::load_vae(&snap).unwrap(), &lat).unwrap();
+        let img = decode_image(&mlx_gen_sdxl::load_vae(&snap).unwrap(), &lat, None).unwrap();
         let gpix: Vec<u8> = g.require("image_u8").unwrap().as_slice::<u8>().to_vec();
         save_png("sdxl_accel_base_tf.png", &img);
         let b8 = px_frac(&img.pixels, &gpix, 8) * 100.0;
@@ -330,7 +330,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
                 &mut |_| {},
             )
             .unwrap();
-            decode_image(&vae, &lat).unwrap()
+            decode_image(&vae, &lat, None).unwrap()
         };
 
         // (1) MLX CLIP conditioning — the full MLX path (CLIP + U-Net both MLX).
@@ -398,7 +398,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
                     &mut |_| {},
                 )
                 .unwrap();
-                let img = decode_image(&vae, &lat).unwrap();
+                let img = decode_image(&vae, &lat, None).unwrap();
                 let gpix_l: Vec<u8> = gl.require("image_u8").unwrap().as_slice::<u8>().to_vec();
                 let l8 = px_frac(&img.pixels, &gpix_l, 8) * 100.0;
                 println!("• lightning: MLX-full vs torch-CONV-STRIPPED px>8 {l8:.1}% — large gap ⇒ conv merge is live (sc-2919)");

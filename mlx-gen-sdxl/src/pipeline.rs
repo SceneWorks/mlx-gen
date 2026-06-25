@@ -12,7 +12,7 @@ use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, Progress, Result};
+use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, Progress, Result};
 
 use crate::inpaint::InpaintBlend;
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -676,8 +676,26 @@ pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
 }
 
 /// Decode final latents `[1, h, w, 4]` to an RGB8 image.
-pub fn decode_image(vae: &Autoencoder, latents: &Array) -> Result<Image> {
-    let decoded = vae.decode(latents)?;
+///
+/// When `pid` is `Some` (epic 7840, sc-7848 — the model was loaded with `LoadSpec::pid` and the
+/// request set `use_pid`), the latent is decoded by the **PiD super-resolving student** (4× SR)
+/// instead of the SDXL VAE. The SDXL `latents` (NHWC `[1,h,w,4]`) are already the
+/// `0.13025`-normalized tensor the `sdxl` student trained on — the exact tensor `vae.decode`
+/// consumes (zero-transform handoff), so we just relayout: NHWC `[1,h,w,4]` → NCHW `[1,4,h,w]` for
+/// the LQ adapter; the student returns NCHW `[1,3,4H,4W]`, transposed back to NHWC for
+/// [`decoded_to_image`] (which, like the VAE output, expects channels-last). Both decoders return
+/// pixels in `≈[-1,1]`, so the `x·0.5+0.5` mapping in [`decoded_to_image`] is identical.
+pub fn decode_image(
+    vae: &Autoencoder,
+    latents: &Array,
+    pid: Option<&dyn LatentDecoder>,
+) -> Result<Image> {
+    let decoded = match pid {
+        Some(d) => d
+            .decode(&latents.transpose_axes(&[0, 3, 1, 2])?)?
+            .transpose_axes(&[0, 2, 3, 1])?,
+        None => vae.decode(latents)?,
+    };
     decoded_to_image(&decoded)
 }
 
@@ -718,7 +736,8 @@ pub(crate) fn render_sample(
         &CancelFlag::default(),
         &mut |_| {},
     )?;
-    decode_image(vae, &latents)
+    // Training preview — always the native VAE decode (no PiD overlay in the trainer's render path).
+    decode_image(vae, &latents, None)
 }
 
 #[cfg(test)]

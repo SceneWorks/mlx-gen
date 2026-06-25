@@ -10,6 +10,10 @@ categories = ["science"]
 
 [dependencies]
 mlx-gen = { path = ".." }
+# Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): the `sdxl` PiD student as an
+# opt-in 4× decode replacement for the SDXL-family VAE. `mlx-gen-pid` depends only on the mlx-gen
+# core (not on any provider), so this edge is acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.

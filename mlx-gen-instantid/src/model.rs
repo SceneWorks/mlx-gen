@@ -420,7 +420,9 @@ impl InstantId {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents)
+        // InstantID is out of sc-7848 scope (a struct API, not a registered SDXL-family generator);
+        // it always uses the native SDXL VAE decode — no PiD overlay.
+        decode_image(&self.vae, &latents, None)
     }
 
     /// Run the InstantID dual-conditioning denoise — the bespoke ancestral default (byte-exact N1) or,
@@ -711,7 +713,9 @@ impl InstantId {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents)
+        // InstantID is out of sc-7848 scope (a struct API, not a registered SDXL-family generator);
+        // it always uses the native SDXL VAE decode — no PiD overlay.
+        decode_image(&self.vae, &latents, None)
     }
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.

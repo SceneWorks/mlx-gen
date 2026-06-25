@@ -17,12 +17,13 @@ use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
     curated_scheduler_names, default_seed, Capabilities, Conditioning, ConditioningKind,
-    ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
+    ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
 };
 
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_gen_sdxl::{
-    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder,
+    decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder, PID_BACKBONE,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
@@ -113,6 +114,11 @@ pub struct KolorsGenerator {
     kolors: Kolors,
     control: Option<ControlNet>,
     ip_encoder: Option<IpImageEncoder>,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): loaded when the spec
+    /// carries [`LoadSpec::pid`]. Kolors shares the SDXL VAE latent space, so it reuses the `sdxl`
+    /// PiD student (via [`PID_BACKBONE`]). `Some` ⇒ a `req.use_pid` generation decodes the final
+    /// latent 4× through PiD instead of the VAE; `None` ⇒ the default byte-exact VAE decode.
+    pid: Option<PidEngine>,
 }
 
 /// Build a [`KolorsGenerator`] from a [`LoadSpec`].
@@ -174,11 +180,20 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             None => None,
         };
 
+    // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
+    // when the spec carries it (Kolors = SDXL VAE latent space → reuses the `sdxl` PiD student).
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
+
     Ok(Box::new(KolorsGenerator {
         descriptor: descriptor(),
         kolors,
         control,
         ip_encoder,
+        pid,
     }))
 }
 
@@ -310,6 +325,15 @@ impl KolorsGenerator {
         };
 
         let (lh, lw) = (h / SPATIAL_SCALE, w / SPATIAL_SCALE);
+
+        // PiD decode overlay (epic 7840, sc-7848): mint a per-generation decoder (clean σ=0, seeded
+        // from `base_seed`) when `req.use_pid` is set and the model was loaded with `LoadSpec::pid`;
+        // it super-resolves the final latent 4× in place of the SDXL VAE. `None` ⇒ byte-exact VAE.
+        // Resolved once — the Gemma caption encode is shared across the count loop.
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
@@ -384,7 +408,7 @@ impl KolorsGenerator {
                     on_progress,
                 )?;
                 on_progress(Progress::Decoding);
-                images.push(decode_image(self.kolors.vae(), &latents)?);
+                images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
                 continue;
             }
 
@@ -475,7 +499,7 @@ impl KolorsGenerator {
             };
 
             on_progress(Progress::Decoding);
-            images.push(decode_image(self.kolors.vae(), &latents)?);
+            images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
         }
         Ok(GenerationOutput::Images(images))
     }

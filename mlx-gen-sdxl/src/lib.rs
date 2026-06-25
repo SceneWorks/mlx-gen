@@ -48,7 +48,7 @@ pub use loader::{
     load_text_encoder_2, load_text_encoder_2_dtype, load_tokenizer, load_unet, load_unet_dtype,
     load_unet_kolors_dtype, load_unet_with_config, load_vae,
 };
-pub use model::{descriptor, load, Sdxl, MODEL_ID};
+pub use model::{descriptor, load, Sdxl, MODEL_ID, PID_BACKBONE};
 pub use pipeline::{
     decode_image, decoded_to_image, denoise, denoise_control, denoise_curated, denoise_inpaint,
     denoise_ip, denoise_ip_control, denoise_ip_multi_control, denoise_multi_control,
