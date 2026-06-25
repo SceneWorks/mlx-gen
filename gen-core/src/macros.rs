@@ -1,10 +1,18 @@
-/// Register one or more generator descriptors and loaders with the link-time registry.
+/// Internal: expand each `$desc => $load` arm into an `inventory::submit!` of the given
+/// registration struct `$reg`, bridging the loader's `Result` into `gen_core::Result` via
+/// `Into::into` (identity when the loader already returns `gen_core::Result`).
+///
+/// The public `register_*!` macros below are thin wrappers that fix `$reg` to a specific
+/// `*Registration` struct. Sharing one rule keeps the link-time wiring identical across every
+/// registration kind (generators, trainers, captioners, image/text embedders) and mirrors what
+/// candle-gen needs — the sc-7779 cross-backend note anticipated folding all kinds onto one rule.
+#[doc(hidden)]
 #[macro_export]
-macro_rules! register_generators {
-    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+macro_rules! __register_kind {
+    ( $reg:path, $( $desc:path => $load:path ),+ $(,)? ) => {
         $(
             $crate::inventory::submit! {
-                $crate::registry::ModelRegistration {
+                $reg {
                     descriptor: $desc,
                     load: |spec| $load(spec).map_err(::core::convert::Into::into),
                 }
@@ -13,18 +21,47 @@ macro_rules! register_generators {
     };
 }
 
+/// Register one or more generator descriptors and loaders with the link-time registry.
+#[macro_export]
+macro_rules! register_generators {
+    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+        $crate::__register_kind! { $crate::registry::ModelRegistration, $( $desc => $load ),+ }
+    };
+}
+
 /// Register one or more trainer descriptors and loaders with the link-time registry.
 #[macro_export]
 macro_rules! register_trainer {
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $(
-            $crate::inventory::submit! {
-                $crate::registry::TrainerRegistration {
-                    descriptor: $desc,
-                    load: |spec| $load(spec).map_err(::core::convert::Into::into),
-                }
-            }
-        )+
+        $crate::__register_kind! { $crate::registry::TrainerRegistration, $( $desc => $load ),+ }
+    };
+}
+
+/// Register one or more captioner descriptors and loaders with the link-time registry.
+#[macro_export]
+macro_rules! register_captioner {
+    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+        $crate::__register_kind! { $crate::registry::CaptionerRegistration, $( $desc => $load ),+ }
+    };
+}
+
+/// Register one or more image-embedder descriptors and loaders with the link-time registry.
+#[macro_export]
+macro_rules! register_image_embedder {
+    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+        $crate::__register_kind! {
+            $crate::registry::ImageEmbedderRegistration, $( $desc => $load ),+
+        }
+    };
+}
+
+/// Register one or more text-embedder descriptors and loaders with the link-time registry.
+#[macro_export]
+macro_rules! register_text_embedder {
+    ( $( $desc:path => $load:path ),+ $(,)? ) => {
+        $crate::__register_kind! {
+            $crate::registry::TextEmbedderRegistration, $( $desc => $load ),+
+        }
     };
 }
 

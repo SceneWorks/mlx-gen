@@ -18,8 +18,8 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::runtime::Precision;
 use mlx_gen::{
-    CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor,
-    CaptionerRegistration, LoadSpec, Progress, WeightsSource,
+    CaptionFinishReason, CaptionOutput, CaptionRequest, Captioner, CaptionerDescriptor, LoadSpec,
+    Progress, WeightsSource,
 };
 
 // Force-link the mlx-llm engine so the `mlx-joycaption` provider's `inventory::submit!` into
@@ -230,9 +230,9 @@ fn map_finish(f: core_llm::FinishReason) -> CaptionFinishReason {
     }
 }
 
-inventory::submit! {
-    CaptionerRegistration { descriptor, load }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!`; `load` already
+// returns `gen_core::Result`, so the macro's `Into::into` bridge is the identity here (sc-7970).
+mlx_gen::register_captioner! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

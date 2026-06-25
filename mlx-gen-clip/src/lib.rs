@@ -16,7 +16,6 @@ use mlx_rs::fast::layer_norm;
 use mlx_rs::ops::matmul;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::gen_core::registry::{ImageEmbedderRegistration, TextEmbedderRegistration};
 use mlx_gen::gen_core::runtime::{LoadSpec, WeightsSource};
 use mlx_gen::gen_core::{
     ImageEmbedder, ImageEmbedderDescriptor, Result as GenResult, TextEmbedder,
@@ -219,22 +218,11 @@ pub fn load_text(spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
     Ok(Box::new(ClipTextEmbedder::from_weights_dir(root)?))
 }
 
-/// Registry adapter: bridge the crate's rich `Result` into the backend-neutral `gen_core::Result`.
-fn load_registered(spec: &LoadSpec) -> GenResult<Box<dyn ImageEmbedder>> {
-    load(spec).map_err(Into::into)
-}
-
-fn load_text_registered(spec: &LoadSpec) -> GenResult<Box<dyn TextEmbedder>> {
-    load_text(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ImageEmbedderRegistration { descriptor, load: load_registered }
-}
-
-inventory::submit! {
-    TextEmbedderRegistration { descriptor: text_descriptor, load: load_text_registered }
-}
+// Link-time registration (epic 3720): the macros emit the `inventory::submit!`s and bridge the
+// crate `Result` into the neutral `gen_core::Result` via `Into::into`, so no hand-written adapter
+// is needed (sc-7970).
+mlx_gen::register_image_embedder! { descriptor => load }
+mlx_gen::register_text_embedder! { text_descriptor => load_text }
 
 #[cfg(test)]
 mod tests {

@@ -188,6 +188,7 @@ mod tests {
     use crate::generator::{
         Capabilities, GenerationOutput, GenerationRequest, Modality, ModelDescriptor,
     };
+    use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
     use crate::media::Image;
     use crate::runtime::{Progress, WeightsSource};
     use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
@@ -445,12 +446,7 @@ mod tests {
         }))
     }
 
-    inventory::submit! {
-        CaptionerRegistration {
-            descriptor: dummy_captioner_descriptor,
-            load: dummy_captioner_load,
-        }
-    }
+    crate::register_captioner! { dummy_captioner_descriptor => dummy_captioner_load }
 
     #[test]
     fn registry_resolves_by_id() {
@@ -555,12 +551,7 @@ mod tests {
         }))
     }
 
-    inventory::submit! {
-        TextEmbedderRegistration {
-            descriptor: dummy_text_embedder_descriptor,
-            load: dummy_text_embedder_load,
-        }
-    }
+    crate::register_text_embedder! { dummy_text_embedder_descriptor => dummy_text_embedder_load }
 
     #[test]
     fn text_embedder_registry_resolves_by_id() {
@@ -584,5 +575,63 @@ mod tests {
     #[test]
     fn dummy_text_embedder_appears_in_iteration() {
         assert!(text_embedders().any(|r| (r.descriptor)().id == "dummy_test_text_embedder"));
+    }
+
+    struct DummyImageEmbedder {
+        desc: ImageEmbedderDescriptor,
+    }
+
+    impl ImageEmbedder for DummyImageEmbedder {
+        fn descriptor(&self) -> &ImageEmbedderDescriptor {
+            &self.desc
+        }
+
+        fn embed(&self, image: &Image) -> Result<Vec<f32>> {
+            Ok(vec![image.width as f32, image.height as f32])
+        }
+    }
+
+    fn dummy_image_embedder_descriptor() -> ImageEmbedderDescriptor {
+        ImageEmbedderDescriptor {
+            id: "dummy_test_image_embedder",
+            family: "test",
+            backend: "mlx",
+            embedding_dim: 2,
+            space: "test-space",
+            mac_only: true,
+        }
+    }
+
+    fn dummy_image_embedder_load(_spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
+        Ok(Box::new(DummyImageEmbedder {
+            desc: dummy_image_embedder_descriptor(),
+        }))
+    }
+
+    crate::register_image_embedder! { dummy_image_embedder_descriptor => dummy_image_embedder_load }
+
+    #[test]
+    fn image_embedder_registry_resolves_by_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let e = load_image_embedder("dummy_test_image_embedder", &spec)
+            .expect("dummy image embedder is registered");
+        assert_eq!(e.descriptor().id, "dummy_test_image_embedder");
+        let img = Image {
+            width: 7,
+            height: 3,
+            pixels: vec![0; 7 * 3 * 3],
+        };
+        assert_eq!(e.embed(&img).unwrap(), vec![7.0, 3.0]);
+    }
+
+    #[test]
+    fn unknown_image_embedder_id_errors() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        assert!(load_image_embedder("no_such_image_embedder", &spec).is_err());
+    }
+
+    #[test]
+    fn dummy_image_embedder_appears_in_iteration() {
+        assert!(image_embedders().any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
     }
 }
