@@ -93,7 +93,15 @@ impl KreaPipeline {
     /// [`Self::generate_turbo_with_progress`] with no cancellation, a no-op progress sink, and the
     /// native VAE decode (no PiD).
     pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
-        self.generate_turbo_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
+        // `keep = usize::MAX` → the full schedule (clean σ=0 decode; no from_ldm early-stop).
+        self.generate_turbo_with_progress(
+            prompt,
+            opts,
+            None,
+            usize::MAX,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
     }
 
     /// Generate one RGB image, streaming [`Progress`] and honoring `cancel` at each denoise step. A
@@ -103,11 +111,18 @@ impl KreaPipeline {
     /// [`QwenVae`] (the byte-exact default), `Some` routes through a PiD super-resolving decoder
     /// (built per-generation from the prompt by the caller). The caller owns the PiD decoder so it can
     /// be reused across a batch (same prompt → same caption); PiD output is 4× the native resolution.
+    ///
+    /// `keep` (epic 7840, sc-7993) is the PiD `from_ldm` early-stop truncation: run only the first
+    /// `keep` schedule entries so the denoise exits at a partially-denoised `x_k`, then hand that latent
+    /// to the PiD `decoder` bound to the matching degrade σ. `usize::MAX` (the clean default) runs the
+    /// full schedule (σ=0). The caller resolves `keep` + σ together from [`turbo_schedule`] via
+    /// `mlx_gen_pid::flow_capture_for_request`, so the truncation and the decoder's σ always agree.
     pub fn generate_turbo_with_progress(
         &self,
         prompt: &str,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -123,17 +138,13 @@ impl KreaPipeline {
 
         // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes
         // over the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
-        let native = turbo_sigmas(opts.steps);
-        let sigmas = resolve_flow_schedule(
-            opts.scheduler.as_deref(),
-            TURBO_MU as f32,
-            opts.steps,
-            &native,
-        );
+        // `from_ldm` early-stop (sc-7993): truncate to `keep` entries (σ=0 clean path runs them all).
+        let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let sigmas = &full[..keep.min(full.len())];
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
-            &sigmas,
+            sigmas,
             noise,
             opts.seed,
             cancel,
@@ -158,6 +169,16 @@ impl KreaPipeline {
         let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
+}
+
+/// The Turbo flow-match sigma schedule for `steps` (native exponential-mu by default, or a curated
+/// scheduler over the same mu). Length `steps + 1`, strictly descending with a trailing `0.0`. Exposed
+/// so the caller can resolve a PiD `from_ldm` early-stop capture (sc-7993, via
+/// `mlx_gen_pid::flow_capture_for_request`) before building the decoder — the same schedule
+/// [`KreaPipeline::generate_turbo_with_progress`] then runs (the build is pure host math).
+pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
+    let native = turbo_sigmas(steps);
+    resolve_flow_schedule(scheduler, TURBO_MU as f32, steps, &native)
 }
 
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).

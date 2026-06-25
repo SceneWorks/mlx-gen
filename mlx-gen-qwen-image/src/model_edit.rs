@@ -18,7 +18,7 @@ use mlx_gen::{
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
     Precision, Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
@@ -243,12 +243,22 @@ impl QwenImageEdit {
             concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
         };
 
-        // Decode seam (sc-7845): a per-request PiD decoder when `req.use_pid`, else the native VAE.
-        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, params.base_seed, MODEL_ID)?;
+        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): the partially-denoised x_k at the
+        // achieved σ (truncated schedule) when use_pid + pid_capture_sigma; else the clean σ=0 path.
+        // Edit denoises from full noise (no img2img init), so `start_step = 0`.
+        let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, 0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            params.base_seed,
+            MODEL_ID,
+            capture_sigma,
+        )?;
         let decoder: &dyn LatentDecoder = match &pid_decoder {
             Some(d) => d,
             None => &self.vae,
         };
+        let denoise_sigmas = &params.sigmas[..keep];
         let images = decode_and_collect(
             decoder,
             req.count,
@@ -261,7 +271,7 @@ impl QwenImageEdit {
                 denoise_edit_with_progress(
                     &self.transformer,
                     params.sampler_name.as_deref(),
-                    &params.sigmas,
+                    denoise_sigmas,
                     seed,
                     noise,
                     &static_latents,

@@ -186,6 +186,102 @@ fn qwen_image_pid_decode_vs_vae() {
 }
 
 #[test]
+#[ignore = "needs the Qwen-Image snapshot + converted PiD checkpoint + gemma-2-2b-it"]
+fn qwen_image_pid_from_ldm_early_stop() {
+    // sc-7993: the **integrated** from_ldm early-stop. Same model+request as `qwen_image_pid_decode_vs_vae`
+    // but with `pid_capture_sigma` — the denoise exits early at a partially-denoised x_k and PiD decodes
+    // it at the achieved degrade σ. Chaos-limited (no local reference for an arbitrary mid-trajectory
+    // capture; cross-backend RNG≠torch), so this is a coherence/shape smoke + a side-by-side dump vs the
+    // clean σ=0 PiD decode — the sc-7843 runB harness already validated the σ>0 PiD decode itself.
+    let size = size_from_env();
+    let quant = quant_from_env();
+    let mut spec = LoadSpec::new(WeightsSource::Dir(qwen_snapshot()));
+    if let Some(q) = quant {
+        spec = spec.with_quant(q);
+    }
+    spec = spec.with_pid(
+        WeightsSource::File(pid_checkpoint()),
+        WeightsSource::Dir(gemma_dir()),
+    );
+    let model = load(&spec).expect("load Qwen-Image + PiD");
+
+    // 50-step production path so the capture σ has a fine schedule to land on (the runB regime). The
+    // capture ceiling is env-tunable so this test doubles as the per-backbone speed/quality gate
+    // characterization (sc-7993): σ≤0.2 → x_t@44/50 (−6 steps); σ≤0.5 → x_t@33/50 (−17 steps). See
+    // `pid_capture_indices_production_50step` for the σ→step map.
+    let capture_sigma: f32 = std::env::var("QWEN_PID_CAPTURE_SIGMA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.2);
+    let base = GenerationRequest {
+        prompt: "a mountain valley landscape at golden hour with a winding river and pine forest"
+            .into(),
+        width: size,
+        height: size,
+        count: 1,
+        seed: Some(7),
+        steps: Some(50),
+        true_cfg: Some(4.0),
+        use_pid: true,
+        ..Default::default()
+    };
+
+    // Clean σ=0 PiD decode (full denoise) for the side-by-side.
+    let t = Instant::now();
+    let clean = match model
+        .generate(&base, &mut |_| {})
+        .expect("clean pid generate")
+    {
+        GenerationOutput::Images(v) => v,
+        _ => panic!("expected images"),
+    };
+    let clean_dt = t.elapsed().as_secs_f32();
+
+    // from_ldm early-stop at the (env-tunable) capture ceiling.
+    let early_req = GenerationRequest {
+        pid_capture_sigma: Some(capture_sigma),
+        ..base.clone()
+    };
+    let t = Instant::now();
+    let early = match model
+        .generate(&early_req, &mut |_| {})
+        .expect("from_ldm pid generate")
+    {
+        GenerationOutput::Images(v) => v,
+        _ => panic!("expected images"),
+    };
+    let early_dt = t.elapsed().as_secs_f32();
+
+    let (clean_img, early_img) = (&clean[0], &early[0]);
+    let (clo, chi, _cmu) = stats(clean_img);
+    let (elo, ehi, _emu) = stats(early_img);
+    eprintln!(
+        "clean σ=0: {}x{} in {clean_dt:.2}s [{clo},{chi}]   from_ldm σ≤{capture_sigma}: {}x{} in {early_dt:.2}s [{elo},{ehi}]  ({:.0}% wall-clock vs clean)",
+        clean_img.width,
+        clean_img.height,
+        early_img.width,
+        early_img.height,
+        100.0 * (1.0 - early_dt / clean_dt.max(1e-3)),
+    );
+    // Same 4× SR geometry, both non-degenerate full-color (not the grayscale/flat failure mode).
+    assert_eq!(early_img.width, size * 4, "from_ldm width == 4× native");
+    assert_eq!(early_img.height, size * 4, "from_ldm height == 4× native");
+    assert!(ehi as i32 - elo as i32 > 40, "from_ldm output near-flat");
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
+    let _ = std::fs::create_dir_all(dir);
+    save_png(
+        clean_img,
+        &format!("{dir}/qwen_pid_clean_{}.png", clean_img.width),
+    );
+    save_png(
+        early_img,
+        &format!("{dir}/qwen_pid_fromldm_{}.png", early_img.width),
+    );
+    eprintln!("wrote {dir}/qwen_pid_clean_*.png + qwen_pid_fromldm_*.png");
+}
+
+#[test]
 #[ignore = "needs the Qwen-Image snapshot (no PiD weights) — proves the error path"]
 fn use_pid_without_loaded_pid_errors() {
     // Loading WITHOUT spec.pid, then requesting use_pid, must error clearly (not silently VAE-decode).

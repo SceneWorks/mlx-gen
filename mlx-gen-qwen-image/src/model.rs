@@ -16,7 +16,7 @@ use mlx_gen::{
     Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
     Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::loader;
 use crate::pipeline::{
@@ -230,12 +230,23 @@ impl QwenImage {
             None
         };
 
-        // Decode seam (sc-7845): a per-request PiD decoder when `req.use_pid`, else the native VAE.
-        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, params.base_seed, MODEL_ID)?;
+        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): when `req.use_pid` and
+        // `req.pid_capture_sigma` ask for an early exit on this flow-match schedule, decode the
+        // partially-denoised x_k at the achieved degrade σ and truncate the denoise to the matching
+        // step; otherwise the clean σ=0 full-denoise path (`capture_sigma = 0`, full schedule).
+        let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, start_step);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            params.base_seed,
+            MODEL_ID,
+            capture_sigma,
+        )?;
         let decoder: &dyn LatentDecoder = match &pid_decoder {
             Some(d) => d,
             None => &self.vae,
         };
+        let denoise_sigmas = &params.sigmas[..keep];
         let images = decode_and_collect(
             decoder,
             req.count,
@@ -259,7 +270,7 @@ impl QwenImage {
                 denoise_with_progress(
                     &self.transformer,
                     params.sampler_name.as_deref(),
-                    &params.sigmas,
+                    denoise_sigmas,
                     seed,
                     latents,
                     &pos,
@@ -345,6 +356,60 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Documents + guards the PiD `from_ldm` capture-index policy (sc-7993) on the **production
+    /// flow-match** schedule — the 50-step trajectory the sc-7843 runB validation captured. A σ ceiling
+    /// is schedule-agnostic, so the worker/web can expose one knob and it maps to the right step on any
+    /// trajectory. Prints the table with `--nocapture`; the assertions pin the runB anchor
+    /// (`x_t@step44, σ≈0.199`) so a schedule/mu regression that moved the capture index would fail here.
+    #[test]
+    fn pid_capture_indices_production_50step() {
+        let sigmas = crate::pipeline::qwen_scheduler(50, 1024, 1024).sigmas; // 51 entries, trailing 0
+        for ceiling in [0.5_f32, 0.3, 0.2, 0.1] {
+            if let Some(p) = mlx_gen::flow_capture_plan(&sigmas, Some(ceiling)) {
+                eprintln!(
+                    "[qwen 50-step] ceiling σ≤{ceiling:.2} -> stop after {} of 50 steps, decode at σ={:.4} (saves {} steps)",
+                    p.keep - 1,
+                    p.sigma,
+                    50 - (p.keep - 1),
+                );
+            }
+        }
+        // runB anchor: ceiling 0.2 lands at the same x_t@44 (σ≈0.199) the sc-7843 runB harness decoded.
+        let p = mlx_gen::flow_capture_plan(&sigmas, Some(0.2)).expect("a sub-0.2 capture exists");
+        assert_eq!(
+            p.keep, 45,
+            "ceiling 0.2 → keep first 45 (stop after step 44)"
+        );
+        assert!(
+            (0.18..=0.20).contains(&p.sigma),
+            "achieved σ at step 44 ≈ 0.199, got {}",
+            p.sigma
+        );
+        assert_eq!(p.sigma, sigmas[44]);
+    }
+
+    /// The same policy over Krea's 8-step Turbo trajectory and the production path's few-step Lightning
+    /// regime: a *coarse* schedule means a σ ceiling resolves to a much earlier fractional stop (fewer
+    /// steps total), which is exactly why the index differs per trajectory (the story's "8-step ≠
+    /// 50-step"). Prints the table; asserts the early-stop is a genuine truncation with residual noise.
+    #[test]
+    fn pid_capture_indices_fewstep_trajectories() {
+        // Krea Turbo (8-step) shares the exponential-mu flow-match shape; reuse the production builder
+        // at 8 steps as a faithful stand-in for the coarse trajectory (same family of sigmas).
+        let sigmas8 = crate::pipeline::qwen_scheduler(8, 1024, 1024).sigmas; // 9 entries
+        for ceiling in [0.5_f32, 0.3, 0.2] {
+            if let Some(p) = mlx_gen::flow_capture_plan(&sigmas8, Some(ceiling)) {
+                eprintln!(
+                    "[8-step] ceiling σ≤{ceiling:.2} -> stop after {} of 8 steps, decode at σ={:.4}",
+                    p.keep - 1,
+                    p.sigma,
+                );
+                assert!(p.sigma <= ceiling && p.sigma > 0.0);
+                assert!(p.keep < sigmas8.len(), "a real early stop");
+            }
+        }
+    }
 
     #[test]
     fn descriptor_is_qwen_image() {

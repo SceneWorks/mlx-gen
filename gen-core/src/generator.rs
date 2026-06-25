@@ -146,6 +146,20 @@ pub struct GenerationRequest {
     /// output resolution (native → 4×), so it is not a transparent decoder swap. PiD output is
     /// research/evaluation-only (NSCLv1), surfaced/labeled at the worker/web layer (Phase 3).
     pub use_pid: bool,
+    /// PiD **`from_ldm` early-stop** capture σ (epic 7840, sc-7993). Only consulted when
+    /// [`use_pid`](Self::use_pid) is set. When `Some(σ)`, stop the denoise as soon as the schedule's
+    /// noise level first drops to `≤ σ`, then hand that *partially-denoised* `x_k` to PiD with the
+    /// **achieved** degrade σ (`= sigmas[k]`) — the speed optimization that lets the (expensive)
+    /// backbone denoise exit early and the 4-step pixel decoder finish the rest. `None`/`≤0` (the
+    /// default) = the clean σ=0 path (full denoise, then decode the clean latent). The value is a
+    /// noise *ceiling*, schedule-agnostic, so the same σ maps to the right step on an 8-step Turbo and
+    /// a 50-step trajectory alike (the policy is [`crate::sampling::flow_capture_plan`]).
+    ///
+    /// **Frame:** σ is interpreted in the **flow-matching** frame `x_t = (1−σ)x0 + σε` — the path wired
+    /// today is the qwenimage latent space (Qwen-Image / Krea / Lightning-Qwen). A latent space whose
+    /// PiD student is variance-preserving (SDXL) or whose `from_ldm` wiring is a follow-on errors rather
+    /// than silently ignoring the request (see `mlx_gen_pid::resolve_pid_decoder`).
+    pub pid_capture_sigma: Option<f32>,
 
     // --- Control ---
     pub cancel: CancelFlag,
@@ -185,6 +199,7 @@ impl Default for GenerationRequest {
             enhance_max_tokens: None,
             enhance_temperature: None,
             use_pid: false,
+            pid_capture_sigma: None,
             cancel: CancelFlag::default(),
         }
     }

@@ -71,8 +71,8 @@ pub use caption::{
 pub use decoder::LatentDecoder;
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
-    schedule_sigmas, DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType,
-    Scheduler, Solver, TimestepConvention,
+    flow_capture_plan, schedule_sigmas, CapturePlan, DiscreteModelSampling, EdmModelSampling,
+    ModelSampling, PredictionType, Scheduler, Solver, TimestepConvention,
 };
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,

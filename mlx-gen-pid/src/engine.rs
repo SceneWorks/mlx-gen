@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use mlx_rs::Dtype;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, GenerationRequest, PidWeights, Result, WeightsSource};
+use mlx_gen::{flow_capture_plan, Error, GenerationRequest, PidWeights, Result, WeightsSource};
 
 use crate::caption::CaptionEncoder;
 use crate::config::{PidConfig, SamplerConfig};
@@ -134,14 +134,42 @@ impl PidEngine {
 ///
 /// `model_id` only labels the error. The returned decoder owns its caption embeddings + a freshly built
 /// `PidNet`, so it lives as long as the borrow passed to the decode site; all `count` images in a
-/// request share this one decoder (same prompt → same caption). The `from_ldm` early-stop x_t-capture
-/// (σ>0, decoding a partially-denoised latent) is a separate follow-on — this path always decodes the
-/// fully-denoised latent at σ=0.
+/// request share this one decoder (same prompt → same caption).
+///
+/// This is the **clean σ=0** entry: it always decodes the fully-denoised latent. The `from_ldm`
+/// early-stop x_t-capture (σ>0, decoding a partially-denoised latent — sc-7993) is wired only for the
+/// flow-match qwenimage space today via [`resolve_pid_decoder_at_sigma`]; any other latent space that
+/// still routes through this function rejects a [`pid_capture_sigma`](GenerationRequest::pid_capture_sigma)
+/// request rather than silently dropping it (the σ-frame map for a variance-preserving SDXL student and
+/// the flux/flux2 siblings are follow-ons).
 pub fn resolve_pid_decoder(
     pid: Option<&PidEngine>,
     req: &GenerationRequest,
     base_seed: u64,
     model_id: &str,
+) -> Result<Option<PidDecoder>> {
+    if req.use_pid && req.pid_capture_sigma.is_some() {
+        return Err(Error::Msg(format!(
+            "{model_id}: pid_capture_sigma (from_ldm early-stop) is not wired for this latent space \
+             yet — sc-7993 wired the flow-match qwenimage space (Qwen-Image / Krea); the flux / flux2 \
+             and the variance-preserving SDXL siblings are follow-ons"
+        )));
+    }
+    resolve_pid_decoder_at_sigma(pid, req, base_seed, model_id, 0.0)
+}
+
+/// `from_ldm`-aware variant of [`resolve_pid_decoder`] (sc-7993): mint the per-generation [`PidDecoder`]
+/// at an explicit degrade `capture_sigma` (the **achieved** σ of a partially-denoised `x_k`, in the
+/// flow-match frame). `0.0` reproduces the clean-latent decode. The caller is responsible for actually
+/// truncating its denoise schedule to the matching step (see [`mlx_gen::flow_capture_plan`]),
+/// so the latent it later hands to [`PidDecoder::decode`] really sits at this σ — this function only
+/// binds σ into the decoder. Same `use_pid`/loaded-engine contract as [`resolve_pid_decoder`].
+pub fn resolve_pid_decoder_at_sigma(
+    pid: Option<&PidEngine>,
+    req: &GenerationRequest,
+    base_seed: u64,
+    model_id: &str,
+    capture_sigma: f32,
 ) -> Result<Option<PidDecoder>> {
     if !req.use_pid {
         return Ok(None);
@@ -151,7 +179,35 @@ pub fn resolve_pid_decoder(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    Ok(Some(engine.decoder(&req.prompt, 0.0, base_seed)?))
+    Ok(Some(engine.decoder(
+        &req.prompt,
+        capture_sigma,
+        base_seed,
+    )?))
+}
+
+/// Resolve the `from_ldm` early-stop for one **flow-match** generation (sc-7993): fold `req.use_pid` +
+/// [`req.pid_capture_sigma`](GenerationRequest::pid_capture_sigma) together with the schedule into the
+/// two values a wired site needs — the decoder's degrade σ and how many schedule entries to denoise.
+///
+/// Returns `(capture_sigma, keep)`: pass `capture_sigma` to [`resolve_pid_decoder_at_sigma`] and run the
+/// denoise over `&sigmas[..keep]` (the latent then sits at exactly `capture_sigma`, so the two agree).
+/// The clean path yields `(0.0, sigmas.len())` — the full schedule, σ=0 — whenever PiD is off, no
+/// capture is requested, or the requested ceiling would stop the denoise at/before the img2img
+/// `start_step` (no benefit). `start_step` is `0` for txt2img / edit / control.
+pub fn flow_capture_for_request(
+    req: &GenerationRequest,
+    sigmas: &[f32],
+    start_step: usize,
+) -> (f32, usize) {
+    let plan = req
+        .use_pid
+        .then(|| flow_capture_plan(sigmas, req.pid_capture_sigma))
+        .flatten();
+    match plan {
+        Some(c) if c.keep > start_step + 1 => (c.sigma, c.keep),
+        _ => (0.0, sigmas.len()),
+    }
 }
 
 /// Extract the single-file path from a [`WeightsSource`], rejecting a directory.
@@ -231,5 +287,37 @@ mod tests {
         };
         let err = err_string(resolve_pid_decoder(None, &req, 0, "some_model"));
         assert!(err.contains("no PiD decoder is loaded"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_pid_decoder_rejects_capture_sigma_for_unwired_space() {
+        // A latent space still on the clean-σ=0 resolve must not silently drop a from_ldm request
+        // (sc-7993): pid_capture_sigma + use_pid → a clear "not wired for this latent space" error,
+        // surfaced before any load. The flow-match qwenimage sites use resolve_pid_decoder_at_sigma.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            pid_capture_sigma: Some(0.2),
+            ..Default::default()
+        };
+        let err = err_string(resolve_pid_decoder(None, &req, 0, "flux"));
+        assert!(
+            err.contains("not wired for this latent space"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_pid_decoder_ignores_capture_sigma_when_pid_off() {
+        // pid_capture_sigma is only consulted under use_pid — off → None (native VAE), no error.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: false,
+            pid_capture_sigma: Some(0.2),
+            ..Default::default()
+        };
+        assert!(resolve_pid_decoder(None, &req, 0, "flux")
+            .unwrap()
+            .is_none());
     }
 }

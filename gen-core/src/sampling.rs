@@ -239,6 +239,58 @@ pub fn build_flow_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
     sigmas
 }
 
+/// A PiD **`from_ldm` early-stop** capture plan (epic 7840, sc-7993): how far to denoise before
+/// handing the partially-denoised `x_k` to the PiD pixel decoder, and the achieved degrade σ to decode
+/// it with. Resolved by [`flow_capture_plan`] from a flow-match schedule + the request's
+/// `pid_capture_sigma`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CapturePlan {
+    /// Number of leading schedule entries to keep — pass `&sigmas[..keep]` to the denoise so it stops
+    /// at step `keep − 1`. The resulting latent sits at σ = [`sigma`](Self::sigma) (= `sigmas[keep-1]`).
+    pub keep: usize,
+    /// The **achieved** degrade σ to hand PiD, in the flow-match frame `x_t = (1−σ)x0 + σε` — exactly
+    /// the schedule σ at the capture step. Always `> 0` (a `CapturePlan` is only minted for a genuine
+    /// early stop; the clean σ=0 path is `None`).
+    pub sigma: f32,
+}
+
+/// Resolve a PiD `from_ldm` early-stop capture plan for a **flow-matching** sigma schedule (epic 7840,
+/// sc-7993). `sigmas` is the usual flow-match schedule — strictly descending from ~1 with a trailing
+/// `0.0` (length `num_steps + 1`); `capture_sigma` is the request's noise *ceiling*
+/// ([`GenerationRequest::pid_capture_sigma`](crate::GenerationRequest::pid_capture_sigma)).
+///
+/// Returns `Some` when an early stop with residual noise is warranted: the first step `k ≥ 1` whose
+/// scheduled noise has dropped to `≤ capture_sigma`, keeping `&sigmas[..=k]` and reporting the achieved
+/// σ = `sigmas[k]`. Because the threshold is a σ *ceiling*, the same `capture_sigma` resolves to the
+/// right index on any trajectory (an 8-step Turbo and a 50-step run alike) — the schedule-agnostic
+/// "work out the capture index per trajectory" the story asks for.
+///
+/// Returns `None` (the clean σ=0 full-denoise path) when: `capture_sigma` is `None`/`≤ 0`/non-finite;
+/// the schedule is degenerate (`< 2` entries); or the requested ceiling is below the smallest positive
+/// σ (so only the terminal `0.0` qualifies → no benefit over a clean decode).
+///
+/// **Frame:** this is the flow-match identity mapping (schedule σ *is* the degrade σ). A
+/// variance-preserving student (SDXL, `BackboneSpec.vp_frame`) needs a different frame map and is a
+/// separate sibling — callers there must not use this helper.
+pub fn flow_capture_plan(sigmas: &[f32], capture_sigma: Option<f32>) -> Option<CapturePlan> {
+    let target = capture_sigma?;
+    if !target.is_finite() || target <= 0.0 || sigmas.len() < 2 {
+        return None;
+    }
+    // Descending schedule: the first index at/below the ceiling is the earliest step that reaches the
+    // requested cleanliness. k starts at 1 so at least one denoise step always runs.
+    for (k, &s) in sigmas.iter().enumerate().skip(1) {
+        if s <= target {
+            // s == 0 (the terminal tail) means the ceiling is below every positive σ → no early stop.
+            return (s > 0.0).then_some(CapturePlan {
+                keep: k + 1,
+                sigma: s,
+            });
+        }
+    }
+    None
+}
+
 // =================================================================================================
 // Concrete policies
 // =================================================================================================
@@ -594,6 +646,57 @@ mod tests {
         assert!(s.alphas_cumprod[0] > 0.99);
         assert!(*s.alphas_cumprod.last().unwrap() < 0.01);
         assert!(s.alphas_cumprod.windows(2).all(|w| w[0] >= w[1]));
+    }
+
+    #[test]
+    fn flow_capture_plan_none_paths_are_clean() {
+        let sigmas = build_flow_sigmas(50, 0.7); // 51 entries, descending, trailing 0.0
+                                                 // No knob, ≤0, or non-finite → clean (full denoise, σ=0).
+        assert!(flow_capture_plan(&sigmas, None).is_none());
+        assert!(flow_capture_plan(&sigmas, Some(0.0)).is_none());
+        assert!(flow_capture_plan(&sigmas, Some(-0.3)).is_none());
+        assert!(flow_capture_plan(&sigmas, Some(f32::NAN)).is_none());
+        // A ceiling below the smallest positive σ → only the terminal 0.0 qualifies → clean.
+        let smallest_positive = sigmas[sigmas.len() - 2];
+        assert!(flow_capture_plan(&sigmas, Some(smallest_positive * 0.5)).is_none());
+        // Degenerate schedules never panic.
+        assert!(flow_capture_plan(&[], Some(0.5)).is_none());
+        assert!(flow_capture_plan(&[0.0], Some(0.5)).is_none());
+    }
+
+    #[test]
+    fn flow_capture_plan_truncates_at_the_first_step_below_the_ceiling() {
+        let sigmas = build_flow_sigmas(50, 0.7);
+        let plan = flow_capture_plan(&sigmas, Some(0.2)).expect("a capture below 0.2");
+        // Achieved σ is the schedule σ at the kept tail — at or below the ceiling, and the first such.
+        assert!(plan.sigma <= 0.2 && plan.sigma > 0.0);
+        assert_eq!(plan.sigma, sigmas[plan.keep - 1]);
+        assert!(plan.keep >= 2 && plan.keep < sigmas.len()); // a genuine early stop, ≥1 step run
+        assert!(sigmas[plan.keep - 2] > 0.2); // the step before was still above the ceiling
+                                              // `&sigmas[..keep]` is what the denoise runs; its last entry is the achieved σ.
+        assert_eq!(*sigmas[..plan.keep].last().unwrap(), plan.sigma);
+    }
+
+    #[test]
+    fn flow_capture_plan_is_schedule_agnostic_in_sigma() {
+        // The same σ ceiling resolves to comparable noise on an 8-step and a 50-step schedule (the
+        // "work out the index per trajectory" property): the achieved σ is ≤ the ceiling on both.
+        let s50 = build_flow_sigmas(50, 0.7);
+        let s8 = build_flow_sigmas(8, 0.7);
+        let p50 = flow_capture_plan(&s50, Some(0.3)).unwrap();
+        let p8 = flow_capture_plan(&s8, Some(0.3)).unwrap();
+        assert!(p50.sigma <= 0.3 && p8.sigma <= 0.3);
+        // Both keep strictly fewer entries than the full schedule (an actual early exit).
+        assert!(p50.keep < s50.len() && p8.keep < s8.len());
+    }
+
+    #[test]
+    fn flow_capture_plan_high_ceiling_keeps_at_least_one_step() {
+        let sigmas = build_flow_sigmas(50, 0.7);
+        // A ceiling at/above σ₁ captures after a single step (never zero steps).
+        let plan = flow_capture_plan(&sigmas, Some(0.999)).expect("an early capture");
+        assert_eq!(plan.keep, 2);
+        assert_eq!(plan.sigma, sigmas[1]);
     }
 
     #[test]

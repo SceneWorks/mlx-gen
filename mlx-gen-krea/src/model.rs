@@ -15,10 +15,10 @@ use mlx_gen::{
     GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
     Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 
-use crate::pipeline::{KreaPipeline, TurboOptions};
+use crate::pipeline::{turbo_schedule, KreaPipeline, TurboOptions};
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
@@ -155,11 +155,21 @@ impl Krea {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or(0);
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-        // Decode seam (sc-7845): when `req.use_pid`, build one PiD decoder from the prompt (σ=0 clean
-        // decode, seeded from `base_seed`) and reuse it across the batch — same prompt → same caption;
-        // per-image variation comes from the per-seed latent. `None` → the native VAE. Errors if PiD
-        // was requested but not loaded.
-        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, KREA_2_TURBO_ID)?;
+        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): when `req.use_pid`, build one PiD
+        // decoder from the prompt and reuse it across the batch — same prompt → same caption; per-image
+        // variation comes from the per-seed latent. `None` → the native VAE. Errors if PiD was requested
+        // but not loaded. With `req.pid_capture_sigma`, resolve the achieved degrade σ + the truncation
+        // `keep` from the (seed-independent) Turbo schedule and decode the partially-denoised x_k; else
+        // the clean σ=0 full-denoise path (`capture_sigma = 0`, `keep = MAX`).
+        let sigmas = turbo_schedule(steps, req.scheduler.as_deref());
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            KREA_2_TURBO_ID,
+            capture_sigma,
+        )?;
         let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
@@ -175,6 +185,7 @@ impl Krea {
                 &req.prompt,
                 &opts,
                 decoder,
+                keep,
                 &req.cancel,
                 on_progress,
             )?;
