@@ -7,7 +7,8 @@
 //! confirmed on the real `stabilityai/stable-diffusion-3.5-large` / `-large-turbo` weights during
 //! the spike (sc-7850).
 //!
-//! ## Slice status: **E1** (sc-7860) + **E2** (sc-7861) + **E4** (sc-7863) + **M1** (sc-7867) — converter + config + triple-TE + VAE + Medium converter
+//! ## Slice status: **E1** (sc-7860) + **E2** (sc-7861) + **E3** (sc-7862) + **E4** (sc-7863)
+//! + **M1** (sc-7867) — converter + config + triple-TE + MMDiT-Large forward + VAE + Medium converter
 //!
 //! This crate currently ships:
 //!
@@ -31,13 +32,19 @@
 //!   latent factors, plus the diffusers→MLX VAE converter + the shape-checked VAE arch validator.
 //!   encode/decode apply the correct (diffusers-SD3-verified) scale/shift de-norm direction.
 //!
-//! The MMDiT forward pass (**E3**), the model/loader/pipeline wiring (**E5+**), and native LoRA
-//! training (**T1–T4**) are separate epic stories and are intentionally NOT implemented here.
-//! No `Generator` is registered yet.
+//! * [`transformer`] (E3) — the SD3.5-Large **MMDiT forward pass** (`SD3Transformer2DModel`): patch
+//!   embed + learned 2D pos_embed (NO RoPE), `(timestep + pooled-text)` adaLN modulation, 38
+//!   all-double-stream joint blocks (qk-RMSNorm both streams, GELU FFN, `context_pre_only` final
+//!   block), and the AdaLN-continuous output head → unpatchify. REUSES flux2's joint-attention
+//!   `process_qkv`/double-stream pattern with the SD3 deltas (no RoPE, all-double topology, GELU).
+//!
+//! The model/loader/pipeline wiring (**E5+**) and native LoRA training (**T1–T4**) are separate epic
+//! stories and are intentionally NOT implemented here. No `Generator` is registered yet.
 
 pub mod config;
 pub mod convert;
 pub mod text;
+pub mod transformer;
 pub mod vae;
 
 pub use config::{
@@ -63,6 +70,7 @@ pub use text::{
     CLIP_CONTEXT_DIM, CLIP_G_DIM, CLIP_L_DIM, CLIP_SEQ_LEN, CONTEXT_SEQ_LEN, JOINT_ATTENTION_DIM,
     POOLED_DIM, T5_SEQ_LEN,
 };
+pub use transformer::Sd3Transformer;
 pub use vae::{
     build_vae_state_dict, expected_vae_tensor_count, expected_vae_tensors, load_sd3_vae,
     validate_vae_arch, validate_vae_dir, ExpectedVaeTensor, Sd3VaeArch, SD3_VAE_LATENT_CHANNELS,
