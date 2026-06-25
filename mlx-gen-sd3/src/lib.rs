@@ -61,12 +61,14 @@
 //!
 //! Native LoRA training (T1–T4) is a separate epic story and is NOT implemented here.
 
+pub mod adapters;
 pub mod config;
 pub mod convert;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
 pub mod text;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
