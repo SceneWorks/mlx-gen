@@ -16,17 +16,25 @@
 //! reports both:
 //!
 //!   * **MLX `metal::get_peak_memory()`** (printed here per phase) — the MLX-allocator high-water
-//!     mark in bytes. This is the authoritative *allocator* peak and the basis for `minMemoryGb`.
-//!   * **Process "peak memory footprint"** — the wired-inclusive OS figure. MLX's wired buffers do
-//!     NOT show in RSS, so capture this by running the harness UNDER `/usr/bin/time -l` and reading
-//!     the `peak memory footprint` line:
+//!     mark in bytes. This is the *allocator* (relative) read; it UNDER-counts wired memory by ~2×,
+//!     so it is NOT the basis for `minMemoryGb` — use it for relative comparisons across cells.
+//!   * **Process "peak memory footprint"** — the wired-inclusive OS figure (from `/usr/bin/time -l`).
+//!     MLX's wired buffers do NOT show in RSS, and this OS footprint is what `minMemoryGb` is based on.
+//!
+//! Capture the OS footprint by running the **compiled test binary directly** under `/usr/bin/time -l`,
+//! NOT `cargo test`: `/usr/bin/time` measures its immediate child, and `cargo test` execs the test
+//! binary as a *grandchild*, so timing `cargo` reports only cargo's own ~40 MB footprint. Build the
+//! test binary with `--no-run`, then run the resolved binary directly:
 //!
 //! ```sh
+//! # 1) Build the test binary WITHOUT running it.
+//! cargo test -p mlx-gen-sd3 --release --test profile_memory --no-run
+//! # 2) Resolve the binary and run it DIRECTLY under /usr/bin/time -l.
+//! BIN=$(ls -t target/release/deps/profile_memory-* | grep -v '\.d$' | head -1)
 //! SD3_LARGE_SNAPSHOT=~/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large/snapshots/<rev> \
 //! SD3_TURBO_SNAPSHOT=~/.cache/huggingface/hub/models--stabilityai--stable-diffusion-3.5-large-turbo/snapshots/<rev> \
 //! SD3_PROFILE_VARIANT=large SD3_PROFILE_QUANT=q8 \
-//!   /usr/bin/time -l cargo test -p mlx-gen-sd3 --release --test profile_memory \
-//!     profile_memory_single -- --ignored --nocapture
+//!   /usr/bin/time -l "$BIN" profile_memory_single --ignored --nocapture
 //! ```
 //!
 //! Select the variant / quant / path via env (so each `/usr/bin/time -l` run isolates ONE figure —
