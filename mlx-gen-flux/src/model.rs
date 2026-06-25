@@ -6,8 +6,8 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    TimestepConvention, WeightsSource,
+    Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
+    WeightsSource,
 };
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
@@ -521,20 +521,13 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
     Ok(())
 }
 
-fn load_schnell_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_schnell(spec).map_err(Into::into)
-}
-
-fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_dev(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_schnell, load: load_schnell_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl Generator`
+// above stays hand-written because `generate` is bespoke (IP-adapter / true-CFG branching), not the
+// plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! {
+    descriptor_schnell => load_schnell,
+    descriptor_dev => load_dev,
 }
 
 #[cfg(test)]

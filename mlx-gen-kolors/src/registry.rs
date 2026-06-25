@@ -16,9 +16,9 @@
 use mlx_rs::{random, Dtype};
 
 use mlx_gen::{
-    curated_scheduler_names, default_seed, gen_core, Capabilities, Conditioning, ConditioningKind,
+    curated_scheduler_names, default_seed, Capabilities, Conditioning, ConditioningKind,
     ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, ModelRegistration, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
+    ModelDescriptor, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
 };
 
 use mlx_gen_sdxl::{
@@ -182,23 +182,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for KolorsGenerator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(KolorsGenerator {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl KolorsGenerator {
     /// The rich-`Result` body behind [`Generator::validate`]. Kept on the crate's own
@@ -569,15 +556,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

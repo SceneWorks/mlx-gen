@@ -13,7 +13,7 @@
 //! is wired and parity-proven.
 
 use mlx_gen::{
-    curated_scheduler_names, default_seed, gen_core, schedule_sigmas, AlphaSchedule, Capabilities,
+    curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler, LoadSpec,
     Modality, ModelDescriptor, Precision, Progress, Quant, Result, Scheduler, Solver, TcdSampler,
@@ -299,23 +299,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Sdxl {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Sdxl {
+    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    generate: generate_impl,
+});
 
 impl Sdxl {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -852,17 +839,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-
-use mlx_gen::ModelRegistration;
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

@@ -19,9 +19,8 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, run_flow_sampler, Error, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, ModelDescriptor, ModelRegistration, Precision, Progress, Result,
-    TimestepConvention, WeightsSource,
+    default_seed, run_flow_sampler, Error, GenerationOutput, GenerationRequest, Generator,
+    LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
@@ -536,23 +535,10 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
     Ok(x)
 }
 
-impl Generator for Flux2 {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Flux2 {
+    validate: |s, req| validate_request(&s.descriptor, req),
+    generate: generate_impl,
+});
 
 impl Flux2 {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -796,46 +782,14 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` load fns into it.
-fn load_klein_9b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_klein_9b(spec).map_err(Into::into)
-}
-
-fn load_klein_9b_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_klein_9b_edit(spec).map_err(Into::into)
-}
-
-fn load_klein_9b_kv_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_klein_9b_kv_edit(spec).map_err(Into::into)
-}
-
-fn load_dev_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_dev(spec).map_err(Into::into)
-}
-
-fn load_dev_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_dev_edit(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b, load: load_klein_9b_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b_edit, load: load_klein_9b_edit_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_klein_9b_kv_edit, load: load_klein_9b_kv_edit_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev, load: load_dev_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_dev_edit, load: load_dev_edit_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! {
+    descriptor_klein_9b => load_klein_9b,
+    descriptor_klein_9b_edit => load_klein_9b_edit,
+    descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit,
+    descriptor_dev => load_dev,
+    descriptor_dev_edit => load_dev_edit,
 }
 
 #[cfg(test)]

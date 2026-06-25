@@ -60,8 +60,7 @@ use mlx_gen::train::lora::{
 use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::{
     gen_core, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer, TrainerDescriptor,
-    TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
-    WeightsSource,
+    TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest, WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -167,15 +166,9 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     }))
 }
 
-/// Registry adapter: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge the crate's rich-`Result` [`load_trainer`] into it.
-fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
-    load_trainer(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    TrainerRegistration { descriptor: trainer_descriptor, load: load_trainer_registered }
-}
+// Link-time trainer registration (epic 3720): the macro emits the `inventory::submit!` and bridges
+// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_trainer! { trainer_descriptor => load_trainer }
 
 impl KolorsTrainer {
     /// Caption → `(context [1, 256, 4096], pooled [1, 4096])`: tokenize (left-padded, with the

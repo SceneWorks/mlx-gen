@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    gen_core, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
+    AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision,
     Progress, Quant, Result, WeightsSource,
 };
@@ -219,23 +219,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Wan {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Wan {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl Wan {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -497,15 +484,9 @@ impl Wan {
     }
 }
 
-/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 // ===========================================================================================
 // Wan2.2 T2V-A14B — dual-expert MoE text→video (the S1–S5 core, fully wired)
@@ -683,23 +664,10 @@ pub fn load_t2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for Wan14b {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Wan14b {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl Wan14b {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -939,15 +907,7 @@ impl Wan14b {
     }
 }
 
-/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge the crate's rich-`Result` [`load_t2v_14b`] into it.
-fn load_t2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_t2v_14b(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_t2v_14b, load: load_t2v_14b_registered }
-}
+mlx_gen::register_generators! { descriptor_t2v_14b => load_t2v_14b }
 
 // ===========================================================================================
 // Wan2.2 I2V-A14B — dual-expert MoE image→video (channel-concat conditioning, in_dim 36)
@@ -1085,15 +1045,7 @@ pub fn load_i2v_14b(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge the crate's rich-`Result` [`load_i2v_14b`] into it.
-fn load_i2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_i2v_14b(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_i2v_14b, load: load_i2v_14b_registered }
-}
+mlx_gen::register_generators! { descriptor_i2v_14b => load_i2v_14b }
 
 #[cfg(test)]
 mod tests {

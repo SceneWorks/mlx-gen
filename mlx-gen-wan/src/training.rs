@@ -53,8 +53,8 @@ use mlx_gen::train::schedule::{lr_multiplier, schedule_updates};
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     gen_core, CancelFlag, LoadSpec, Modality, NetworkType, Result, TrainOptimizer, Trainer,
-    TrainerDescriptor, TrainerRegistration, TrainingConfig, TrainingOutput, TrainingProgress,
-    TrainingRequest, WeightsSource,
+    TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
+    WeightsSource,
 };
 use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::memory::get_memory_limit;
@@ -342,26 +342,12 @@ pub fn load_trainer_ti2v_5b(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
     build_trainer(spec, descriptor_ti2v_5b())
 }
 
-/// Registry adapters: the trainer registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge each crate's rich-`Result` loader into it.
-fn load_trainer_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
-    load_trainer(spec).map_err(Into::into)
-}
-fn load_trainer_i2v_14b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
-    load_trainer_i2v_14b(spec).map_err(Into::into)
-}
-fn load_trainer_ti2v_5b_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Trainer>> {
-    load_trainer_ti2v_5b(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_t2v_14b, load: load_trainer_registered }
-}
-inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_i2v_14b, load: load_trainer_i2v_14b_registered }
-}
-inventory::submit! {
-    TrainerRegistration { descriptor: descriptor_ti2v_5b, load: load_trainer_ti2v_5b_registered }
+// Link-time trainer registration (epic 3720): the macro emits each `inventory::submit!` and bridges
+// the crate's rich `Result` into the trainer registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_trainer! {
+    descriptor_t2v_14b => load_trainer,
+    descriptor_i2v_14b => load_trainer_i2v_14b,
+    descriptor_ti2v_5b => load_trainer_ti2v_5b,
 }
 
 impl Trainer for WanMoeTrainer {

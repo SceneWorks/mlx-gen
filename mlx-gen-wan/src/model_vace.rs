@@ -27,9 +27,9 @@ use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    gen_core, AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision,
-    Progress, Quant, Result, WeightsSource,
+    AdapterSpec, Capabilities, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, MoeExpert, Precision, Progress, Quant,
+    Result, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
@@ -203,23 +203,10 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
     Ok(concatenate_axis(&refs, 1)?) // [3, F, H, W]
 }
 
-impl Generator for WanVace {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(WanVace {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl WanVace {
     /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
@@ -408,15 +395,9 @@ fn load_vace_transformer_weights(root: &std::path::Path) -> Result<Weights> {
     )))
 }
 
-/// Registry adapter: the generator registry's `load` slot is typed on [`gen_core::Result`] (epic
-/// 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_vace, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor_vace => load }
 
 // ============================================================================================
 // Wan2.2 VACE-Fun A14B — dual-expert (MoE) controllable video (sc-6604, epic 3456).
@@ -501,24 +482,11 @@ pub fn load_vace_fun(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl Generator for WanVaceFun {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // Identical control-clip contract as single-expert VACE.
-        validate_vace_clip(&self.descriptor, MODEL_ID_VACE_FUN, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+// Identical control-clip contract as single-expert VACE.
+mlx_gen::impl_generator!(WanVaceFun {
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE_FUN, req),
+    generate: generate_impl,
+});
 
 impl WanVaceFun {
     /// The dual-expert VACE pipeline: identical staging to [`WanVace::generate_impl`] (UMT5 encode →
@@ -725,11 +693,5 @@ fn validate_vace_clip(
     Ok(())
 }
 
-/// Registry adapter for the dual-expert VACE-Fun (bridge the crate's rich `Result` into `gen_core`).
-fn load_vace_fun_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_vace_fun(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    mlx_gen::ModelRegistration { descriptor: descriptor_vace_fun, load: load_vace_fun_registered }
-}
+// Link-time registration for the dual-expert VACE-Fun variant (epic 3720).
+mlx_gen::register_generators! { descriptor_vace_fun => load_vace_fun }
