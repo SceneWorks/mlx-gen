@@ -13,9 +13,9 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, gen_core, resolve_flow_schedule, run_flow_sampler, CancelFlag, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Result, TimestepConvention, WeightsSource,
+    default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
 use mlx_gen_z_image::vae::Vae;
@@ -395,23 +395,10 @@ impl Chroma {
     }
 }
 
-impl Generator for Chroma {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Chroma {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl Chroma {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -484,33 +471,18 @@ impl Chroma {
     }
 }
 
-fn load_hd_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_hd(spec).map_err(Into::into)
-}
-
-fn load_base_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_base(spec).map_err(Into::into)
-}
-
-fn load_flash_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_flash(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_hd, load: load_hd_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_base, load: load_base_registered }
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_flash, load: load_flash_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! {
+    descriptor_hd => load_hd,
+    descriptor_base => load_base,
+    descriptor_flash => load_flash,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core;
 
     /// A Chroma with no weights — enough to exercise the request-boundary paths (`validate`,
     /// cancellation) that run before any tensor is touched.

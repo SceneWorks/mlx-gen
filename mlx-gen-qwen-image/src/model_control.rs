@@ -17,9 +17,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, ControlKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, ControlKind, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Quant, Result, WeightsSource,
 };
 
 use crate::control_transformer::QwenControlNet;
@@ -161,23 +161,10 @@ impl QwenImageControl {
     }
 }
 
-impl Generator for QwenImageControl {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(QwenImageControl {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl QwenImageControl {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
@@ -259,15 +246,9 @@ impl QwenImageControl {
     }
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

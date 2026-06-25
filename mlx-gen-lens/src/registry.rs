@@ -22,9 +22,9 @@
 use mlx_rs::Dtype;
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor,
-    ModelRegistration, Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
+    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
 
 use crate::pipeline::{GenerateOptions, LensPipeline, DEFAULT_DATE, VAE_SCALE_FACTOR};
@@ -159,23 +159,10 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
     }))
 }
 
-impl Generator for LensGenerator {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.validate_impl(req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(LensGenerator {
+    validate: |s, req| s.validate_impl(req),
+    generate: generate_impl,
+});
 
 impl LensGenerator {
     /// The rich-`Result` body behind [`Generator::validate`].
@@ -264,20 +251,19 @@ pub(crate) fn validate_request(
     Ok(())
 }
 
-/// Registry adapters: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` loads into it.
-fn load_turbo_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_with(spec, TURBO_DEFAULTS).map_err(Into::into)
+// Thin id-binding loaders: each pins the variant defaults onto `load_with`, so they can't be a
+// plain `load` path. They return the crate's rich `Result`; `register_generators!` adds the
+// `gen_core::Result` bridge (epic 3720) and emits each `inventory::submit!`.
+fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_with(spec, TURBO_DEFAULTS)
 }
-fn load_base_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_with(spec, BASE_DEFAULTS).map_err(Into::into)
+fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_with(spec, BASE_DEFAULTS)
 }
 
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_turbo, load: load_turbo_registered }
-}
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_base, load: load_base_registered }
+mlx_gen::register_generators! {
+    descriptor_turbo => load_turbo,
+    descriptor_base => load_base,
 }
 
 #[cfg(test)]

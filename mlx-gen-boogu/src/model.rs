@@ -11,12 +11,10 @@
 //! so pointing at a pre-quantized snapshot skips the dense transient. A precision override and LoRA
 //! adapters are rejected rather than silently ignored.
 
-use mlx_gen::gen_core;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, ModelRegistration, Precision, Progress, Quant, Result,
-    WeightsSource,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
@@ -192,23 +190,10 @@ pub fn load_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, descriptor_edit())
 }
 
-impl Generator for Boogu {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Boogu {
+    validate: |s, req| validate_request(&s.descriptor, req),
+    generate: generate_impl,
+});
 
 impl Boogu {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
@@ -373,35 +358,18 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`]; bridge the crate's rich-`Result` loaders into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-
-fn load_turbo_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_turbo(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_turbo, load: load_turbo_registered }
-}
-
-fn load_edit_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load_edit(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor: descriptor_edit, load: load_edit_registered }
+// Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! {
+    descriptor => load,
+    descriptor_turbo => load_turbo,
+    descriptor_edit => load_edit,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::gen_core;
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {

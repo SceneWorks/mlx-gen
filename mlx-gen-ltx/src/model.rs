@@ -47,9 +47,9 @@ use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::weights::{to_dtype, Weights};
 use mlx_gen::{
-    curated_sampler_names, default_seed, gen_core, Capabilities, Conditioning, ConditioningKind,
-    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Precision as LoadPrecision, Progress, Result, WeightsSource,
+    curated_sampler_names, default_seed, Capabilities, Conditioning, ConditioningKind, Error,
+    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
+    Precision as LoadPrecision, Progress, Result, WeightsSource,
 };
 
 use crate::audio_vae::AudioDecoder;
@@ -910,23 +910,10 @@ pub(crate) fn frames_to_images(frames: &Array) -> Result<Vec<Image>> {
         .collect())
 }
 
-impl Generator for Ltx {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(Ltx {
+    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    generate: generate_impl,
+});
 
 impl Ltx {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -981,17 +968,9 @@ impl Ltx {
     }
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
-
-use mlx_gen::ModelRegistration;
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

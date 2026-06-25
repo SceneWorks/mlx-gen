@@ -12,9 +12,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    WeightsSource,
 };
 
 use crate::loader;
@@ -156,23 +156,10 @@ impl QwenImage {
     }
 }
 
-impl Generator for QwenImage {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req).map_err(Into::into)
-    }
-
-    fn generate(
-        &self,
-        req: &GenerationRequest,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> gen_core::Result<GenerationOutput> {
-        self.generate_impl(req, on_progress).map_err(Into::into)
-    }
-}
+mlx_gen::impl_generator!(QwenImage {
+    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    generate: generate_impl,
+});
 
 impl QwenImage {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
@@ -333,15 +320,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {

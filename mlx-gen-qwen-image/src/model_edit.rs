@@ -15,8 +15,8 @@ use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, ModelRegistration,
-    Precision, Progress, Quant, Result, WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
+    Quant, Result, WeightsSource,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
@@ -331,15 +331,11 @@ fn validate_reference_images(req: &GenerationRequest) -> Result<()> {
     Ok(())
 }
 
-/// Registry adapter: the link-time registry's `load` slot is typed on the backend-neutral
-/// [`gen_core::Result`] (epic 3720); bridge the crate's rich-`Result` [`load`] into it.
-fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
-    load(spec).map_err(Into::into)
-}
-
-inventory::submit! {
-    ModelRegistration { descriptor, load: load_registered }
-}
+// Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
+// Generator` above stays hand-written because `validate` adds a reference-image check beyond the
+// shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
+mlx_gen::register_generators! { descriptor => load }
 
 #[cfg(test)]
 mod tests {
