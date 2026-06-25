@@ -27,6 +27,7 @@ fn tiny_arch() -> Sd3Arch {
         caption_projection_dim: 8, // == hidden (2*4)
         pos_embed_max_size: 3,
         time_proj_dim: 7,
+        dual_attention_layers: 0, // plain MMDiT (Large family) — no attn2 blocks
     }
 }
 

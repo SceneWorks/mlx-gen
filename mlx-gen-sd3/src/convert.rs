@@ -16,6 +16,20 @@
 //! 4096, pooled 2048, caption 2432, qk_norm rms_norm, learned pos_embed `[1, 36864, 2432]` +
 //! `pos_embed.proj` `[2432, 16, 2, 2]`, NO RoPE) are documented in [`crate::config`].
 //!
+//! ## SD3.5-Medium (MMDiT-X) — sc-7867 / M1
+//!
+//! The SAME converter + validator serve SD3.5-Medium, parameterized by [`Sd3Arch::medium`] (24
+//! layers, hidden 1536, head_dim 64, 24 heads, `pos_embed_max_size` 384 ⇒ pos table
+//! `[1, 147456, 1536]`, joint 4096, pooled 2048, qk_norm rms_norm). Medium is an **MMDiT-X**: its
+//! FIRST 13 blocks (`dual_attention_layers = [0..=12]`, real config) carry a SECOND, image-stream-only
+//! self-attention `attn2` (`to_q`/`to_k`/`to_v`/`to_out.0` + `norm_q`/`norm_k` only — NO `add_*`,
+//! NO `to_add_out`, NO `norm_added_*`) ALONGSIDE the joint attention, and their image-stream `norm1`
+//! is an EXTENDED AdaLN-zero of `9·hidden` (the extra 3 chunks modulate `attn2`). Blocks 13..23 are
+//! plain joint blocks; block 23 is `context_pre_only`. The diffusers→MLX key map stays a pure 1:1
+//! rename (the dual-attention `attn2` keys are already unfused per-projection). The whole transformer
+//! is **909 tensors** (real-weight confirmed against the cached `stable-diffusion-3.5-medium` header).
+//! The Medium MMDiT-X *forward* (wiring `attn2` + the extended modulation) is M2 (sc-7868), NOT here.
+//!
 //! Diffusers `SD3Transformer2DModel` top-level keys (real-weight confirmed):
 //!   * `pos_embed.pos_embed`                                    `[1, 36864, 2432]` (learned, NO RoPE)
 //!   * `pos_embed.proj.{weight,bias}`                           `[2432, 16, 2, 2]` / `[2432]`
@@ -56,6 +70,10 @@ use crate::config::Sd3Arch;
 /// AdaLayerNormZero packs 6 chunks (shift/scale/gate × msa + mlp). The non-final blocks' `norm1`
 /// and `norm1_context` both use it.
 const ADALN_ZERO_CHUNKS: usize = 6;
+/// The MMDiT-X (`attn2`) image-stream `norm1` is an EXTENDED AdaLayerNormZero packing 9 chunks — the
+/// 6 of the plain block plus shift/scale/gate for the second (`attn2`) attention branch. Real-weight
+/// confirmed: Medium dual-attention blocks have `norm1.linear` = `[9·hidden, hidden]` (sc-7867).
+const ADALN_ZERO_X_CHUNKS: usize = 9;
 /// AdaLayerNormContinuous packs 2 chunks (shift, scale). The final block's `norm1_context` and the
 /// model-level `norm_out` both use it.
 const ADALN_CONT_CHUNKS: usize = 2;
@@ -157,7 +175,8 @@ pub fn expected_transformer_tensors(arch: &Sd3Arch) -> Vec<ExpectedTensor> {
     // ---- per-block tensors --------------------------------------------------------------------
     for i in 0..arch.num_layers {
         let is_last = i + 1 == arch.num_layers;
-        out.extend(expected_block_tensors(arch, i, is_last));
+        let is_dual = arch.is_dual_attention_block(i);
+        out.extend(expected_block_tensors(arch, i, is_last, is_dual));
     }
 
     // ---- output head --------------------------------------------------------------------------
@@ -186,7 +205,16 @@ pub fn expected_transformer_tensors(arch: &Sd3Arch) -> Vec<ExpectedTensor> {
 /// Expected tensors for one `transformer_blocks.{i}` joint block. `is_last` ⇒ `context_pre_only`:
 /// the text stream is read-only after attention, so `attn.to_add_out`, `ff_context.*`, and the
 /// AdaLN-zero `norm1_context` are replaced/dropped (its `norm1_context` becomes AdaLN-continuous).
-fn expected_block_tensors(arch: &Sd3Arch, i: usize, is_last: bool) -> Vec<ExpectedTensor> {
+/// `is_dual` ⇒ MMDiT-X: the block adds an image-stream-only second self-attention (`attn2`) and its
+/// `norm1` AdaLN-zero is EXTENDED to 9 chunks (the `attn2` shift/scale/gate). (No real-weight
+/// checkpoint pairs `is_dual` with `is_last` — Medium's dual blocks are 0..12, its last is 23 — but
+/// the table handles each flag independently.)
+fn expected_block_tensors(
+    arch: &Sd3Arch,
+    i: usize,
+    is_last: bool,
+    is_dual: bool,
+) -> Vec<ExpectedTensor> {
     let h = hidden(arch);
     let head = arch.head_dim as i64;
     let p = format!("transformer_blocks.{i}");
@@ -203,8 +231,14 @@ fn expected_block_tensors(arch: &Sd3Arch, i: usize, is_last: bool) -> Vec<Expect
         ));
     };
 
-    // AdaLN modulation for the image stream (always AdaLN-zero, 6 chunks).
-    lin(&mut t, "norm1.linear", ADALN_ZERO_CHUNKS as i64 * h, h);
+    // AdaLN modulation for the image stream — AdaLN-zero (6 chunks), or the extended MMDiT-X variant
+    // (9 chunks) on dual-attention blocks.
+    let img_chunks = if is_dual {
+        ADALN_ZERO_X_CHUNKS
+    } else {
+        ADALN_ZERO_CHUNKS
+    } as i64;
+    lin(&mut t, "norm1.linear", img_chunks * h, h);
     // AdaLN modulation for the text stream: zero (6) normally, continuous (2) on the final block.
     let ctx_chunks = if is_last {
         ADALN_CONT_CHUNKS
@@ -243,6 +277,23 @@ fn expected_block_tensors(arch: &Sd3Arch, i: usize, is_last: bool) -> Vec<Expect
         format!("{p}.attn.norm_added_k.weight"),
         vec![head],
     ));
+
+    // MMDiT-X second attention (`attn2`) — image stream ONLY: q/k/v + out projection + qk-RMSNorms.
+    // NO added/text projections (`add_*`, `to_add_out`), NO `norm_added_*`. Real-weight confirmed.
+    if is_dual {
+        lin(&mut t, "attn2.to_q", h, h);
+        lin(&mut t, "attn2.to_k", h, h);
+        lin(&mut t, "attn2.to_v", h, h);
+        lin(&mut t, "attn2.to_out.0", h, h);
+        t.push(ExpectedTensor::new(
+            format!("{p}.attn2.norm_q.weight"),
+            vec![head],
+        ));
+        t.push(ExpectedTensor::new(
+            format!("{p}.attn2.norm_k.weight"),
+            vec![head],
+        ));
+    }
 
     // Image-stream feed-forward (GELU-approx; net.0.proj gate then net.2 down).
     lin(&mut t, "ff.net.0.proj", FF_MULT as i64 * h, h);
@@ -335,7 +386,7 @@ fn shape_matches(expected: &[i64], got: &[i64]) -> bool {
 
 /// The total number of transformer tensors the validator expects for a given arch — handy for a
 /// quick "did we load the whole checkpoint" count check (the real Large transformer is 1227 tensors
-/// per the spike; the VAE / text encoders add the rest of a full snapshot).
+/// per the spike, Medium is 909; the VAE / text encoders add the rest of a full snapshot).
 pub fn expected_tensor_count(arch: &Sd3Arch) -> usize {
     expected_transformer_tensors(arch).len()
 }
