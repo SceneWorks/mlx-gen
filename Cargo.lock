@@ -758,6 +758,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-pid"
+version = "0.0.0"
+dependencies = [
+ "image",
+ "mlx-gen",
+ "pmetal-mlx-rs",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "mlx-gen-pulid"
 version = "0.0.0"
 dependencies = [

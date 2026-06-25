@@ -1,0 +1,22 @@
+[package]
+name = "mlx-gen-pid"
+version = "0.0.0"
+edition = "2021"
+description = "NVIDIA PiD (Pixel Diffusion Decoder) — optional latent→pixel super-resolving decoder for mlx-gen (epic 7840)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "pixel-decoder", "super-resolution"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Parse the PiD checkpoint's sidecar config (channels / latent-norm / scale) at load time.
+serde_json = "1"
+# Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-krea / mlx-gen-z-image).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# Backend-neutral gen-core contract conformance (sc-4481). Weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }
