@@ -18,16 +18,18 @@
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     Capabilities, Conditioning, ConditioningKind, ControlKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_pid::PidEngine;
 
 use crate::control_transformer::QwenControlNet;
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
-    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params,
+    encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_pid_decoder,
+    resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -75,6 +77,8 @@ pub struct QwenImageControl {
     transformer: QwenTransformer,
     controlnet: QwenControlNet,
     vae: QwenVae,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
+    pid: Option<PidEngine>,
 }
 
 /// Construct a [`QwenImageControl`] from a [`LoadSpec`].
@@ -124,6 +128,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(QwenImageControl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
@@ -131,6 +140,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         transformer,
         controlnet,
         vae: loader::load_vae(root)?,
+        pid,
     }))
 }
 
@@ -214,8 +224,14 @@ impl QwenImageControl {
         // the control image with the VAE and `_pack_latents` 2×2, identical to the noise packing).
         let control_cond = encode_init_latents(&self.vae, control_image, req.width, req.height)?;
 
+        // Decode seam (sc-7845): a per-request PiD decoder when `req.use_pid`, else the native VAE.
+        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, params.base_seed, MODEL_ID)?;
+        let decoder: &dyn LatentDecoder = match &pid_decoder {
+            Some(d) => d,
+            None => &self.vae,
+        };
         let images = decode_and_collect(
-            &self.vae,
+            decoder,
             req.count,
             params.base_seed,
             req.width,

@@ -106,6 +106,7 @@ fn spec(base: PathBuf, control: Option<PathBuf>, ip: Option<PathBuf>) -> LoadSpe
         ip_adapter: ip.map(WeightsSource::Dir),
         adapters: Vec::new(),
         extra_controls: Vec::new(),
+        pid: None,
     }
 }
 

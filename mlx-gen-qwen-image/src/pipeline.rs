@@ -20,6 +20,7 @@ use mlx_gen::{
     Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, Progress, Result,
     TimestepConvention,
 };
+use mlx_gen_pid::{PidDecoder, PidEngine};
 
 use crate::control_transformer::QwenControlNet;
 use crate::sampler::{lightning_sigmas, LIGHTNING_SHIFT};
@@ -175,6 +176,40 @@ where
         images.push(decoded_to_image(&decoded)?);
     }
     Ok(images)
+}
+
+/// The PiD backbone (latent-space) tag for the Qwen-Image VAE — shared by all three Qwen generators
+/// and by Krea (which reuses [`QwenVae`]). Resolves to the `qwenimage` `2kto4k` student + 4× SR
+/// (`mlx_gen_pid::registry`).
+pub const PID_BACKBONE: &str = "qwenimage";
+
+/// Resolve the decode seam for one generation (epic 7840, sc-7845), shared by the three Qwen
+/// generators. When `req.use_pid` is set, mint a per-generation PiD decoder bound to the prompt — a
+/// **clean σ=0 decode of the fully-denoised latent**, seeded from `base_seed`; the caller passes it to
+/// [`decode_and_collect`] in place of the native [`QwenVae`]. Errors (rather than silently falling
+/// back) if PiD was requested but the model was not loaded with `LoadSpec::pid`. When the flag is
+/// unset, returns `None` and the caller uses the native VAE — the byte-exact default path.
+///
+/// The returned [`PidDecoder`] owns its caption embeddings + a freshly-built `PidNet`, so it lives as
+/// long as the borrow passed to `decode_and_collect`. All `count` images in a request share this one
+/// decoder (same prompt → same caption); per-image variation comes from the per-seed denoised latent.
+/// The from_ldm early-stop x_t-capture (σ>0, decoding a partially-denoised latent) is a separate
+/// follow-on — this path always decodes the fully-denoised latent at σ=0.
+pub fn resolve_pid_decoder(
+    pid: Option<&PidEngine>,
+    req: &GenerationRequest,
+    base_seed: u64,
+    model_id: &str,
+) -> Result<Option<PidDecoder>> {
+    if !req.use_pid {
+        return Ok(None);
+    }
+    let engine = pid.ok_or_else(|| {
+        Error::Msg(format!(
+            "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
+        ))
+    })?;
+    Ok(Some(engine.decoder(&req.prompt, 0.0, base_seed)?))
 }
 
 /// VAE latent channel count.
@@ -628,6 +663,34 @@ mod tests {
         assert!(v.iter().all(|&x| (-1.0..=1.0).contains(&x)));
         // first pixel (0,0,0) → -1 across channels; channel-planar NCHW so index 0,4,8 are R,G,B@(0,0).
         assert!((v[0] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_pid_decoder_off_is_none() {
+        // use_pid unset → None (the native VAE path), even with no engine loaded.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(resolve_pid_decoder(None, &req, 0, "qwen_image")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_pid_decoder_requested_without_engine_errors() {
+        // use_pid set but no PiD loaded → a clear error, not a silent VAE fallback. `PidDecoder` is
+        // not `Debug`, so match rather than `.expect_err()`.
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            ..Default::default()
+        };
+        let err = match resolve_pid_decoder(None, &req, 0, "qwen_image") {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no PiD decoder is loaded"), "got: {err}");
     }
 
     #[test]

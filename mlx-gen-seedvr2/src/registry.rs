@@ -275,6 +275,7 @@ mod tests {
                 ip_adapter: None,
                 adapters: Vec::new(),
                 extra_controls: Vec::new(),
+                pid: None,
             };
             let err = match mlx_gen::load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),

@@ -14,6 +14,10 @@ mlx-gen = { path = ".." }
 # `_name_or_path = "Qwen/Qwen-Image"`); reuse `QwenVae` + its diffusers→internal key remap wholesale
 # rather than re-port the causal-Conv3d VAE (the boogu→z-image / kolors→sdxl provider-reuse precedent).
 mlx-gen-qwen-image = { path = "../mlx-gen-qwen-image" }
+# Optional PiD super-resolving decoder (epic 7840, sc-7845): Krea reuses the Qwen-Image latent space,
+# so `req.use_pid` routes decode through a `mlx_gen_pid::PidDecoder` (built via the shared
+# `mlx_gen_qwen_image::pipeline::resolve_pid_decoder`). `mlx-gen-pid` depends only on core (acyclic).
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time self-registration of the `krea_2_turbo` generator into the `mlx_gen` registry

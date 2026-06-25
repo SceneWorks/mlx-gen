@@ -15,9 +15,10 @@ use mlx_gen::array::host_i32;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
+    Precision, Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_pid::PidEngine;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::{Array, Dtype};
 
@@ -26,7 +27,7 @@ use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
     create_noise, decode_and_collect, denoise_edit_with_progress, qwen_samplers, qwen_schedulers,
-    resolve_run_params,
+    resolve_pid_decoder, resolve_run_params, PID_BACKBONE,
 };
 use crate::text_encoder::vision::grid::Grid;
 use crate::text_encoder::QwenVisionLanguageEncoder;
@@ -83,6 +84,8 @@ pub struct QwenImageEdit {
     vl_encoder: QwenVisionLanguageEncoder,
     transformer: QwenTransformer,
     vae: QwenVae,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
+    pid: Option<PidEngine>,
 }
 
 /// Construct a [`QwenImageEdit`] from a [`LoadSpec`] (a `Qwen/Qwen-Image-Edit` snapshot dir; the
@@ -119,6 +122,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(QwenImageEdit {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
@@ -126,6 +134,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         vl_encoder: loader::load_vision_language_encoder(root)?,
         transformer,
         vae: loader::load_vae(root)?,
+        pid,
     }))
 }
 
@@ -234,8 +243,14 @@ impl QwenImageEdit {
             concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
         };
 
+        // Decode seam (sc-7845): a per-request PiD decoder when `req.use_pid`, else the native VAE.
+        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, params.base_seed, MODEL_ID)?;
+        let decoder: &dyn LatentDecoder = match &pid_decoder {
+            Some(d) => d,
+            None => &self.vae,
+        };
         let images = decode_and_collect(
-            &self.vae,
+            decoder,
             req.count,
             params.base_seed,
             out_w,

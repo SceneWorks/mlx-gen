@@ -22,7 +22,8 @@ use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Progress, Result, TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, LatentDecoder, Progress, Result,
+    TimestepConvention,
 };
 
 use std::path::Path;
@@ -89,18 +90,24 @@ impl KreaPipeline {
     }
 
     /// Generate one RGB image from a text prompt. Convenience wrapper over
-    /// [`Self::generate_turbo_with_progress`] with no cancellation and a no-op progress sink.
+    /// [`Self::generate_turbo_with_progress`] with no cancellation, a no-op progress sink, and the
+    /// native VAE decode (no PiD).
     pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
-        self.generate_turbo_with_progress(prompt, opts, &CancelFlag::new(), &mut |_| {})
+        self.generate_turbo_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
     }
 
     /// Generate one RGB image, streaming [`Progress`] and honoring `cancel` at each denoise step. A
     /// pre/mid-flight cancellation returns [`mlx_gen::Error::Canceled`]; the per-step `eval` (inside
     /// [`run_flow_sampler`]) bounds the lazy MLX graph so the cancel check can interrupt mid-render.
+    /// `decoder` (epic 7840, sc-7845): the latent→pixel decode seam — `None` uses the native
+    /// [`QwenVae`] (the byte-exact default), `Some` routes through a PiD super-resolving decoder
+    /// (built per-generation from the prompt by the caller). The caller owns the PiD decoder so it can
+    /// be reused across a batch (same prompt → same caption); PiD output is 4× the native resolution.
     pub fn generate_turbo_with_progress(
         &self,
         prompt: &str,
         opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
@@ -139,14 +146,16 @@ impl KreaPipeline {
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode_latents(&lat)
+        self.decode_latents(&lat, decoder)
     }
 
-    /// VAE-decode a latent to an RGB image. `decoded_to_image` applies `clip(x·0.5 + 0.5, 0, 1)` — the
-    /// algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` — and drops the singleton temporal
-    /// axis (`QwenVae::decode` is NCTHW with T=1).
-    fn decode_latents(&self, lat: &Array) -> Result<Image> {
-        let decoded = self.vae.decode(lat)?.as_dtype(Dtype::Float32)?; // [1, 3, 1, H, W]
+    /// Decode a latent to an RGB image through the seam. `decoded_to_image` applies
+    /// `clip(x·0.5 + 0.5, 0, 1)` — the algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` —
+    /// and drops the singleton temporal axis when present (`QwenVae::decode` is NCTHW with T=1; PiD
+    /// returns NCHW at 4× resolution). `decoder` is the native VAE when `None`.
+    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
+        let dec: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
+        let decoded = dec.decode(lat)?.as_dtype(Dtype::Float32)?;
         decoded_to_image(&decoded)
     }
 }

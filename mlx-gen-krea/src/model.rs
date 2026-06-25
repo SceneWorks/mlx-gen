@@ -12,9 +12,11 @@
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    Result, WeightsSource,
+    GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
+    Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_pid::PidEngine;
+use mlx_gen_qwen_image::pipeline::{resolve_pid_decoder, PID_BACKBONE};
 
 use crate::pipeline::{KreaPipeline, TurboOptions};
 
@@ -81,6 +83,10 @@ pub fn descriptor() -> ModelDescriptor {
 pub struct Krea {
     descriptor: ModelDescriptor,
     pipeline: KreaPipeline,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-7845), loaded when `spec.pid` is set; Krea
+    /// reuses the Qwen-Image latent space, so it shares the `qwenimage` PiD student. `req.use_pid`
+    /// routes decode through it instead of the VAE. `None` for the plain VAE path.
+    pid: Option<PidEngine>,
 }
 
 /// Load a Krea generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`] pointing
@@ -117,9 +123,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if let Some(q) = spec.quantize {
         pipeline.quantize(q.bits())?;
     }
+    // Optional PiD decoder overlay (sc-7845): Krea reuses the Qwen-Image latent space, so it loads the
+    // same `qwenimage` student + Gemma-2 caption encoder when `spec.pid` is set.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(Krea {
         descriptor: descriptor(),
         pipeline,
+        pid,
     }))
 }
 
@@ -141,6 +155,12 @@ impl Krea {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or(0);
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        // Decode seam (sc-7845): when `req.use_pid`, build one PiD decoder from the prompt (σ=0 clean
+        // decode, seeded from `base_seed`) and reuse it across the batch — same prompt → same caption;
+        // per-image variation comes from the per-seed latent. `None` → the native VAE. Errors if PiD
+        // was requested but not loaded.
+        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, KREA_2_TURBO_ID)?;
+        let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = TurboOptions {
@@ -154,6 +174,7 @@ impl Krea {
             let img = self.pipeline.generate_turbo_with_progress(
                 &req.prompt,
                 &opts,
+                decoder,
                 &req.cancel,
                 on_progress,
             )?;

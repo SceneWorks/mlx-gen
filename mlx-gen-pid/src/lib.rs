@@ -7,18 +7,17 @@
 //!
 //! This crate implements the core [`mlx_gen::LatentDecoder`] trait (the seam from sc-7844), so a
 //! PiD-eligible engine can swap `vae.decode(latent)` for `pid.decode(latent)` at its decode call site
-//! when the per-generation toggle is set — without N bespoke per-engine ports.
+//! when the per-generation toggle is set — without N bespoke per-engine ports. [`PidEngine`] is the
+//! load-once / decode-many entry a provider holds; [`PidEngine::decoder`] mints a per-generation
+//! [`PidDecoder`] bound to that generation's caption + degrade σ + seed.
 //!
-//! ## Status (sc-7843, in progress)
-//! Parity-verified against torch fixtures to the mlx-Metal-f32 matmul floor (see `tests/`): the
-//! [`config`] + [`registry`] tables, the [`backbone`] `PixDiT_T2I` forward, the [`lq`] sigma-aware LQ
-//! adapter + gate-injected [`lq::PidNet`], and the [`sampler`] 4-step SDE distill loop. The
-//! `.pth → safetensors` converter (`tools/convert_pid.py`) is written + transform-verified.
-//!
-//! Remaining (the real-weight tail gated on the `nvidia/PiD` qwenimage checkpoint + the
-//! `gemma-2-2b-it` weights + the sc-7931 CUDA reference samples): the Gemma-2-2B caption encoder
-//! (a port, not an LTX reuse — LTX's Gemma is the 3-12B generation), the `LatentDecoder` decode
-//! entry (caption embeds + target resolution + latent handoff), and the end-to-end real-weight smoke.
+//! ## Status (sc-7843 engine DONE + real-weight validated; sc-7845 wires Qwen-Image/Krea)
+//! Every component is parity-verified against torch fixtures to the mlx-Metal-f32 matmul floor (see
+//! `tests/`) and the full path is real-weight validated against the CUDA reference (`from_clean`
+//! runA + `from_ldm` runB): the [`config`] + [`registry`] tables, the [`backbone`] `PixDiT_T2I`
+//! forward, the [`lq`] sigma-aware LQ adapter + gate-injected [`lq::PidNet`], the [`sampler`] 4-step
+//! SDE distill loop, the [`gemma2`] Gemma-2-2B caption encoder, and the [`caption`] glue. The
+//! `.pth → safetensors` converter (`tools/convert_pid.py`) is validated on the real 1.36 B checkpoint.
 //!
 //! ## License
 //! PiD weights are NVIDIA NSCLv1 (non-commercial). The NC restriction flows to PiD-decoded output —
@@ -28,6 +27,7 @@ pub mod backbone;
 pub mod caption;
 pub mod config;
 pub mod decoder;
+pub mod engine;
 pub mod gemma2;
 pub mod lq;
 pub mod registry;
@@ -37,6 +37,7 @@ pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;
 pub use config::{CaptionConfig, PidConfig, RopeMode, SampleType, SamplerConfig};
 pub use decoder::PidDecoder;
+pub use engine::PidEngine;
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};
 pub use registry::{lookup, BackboneSpec, CkptType, LatentNorm};

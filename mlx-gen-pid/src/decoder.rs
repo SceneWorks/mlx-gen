@@ -4,7 +4,7 @@
 //! (the engine already holds the conditioning). Faithful to `from_clean.py`: PiD consumes the
 //! **normalized** VAE latent directly; the output resolution is `latent_grid · vae_compression · scale`.
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::decoder::LatentDecoder;
 use mlx_gen::Result;
@@ -64,11 +64,16 @@ impl LatentDecoder for PidDecoder {
     fn decode(&self, latents: &Array) -> Result<Array> {
         let b = latents.shape()[0];
         let (th, tw) = self.target_hw(latents);
+        // PiD runs the released bf16 inference dtype, and the LQ-adapter convs require their input in
+        // that dtype. An engine may hand us an f32 sampler latent (Qwen/Krea keep latents f32 through
+        // the denoise loop), so cast here — a no-op when the latent is already bf16. Matches the
+        // validated `from_clean` path (sc-7843), which cast the VAE latent to bf16 before decode.
+        let latents = latents.as_dtype(Dtype::Bfloat16)?;
         let sigma = Array::from_slice(&vec![self.sigma; b as usize], &[b]);
         self.sampler.sample(
             &self.net,
             &self.caption_embs,
-            latents,
+            &latents,
             &sigma,
             b,
             th,

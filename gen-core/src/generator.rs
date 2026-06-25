@@ -137,6 +137,16 @@ pub struct GenerationRequest {
     /// caption-upsample 0.15 — the reference `caption_upsample_temperature`).
     pub enhance_temperature: Option<f32>,
 
+    // --- Decoder (epic 7840; ignored by models without a PiD backbone) ---
+    /// Route this generation's decode through the optional **PiD** super-resolving decoder instead of
+    /// the native VAE. Default `false` — the VAE-decode path is unchanged. Only honored when the model
+    /// was loaded with [`LoadSpec::pid`](crate::LoadSpec::pid) weights (the PiD-eligible providers,
+    /// Qwen-Image / Krea today — sc-7845); a provider with no PiD loaded errors rather than silently
+    /// ignoring the request, and PiD-ineligible models ignore the flag. Turning PiD on also changes the
+    /// output resolution (native → 4×), so it is not a transparent decoder swap. PiD output is
+    /// research/evaluation-only (NSCLv1), surfaced/labeled at the worker/web layer (Phase 3).
+    pub use_pid: bool,
+
     // --- Control ---
     pub cancel: CancelFlag,
 }
@@ -174,6 +184,7 @@ impl Default for GenerationRequest {
             use_uncensored_enhancer: false,
             enhance_max_tokens: None,
             enhance_temperature: None,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }

@@ -83,8 +83,8 @@ pub use registry::{
 };
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, Precision, Progress, Quant,
-    WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, PidWeights, Precision, Progress,
+    Quant, WeightsSource,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,

@@ -14,3 +14,12 @@ mlx-gen = { path = ".." }
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry (wired when the Generator lands).
 inventory = { workspace = true }
+# Optional PiD super-resolving decoder (epic 7840, sc-7845): the Qwen-Image latent space has a PiD
+# backbone, so `decode_and_collect` routes through a `mlx_gen_pid::PidDecoder` when `req.use_pid` is
+# set. `mlx-gen-pid` depends only on core (no dep on this crate), so the dependency is acyclic.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
+
+[dev-dependencies]
+# Encode the PiD-vs-VAE real-weight smoke output to PNG for eyeball comparison (sc-7845;
+# `tests/pid_decode_real_weights.rs`); mirrors mlx-gen-pid / mlx-gen-krea.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

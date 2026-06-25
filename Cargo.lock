@@ -728,6 +728,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "mlx-gen-qwen-image",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
@@ -783,8 +784,10 @@ dependencies = [
 name = "mlx-gen-qwen-image"
 version = "0.0.0"
 dependencies = [
+ "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "pmetal-mlx-rs",
 ]
 

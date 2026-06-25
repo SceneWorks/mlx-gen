@@ -85,6 +85,29 @@ pub struct LoadSpec {
     /// the seam, since `Generator::generate`/`Transform::apply` take `&self` and the frozen fork
     /// likewise applies adapters in its initializer. Changing the adapter set means reloading.
     pub adapters: Vec<AdapterSpec>,
+    /// Auxiliary **PiD** (NVIDIA Pixel-Diffusion) decoder weights overlaid at load time (epic 7840) —
+    /// the optional super-resolving replacement for the model's VAE decode step. `None` for the plain
+    /// VAE-decoding model; `Some` makes the PiD decoder *available*, after which the per-generation
+    /// [`crate::GenerationRequest::use_pid`] flag selects it at the decode call site. Like
+    /// [`control`](Self::control)/[`ip_adapter`](Self::ip_adapter) it is a load-time component (PiD's
+    /// net + Gemma-2 caption encoder are heavy, so they load once and the toggle rides each request);
+    /// only providers whose latent space has a PiD backbone read it (Qwen-Image / Krea today —
+    /// sc-7845), and they ignore it when the request does not request PiD.
+    pub pid: Option<PidWeights>,
+}
+
+/// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
+/// *latent space*, not a model, so a provider in an eligible space points at the converted
+/// per-latent-space checkpoint plus the shared Gemma-2-2b caption encoder. Backend-neutral (just
+/// paths); the tensor load lives in `mlx-gen-pid`.
+#[derive(Clone, Debug)]
+pub struct PidWeights {
+    /// The converted PiD student checkpoint — a single `.safetensors`
+    /// ([`WeightsSource::File`]; `tools/convert_pid.py` output for this latent space).
+    pub checkpoint: WeightsSource,
+    /// The `gemma-2-2b-it` snapshot **directory** ([`WeightsSource::Dir`]) — the caption encoder PiD
+    /// conditions on (must contain the weights + `tokenizer.json`).
+    pub gemma: WeightsSource,
 }
 
 impl LoadSpec {
@@ -98,6 +121,7 @@ impl LoadSpec {
             extra_controls: Vec::new(),
             ip_adapter: None,
             adapters: Vec::new(),
+            pid: None,
         }
     }
 
@@ -131,6 +155,14 @@ impl LoadSpec {
     /// Builder-style LoRA/LoKr adapters to bake on at load time (replaces any already set).
     pub fn with_adapters(mut self, adapters: Vec<AdapterSpec>) -> Self {
         self.adapters = adapters;
+        self
+    }
+
+    /// Builder-style optional PiD decoder overlay (epic 7840) — the converted per-latent-space PiD
+    /// checkpoint + the Gemma-2 caption-encoder snapshot dir. Makes PiD *available*; the per-request
+    /// [`crate::GenerationRequest::use_pid`] flag then selects it at decode.
+    pub fn with_pid(mut self, checkpoint: WeightsSource, gemma: WeightsSource) -> Self {
+        self.pid = Some(PidWeights { checkpoint, gemma });
         self
     }
 }
