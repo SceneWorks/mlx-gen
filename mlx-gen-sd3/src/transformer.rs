@@ -301,8 +301,13 @@ impl AdaLnZero {
     }
 }
 
-/// AdaLayerNormContinuous: `silu(emb) → linear → [shift, scale]`, each `[B, hidden]`. Used by the
+/// AdaLayerNormContinuous: `silu(emb) → linear → [scale, shift]`, each `[B, hidden]`. Used by the
 /// final block's `norm1_context` (`context_pre_only`) and the model-level `norm_out`.
+///
+/// NOTE the diffusers chunk order: `AdaLayerNormContinuous` does `scale, shift =
+/// emb.chunk(2, dim=1)` — i.e. the FIRST chunk is `scale`, the SECOND is `shift` (the opposite of
+/// `AdaLayerNormZero`, which is shift-first). The net norm it applies is `norm(x)·(1+scale) +
+/// shift`. See the sibling crate `mlx-gen-flux2/src/transformer.rs::norm_out` for the same module.
 struct AdaLnContinuous {
     linear: AdaptableLinear,
 }
@@ -319,10 +324,17 @@ impl AdaLnContinuous {
     }
 
     /// Returns `(shift, scale)`, each `[B, 1, hidden]`.
+    ///
+    /// diffusers chunks the projection as `scale, shift = emb.chunk(2)`, so `parts[0]` is the
+    /// **scale** and `parts[1]` is the **shift**. We return them in `(shift, scale)` order so the
+    /// downstream `modulated_layer_norm(x, shift, scale)` applies `(1+scale)·norm(x) + shift`,
+    /// matching diffusers `AdaLayerNormContinuous`.
     fn forward(&self, emb: &Array) -> Result<(Array, Array)> {
         let e = self.linear.forward(&silu(emb)?)?; // [B, 2·hidden]
         let parts = split(&e, 2, -1)?;
-        Ok((parts[0].expand_dims(1)?, parts[1].expand_dims(1)?))
+        let scale = parts[0].expand_dims(1)?;
+        let shift = parts[1].expand_dims(1)?;
+        Ok((shift, scale))
     }
 }
 
@@ -707,5 +719,115 @@ impl Sd3Transformer {
         let x = x.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
         // [B, c, ph*p, pw*p]
         Ok(x.reshape(&[b, c, ph * p, pw * p])?)
+    }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Unit tests.
+// ----------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::{add, multiply};
+    use mlx_rs::transforms::eval;
+
+    /// Build an [`AdaLnContinuous`] whose projection is a pure bias: a zero weight matrix `[2H, E]`
+    /// plus a bias `[2H]` equal to `concat(scale_vals, shift_vals)`. With a zero weight the projection
+    /// output is exactly the bias regardless of `emb` (and of the inner `silu`), so `forward` must
+    /// return that bias chunked in the diffusers `scale, shift = chunk(2)` order — which lets us pin
+    /// the (shift, scale) labelling with asymmetric known values.
+    fn ada_ln_continuous_pure_bias(
+        hidden: i32,
+        scale_vals: &[f32],
+        shift_vals: &[f32],
+    ) -> AdaLnContinuous {
+        assert_eq!(scale_vals.len() as i32, hidden);
+        assert_eq!(shift_vals.len() as i32, hidden);
+        let mut w = Weights::empty();
+        // dense Linear: `{prefix}.weight` is [out, in] = [2*hidden, emb_dim], `{prefix}.bias` [2*hidden].
+        let emb_dim = hidden; // arbitrary; weight is zero so the value is irrelevant.
+        w.insert(
+            "norm.linear.weight",
+            Array::zeros::<f32>(&[2 * hidden, emb_dim]).unwrap(),
+        );
+        let mut bias = Vec::with_capacity(2 * hidden as usize);
+        bias.extend_from_slice(scale_vals); // diffusers FIRST chunk = scale
+        bias.extend_from_slice(shift_vals); // diffusers SECOND chunk = shift
+        w.insert("norm.linear.bias", Array::from_slice(&bias, &[2 * hidden]));
+        AdaLnContinuous::from_weights(&w, "norm").unwrap()
+    }
+
+    /// Guards the diffusers `AdaLayerNormContinuous` chunk order: the FIRST projection chunk is
+    /// `scale`, the SECOND is `shift` (the opposite of `AdaLayerNormZero`). A regression that swaps
+    /// them — e.g. returning `(parts[0], parts[1])` as `(shift, scale)` — produces the wrong applied
+    /// norm and corrupts every channel before `proj_out`, so this asserts BOTH the returned tuple
+    /// AND the net application `norm(x)·(1+scale) + shift`.
+    #[test]
+    fn ada_ln_continuous_chunk_order_is_scale_then_shift() {
+        let hidden = 4;
+        // Deliberately asymmetric so a scale/shift swap can never coincidentally pass.
+        let scale_vals = [0.5f32, -1.0, 2.0, 0.0];
+        let shift_vals = [10.0f32, -20.0, 30.0, -40.0];
+        let ada = ada_ln_continuous_pure_bias(hidden, &scale_vals, &shift_vals);
+
+        let emb = Array::from_slice(&[0.3f32, -0.7, 1.1, 0.0], &[1, hidden]);
+        let (shift, scale) = ada.forward(&emb).unwrap();
+        eval([&shift, &scale]).unwrap();
+
+        // Tuple is (shift, scale): shift == second chunk, scale == first chunk.
+        let shift_v: Vec<f32> = shift.as_slice::<f32>().to_vec();
+        let scale_v: Vec<f32> = scale.as_slice::<f32>().to_vec();
+        for i in 0..hidden as usize {
+            assert!(
+                (shift_v[i] - shift_vals[i]).abs() < 1e-4,
+                "shift[{i}] = {} expected {}",
+                shift_v[i],
+                shift_vals[i]
+            );
+            assert!(
+                (scale_v[i] - scale_vals[i]).abs() < 1e-4,
+                "scale[{i}] = {} expected {}",
+                scale_v[i],
+                scale_vals[i]
+            );
+        }
+
+        // Net application must match diffusers: norm(x)·(1 + scale) + shift.
+        let x = Array::from_slice(&[1.0f32, 2.0, -3.0, 4.0], &[1, 1, hidden]);
+        let got = modulated_layer_norm(&x, &shift, &scale).unwrap();
+        let normed = layer_norm(&x, None, None, LN_EPS).unwrap();
+        let one = Array::from_slice(&[1.0f32], &[1]);
+        let one_plus_scale = add(&scale, &one).unwrap();
+        let scaled = multiply(&normed, &one_plus_scale).unwrap();
+        let expected = add(&scaled, &shift).unwrap();
+        eval([&got, &expected]).unwrap();
+        let got_v: Vec<f32> = got.as_slice::<f32>().to_vec();
+        let exp_v: Vec<f32> = expected.as_slice::<f32>().to_vec();
+        for i in 0..got_v.len() {
+            assert!(
+                (got_v[i] - exp_v[i]).abs() < 1e-4,
+                "modulated[{i}] = {} expected {}",
+                got_v[i],
+                exp_v[i]
+            );
+        }
+
+        // Sanity: the SWAPPED application (the bug) would NOT match — proves the test discriminates.
+        let one_plus_shift = add(&shift, &one).unwrap();
+        let swap_scaled = multiply(&normed, &one_plus_shift).unwrap();
+        let swapped = add(&swap_scaled, &scale).unwrap();
+        eval([&swapped]).unwrap();
+        let swap_v: Vec<f32> = swapped.as_slice::<f32>().to_vec();
+        let mut differs = false;
+        for i in 0..got_v.len() {
+            if (got_v[i] - swap_v[i]).abs() > 1e-3 {
+                differs = true;
+            }
+        }
+        assert!(
+            differs,
+            "test cannot distinguish correct from swapped scale/shift"
+        );
     }
 }

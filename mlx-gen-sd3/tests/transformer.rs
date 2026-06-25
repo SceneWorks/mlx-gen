@@ -44,6 +44,7 @@ fn tiny_arch() -> Sd3Arch {
         caption_projection_dim: 32, // == hidden
         pos_embed_max_size: 12,     // table spans up to a 12×12 patch grid
         time_proj_dim: 16,
+        dual_attention_layers: 0, // plain MMDiT (Large topology), no MMDiT-X dual-attention blocks
     }
 }
 
