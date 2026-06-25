@@ -35,6 +35,7 @@ pub mod weights;
 // Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,
 // train→kernels, tokenizer→to_arrays, image→decoded_to_image).
 pub mod caption;
+pub mod decoder;
 pub mod image;
 pub mod tokenizer;
 pub mod train;
@@ -63,6 +64,7 @@ pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
+pub use decoder::LatentDecoder;
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
     schedule_sigmas, DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType,

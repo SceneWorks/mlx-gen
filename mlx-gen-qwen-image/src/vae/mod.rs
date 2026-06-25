@@ -15,7 +15,7 @@ use mlx_rs::Array;
 
 use mlx_gen::nn::silu;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{LatentDecoder, Result};
 
 use blocks::{rms_norm_channels, CausalConv3d, DownBlock3D, MidBlock3D, UpBlock3D, NORM_EPS};
 
@@ -150,6 +150,16 @@ impl QwenVae {
         let e = self.quant_conv.forward(&e)?;
         let e16 = split(&e, 2, 1)?.swap_remove(0); // keep first 16 of 32 channels
         Ok(divide(&subtract(&e16, &self.mean)?, &self.std)?)
+    }
+}
+
+/// The native decoder for the Qwen-Image latent space (the behavior-preserving default of the
+/// PiD decode seam, sc-7844). Delegates to the inherent [`QwenVae::decode`]; a PiD decoder for this
+/// same latent space (`mlx-gen-pid`, sc-7843/7845) implements the same trait so an engine can swap
+/// between them at the decode call site.
+impl LatentDecoder for QwenVae {
+    fn decode(&self, latents: &Array) -> Result<Array> {
+        QwenVae::decode(self, latents)
     }
 }
 

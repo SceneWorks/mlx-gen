@@ -17,7 +17,8 @@ pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preproces
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_scheduler_names, default_seed, resolve_flow_schedule, run_flow_sampler, CancelFlag,
-    Error, FlowMatchEuler, GenerationRequest, Image, Progress, Result, TimestepConvention,
+    Error, FlowMatchEuler, GenerationRequest, Image, LatentDecoder, Progress, Result,
+    TimestepConvention,
 };
 
 use crate::control_transformer::QwenControlNet;
@@ -147,9 +148,13 @@ pub fn encode_prompt(
 /// The per-count seed → final-latents → decode → collect loop shared by all three generators
 /// (F-117). `denoise_one(seed, on_progress)` runs the variant-specific denoise for one sample and
 /// returns its packed final latents; this helper handles the seed sequence, the `Decoding` progress
-/// tick, unpack + VAE-decode, and image collection identically for every variant.
+/// tick, unpack + decode, and image collection identically for every variant.
+///
+/// `decoder` is the latent→pixel decode seam (sc-7844): the native [`QwenVae`] by default, or a PiD
+/// decoder for this latent space once wired (sc-7845). PiD output may be larger than VAE-native, so
+/// downstream size is taken from the decoded tensor, not assumed.
 pub fn decode_and_collect<F>(
-    vae: &QwenVae,
+    decoder: &dyn LatentDecoder,
     count: u32,
     base_seed: u64,
     width: u32,
@@ -166,7 +171,7 @@ where
         let latents = denoise_one(seed, on_progress)?;
         on_progress(Progress::Decoding);
         let unpacked = unpack_latents(&latents, width, height)?;
-        let decoded = vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+        let decoded = decoder.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
         images.push(decoded_to_image(&decoded)?);
     }
     Ok(images)
