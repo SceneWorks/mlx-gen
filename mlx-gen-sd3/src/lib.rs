@@ -38,14 +38,28 @@
 //!   block), and the AdaLN-continuous output head → unpatchify. REUSES flux2's joint-attention
 //!   `process_qkv`/double-stream pattern with the SD3 deltas (no RoPE, all-double topology, GELU).
 //!
-//! The model/loader/pipeline wiring (**E5+**) and native LoRA training (**T1–T4**) are separate epic
-//! stories and are intentionally NOT implemented here. No `Generator` is registered yet.
+//! * [`loader`] / [`pipeline`] / [`model`] (E5 sc-7864 = Large; E6 sc-7865 = Large-Turbo) — the
+//!   SD3.5 text-to-image vertical: the snapshot-layout loader (reusing the SDXL CLIP encoder ×2 +
+//!   FLUX T5 + Z-Image VAE), the flow-match-Euler (static shift 3.0) sampling pipeline, and the
+//!   [`model::Sd3Large`] [`Generator`](mlx_gen::Generator) registered under BOTH engine ids:
+//!   **`sd3_5_large`** (true-CFG, 28 steps / guidance 3.5) and **`sd3_5_large_turbo`** (ADD-distilled,
+//!   4 steps / guidance-baked CFG-off — same backbone + snapshot layout, distilled checkpoint, one
+//!   forward per step). The pipeline's `denoise_cfg` skips the uncond forward when guidance == 1.0, so
+//!   the Turbo path reuses E5's pipeline unchanged.
+//!
+//! Medium (M3) and native LoRA training (T1–T4) are separate epic stories and are NOT implemented
+//! here.
 
 pub mod config;
 pub mod convert;
+pub mod loader;
+pub mod model;
+pub mod pipeline;
 pub mod text;
 pub mod transformer;
 pub mod vae;
+
+pub use model::{Sd3Large, MODEL_ID, TURBO_MODEL_ID};
 
 pub use config::{
     Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,
