@@ -25,8 +25,14 @@
 //! (and `uncond` is `None`), so the Turbo path reuses E5's pipeline unchanged — only the per-variant
 //! step/guidance defaults + descriptor differ.
 //!
-//! Registered engine ids: **`sd3_5_large`** + **`sd3_5_large_turbo`** (the SceneWorks worker's
-//! `payload.model`). Medium (M3) is a separate story and registers its own id on the same scaffolding.
+//! Registered engine ids: **`sd3_5_large`** + **`sd3_5_large_turbo`** + **`sd3_5_medium`** (the
+//! SceneWorks worker's `payload.model`). Medium (M3, sc-7869) reuses ALL of this scaffolding — the
+//! same [`Sd3Large`] generator struct, loader, and pipeline — but is driven by the MMDiT-X arch
+//! ([`Sd3Variant::Medium`](crate::config::Sd3Variant::Medium) →
+//! [`Sd3Arch::medium`](crate::config::Sd3Arch::medium): 24 blocks,
+//! hidden 1536, `pos_embed_max_size` 384, dual-attention blocks `0..=12`) and the Medium
+//! true-CFG recipe (40 steps / guidance 5.0). The struct keeps the historical `Sd3Large` name; it is
+//! variant-parameterized and serves all three variants.
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -48,6 +54,9 @@ use crate::transformer::Sd3Transformer;
 pub const MODEL_ID: &str = crate::config::SD3_5_LARGE_ID;
 /// Registry id for SD3.5-Large-Turbo (the distilled few-step / CFG-off variant on the same backbone).
 pub const TURBO_MODEL_ID: &str = crate::config::SD3_5_LARGE_TURBO_ID;
+/// Registry id for SD3.5-Medium (the MMDiT-X variant — 24 blocks, hidden 1536, dual-attention in the
+/// first 13 — true-CFG, on the same triple-TE + 16-ch VAE + flow-match-Euler scaffolding).
+pub const MEDIUM_MODEL_ID: &str = crate::config::SD3_5_MEDIUM_ID;
 
 /// SD3.5-Large's identity + capabilities — constructible without loading weights (registry
 /// introspection). The full capability surface lives on [`Sd3Variant::Large`].
@@ -59,6 +68,15 @@ pub fn descriptor() -> ModelDescriptor {
 /// prompt). The capability surface lives on [`Sd3Variant::LargeTurbo`].
 pub fn turbo_descriptor() -> ModelDescriptor {
     Sd3Variant::LargeTurbo.descriptor()
+}
+
+/// SD3.5-Medium's identity + capabilities (M3, sc-7869) — the MMDiT-X variant: true-CFG (negative
+/// prompt + guidance), default 40 steps / guidance 5.0, on the same triple-TE + 16-ch VAE +
+/// flow-match-Euler (shift 3.0) pipeline. The capability surface lives on [`Sd3Variant::Medium`];
+/// its `max_size` (1440) is the higher-res ceiling Medium's `pos_embed_max_size` (384) can span while
+/// staying inside the Mac activation budget (see [`load_medium`]).
+pub fn medium_descriptor() -> ModelDescriptor {
+    Sd3Variant::Medium.descriptor()
 }
 
 /// A loaded SD3.5-Large / Large-Turbo generator: the tokenizers + three text encoders + MMDiT + VAE
@@ -84,6 +102,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// guidance-baked CFG-off) and the advertised capabilities differ. See [`load_variant`].
 pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, Sd3Variant::LargeTurbo)
+}
+
+/// Construct a SD3.5-**Medium** generator from a [`LoadSpec`] (M3, sc-7869). Same load path as
+/// [`load`] but driven by the Medium **MMDiT-X** arch
+/// ([`Sd3Arch::medium`](crate::config::Sd3Arch::medium): 24 blocks, hidden 1536,
+/// `pos_embed_max_size` 384, dual-attention in blocks `0..=12`) and the
+/// `stabilityai/stable-diffusion-3.5-medium` snapshot. The triple-TE, the 16-ch VAE, the snapshot
+/// layout, and the flow-match-Euler (shift 3.0 — verified against Medium's `scheduler_config.json`)
+/// pipeline are all shared with Large; only the transformer arch + the true-CFG sampling recipe
+/// (40 steps / guidance 5.0) differ. See [`load_variant`].
+pub fn load_medium(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, Sd3Variant::Medium)
 }
 
 /// Construct a [`Sd3Large`] for `variant` from a [`LoadSpec`].
@@ -278,6 +308,7 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 mlx_gen::register_generators! {
     descriptor => load,
     turbo_descriptor => load_turbo,
+    medium_descriptor => load_medium,
 }
 
 #[cfg(test)]
@@ -421,6 +452,103 @@ mod tests {
         for q in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
             let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(!err.contains("quantization"), "got: {err}");
+        }
+    }
+
+    // --- M3 (sc-7869): SD3.5-Medium vertical -----------------------------------------------------
+
+    #[test]
+    fn medium_descriptor_is_sd3_5_medium_true_cfg() {
+        // Medium registers its own engine id and is true-CFG (negative prompt + guidance), like Large
+        // (NOT a distilled Turbo).
+        let d = medium_descriptor();
+        assert_eq!(d.id, "sd3_5_medium");
+        assert_eq!(d.family, "sd3");
+        assert_eq!(d.modality, Modality::Image);
+        assert!(d.capabilities.supports_true_cfg);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        // The higher-res ceiling: Medium's pos_embed_max_size (384) spans up to 1440² (patch grid
+        // 90×90 ≤ 384²); the descriptor caps there to stay inside the Mac activation budget (2K is
+        // activation-bound — the SCAIL-2 / SeedVR2 lesson).
+        assert_eq!(d.capabilities.max_size, 1440);
+    }
+
+    #[test]
+    fn medium_recipe_defaults() {
+        // Medium's reference recipe: 40 steps / guidance 5.0 (true-CFG, more guidance-sensitive than
+        // Large per Stability's model card). Shift stays 3.0 (Medium scheduler_config.json).
+        assert_eq!(Sd3Variant::Medium.default_steps(), 40);
+        assert_eq!(Sd3Variant::Medium.default_guidance(), 5.0);
+    }
+
+    #[test]
+    fn medium_uses_mmdit_x_arch() {
+        // The Medium generator is driven by the MMDiT-X arch (24 blocks, hidden 1536, dual-attention
+        // in the first 13) — distinct from Large's plain MMDiT.
+        let arch = Sd3Variant::Medium.arch();
+        assert_eq!(arch.num_layers, 24);
+        assert_eq!(arch.hidden(), 1536);
+        assert_eq!(arch.dual_attention_layers, 13);
+        assert_eq!(arch.pos_embed_max_size, 384);
+        assert!(arch.is_dual_attention_block(12));
+        assert!(!arch.is_dual_attention_block(13));
+    }
+
+    #[test]
+    fn medium_validate_accepts_guidance_and_negative_prompt() {
+        let d = medium_descriptor();
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            guidance: Some(5.0),
+            negative_prompt: Some("blurry".into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&d, &req).is_ok());
+    }
+
+    #[test]
+    fn medium_validate_guards_resolution_ceiling() {
+        // 1440² is allowed (the validated Medium ceiling); anything above max_size is rejected by the
+        // shared guard — the activation-budget cap (2K would be activation-bound).
+        let d = medium_descriptor();
+        let ok = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1440,
+            height: 1440,
+            ..Default::default()
+        };
+        assert!(validate_request(&d, &ok).is_ok());
+        let too_big = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 2048,
+            height: 2048,
+            ..Default::default()
+        };
+        let err = validate_request(&d, &too_big).unwrap_err().to_string();
+        assert!(err.contains("out of supported range"), "got: {err}");
+    }
+
+    #[test]
+    fn medium_load_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/sd3.safetensors".into()));
+        let err = load_medium(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+        assert!(err.contains("sd3_5_medium"), "got: {err}");
+    }
+
+    #[test]
+    fn medium_load_accepts_quant_spec() {
+        for q in [mlx_gen::Quant::Q4, mlx_gen::Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into())).with_quant(q);
+            let err = load_medium(&spec)
+                .err()
+                .expect("expected an error")
+                .to_string();
             assert!(!err.contains("quantization"), "got: {err}");
         }
     }

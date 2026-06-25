@@ -7,8 +7,12 @@
 //! confirmed on the real `stabilityai/stable-diffusion-3.5-large` / `-large-turbo` weights during
 //! the spike (sc-7850).
 //!
-//! ## Slice status: **E1** (sc-7860) + **E2** (sc-7861) + **E3** (sc-7862) + **E4** (sc-7863)
-//! + **M1** (sc-7867) — converter + config + triple-TE + MMDiT-Large forward + VAE + Medium converter
+//! ## Slice status
+//!
+//! **E1** (sc-7860) + **E2** (sc-7861) + **E3** (sc-7862) + **E4** (sc-7863) + **E5/E6**
+//! (sc-7864/7865) + **M1** (sc-7867) + **M2** (sc-7868) + **M3** (sc-7869) — converter + config +
+//! triple-TE + MMDiT forward + VAE + Large/Turbo verticals + Medium converter/MMDiT-X forward + the
+//! **Medium text-to-image vertical**.
 //!
 //! This crate currently ships:
 //!
@@ -47,8 +51,15 @@
 //!   forward per step). The pipeline's `denoise_cfg` skips the uncond forward when guidance == 1.0, so
 //!   the Turbo path reuses E5's pipeline unchanged.
 //!
-//! Medium (M3) and native LoRA training (T1–T4) are separate epic stories and are NOT implemented
-//! here.
+//! * [`model`] also registers **`sd3_5_medium`** (M3, sc-7869) — the MMDiT-X **Medium** vertical:
+//!   the same [`model::Sd3Large`] generator + loader + pipeline parameterized by
+//!   [`config::Sd3Variant::Medium`] (→ [`config::Sd3Arch::medium`]: 24 blocks, hidden 1536,
+//!   `pos_embed_max_size` 384, dual-attention blocks `0..=12`) at the Medium true-CFG recipe
+//!   (40 steps / guidance 5.0, flow-match-Euler shift 3.0). Higher-res support up to **1440²**
+//!   (the validated Mac-budget ceiling — 2K is activation-bound) is guarded by the descriptor's
+//!   `max_size`.
+//!
+//! Native LoRA training (T1–T4) is a separate epic story and is NOT implemented here.
 
 pub mod config;
 pub mod convert;
@@ -59,7 +70,7 @@ pub mod text;
 pub mod transformer;
 pub mod vae;
 
-pub use model::{Sd3Large, MODEL_ID, TURBO_MODEL_ID};
+pub use model::{Sd3Large, MEDIUM_MODEL_ID, MODEL_ID, TURBO_MODEL_ID};
 
 pub use config::{
     Sd3Arch, Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_GUIDANCE_MEDIUM, DEFAULT_GUIDANCE_TURBO,
