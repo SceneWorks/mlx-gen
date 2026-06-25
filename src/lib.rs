@@ -19,6 +19,7 @@
 // below so every downstream `use mlx_gen::…` keeps compiling. Re-exported as a module too, so
 // `mlx_gen::gen_core::{Error, Result}` (the neutral contract error) is reachable by name.
 pub use ::gen_core;
+pub use gen_core::{impl_generator, register_generators, register_trainer};
 
 // Local MLX modules (tensor ops, weights, quant, samplers' tensor application, error w/ mlx variants).
 pub mod adapters;

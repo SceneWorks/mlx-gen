@@ -17,6 +17,7 @@ pub mod generator;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;
+mod macros;
 pub mod media;
 pub mod registry;
 pub mod runtime;
@@ -67,6 +68,8 @@ pub use tiling::{TilingConfig, VaeTiling};
 // sc-7692). All text-LLM serving — including model-first resolution via `core_llm::load_for_model` —
 // goes through this path.
 pub use ::core_llm;
+#[doc(hidden)]
+pub use inventory;
 // NOTE: `TrainOptimizer` is intentionally NOT re-exported here — it wraps an mlx-rs optimizer and
 // lives in mlx-gen (`mlx_gen::train::optim`). `LrSchedule` is pure policy and lives here.
 pub use train::{
