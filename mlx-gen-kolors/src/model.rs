@@ -109,7 +109,8 @@ pub(crate) fn render_sample(
         &CancelFlag::default(),
         &mut |_| {},
     )?;
-    decode_image(vae, &latents)
+    // Training preview — native VAE decode only (no PiD overlay in the trainer's render path).
+    decode_image(vae, &latents, None)
 }
 
 impl Kolors {
@@ -172,9 +173,11 @@ impl Kolors {
             .encode_prompt(&t.input_ids, &t.attention_mask, Some(&t.position_ids))
     }
 
-    /// Decode latents `[1, h, w, 4]` → an RGB [`Image`] (`vae.decode(latents / 0.13025)`).
+    /// Decode latents `[1, h, w, 4]` → an RGB [`Image`] (`vae.decode(latents / 0.13025)`). The
+    /// lower-level struct API always uses the native VAE; the dispatchable `KolorsGenerator`
+    /// (`registry.rs`) is where the optional PiD overlay (sc-7848) is threaded.
     pub fn decode(&self, latents: &Array) -> Result<Image> {
-        decode_image(&self.vae, latents)
+        decode_image(&self.vae, latents, None)
     }
 
     /// Crate-internal VAE accessor for the registry [`Generator`](crate::registry) wrapper, which

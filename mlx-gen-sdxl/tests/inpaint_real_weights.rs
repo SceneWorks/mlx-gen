@@ -116,8 +116,12 @@ fn inpaint_blend_invariants() {
         &req("a fox in a field", &init, Some(&black), 0.85),
     );
     let vae = load_vae(&snap).unwrap();
-    let roundtrip =
-        decode_image(&vae, &encode_init_latents(&vae, &init, 512, 512).unwrap()).unwrap();
+    let roundtrip = decode_image(
+        &vae,
+        &encode_init_latents(&vae, &init, 512, 512).unwrap(),
+        None,
+    )
+    .unwrap();
     let diff2 = inpaint_black
         .pixels
         .iter()

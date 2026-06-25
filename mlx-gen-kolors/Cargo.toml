@@ -13,6 +13,9 @@ mlx-gen = { path = ".." }
 # Kolors reuses the SDXL U-Net + VAE + sampler. The U-Net gains an auto-detected `encoder_hid_proj`
 # for the ChatGLM3 4096→2048 context projection (see `UNetConfig::kolors`).
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
+# Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): Kolors shares the SDXL VAE
+# latent space, so it reuses the `sdxl` PiD student via the same `decode_image` seam. pid → core only.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # Link-time model registration (the `mlx_gen` registry; mirrors mlx-gen-sdxl). sc-3874.

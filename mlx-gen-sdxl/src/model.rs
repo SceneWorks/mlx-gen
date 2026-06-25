@@ -15,14 +15,15 @@
 use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LcmSampler, LightningSampler, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Result, Scheduler, Solver, TcdSampler,
-    WeightsSource,
+    GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
+    LightningSampler, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    Scheduler, Solver, TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
 
 use mlx_gen::array::scalar;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
 use crate::config::DiffusionConfig;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
@@ -83,6 +84,12 @@ fn accel_defaults(sampler: &str) -> (u32, f32, f32) {
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TARGETS["sdxl"]`).
 pub const MODEL_ID: &str = "sdxl";
+
+/// PiD latent-space backbone tag (epic 7840, sc-7848): the `sdxl` student in
+/// [`mlx_gen_pid::registry`] (SDXL's 4-ch, `0.13025`-affine VAE latent). The whole SDXL family
+/// shares this latent space, so [`mlx-gen-kolors`](mlx_gen_kolors) (and the RealVisXL variants,
+/// which register under this same `"sdxl"` generator) reuse this tag rather than redeclaring it.
+pub const PID_BACKBONE: &str = "sdxl";
 
 /// SDXL's identity + capabilities — constructible without loading weights (registry
 /// introspection). Capability flags are turned on as each slice lands and is parity-proven, so the
@@ -173,6 +180,11 @@ pub struct Sdxl {
     /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
     /// samplers (sc-2769). Built once at load (the ancestral `sampler` keeps its own σ table).
     alpha_schedule: AlphaSchedule,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): loaded when the spec
+    /// carries [`LoadSpec::pid`]. `Some` ⇒ a `req.use_pid` generation decodes the final SDXL latent
+    /// through the `sdxl` PiD student (4× SR) instead of the VAE. `None` ⇒ the default byte-exact
+    /// VAE decode. The student + Gemma caption encoder load once here and are reused per generation.
+    pid: Option<PidEngine>,
 }
 
 /// Construct an [`Sdxl`] from a [`LoadSpec`].
@@ -282,6 +294,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
     }
 
+    // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
+    // when the spec carries it. Shared across the whole SDXL family (sdxl/realvisxl) — and Kolors,
+    // which loads its own engine via `mlx_gen_sdxl::model::PID_BACKBONE`.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
+
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
         AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end)?;
@@ -296,6 +317,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         vae,
         sampler: EulerSampler::new_with_dtype(&cfg, true, dtype)?,
         alpha_schedule,
+        pid,
     }))
 }
 
@@ -471,6 +493,17 @@ impl Sdxl {
             _ => None,
         };
 
+        // PiD decode overlay (epic 7840, sc-7848): when `req.use_pid` is set and the model was loaded
+        // with `LoadSpec::pid`, mint a per-generation decoder (clean σ=0, seeded from `base_seed`)
+        // that super-resolves the final latent 4× in place of the VAE. `None` ⇒ the byte-exact VAE
+        // decode. Resolved once — the Gemma caption encode is shared across the count loop; each
+        // image's latent already differs by its own init-noise seed. (SDXL is the lone VP-frame
+        // student, but at σ=0 the VP/flow-match `add_noise` is identical, so the clean decode needs no
+        // VP-specific handling — the from_ldm/σ>0 path is the deferred sibling of sc-7993.)
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             // One image per iteration (the vendored `_run_one`, n_images=1), each with its own seed.
@@ -529,7 +562,7 @@ impl Sdxl {
                     None,
                 )?;
                 on_progress(Progress::Decoding);
-                images.push(decode_image(&self.vae, &latents)?);
+                images.push(decode_image(&self.vae, &latents, pid_ref)?);
                 continue;
             }
 
@@ -659,7 +692,7 @@ impl Sdxl {
             };
 
             on_progress(Progress::Decoding);
-            images.push(decode_image(&self.vae, &latents)?);
+            images.push(decode_image(&self.vae, &latents, pid_ref)?);
         }
         Ok(GenerationOutput::Images(images))
     }
