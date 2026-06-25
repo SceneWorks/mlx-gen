@@ -152,10 +152,12 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         transformer.quantize(bits)?;
         encoders.quantize(bits)?;
     }
+    // T2 (sc-7883) — apply any trained LoRA/LoKr adapters over the (possibly quantized) base. The
+    // base is never fused/mutated, so adapters compose with Q4/Q8 for free. The trainer's PEFT save
+    // (bare diffusers paths + `.alpha`/`__metadata__`) round-trips through this exact loader. No-op
+    // when `spec.adapters` is empty.
     if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{id}: LoRA/LoKr adapters are a later epic story (T1–T4); none are wired yet"
-        )));
+        crate::adapters::apply_sd3_adapters(&mut transformer, &spec.adapters)?;
     }
     Ok(Box::new(Sd3Large {
         variant,

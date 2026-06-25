@@ -146,6 +146,100 @@ fn tiny_forward_nonsquare_grid_exercises_centered_pos_embed_crop() {
     assert!(std > 0.0);
 }
 
+/// Inference [`Sd3Transformer::forward`] must run **f32 activations regardless of the base weight
+/// dtype** (sc-7883 review fix). SD3.5-large dense weights are bf16 on disk and the dense inference
+/// path keeps them bf16 — but the activation dtype must NOT follow the weights, or dense inference
+/// silently drops to bf16 activations (the regression this pins). The pre-PR validated path cast
+/// activations to f32 unconditionally; the regression made `forward` follow `compute_dtype()` (= the
+/// on-disk bf16 for a dense Large load), running bf16 activations.
+///
+/// We load a model with **bf16 base weights** (the on-disk-Large case) and assert:
+///   1. `forward` (the inference entry) is bit-identical to the explicit-f32 seam
+///      `forward_with(.., Float32)` — proving inference is f32-pinned, NOT weight-following; and
+///   2. it DIFFERS from the explicit-bf16 seam `forward_with(.., Bfloat16)` by the bf16-rounding
+///      magnitude — proving the body really would have changed had it followed the weight dtype (so
+///      the pin is meaningful, not vacuous).
+#[test]
+fn inference_forward_is_f32_pinned_regardless_of_weight_dtype() {
+    use mlx_rs::Dtype;
+
+    let arch = tiny_arch();
+    let w = synthetic_transformer(&arch);
+
+    // Base weights at bf16 — mimics the SD3.5-large dense on-disk dtype, where the regression bit.
+    let mut model = Sd3Transformer::from_weights(&w, &arch).unwrap();
+    model.cast_weights(Dtype::Bfloat16).unwrap();
+
+    let b = 1;
+    let (h, ww, ctx_seq) = (16, 16, 7);
+    let key = random::key(101).unwrap();
+    let latent =
+        random::normal::<f32>(&[b, arch.in_channels as i32, h, ww], None, None, Some(&key))
+            .unwrap();
+    let context = random::normal::<f32>(
+        &[b, ctx_seq, arch.joint_attention_dim as i32],
+        None,
+        None,
+        Some(&key),
+    )
+    .unwrap();
+    let pooled = random::normal::<f32>(
+        &[b, arch.pooled_projection_dim as i32],
+        None,
+        None,
+        Some(&key),
+    )
+    .unwrap();
+    let timestep = Array::from_slice(&[500.0f32], &[b]);
+
+    let out_infer = model
+        .forward(&latent, &context, &pooled, &timestep)
+        .unwrap();
+    let out_f32 = model
+        .forward_with(&latent, &context, &pooled, &timestep, Dtype::Float32)
+        .unwrap();
+    let out_bf16 = model
+        .forward_with(&latent, &context, &pooled, &timestep, Dtype::Bfloat16)
+        .unwrap();
+    eval([&out_infer, &out_f32, &out_bf16]).unwrap();
+
+    // The velocity is always returned f32.
+    assert_eq!(out_infer.dtype(), Dtype::Float32);
+
+    let infer: Vec<f32> = out_infer.as_slice::<f32>().to_vec();
+    let f32v: Vec<f32> = out_f32.as_slice::<f32>().to_vec();
+    let bf16v: Vec<f32> = out_bf16.as_slice::<f32>().to_vec();
+    assert_eq!(infer.len(), f32v.len());
+    assert_eq!(infer.len(), bf16v.len());
+
+    // (1) Inference is f32-pinned: bit-identical to the explicit-f32 seam, despite bf16 base weights.
+    let d_f32 = infer
+        .iter()
+        .zip(&f32v)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        d_f32 == 0.0,
+        "inference forward must be f32-pinned (== forward_with f32) regardless of base weight dtype \
+         (max_abs={d_f32})"
+    );
+
+    // (2) The bf16-activation body really differs — so the pin is non-vacuous (this is what the
+    //     regression would have silently run).
+    let d_bf16 = infer
+        .iter()
+        .zip(&bf16v)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    // `> 0` (not a fixed magnitude): the bf16 seam casts activations to bf16, a genuinely distinct
+    // computation, so it must differ from f32. The tiny synthetic model keeps the gap small, but any
+    // non-zero gap proves the dtype parameter is live and the f32 pin is comparing real alternatives.
+    assert!(
+        d_bf16 > 0.0,
+        "bf16-activation forward must differ from f32 (else the f32 pin is vacuous) (max_abs={d_bf16})"
+    );
+}
+
 #[test]
 fn pos_embed_grid_exceeding_max_size_errors() {
     let arch = tiny_arch(); // pos_embed_max_size = 12

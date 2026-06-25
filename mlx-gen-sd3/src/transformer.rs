@@ -57,12 +57,15 @@
 //! (the mlx-gen DiT convention; the 16-bit Metal GEMM bug + the quality target), so the quantized
 //! forward feeds `quantized_matmul` f32 inputs.
 
+use mlx_rs::error::{Exception, Result as MlxResult};
 use mlx_rs::fast::{layer_norm, rms_norm, scaled_dot_product_attention};
 use mlx_rs::ops::{concatenate_axis, split};
+use mlx_rs::transforms::checkpoint;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::adapters::AdaptableLinear;
+use mlx_gen::adapters::{prefixed_paths, AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::nn::{conv2d, gelu_tanh, modulate, silu, timestep_sincos};
+use mlx_gen::train::lora::LoraParams;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -126,18 +129,41 @@ fn process_qkv(
 }
 
 /// SDPA over `[B,H,S,D] → [B,S,H·D]` (no mask; full bidirectional attention over the joint sequence).
-fn attention(q: &Array, k: &Array, v: &Array, head_dim: i32) -> Result<Array> {
+/// When `sdpa_checkpoint` (training only), the fused SDPA runs inside an `mlx::checkpoint` segment so
+/// its backward recomputes attention rather than retaining the `[H,S,S]` probability matrix (the
+/// dominant seq² transient). Numerically identical; off in every inference path.
+fn attention(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    head_dim: i32,
+    sdpa_checkpoint: bool,
+) -> Result<Array> {
     let b = q.shape()[0];
+    let s = q.shape()[1];
     let scale = (head_dim as f32).powf(-0.5);
-    let o = scaled_dot_product_attention(q, k, v, scale, None, None)?;
+    let o = if sdpa_checkpoint {
+        let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+            Ok(vec![scaled_dot_product_attention(
+                &inp[0], &inp[1], &inp[2], scale, None, None,
+            )?])
+        });
+        seg(&[q.clone(), k.clone(), v.clone()])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Msg("sd3: SDPA checkpoint produced no output".into()))?
+    } else {
+        scaled_dot_product_attention(q, k, v, scale, None, None)?
+    };
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[b, -1, q.shape()[1] * head_dim])?)
+        .reshape(&[b, -1, s * head_dim])?)
 }
 
 // ----------------------------------------------------------------------------------------------
 // Joint (double-stream) attention.
 // ----------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct JointAttention {
     // image stream
     to_q: AdaptableLinear,
@@ -156,6 +182,8 @@ struct JointAttention {
     norm_added_k: Array,
     heads: i32,
     head_dim: i32,
+    /// SDPA-segment gradient checkpointing (T2 sc-7883, training only). Off in inference.
+    sdpa_checkpoint: bool,
 }
 
 impl JointAttention {
@@ -187,7 +215,32 @@ impl JointAttention {
             norm_added_k: g("norm_added_k")?,
             heads,
             head_dim,
+            sdpa_checkpoint: false,
         })
+    }
+
+    /// Cast the projection weights to the training compute `dtype` in place (T2). The qk-RMSNorm
+    /// weights stay f32 (norms reduce in f32). Inference never calls this.
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for p in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+            &mut self.add_q,
+            &mut self.add_k,
+            &mut self.add_v,
+        ] {
+            p.cast_weights(dtype)?;
+        }
+        if let Some(o) = self.to_add_out.as_mut() {
+            o.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.sdpa_checkpoint = on;
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -236,7 +289,7 @@ impl JointAttention {
         let q = concatenate_axis(&[&iq, &tq], 2)?;
         let k = concatenate_axis(&[&ik, &tk], 2)?;
         let v = concatenate_axis(&[&iv, &tv], 2)?;
-        let o = attention(&q, &k, &v, self.head_dim)?;
+        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
 
         let img_seq = img.shape()[1];
         let img_idx = Array::from_slice(&(0..img_seq).collect::<Vec<i32>>(), &[img_seq]);
@@ -256,6 +309,46 @@ impl JointAttention {
     }
 }
 
+/// LoRA target routing for the joint (double-stream) attention: the image stream
+/// (`to_q`/`to_k`/`to_v`/`to_out.0`) and the text stream (`add_q_proj`/`add_k_proj`/`add_v_proj`/
+/// `to_add_out`). The final `context_pre_only` block has no `to_add_out` — that suffix returns `None`
+/// cleanly there (and is omitted from the enumerated paths). Diffusers SD3 LoRA naming.
+impl AdaptableHost for JointAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out", "0"] => Some(&mut self.to_out),
+            ["add_q_proj"] => Some(&mut self.add_q),
+            ["add_k_proj"] => Some(&mut self.add_k),
+            ["add_v_proj"] => Some(&mut self.add_v),
+            ["to_add_out"] => self.to_add_out.as_mut(),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out: Vec<String> = [
+            "to_q",
+            "to_k",
+            "to_v",
+            "to_out.0",
+            "add_q_proj",
+            "add_k_proj",
+            "add_v_proj",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // `to_add_out` is absent on the `context_pre_only` final block — only enumerate it when present.
+        if self.to_add_out.is_some() {
+            out.push("to_add_out".to_string());
+        }
+        out
+    }
+}
+
 // ----------------------------------------------------------------------------------------------
 // MMDiT-X second attention (`attn2`) — image-stream-only self-attention.
 // ----------------------------------------------------------------------------------------------
@@ -264,6 +357,7 @@ impl JointAttention {
 /// projections). Mirrors diffusers `Attention(cross_attention_dim=None, qk_norm="rms_norm", eps=1e-6)`
 /// — `to_q`/`to_k`/`to_v`/`to_out.0` + per-head `norm_q`/`norm_k` RMSNorm, reusing the same
 /// [`process_qkv`]/[`attention`] ops as the joint attention's image side (no RoPE).
+#[derive(Clone)]
 struct SelfAttention {
     to_q: AdaptableLinear,
     to_k: AdaptableLinear,
@@ -273,6 +367,8 @@ struct SelfAttention {
     norm_k: Array,
     heads: i32,
     head_dim: i32,
+    /// SDPA-segment gradient checkpointing (T2, training only). Off in inference.
+    sdpa_checkpoint: bool,
 }
 
 impl SelfAttention {
@@ -288,7 +384,24 @@ impl SelfAttention {
             norm_k: g("norm_k")?,
             heads,
             head_dim,
+            sdpa_checkpoint: false,
         })
+    }
+
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for p in [
+            &mut self.to_q,
+            &mut self.to_k,
+            &mut self.to_v,
+            &mut self.to_out,
+        ] {
+            p.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.sdpa_checkpoint = on;
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -315,8 +428,30 @@ impl SelfAttention {
             self.heads,
             self.head_dim,
         )?;
-        let o = attention(&q, &k, &v, self.head_dim)?;
+        let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
         self.to_out.forward(&o)
+    }
+}
+
+/// LoRA target routing for the MMDiT-X second attention (`attn2`): image-stream-only self-attention
+/// (`to_q`/`to_k`/`to_v`/`to_out.0`). Enables Medium dual-attention training (T4 sc-7885 validates it;
+/// enumerated here so T4 is a validation story, not a re-architecture).
+impl AdaptableHost for SelfAttention {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["to_q"] => Some(&mut self.to_q),
+            ["to_k"] => Some(&mut self.to_k),
+            ["to_v"] => Some(&mut self.to_v),
+            ["to_out", "0"] => Some(&mut self.to_out),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        ["to_q", "to_k", "to_v", "to_out.0"]
+            .into_iter()
+            .map(String::from)
+            .collect()
     }
 }
 
@@ -324,6 +459,7 @@ impl SelfAttention {
 // FeedForward (GELU-approx).
 // ----------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct FeedForward {
     net0: AdaptableLinear, // net.0.proj  [4·hidden, hidden]
     net2: AdaptableLinear, // net.2       [hidden, 4·hidden]
@@ -343,10 +479,30 @@ impl FeedForward {
         Ok(())
     }
 
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.net0.cast_weights(dtype)?;
+        self.net2.cast_weights(dtype)?;
+        Ok(())
+    }
+
     fn forward(&self, x: &Array) -> Result<Array> {
         let h = self.net0.forward(x)?;
         let h = gelu_tanh(&h)?;
         self.net2.forward(&h)
+    }
+}
+
+impl AdaptableHost for FeedForward {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["net", "0", "proj"] => Some(&mut self.net0),
+            ["net", "2"] => Some(&mut self.net2),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        vec!["net.0.proj".to_string(), "net.2".to_string()]
     }
 }
 
@@ -357,6 +513,7 @@ impl FeedForward {
 /// AdaLayerNormZero: `silu(emb) → linear → [shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
 /// gate_mlp]`, each `[B, hidden]`. Mirrors diffusers `AdaLayerNormZero` (which packs the 6 chunks in
 /// exactly this order). Used by `norm1` (image) and the non-final blocks' `norm1_context`.
+#[derive(Clone)]
 struct AdaLnZero {
     linear: AdaptableLinear,
 }
@@ -374,6 +531,10 @@ impl AdaLnZero {
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.linear.quantize(bits, None)
+    }
+
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.linear.cast_weights(dtype)
     }
 
     fn forward(&self, emb: &Array) -> Result<ZeroMod> {
@@ -396,6 +557,7 @@ impl AdaLnZero {
 /// shift_msa2, scale_msa2, gate_msa2)`. The first 6 are the AdaLN-zero modulation for the joint
 /// attention + MLP (identical role to [`AdaLnZero`]); the last 3 are shift/scale/gate for the second
 /// (`attn2`) attention branch. Real-weight confirmed: dual blocks' `norm1.linear` is `[9·hidden, hidden]`.
+#[derive(Clone)]
 struct AdaLnZeroX {
     linear: AdaptableLinear,
 }
@@ -425,6 +587,10 @@ impl AdaLnZeroX {
         self.linear.quantize(bits, None)
     }
 
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.linear.cast_weights(dtype)
+    }
+
     fn forward(&self, emb: &Array) -> Result<ZeroXMod> {
         let e = self.linear.forward(&silu(emb)?)?; // [B, 9·hidden]
         let parts = split(&e, 9, -1)?;
@@ -450,6 +616,7 @@ impl AdaLnZeroX {
 /// emb.chunk(2, dim=1)` — i.e. the FIRST chunk is `scale`, the SECOND is `shift` (the opposite of
 /// `AdaLayerNormZero`, which is shift-first). The net norm it applies is `norm(x)·(1+scale) +
 /// shift`. See the sibling crate `mlx-gen-flux2/src/transformer.rs::norm_out` for the same module.
+#[derive(Clone)]
 struct AdaLnContinuous {
     linear: AdaptableLinear,
 }
@@ -463,6 +630,10 @@ impl AdaLnContinuous {
 
     fn quantize(&mut self, bits: i32) -> Result<()> {
         self.linear.quantize(bits, None)
+    }
+
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.linear.cast_weights(dtype)
     }
 
     /// Returns `(shift, scale)`, each `[B, 1, hidden]`.
@@ -496,6 +667,7 @@ fn gated(x: &Array, gate: &Array, y: &Array) -> Result<Array> {
 // Joint transformer block.
 // ----------------------------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct JointBlock {
     /// Plain block: AdaLN-zero (6 chunks). MMDiT-X dual block: `SD35AdaLayerNormZeroX` (9 chunks).
     norm1: ImageNorm,
@@ -511,11 +683,13 @@ struct JointBlock {
 
 /// The image-stream `norm1`: AdaLN-zero (plain joint block) or the extended `SD35AdaLayerNormZeroX`
 /// (MMDiT-X dual-attention block, paired with `attn2`).
+#[derive(Clone)]
 enum ImageNorm {
     Zero(AdaLnZero),
     ZeroX(AdaLnZeroX),
 }
 
+#[derive(Clone)]
 enum ContextNorm {
     Zero(AdaLnZero),
     Continuous(AdaLnContinuous),
@@ -587,6 +761,36 @@ impl JointBlock {
             ff.quantize(bits)?;
         }
         Ok(())
+    }
+
+    /// Cast every Linear in the block to the training compute `dtype` (T2). The qk-RMSNorm weights
+    /// stay f32 (handled inside the attention cast). Inference never calls this.
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        match &mut self.norm1 {
+            ImageNorm::Zero(z) => z.cast_weights(dtype)?,
+            ImageNorm::ZeroX(z) => z.cast_weights(dtype)?,
+        }
+        match &mut self.norm1_context {
+            ContextNorm::Zero(z) => z.cast_weights(dtype)?,
+            ContextNorm::Continuous(c) => c.cast_weights(dtype)?,
+        }
+        self.attn.cast_weights(dtype)?;
+        if let Some(a2) = self.attn2.as_mut() {
+            a2.cast_weights(dtype)?;
+        }
+        self.ff.cast_weights(dtype)?;
+        if let Some(ff) = self.ff_context.as_mut() {
+            ff.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on both attentions (T2, training only).
+    fn set_sdpa_checkpoint(&mut self, on: bool) {
+        self.attn.set_sdpa_checkpoint(on);
+        if let Some(a2) = self.attn2.as_mut() {
+            a2.set_sdpa_checkpoint(on);
+        }
     }
 
     /// `(hidden_states, encoder_hidden_states, temb)` → updated `(hidden_states,
@@ -681,6 +885,34 @@ impl JointBlock {
     }
 }
 
+/// LoRA target routing inside one joint block: `attn` (the joint double-stream attention), `attn2`
+/// (the MMDiT-X second image-stream attention, dual blocks only), `ff` / `ff_context` (the GELU FFNs).
+/// The adaLN modulation linears are reachable but excluded from enumeration (not the default LoRA
+/// surface; the trainer's suffix-match would not select them anyway).
+impl AdaptableHost for JointBlock {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
+            ["attn2", rest @ ..] => self.attn2.as_mut()?.adaptable_mut(rest),
+            ["ff", rest @ ..] => self.ff.adaptable_mut(rest),
+            ["ff_context", rest @ ..] => self.ff_context.as_mut()?.adaptable_mut(rest),
+            _ => None,
+        }
+    }
+
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = prefixed_paths("attn", &self.attn);
+        if let Some(a2) = &self.attn2 {
+            out.extend(prefixed_paths("attn2", a2));
+        }
+        out.extend(prefixed_paths("ff", &self.ff));
+        if let Some(ff) = &self.ff_context {
+            out.extend(prefixed_paths("ff_context", ff));
+        }
+        out
+    }
+}
+
 // ----------------------------------------------------------------------------------------------
 // Patch embed (learned 2D pos_embed, NO RoPE).
 // ----------------------------------------------------------------------------------------------
@@ -744,18 +976,34 @@ impl PatchEmbed {
         Ok(cropped.reshape(&[1, ph * pw, self.hidden])?)
     }
 
-    /// `latent [B, in_ch, H, W]` (f32) → `(tokens [B, ph*pw, hidden], ph, pw)`.
+    /// Cast the patchify conv weight/bias to the training compute `dtype` (T2). The learned
+    /// `pos_embed` table stays f32 (it is added on-the-fly cast to the token dtype in `forward`).
+    /// Inference never calls this.
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        if self.proj_w.dtype() != dtype {
+            self.proj_w = self.proj_w.as_dtype(dtype)?;
+        }
+        if self.proj_b.dtype() != dtype {
+            self.proj_b = self.proj_b.as_dtype(dtype)?;
+        }
+        Ok(())
+    }
+
+    /// `latent [B, in_ch, H, W]` (compute dtype) → `(tokens [B, ph*pw, hidden], ph, pw)`.
     fn forward(&self, latent: &Array) -> Result<(Array, i32, i32)> {
         let sh = latent.shape();
         let (h, ww) = (sh[2], sh[3]);
         let (ph, pw) = (h / self.patch, ww / self.patch);
-        // NCHW → NHWC for the conv.
-        let x = latent.transpose_axes(&[0, 2, 3, 1])?;
+        // NCHW → NHWC for the conv. The conv weight/bias and the latent must share a dtype (set by
+        // `cast_weights` in training; f32 in inference) — cast the latent to the conv weight's dtype.
+        let x = latent
+            .transpose_axes(&[0, 2, 3, 1])?
+            .as_dtype(self.proj_w.dtype())?;
         // conv2d, stride = patch, padding 0 → `[B, ph, pw, hidden]`.
         let conv = conv2d(&x, &self.proj_w, Some(&self.proj_b), self.patch, 0)?;
         let b = conv.shape()[0];
         let tokens = conv.reshape(&[b, ph * pw, self.hidden])?; // flatten(2).transpose -> NHWC flatten is row-major (h,w)
-        let pos = self.cropped_pos_embed(ph, pw)?;
+        let pos = self.cropped_pos_embed(ph, pw)?.as_dtype(tokens.dtype())?;
         Ok((mlx_rs::ops::add(&tokens, &pos)?, ph, pw))
     }
 }
@@ -795,19 +1043,37 @@ impl TimeTextEmbed {
         Ok(())
     }
 
+    /// Cast the four embedder Linears to the training compute `dtype` (T2). Inference never calls this.
+    fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        for p in [
+            &mut self.ts_l1,
+            &mut self.ts_l2,
+            &mut self.txt_l1,
+            &mut self.txt_l2,
+        ] {
+            p.cast_weights(dtype)?;
+        }
+        Ok(())
+    }
+
     /// `(timestep [B], pooled [B, pooled_dim])` → `temb [B, hidden]`.
     fn forward(&self, timestep: &Array, pooled: &Array) -> Result<Array> {
+        // The embedder Linears run at their loaded dtype (f32 inference / bf16 training). Follow the
+        // timestep-embedder weight dtype so the sinusoidal proj and the pooled vector match it (f32
+        // when quantized or dense-f32 — the inference default).
+        let dt = self.ts_l1.weight_dtype().unwrap_or(Dtype::Float32);
         // Sinusoidal timestep proj (diffusers `Timesteps(256, flip_sin_to_cos=True, shift=0)`).
         let t_proj = timestep_sincos(
             timestep,
             self.time_proj_dim,
             TIME_MAX_PERIOD,
             TIME_DOWNSCALE_FREQ_SHIFT,
-        )?;
+        )?
+        .as_dtype(dt)?;
         // timestep_embedder: linear_1 → SiLU → linear_2.
         let t = self.ts_l2.forward(&silu(&self.ts_l1.forward(&t_proj)?)?)?;
         // text_embedder (PixArtAlphaTextProjection): linear_1 → SiLU → linear_2.
-        let pooled = pooled.as_dtype(Dtype::Float32)?;
+        let pooled = pooled.as_dtype(dt)?;
         let p = self
             .txt_l2
             .forward(&silu(&self.txt_l1.forward(&pooled)?)?)?;
@@ -884,13 +1150,68 @@ impl Sd3Transformer {
         &self.arch
     }
 
+    /// The transformer's loaded base-weight dtype, probed from the dense `context_embedder` weight:
+    /// `bf16` for an SD3.5-large checkpoint on disk (and after [`cast_weights`](Self::cast_weights)
+    /// to bf16 in training), `f32` for an f32 load, `f32` for any quantized base (the packed weight
+    /// has no logical activation dtype). The trainer uses it to detect whether a
+    /// [`cast_weights`](Self::cast_weights) is needed to reach its train dtype; it is NOT the
+    /// inference activation dtype. Inference always runs f32 activations regardless of this — see
+    /// [`forward`](Self::forward).
+    pub fn compute_dtype(&self) -> Dtype {
+        self.context_embedder
+            .weight_dtype()
+            .unwrap_or(Dtype::Float32)
+    }
+
+    /// The number of joint `transformer_blocks` — the trainer's gradient-checkpoint bookkeeping
+    /// indexes per block.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Cast the whole MMDiT to the training compute `dtype` in place (T2 sc-7883). Covers every
+    /// adaptable Linear (patch-embed conv, time/text embedders, context embedder, all block attn/FFN +
+    /// adaLN linears, output norm, proj_out). The per-head qk-RMSNorm weights and the learned
+    /// `pos_embed` table stay f32 (norms reduce in f32; pos_embed is added cast-on-the-fly). Destructive
+    /// for a narrowing cast (f32→bf16) — reload for f32. Inference never calls this.
+    pub fn cast_weights(&mut self, dtype: Dtype) -> Result<()> {
+        self.patch_embed.cast_weights(dtype)?;
+        self.time_text_embed.cast_weights(dtype)?;
+        self.context_embedder.cast_weights(dtype)?;
+        for b in &mut self.blocks {
+            b.cast_weights(dtype)?;
+        }
+        self.norm_out.cast_weights(dtype)?;
+        self.proj_out.cast_weights(dtype)?;
+        Ok(())
+    }
+
+    /// Toggle SDPA-segment gradient checkpointing on every block's attention(s) (T2, training only).
+    /// Numerically identical to the retained backward; the trainer turns it OFF when whole-block
+    /// checkpointing is on (the block recompute already covers attention). Inference never calls it.
+    pub fn set_sdpa_checkpoint(&mut self, on: bool) {
+        for b in &mut self.blocks {
+            b.set_sdpa_checkpoint(on);
+        }
+    }
+
     /// MMDiT forward (noise prediction). Inputs:
     ///   * `latent`   `[B, in_channels, H, W]` (the 16-ch noisy latent),
     ///   * `context`  `[B, ctx_seq, joint_attention_dim]` (= `[B, 333, 4096]` from E2),
     ///   * `pooled`   `[B, pooled_projection_dim]` (= `[B, 2048]` from E2),
-    ///   * `timestep` `[B]` (the continuous flow-match timestep, 0..1000 scale).
+    ///   * `timestep` `[B]` (the continuous flow-match timestep, **σ·1000** diffusers scale).
     ///
-    /// Returns `[B, out_channels, H, W]` (the predicted velocity/noise latent). Activations run f32.
+    /// Returns `[B, out_channels, H, W]` (the predicted velocity/noise latent), always cast back to
+    /// **f32** so the caller's sampler / loss math is dtype-stable.
+    ///
+    /// INFERENCE entry point: the body runs **f32 activations unconditionally**, independent of the
+    /// loaded base-weight dtype. SD3.5-large dense weights are bf16 on disk (and quant keeps a packed
+    /// base), but casting the activations to f32 promotes every base matmul to f32, so dense AND
+    /// quantized inference are f32-exact — exactly the path every E5/E6/M3 real-weight smoke validated.
+    /// The activation dtype must NOT follow the base weight dtype here. The bf16 training path goes
+    /// through [`forward_with`](Self::forward_with) /
+    /// [`forward_with_blocks_checkpointed`](Self::forward_with_blocks_checkpointed), which drive the
+    /// compute dtype explicitly.
     pub fn forward(
         &self,
         latent: &Array,
@@ -898,8 +1219,28 @@ impl Sd3Transformer {
         pooled: &Array,
         timestep: &Array,
     ) -> Result<Array> {
-        let latent = latent.as_dtype(Dtype::Float32)?;
-        let context = context.as_dtype(Dtype::Float32)?;
+        // f32-exact inference: do NOT follow the base weight dtype (see method docs). The training
+        // seam is the only caller that runs the body in bf16, via `forward_with`.
+        self.forward_with(latent, context, pooled, timestep, Dtype::Float32)
+    }
+
+    /// MMDiT forward at an explicitly-chosen compute `dtype` — the shared body behind
+    /// [`forward`](Self::forward) (which always passes `f32`) and the training non-checkpointed path
+    /// (which passes the bf16 train dtype). Driving the dtype as a parameter — rather than probing the
+    /// base weight via [`compute_dtype`](Self::compute_dtype) — keeps inference f32-exact regardless of
+    /// the on-disk weight dtype while letting bf16 training run the heavy matmuls in bf16 (mirrors how
+    /// Krea / z-image separate inference vs training compute dtype). Returns the velocity cast back to
+    /// f32. See [`forward`](Self::forward) for the input/output shapes.
+    pub fn forward_with(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        dt: Dtype,
+    ) -> Result<Array> {
+        let latent = latent.as_dtype(dt)?;
+        let context = context.as_dtype(dt)?;
 
         // 1. patchify + learned pos_embed (NO RoPE).
         let (mut img, ph, pw) = self.patch_embed.forward(&latent)?;
@@ -920,8 +1261,116 @@ impl Sd3Transformer {
         let img = modulated_layer_norm(&img, &shift, &scale)?;
         let img = self.proj_out.forward(&img)?; // [B, ph*pw, patch*patch*out_ch]
 
-        // 6. unpatchify → [B, out_ch, H, W].
-        self.unpatchify(&img, ph, pw)
+        // 6. unpatchify → [B, out_ch, H, W], in f32 (sampler / loss math is dtype-stable).
+        Ok(self.unpatchify(&img, ph, pw)?.as_dtype(Dtype::Float32)?)
+    }
+
+    /// Training velocity prediction with **per-joint-block gradient checkpointing** (T2 sc-7883). The
+    /// embed/fuse preamble + the output head run normally; each of the `num_blocks` joint blocks runs
+    /// inside an `mlx::checkpoint` segment whose explicit inputs are the `(img, txt)` hidden states plus
+    /// that block's trainable LoRA factors — so the backward recomputes the block instead of retaining
+    /// its activations (bounding the first-step working set for the 8.1B Large), while gradients still
+    /// flow to the LoRA params. `block_local_targets[i]` lists the adapter-routable LOCAL paths (e.g.
+    /// `"attn.to_q"`) trained on block `i`, in the order their factors are threaded as checkpoint
+    /// inputs. Blocks with no trained targets still run checkpointed (hidden-only). Training-only:
+    /// `dt` is the explicitly-chosen compute dtype (the bf16 train dtype, or f32) — driven as a
+    /// parameter for the same reason as [`forward_with`](Self::forward_with), never probed from the
+    /// base weight. Numerically identical to [`forward_with`](Self::forward_with) at the same `dt`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_blocks_checkpointed(
+        &self,
+        latent: &Array,
+        context: &Array,
+        pooled: &Array,
+        timestep: &Array,
+        params: &LoraParams,
+        block_local_targets: &[Vec<String>],
+        alpha: f32,
+        dt: Dtype,
+    ) -> Result<Array> {
+        let latent = latent.as_dtype(dt)?;
+        let context = context.as_dtype(dt)?;
+
+        let (img0, ph, pw) = self.patch_embed.forward(&latent)?;
+        let temb = self.time_text_embed.forward(timestep, pooled)?;
+        let txt0 = self.context_embedder.forward(&context)?;
+
+        let mut img = img0;
+        let mut txt = txt0;
+        for (i, block) in self.blocks.iter().enumerate() {
+            // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
+            // recompute runs after this frame is gone. `set_adapters` inside the closure replaces
+            // whatever the clone carried with the explicit-input LoRA, so any caller-installed block
+            // adapters are moot here.
+            let mut b = block.clone();
+            let locals = block_local_targets.get(i).cloned().unwrap_or_default();
+            let temb_c = temb.clone();
+
+            // Threaded inputs: [img, txt, a_0, b_0, a_1, b_1, …] (raw `[r,in]`/`[out,r]` factors).
+            let mut inputs: Vec<Array> = Vec::with_capacity(2 + 2 * locals.len());
+            inputs.push(img.clone());
+            inputs.push(txt.clone());
+            for local in &locals {
+                let ak = format!("transformer_blocks.{i}.{local}.lora_a");
+                let bk = format!("transformer_blocks.{i}.{local}.lora_b");
+                inputs.push(
+                    params
+                        .get(ak.as_str())
+                        .ok_or_else(|| Error::Msg(format!("LoRA param missing: {ak}")))?
+                        .clone(),
+                );
+                inputs.push(
+                    params
+                        .get(bk.as_str())
+                        .ok_or_else(|| Error::Msg(format!("LoRA param missing: {bk}")))?
+                        .clone(),
+                );
+            }
+
+            let alpha_c = alpha;
+            let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
+                // Reinstall the explicit-input factors with the SAME `(transpose, alpha/rank fold,
+                // scale = 1)` `install_training_lora` applies, so the checkpointed block forward is
+                // numerically identical to the installed-adapter path and grads route to `inp`.
+                // Dtype-following on the hidden state (bf16 training): the f32 factors join the hidden
+                // stream so the adapted Linear stays bf16; no-op in f32. Grads flow back through astype.
+                let hdt = inp[0].dtype();
+                for (k, local) in locals.iter().enumerate() {
+                    let a = inp[2 + 2 * k].t().as_dtype(hdt)?; // [r,in] -> [in,r]
+                    let rank = a.shape()[1] as f32;
+                    let bb = inp[3 + 2 * k]
+                        .t() // [out,r] -> [r,out]
+                        .multiply(Array::from_slice(&[alpha_c / rank], &[1]))?
+                        .as_dtype(hdt)?;
+                    let segs: Vec<&str> = local.split('.').collect();
+                    b.adaptable_mut(&segs)
+                        .ok_or_else(|| {
+                            Exception::custom(format!("checkpoint LoRA target not found: {local}"))
+                        })?
+                        .set_adapters(vec![Adapter::Lora {
+                            a,
+                            b: bb,
+                            scale: 1.0,
+                        }]);
+                }
+                let (img_o, txt_o) = b
+                    .forward(&inp[0], &inp[1], &temb_c)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                Ok(vec![img_o, txt_o])
+            });
+            let mut out = seg(&inputs)?.into_iter();
+            img = out
+                .next()
+                .ok_or_else(|| Error::Msg("sd3: checkpoint block produced no img output".into()))?;
+            txt = out
+                .next()
+                .ok_or_else(|| Error::Msg("sd3: checkpoint block produced no txt output".into()))?;
+        }
+
+        let (shift, scale) = self.norm_out.forward(&temb)?;
+        let img = modulated_layer_norm(&img, &shift, &scale)?;
+        let img = self.proj_out.forward(&img)?;
+        Ok(self.unpatchify(&img, ph, pw)?.as_dtype(Dtype::Float32)?)
     }
 
     /// `[B, ph*pw, patch*patch*out_ch]` → `[B, out_ch, ph*patch, pw*patch]`. Mirrors diffusers
@@ -936,6 +1385,39 @@ impl Sd3Transformer {
         let x = x.transpose_axes(&[0, 5, 1, 3, 2, 4])?;
         // [B, c, ph*p, pw*p]
         Ok(x.reshape(&[b, c, ph * p, pw * p])?)
+    }
+}
+
+/// LoRA/LoKr target routing for the SD3.5 MMDiT (T2 sc-7883 trainer / inference apply): the per-block
+/// `attn` (joint double-stream), `attn2` (MMDiT-X second self-attention, Medium dual blocks), and the
+/// GELU FFNs (`ff` / `ff_context`) of the `transformer_blocks`, plus the global projections
+/// (`context_embedder`, `proj_out`). Adapter files address modules by their diffusers (trained-file)
+/// path; this routes those paths to the module tree. The default training surface is the per-block
+/// attention (`to_q`/`to_k`/`to_v`/`to_out.0` image + `add_q_proj`/`add_k_proj`/`add_v_proj`/
+/// `to_add_out` text); FFN is opt-in. The text encoders are NOT adaptable here.
+impl AdaptableHost for Sd3Transformer {
+    fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+        match path {
+            ["transformer_blocks", n, rest @ ..] => self
+                .blocks
+                .get_mut(n.parse::<usize>().ok()?)?
+                .adaptable_mut(rest),
+            ["context_embedder"] => Some(&mut self.context_embedder),
+            ["proj_out"] => Some(&mut self.proj_out),
+            _ => None,
+        }
+    }
+
+    /// Enumerate the per-block adapter targets (joint `attn` + dual-block `attn2` + the FFNs). The
+    /// global projections stay reachable via [`adaptable_mut`](Self::adaptable_mut) but are excluded
+    /// here — they are not part of the default training surface, and the suffix-match the trainer
+    /// applies (`to_q`/…) would not select them anyway.
+    fn adaptable_paths(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.extend(prefixed_paths(&format!("transformer_blocks.{i}"), b));
+        }
+        out
     }
 }
 

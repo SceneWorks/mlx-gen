@@ -29,7 +29,5 @@ mlx-rs = { workspace = true }
 inventory = { workspace = true }
 # Parse the diffusers `transformer/config.json` arch manifest in the converter / validator.
 serde_json = "1"
-
-[dev-dependencies]
-# Save the real-weight e2e smoke render to a PNG for visual inspection (E5, sc-7864).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Decode the LoRA-training dataset images (T2 sc-7883). Also serves the e2e smoke PNG save in tests.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
