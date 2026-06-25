@@ -105,6 +105,36 @@ impl Vae {
         })
     }
 
+    /// Like [`Vae::from_weights`] but with caller-supplied latent `scaling_factor` / `shift_factor`.
+    /// The AutoencoderKL structure (16-ch, GroupNorm-32, the decoder's scale/shift de-norm math) is
+    /// shared across diffusers 16-ch VAEs; only the two latent-normalization constants differ between
+    /// families. Z-Image uses the [`Vae::SCALING_FACTOR`] / [`Vae::SHIFT_FACTOR`] defaults; SD3.5
+    /// reuses this same module with its own `1.5305` / `0.0609` factors (mlx-gen-sd3, sc-7863).
+    pub fn from_weights_with_factors(
+        w: &Weights,
+        prefix: &str,
+        cfg: &VaeDecoderConfig,
+        scaling_factor: f32,
+        shift_factor: f32,
+    ) -> Result<Self> {
+        Ok(Self {
+            decoder: Decoder::from_weights(w, prefix, cfg)?,
+            encoder: None,
+            scaling_factor,
+            shift_factor,
+        })
+    }
+
+    /// The latent `scaling_factor` this VAE de-normalizes with (`decode`: `z/scale + shift`).
+    pub fn scaling_factor(&self) -> f32 {
+        self.scaling_factor
+    }
+
+    /// The latent `shift_factor` this VAE de-normalizes with.
+    pub fn shift_factor(&self) -> f32 {
+        self.shift_factor
+    }
+
     /// Attach the img2img encoder, loaded from `prefix` (the diffusers `encoder.*` tree, remapped
     /// to the crate's internal naming by [`crate::loader::remap_vae_encoder`]).
     pub fn with_encoder(

@@ -827,6 +827,7 @@ dependencies = [
  "mlx-gen",
  "mlx-gen-flux",
  "mlx-gen-sdxl",
+ "mlx-gen-z-image",
  "pmetal-mlx-rs",
  "serde_json",
 ]
