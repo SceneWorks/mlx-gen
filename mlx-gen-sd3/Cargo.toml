@@ -1,0 +1,18 @@
+[package]
+name = "mlx-gen-sd3"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Diffusion 3.5 (MMDiT) provider crate for mlx-gen."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "diffusion", "stable-diffusion-3", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }
+# Link-time self-registration into mlx-gen's model registry (wired by the later E5 model story).
+inventory = { workspace = true }
+# Parse the diffusers `transformer/config.json` arch manifest in the converter / validator.
+serde_json = "1"
