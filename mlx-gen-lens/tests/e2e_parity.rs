@@ -145,7 +145,7 @@ fn lens_e2e_matches_reference() {
     eprintln!("final latents: cosine {lat_cos:.5}  peak_rel {lat_pr:.3e}");
 
     // 4. Compare the decoded image (full e2e incl. the VAE shim).
-    let decoded = vae::decode(pipe.vae(), &latents, lat_h, lat_w).unwrap(); // [1,H,W,3] NHWC [-1,1]
+    let decoded = vae::decode(pipe.vae(), &latents, lat_h, lat_w, None).unwrap(); // [1,H,W,3] NHWC [-1,1]
     let got_img = {
         // → [0,1] to match the golden's stored range.
         let half = Array::from_f32(0.5);

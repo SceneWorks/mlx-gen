@@ -29,8 +29,8 @@ use mlx_gen::image::{resize_lanczos_u8, resize_nearest_u8};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{CancelFlag, Error, Progress, Result};
-use mlx_gen_flux2::Flux2Vae;
+use mlx_gen::{CancelFlag, Error, LatentDecoder, Progress, Result};
+use mlx_gen_flux2::{patchify_latents, Flux2Vae};
 
 use crate::adapters::apply_ideogram_adapters;
 use crate::config::Ideogram4DitConfig;
@@ -335,6 +335,7 @@ impl Ideogram4Pipeline {
             num_steps,
             guidance,
             seed,
+            None, // native VAE decode (no PiD overlay)
             &CancelFlag::new(),
             &mut |_| {},
         )
@@ -355,6 +356,7 @@ impl Ideogram4Pipeline {
         num_steps: usize,
         guidance: f32,
         seed: u64,
+        pid: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -366,6 +368,7 @@ impl Ideogram4Pipeline {
             guidance,
             seed,
             None,
+            pid,
             cancel,
             on_progress,
         )
@@ -386,6 +389,7 @@ impl Ideogram4Pipeline {
         guidance: f32,
         seed: u64,
         edit: &EditInit,
+        pid: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -397,6 +401,7 @@ impl Ideogram4Pipeline {
             guidance,
             seed,
             Some(edit),
+            pid,
             cancel,
             on_progress,
         )
@@ -415,6 +420,7 @@ impl Ideogram4Pipeline {
         guidance: f32,
         seed: u64,
         edit: Option<&EditInit>,
+        pid: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -563,11 +569,19 @@ impl Ideogram4Pipeline {
         }
 
         on_progress(Progress::Decoding);
-        self.decode(&z, grid_h, grid_w)
+        self.decode(&z, grid_h, grid_w, pid)
     }
 
-    /// De-normalize → unpatchify → VAE decode → RGB u8 `[H, W, 3]`.
-    fn decode(&self, z: &Array, grid_h: i32, grid_w: i32) -> Result<Array> {
+    /// De-normalize → unpatchify → VAE decode → RGB u8 `[H, W, 3]`. With a PiD overlay (`pid = Some`,
+    /// epic 7840 sc-7847) the order-canonical raw 32-ch latent is re-packed into the FLUX-canonical
+    /// space and 4×-super-resolved instead (returning a `4H × 4W` image).
+    fn decode(
+        &self,
+        z: &Array,
+        grid_h: i32,
+        grid_w: i32,
+        pid: Option<&dyn LatentDecoder>,
+    ) -> Result<Array> {
         // De-normalize the packed latent with the VAE's BatchNorm stats — `z * bn_std + bn_mean`,
         // exactly the reference (`pipeline_ideogram4`), NOT a separate latent_norm. The earlier
         // hardcoded LATENT_SCALE/LATENT_SHIFT did not match the bn stats and distorted the decode.
@@ -583,9 +597,22 @@ impl Ideogram4Pipeline {
         let latent = denorm
             .reshape(&[1, grid_h, grid_w, 2, 2, 32])?
             .transpose_axes(&[0, 1, 3, 2, 4, 5])?
-            .reshape(&[1, grid_h * 2, grid_w * 2, 32])?;
+            .reshape(&[1, grid_h * 2, grid_w * 2, 32])?; // [1, gh·2, gw·2, 32] NHWC — the raw VAE latent
 
-        let decoded = self.vae.decode(&latent)?; // [1, H, W, 3] f32, ~[-1,1]
+        let decoded = match pid {
+            // PiD 4× super-resolving decode (sc-7847). Ideogram's DiT packs the 128 channels as
+            // (ph,pw,c), but the `flux2` PiD student was trained on the diffusers (c,ph,pw) packing.
+            // Route through the order-canonical raw 32-ch latent (`latent`, the same tensor the VAE
+            // decodes correctly): NCHW → FLUX-order `patchify_latents` → BN-normalize → the student's
+            // input space (identical to what flux2/lens hand PiD). Output NCHW [1,3,4H,4W] → NHWC.
+            Some(d) => {
+                let nchw = latent.transpose_axes(&[0, 3, 1, 2])?; // [1,32,gh·2,gw·2]
+                let patched = patchify_latents(&nchw)?; // [1,128,gh,gw] (c,ph,pw)
+                let normed = self.vae.bn_normalize_nchw(&patched)?; // BN-normalize (FLUX order)
+                d.decode(&normed)?.transpose_axes(&[0, 2, 3, 1])? // [1,3,4H,4W] → [1,4H,4W,3]
+            }
+            None => self.vae.decode(&latent)?, // [1, H, W, 3] f32, ~[-1,1]
+        };
         let sh = decoded.shape();
         let (h, w) = (sh[1], sh[2]);
         let clamped = mlx_rs::ops::clip(&decoded, (&Array::from_f32(-1.0), &Array::from_f32(1.0)))?;

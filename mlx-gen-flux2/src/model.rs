@@ -20,8 +20,10 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler, Error, GenerationOutput, GenerationRequest, Generator,
-    LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention, WeightsSource,
+    LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
+    WeightsSource,
 };
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
@@ -38,6 +40,12 @@ use crate::transformer::{Flux2ForwardInputs, Flux2Transformer};
 use crate::vae::Flux2Vae;
 use crate::vision::{Mistral3Projector, PixtralVisionTower};
 use crate::{loader, Flux2Config};
+
+/// PiD latent-space tag for the FLUX.2 family (epic 7840, sc-7847): the FLUX.2 `AutoencoderKLFlux2`
+/// 32-ch / 2×2-patchified / BatchNorm latent. `flux2`, `flux2-klein-4b`, and `flux2-klein-9b` all
+/// resolve to the same student + checkpoint in [`mlx_gen_pid::registry`]; Lens and Ideogram 4 reuse
+/// this same space.
+pub const PID_BACKBONE: &str = "flux2";
 
 /// Joint DiT sequence length (txt + target + reference tokens) above which the gated activation
 /// levers (sc-6266) engage. Sits between a single-reference 1024² edit (~8.7K tokens, fits the 96 GB
@@ -219,6 +227,13 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     } else {
         (None, None)
     };
+    // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
+    // when the spec carries it. The student is shared across the whole FLUX.2 family (klein + dev).
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(Flux2 {
         descriptor: variant.descriptor(),
         variant,
@@ -231,6 +246,7 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
         }),
         vision_tower,
         projector,
+        pid,
     }))
 }
 
@@ -259,6 +275,11 @@ pub struct Flux2 {
     /// the weightless test instances — caption upsampling is dev-only and gated on `enhance_prompt`.
     vision_tower: Option<PixtralVisionTower>,
     projector: Option<Mistral3Projector>,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the request
+    /// carries `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes the packed BN-normalized
+    /// latent through the `flux2` PiD student (4× SR) instead of the VAE. `None` for the default
+    /// (byte-exact VAE) path and the weightless test instances.
+    pid: Option<PidEngine>,
 }
 
 impl Flux2 {
@@ -271,6 +292,7 @@ impl Flux2 {
             parts: None,
             vision_tower: None,
             projector: None,
+            pid: None,
         }
     }
 
@@ -683,6 +705,13 @@ impl Flux2 {
         // RAII guard (F-007): the process-global toggle is restored on drop, even on an early `?`.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
+        // PiD decode overlay (epic 7840, sc-7847): when `req.use_pid` is set and the model was loaded
+        // with `LoadSpec::pid`, mint a per-generation decoder (clean σ=0, seeded from `base_seed`) that
+        // super-resolves the packed latent 4× in place of the VAE. Errors if requested-but-not-loaded;
+        // `None` (the default) → the byte-exact VAE path. One decoder serves the whole count loop.
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+
         let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -755,8 +784,16 @@ impl Flux2 {
             )?;
             on_progress(Progress::Decoding);
             let packed = final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
-            let decoded = vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
-            let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;
+            let nchw = match &pid_decoder {
+                // PiD: `packed` (NHWC [1,h,w,128]) is already the BN-normalized packed latent the
+                // student trained on — the exact tensor `decode_packed_latents` BN-de-normalizes
+                // (sc-7847). Hand it over as NCHW [1,128,h,w]; the student returns NCHW [1,3,4H,4W].
+                Some(d) => d.decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?,
+                // Native VAE: BN-de-normalize + 2×2-unpatchify + decode → NHWC [1,H,W,3] → NCHW.
+                None => vae
+                    .decode_packed_latents(&packed)?
+                    .transpose_axes(&[0, 3, 1, 2])?,
+            };
             images.push(decoded_to_image(&nchw)?);
         }
         Ok(GenerationOutput::Images(images))

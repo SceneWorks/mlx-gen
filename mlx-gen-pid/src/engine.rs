@@ -54,10 +54,13 @@ impl PidEngine {
                 "pid: unknown/out-of-scope backbone {backbone:?} (no PiD latent-space mapping)"
             ))
         })?;
-        // The released students share the sr4x PixDiT topology; only the LQ latent-channel count
-        // differs per latent space (16 for qwen/flux/sd3, 4 for sdxl).
+        // The released students share the sr4x PixDiT topology; only the LQ latent-channel count and
+        // the latent grid's spatial compression differ per latent space: 16-ch / 8× for qwen/flux/sd3,
+        // 4-ch / 8× for sdxl, and **128-ch / 16×** for flux2 (the packed BN latent — see the registry
+        // `FLUX2` note, sc-7847). Both fields drive the LQ adapter geometry + `PidDecoder` output size.
         let mut cfg = PidConfig::sr4x();
         cfg.lq_latent_channels = spec.latent_channels;
+        cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
 
         let weights = Weights::from_file(checkpoint)?;
 

@@ -675,6 +675,7 @@ dependencies = [
  "image",
  "inventory",
  "mlx-gen",
+ "mlx-gen-pid",
  "mlx-llm",
  "pmetal-mlx-rs",
  "serde_json",
@@ -688,6 +689,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "mlx-gen-flux2",
+ "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
 ]
@@ -746,6 +748,7 @@ dependencies = [
  "inventory",
  "mlx-gen",
  "mlx-gen-flux2",
+ "mlx-gen-pid",
  "pmetal-mlx-rs",
  "serde_json",
 ]

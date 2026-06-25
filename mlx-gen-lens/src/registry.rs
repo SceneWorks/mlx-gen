@@ -23,9 +23,11 @@ use mlx_rs::Dtype;
 
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Result, WeightsSource,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_flux2::model::PID_BACKBONE;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
 use crate::pipeline::{GenerateOptions, LensPipeline, DEFAULT_DATE, VAE_SCALE_FACTOR};
 
@@ -114,6 +116,9 @@ pub struct LensGenerator {
     descriptor: ModelDescriptor,
     defaults: Defaults,
     pipe: LensPipeline,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
+    /// `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes through the `flux2` student (4× SR).
+    pid: Option<PidEngine>,
 }
 
 /// Build a [`LensGenerator`] from a [`LoadSpec`] with the given per-variant defaults.
@@ -152,10 +157,17 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> 
     if let Some(q) = spec.quantize {
         pipe.quantize_dit(q)?;
     }
+    // PiD decoder overlay (epic 7840, sc-7847): load the shared `flux2` student + Gemma once.
+    let pid = spec
+        .pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()?;
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
         pipe,
+        pid,
     }))
 }
 
@@ -186,6 +198,12 @@ impl LensGenerator {
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let total = steps as u32;
 
+        // PiD decode overlay (epic 7840, sc-7847): one decoder serves the whole count loop (same
+        // prompt). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
+        // (the default) → the byte-exact native Flux.2 VAE path.
+        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.defaults.id)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
@@ -209,14 +227,14 @@ impl LensGenerator {
             // Re-encode per image is cheap relative to denoise and keeps the RNG order matching the
             // struct API (one noise draw per image, no shared state). Progress is streamed via the
             // pipeline's per-step callback; cancellation is honored inside `denoise`.
-            let image = self
-                .pipe
-                .generate_with_progress(&opts, &req.cancel, &mut |cur| {
-                    on_progress(Progress::Step {
-                        current: cur as u32,
-                        total,
-                    });
-                })?;
+            let image =
+                self.pipe
+                    .generate_with_progress(&opts, pid_ref, &req.cancel, &mut |cur| {
+                        on_progress(Progress::Step {
+                            current: cur as u32,
+                            total,
+                        });
+                    })?;
             on_progress(Progress::Decoding);
             let _ = i;
             images.push(image);

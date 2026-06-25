@@ -45,7 +45,7 @@ fn lens_vae_decode_matches_reference() {
     let vae = load_vae(&snapshot_root()).expect("load Flux.2 VAE from Lens snapshot");
     let dit_out = g.require("dit_out").unwrap().clone(); // [1, h·w, 128]
 
-    let got = decode(&vae, &dit_out, lat_h, lat_w).unwrap(); // [1, H, W, 3] (NHWC), [-1,1]
+    let got = decode(&vae, &dit_out, lat_h, lat_w, None).unwrap(); // [1, H, W, 3] (NHWC), [-1,1]
 
     // Golden is NCHW [1, 3, H, W]; transpose to NHWC for comparison.
     let want = g

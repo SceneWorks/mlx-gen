@@ -13,6 +13,9 @@ mlx-gen = { path = ".." }
 # The Lens VAE is the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize) —
 # already ported; the Lens decode path reuses `Flux2Vae` / `load_vae` (sc-3169).
 mlx-gen-flux2 = { path = "../mlx-gen-flux2" }
+# Optional PiD super-resolving decoder overlay (epic 7840, sc-7847) — the `flux2` student (Lens is the
+# Flux.2 latent space). Depends only on mlx-gen core (acyclic).
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).

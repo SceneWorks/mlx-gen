@@ -40,10 +40,17 @@ pub enum LatentNorm {
 pub struct BackboneSpec {
     /// The canonical (alias-resolved) latent-space tag.
     pub latent_space: &'static str,
-    /// Latent channel count fed to the LQ adapter.
+    /// Latent channel count fed to the LQ adapter (`net.lq_latent_channels`). **Not** always the
+    /// VAE's raw channel count: the flux2 student consumes the *packed* 128-ch latent (32 raw ×
+    /// 2×2 patchify), so this is 128 for flux2 even though `AutoencoderKLFlux2` is 32-ch (sc-7847).
     pub latent_channels: i32,
     /// Latent normalization convention.
     pub latent_norm: LatentNorm,
+    /// Spatial compression of the latent grid the LQ adapter is fed (`net.latent_spatial_down_factor`):
+    /// pixel side ÷ latent-grid side. 8 for the VAE latent spaces (qwen/flux/sd3/sdxl, latent at H/8);
+    /// **16 for flux2**, whose PiD student is fed the *packed* latent at H/16 (the 2×2 patchify halves
+    /// the grid again). Drives `PidDecoder`'s output-size math and the LQ upsample ratio (sc-7847).
+    pub latent_spatial_down_factor: i32,
     /// Spatial SR factor baked into the student (4× for every diffusers backbone).
     pub pid_scale: i32,
     /// SDXL distilled a **variance-preserving-frame** student (`x_t = √(1−σ²)x0 + σε`); every other
@@ -70,6 +77,7 @@ const QWENIMAGE: BackboneSpec = BackboneSpec {
     latent_space: "qwenimage",
     latent_channels: 16,
     latent_norm: LatentNorm::PerChannelMeanStd,
+    latent_spatial_down_factor: 8,
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: None, // qwenimage ships 2kto4k only
@@ -86,6 +94,7 @@ const FLUX: BackboneSpec = BackboneSpec {
         scale: 0.3611,
         shift: 0.1159,
     },
+    latent_spatial_down_factor: 8,
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: Some("checkpoints/PiD_res2k_sr4x_official_flux_distill_4step/model_ema_bf16.pth"),
@@ -101,6 +110,7 @@ const SD3: BackboneSpec = BackboneSpec {
         scale: 1.5305,
         shift: 0.0609,
     },
+    latent_spatial_down_factor: 8,
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: Some("checkpoints/PiD_res2k_sr4x_official_sd3_distill_4step/model_ema_bf16.pth"),
@@ -116,6 +126,7 @@ const SDXL: BackboneSpec = BackboneSpec {
         scale: 0.13025,
         shift: 0.0,
     },
+    latent_spatial_down_factor: 8,
     pid_scale: 4,
     vp_frame: true, // the one VP-frame student
     ckpt_2k: None,  // sdxl ships 2kto4k only
@@ -126,11 +137,16 @@ const SDXL: BackboneSpec = BackboneSpec {
 
 const FLUX2: BackboneSpec = BackboneSpec {
     latent_space: "flux2",
-    // pipeline_registry.py DiffusionPipelineConfig uses latent_channels=32 for the loader; the
-    // checkpoint_registry comment calls the VAE "128-ch BN" — RE-VERIFY the fed channel count when
-    // the flux2 space is actually wired (sc-7847) before trusting this.
-    latent_channels: 32,
+    // RE-VERIFIED + RESOLVED at wiring time (sc-7847): the PiD student is fed the **packed 128-ch**
+    // BN-normalized latent (`net.lq_latent_channels=128`), NOT the 32-ch raw VAE latent. The "32" in
+    // `pipeline_registry.py::DiffusionPipelineConfig` is the *VAE* channel count (used only to unpack);
+    // `experiment/flux2.py` overrides the net to `lq_latent_channels=128, latent_spatial_down_factor=16`
+    // ("32 raw × 2×2 patchify / 16× compression"), and the released checkpoint's first LQ conv is
+    // `net.lq_proj.latent_proj.0.weight = (512, 128, 3, 3)` — 128 input channels. Confirmed three ways.
+    latent_channels: 128,
     latent_norm: LatentNorm::BatchNorm,
+    // 16, not 8: the packed latent the student consumes is at H/16 (VAE 8× + the 2×2 patchify).
+    latent_spatial_down_factor: 16,
     pid_scale: 4,
     vp_frame: false,
     ckpt_2k: Some("checkpoints/PiD_res2k_sr4x_official_flux2_distill_4step/model_ema_bf16.pth"),
@@ -206,12 +222,28 @@ mod tests {
         let s = lookup("sdxl").unwrap();
         assert!(s.vp_frame);
         assert_eq!(s.latent_channels, 4);
+        assert_eq!(s.latent_spatial_down_factor, 8);
+    }
+
+    #[test]
+    fn flux2_feeds_packed_128ch_at_16x() {
+        // The load-bearing sc-7847 correction: the flux2 student consumes the PACKED 128-ch BN latent
+        // at H/16, not the 32-ch raw VAE latent at H/8. (Checkpoint conv = (512,128,3,3); the
+        // experiment config sets lq_latent_channels=128, latent_spatial_down_factor=16.)
+        let s = lookup("flux2").unwrap();
+        assert_eq!(s.latent_channels, 128);
+        assert_eq!(s.latent_spatial_down_factor, 16);
+        assert_eq!(s.latent_norm, LatentNorm::BatchNorm);
+        // The LQ upsample ratio (sr·lsdf)/patch = (4·16)/16 = 4 (vs 2 for the 8× spaces).
+        assert_eq!((s.pid_scale * s.latent_spatial_down_factor) / 16, 4);
     }
 
     #[test]
     fn flux2_klein_aliases_flux2_with_2606_fix() {
         let k = lookup("flux2-klein-9b").unwrap();
         assert_eq!(k.latent_space, "flux2");
+        assert_eq!(k.latent_channels, 128);
+        assert_eq!(k.latent_spatial_down_factor, 16);
         assert!(k.checkpoint(CkptType::Res2kTo4k).unwrap().contains("_2606"));
     }
 

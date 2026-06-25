@@ -340,16 +340,20 @@ impl LensPipeline {
     }
 
     /// Generate a single image (no cancellation / progress). Draws the initial latents from the
-    /// global RNG seeded with `opts.seed`.
+    /// global RNG seeded with `opts.seed`. Native-VAE decode (no PiD overlay).
     pub fn generate(&self, opts: &GenerateOptions) -> Result<Image> {
-        self.generate_with_progress(opts, &CancelFlag::default(), &mut |_| {})
+        self.generate_with_progress(opts, None, &CancelFlag::default(), &mut |_| {})
     }
 
     /// Generate a single image, threading a cancel flag and a per-step progress callback
     /// (`on_step(completed_step)`). The registry loops `count` with per-image seeds over this.
+    ///
+    /// `pid_decoder`: an optional PiD super-resolving decoder (epic 7840, sc-7847) that replaces the
+    /// native Flux.2 VAE decode (4× SR). `None` → the byte-exact VAE path.
     pub fn generate_with_progress(
         &self,
         opts: &GenerateOptions,
+        pid_decoder: Option<&dyn mlx_gen::LatentDecoder>,
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Image> {
@@ -409,7 +413,9 @@ impl LensPipeline {
             &mut |cur, _total| on_step(cur),
         )?;
 
-        let decoded = vae::decode(&self.vae, &latents, latent_h, latent_w)?; // [1, H, W, 3] in [-1,1]
+        // `vae::decode` returns NHWC [1, H, W, 3] (native) or [1, 4H, 4W, 3] (PiD, 4× SR) — both in
+        // [-1,1] — so the NHWC `decoded_to_image` below handles either.
+        let decoded = vae::decode(&self.vae, &latents, latent_h, latent_w, pid_decoder)?;
         decoded_to_image(&decoded)
     }
 
@@ -478,7 +484,7 @@ pub(crate) fn render_sample(
         latents = schedule.step(&latents, &noise_pred, i)?;
         latents.eval()?;
     }
-    let decoded = vae::decode(vae, &latents, latent, latent)?;
+    let decoded = vae::decode(vae, &latents, latent, latent, None)?; // training preview: native VAE
     decoded_to_image(&decoded)
 }
 

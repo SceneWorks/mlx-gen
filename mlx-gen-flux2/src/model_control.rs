@@ -326,6 +326,11 @@ impl Flux2DevControl {
                 predict,
             )?;
             on_progress(Progress::Decoding);
+            // The PiD decode overlay (epic 7840, sc-7847) is wired on the FLUX.2 txt2img/edit path
+            // (`crate::model::Flux2`); `flux2_dev_control` is NOT in that story's model list, so it
+            // stays on the native VAE — mirroring the sc-7846 decision to scope the Z-Image
+            // Fun-ControlNet path out of PiD. (`packed` here is the same FLUX-canonical BN-normalized
+            // latent, so a future story can wire it identically; flagged on sc-7847 for Michael.)
             let packed = final_latents.reshape(&[1, lat_h as i32, lat_w as i32, in_channels])?;
             let decoded = self.vae.decode_packed_latents(&packed)?; // NHWC [1,H,W,3]
             let nchw = decoded.transpose_axes(&[0, 3, 1, 2])?;

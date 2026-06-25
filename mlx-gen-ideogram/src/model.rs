@@ -13,9 +13,11 @@
 use mlx_gen::array::host_i32;
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
-    GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Quant, Result, WeightsSource,
+    GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
+use mlx_gen_flux2::model::PID_BACKBONE;
+use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{
@@ -96,6 +98,10 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 pub struct Ideogram4 {
     descriptor: ModelDescriptor,
     pipeline: Ideogram4Pipeline,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
+    /// `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes through the `flux2` student (4× SR;
+    /// Ideogram is the FLUX.2 VAE latent space). `None` → the byte-exact native VAE path.
+    pid: Option<PidEngine>,
 }
 
 /// Construct an [`Ideogram4`] from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -130,10 +136,22 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if let Some(q) = spec.quantize {
         pipeline.quantize(q.bits())?;
     }
+    let pid = load_pid(spec)?;
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor(),
         pipeline,
+        pid,
     }))
+}
+
+/// Resolve the optional PiD decoder overlay (epic 7840, sc-7847) from `spec.pid`: load the shared
+/// `flux2` student + Gemma caption encoder once. Ideogram 4 is the FLUX.2 VAE latent space, so it
+/// reuses the same student as flux2/lens. `None` (the default) when the spec carries no PiD weights.
+fn load_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
+    spec.pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()
 }
 
 /// Construct an [`Ideogram4`] **turbo** generator (issue #488) from a [`LoadSpec`]. `spec.weights`
@@ -186,9 +204,11 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         pass_scales: None,
         moe_expert: None,
     }])?;
+    let pid = load_pid(spec)?;
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor_turbo(),
         pipeline,
+        pid,
     }))
 }
 
@@ -232,6 +252,13 @@ impl Ideogram4 {
         // Tokenize once — the JSON caption is identical across the count loop; only the seed varies.
         let ids = self.pipeline.tokenize(&req.prompt)?;
 
+        // PiD decode overlay (epic 7840, sc-7847): one decoder serves the whole count loop (same
+        // prompt). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
+        // (the default) → the byte-exact native VAE path. Applies to both T2I and edit.
+        let pid_decoder =
+            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let seed = base_seed.wrapping_add(n as u64);
@@ -244,6 +271,7 @@ impl Ideogram4 {
                     guidance,
                     seed,
                     edit,
+                    pid_ref,
                     &req.cancel,
                     on_progress,
                 )?,
@@ -254,6 +282,7 @@ impl Ideogram4 {
                     steps,
                     guidance,
                     seed,
+                    pid_ref,
                     &req.cancel,
                     on_progress,
                 )?,

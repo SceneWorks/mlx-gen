@@ -14,16 +14,35 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{LatentDecoder, Result};
 use mlx_gen_flux2::Flux2Vae;
 
 /// Decode the Lens DiT output into an image. `dit_out`: `[B, h·w, 128]` (the transformer's packed
 /// patch-space velocity at the final step); `(latent_h, latent_w)` is the latent grid
-/// (`= height/16, width/16`). Returns `[B, H, W, 3]` (NHWC) in ~`[−1, 1]`, where `H = latent_h·16`,
-/// `W = latent_w·16`.
-pub fn decode(vae: &Flux2Vae, dit_out: &Array, latent_h: usize, latent_w: usize) -> Result<Array> {
+/// (`= height/16, width/16`).
+///
+/// `pid`: an optional PiD super-resolving decoder (epic 7840, sc-7847). When `Some`, the **packed**
+/// BN-normalized latent — the DiT's 128 channels already carry the FLUX-canonical `c·4+p1·2+p2`
+/// packing (see this module's header), exactly the `flux2` student's input — is handed over as NCHW
+/// `[B, 128, h, w]` and the student returns 4× pixels `[B, 3, 4H, 4W]`. When `None`, the native Flux.2
+/// VAE path returns `[B, H, W, 3]` (NHWC) in ~`[−1, 1]`, where `H = latent_h·16`, `W = latent_w·16`.
+pub fn decode(
+    vae: &Flux2Vae,
+    dit_out: &Array,
+    latent_h: usize,
+    latent_w: usize,
+    pid: Option<&dyn LatentDecoder>,
+) -> Result<Array> {
     let b = dit_out.shape()[0];
     let c = dit_out.shape()[2]; // 128 packed channels
     let packed = dit_out.reshape(&[b, latent_h as i32, latent_w as i32, c])?;
-    vae.decode_packed_latents(&packed)
+    match pid {
+        // PiD takes NCHW [B,128,h,w] and returns NCHW [B,3,4H,4W]; transpose back to NHWC so the
+        // result matches the native `decode_packed_latents` layout (Lens's `decoded_to_image` is
+        // NHWC, unlike `mlx_gen::image::decoded_to_image`).
+        Some(d) => Ok(d
+            .decode(&packed.transpose_axes(&[0, 3, 1, 2])?)?
+            .transpose_axes(&[0, 2, 3, 1])?), // NCHW [B,3,4H,4W] → NHWC [B,4H,4W,3]
+        None => vae.decode_packed_latents(&packed), // NHWC [B,H,W,3]
+    }
 }

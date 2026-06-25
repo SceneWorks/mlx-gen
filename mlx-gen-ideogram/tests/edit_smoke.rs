@@ -112,6 +112,7 @@ fn img2img_smoke() {
             7.0,
             0,
             &edit,
+            None,
             &CancelFlag::new(),
             &mut |_| {},
         )
@@ -160,6 +161,7 @@ fn inpaint_mask_routes_keep_vs_repaint() {
                 7.0,
                 seed,
                 &edit,
+                None,
                 &CancelFlag::new(),
                 &mut |_| {},
             )
