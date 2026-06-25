@@ -1,15 +1,32 @@
-//! `Sd3Large` — the SD3.5-Large implementation of [`mlx_gen::Generator`], plus its
+//! `Sd3Large` — the SD3.5-Large / Large-Turbo implementation of [`mlx_gen::Generator`], plus its
 //! [`descriptor`]/[`load`] entry points and the `inventory` registration that wires it into
-//! `mlx_gen`'s registry (E5, sc-7864).
+//! `mlx_gen`'s registry (E5 sc-7864 = Large; E6 sc-7865 = Large-Turbo).
 //!
-//! [`load`] assembles the full model from a `stabilityai/stable-diffusion-3.5-large` snapshot
-//! directory (see [`crate::loader`]) — CLIP BPE + T5 tokenizers, the triple text encoder, the MMDiT
-//! transformer, the 16-ch VAE — and [`Sd3Large::generate`] runs the complete prompt→image pipeline:
-//! tokenize → triple-TE conditioning → seeded noise → flow-match Euler denoise with true-CFG over the
-//! MMDiT → VAE decode → RGB8 (see [`crate::pipeline`]).
+//! [`load`] / [`load_turbo`] assemble the full model from a `stabilityai/stable-diffusion-3.5-large`
+//! (resp. `-large-turbo`) snapshot directory (see [`crate::loader`]) — CLIP BPE + T5 tokenizers, the
+//! triple text encoder, the MMDiT transformer, the 16-ch VAE — and [`Sd3Large::generate`] runs the
+//! complete prompt→image pipeline: tokenize → triple-TE conditioning → seeded noise → flow-match Euler
+//! denoise over the MMDiT → VAE decode → RGB8 (see [`crate::pipeline`]).
 //!
-//! Registered engine id: **`sd3_5_large`** (the SceneWorker worker's `payload.model`). Turbo (E6) and
-//! Medium (M3) are separate stories and register their own ids on the same crate scaffolding.
+//! ## Large vs Large-Turbo
+//!
+//! Both variants share **one MMDiT backbone arch** ([`Sd3Arch::large`](crate::config::Sd3Arch::large))
+//! and one snapshot layout — the Turbo checkpoint is ADD-distilled to a few-step, guidance-baked
+//! schedule, so it differs ONLY in the *sampling recipe*, not the tensor layout:
+//!
+//! * **Large** — true-CFG: default **28 steps**, **guidance 3.5**, negative prompt supported. Each
+//!   denoise step runs the MMDiT TWICE (cond + uncond).
+//! * **Large-Turbo** — distilled: default **4 steps**, **guidance 1.0 → CFG off**, no negative prompt.
+//!   Guidance is baked into the distilled weights, so each step runs the MMDiT ONCE (cond only) — both
+//!   faster and required (a CFG forward on a distilled model is wrong). The flow-match shift is the
+//!   same `3.0` (verified against the Turbo `scheduler_config.json`).
+//!
+//! The variant-aware [`pipeline::denoise_cfg`] already skips the uncond forward when guidance is `1.0`
+//! (and `uncond` is `None`), so the Turbo path reuses E5's pipeline unchanged — only the per-variant
+//! step/guidance defaults + descriptor differ.
+//!
+//! Registered engine ids: **`sd3_5_large`** + **`sd3_5_large_turbo`** (the SceneWorks worker's
+//! `payload.model`). Medium (M3) is a separate story and registers its own id on the same scaffolding.
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -21,7 +38,7 @@ use mlx_gen::{
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
 use mlx_gen_z_image::vae::Vae;
 
-use crate::config::{Sd3Variant, DEFAULT_GUIDANCE_LARGE, DEFAULT_STEPS_LARGE};
+use crate::config::Sd3Variant;
 use crate::loader;
 use crate::pipeline::{self, SCHEDULE_SHIFT};
 use crate::text::Sd3TextEncoders;
@@ -29,6 +46,8 @@ use crate::transformer::Sd3Transformer;
 
 /// Registry id for SD3.5-Large (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = crate::config::SD3_5_LARGE_ID;
+/// Registry id for SD3.5-Large-Turbo (the distilled few-step / CFG-off variant on the same backbone).
+pub const TURBO_MODEL_ID: &str = crate::config::SD3_5_LARGE_TURBO_ID;
 
 /// SD3.5-Large's identity + capabilities — constructible without loading weights (registry
 /// introspection). The full capability surface lives on [`Sd3Variant::Large`].
@@ -36,9 +55,17 @@ pub fn descriptor() -> ModelDescriptor {
     Sd3Variant::Large.descriptor()
 }
 
-/// A loaded SD3.5-Large generator: the tokenizers + three text encoders + MMDiT + VAE assembled from
-/// a snapshot directory, plus the cached descriptor.
+/// SD3.5-Large-Turbo's identity + capabilities — the distilled few-step variant (no CFG / negative
+/// prompt). The capability surface lives on [`Sd3Variant::LargeTurbo`].
+pub fn turbo_descriptor() -> ModelDescriptor {
+    Sd3Variant::LargeTurbo.descriptor()
+}
+
+/// A loaded SD3.5-Large / Large-Turbo generator: the tokenizers + three text encoders + MMDiT + VAE
+/// assembled from a snapshot directory, plus the cached descriptor and the [`Sd3Variant`] that
+/// selects the sampling recipe (step/guidance defaults, CFG on/off).
 pub struct Sd3Large {
+    variant: Sd3Variant,
     descriptor: ModelDescriptor,
     clip_tokenizer: ClipBpeTokenizer,
     t5_tokenizer: TextTokenizer,
@@ -47,34 +74,46 @@ pub struct Sd3Large {
     vae: Vae,
 }
 
-/// Construct a [`Sd3Large`] from a [`LoadSpec`].
+/// Construct a SD3.5-**Large** generator from a [`LoadSpec`]. See [`load_variant`] for the shared body.
+pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, Sd3Variant::Large)
+}
+
+/// Construct a SD3.5-**Large-Turbo** generator from a [`LoadSpec`]. Identical backbone/load path to
+/// [`load`] (same `Sd3Arch::large` arch + snapshot layout); only the sampling recipe (4 steps,
+/// guidance-baked CFG-off) and the advertised capabilities differ. See [`load_variant`].
+pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, Sd3Variant::LargeTurbo)
+}
+
+/// Construct a [`Sd3Large`] for `variant` from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a [`WeightsSource::Dir`] pointing at a `stabilityai/stable-diffusion-3.5-
-/// large` snapshot (the diffusers multi-component tree). `spec.quantize` (Q4/Q8) quantizes the WHOLE
-/// model — transformer + the three text encoders (group_size 64) — after the dense load, matching the
-/// fork's `nn.quantize` over every quantizable Linear so a Q4/Q8 consumer gets the full memory saving.
-/// The VAE stays dense (its decode quality dominates the final image; matches the other DiT families'
+/// `spec.weights` must be a [`WeightsSource::Dir`] pointing at the matching
+/// `stabilityai/stable-diffusion-3.5-{large,large-turbo}` snapshot (the diffusers multi-component
+/// tree; both variants share the same layout). `spec.quantize` (Q4/Q8) quantizes the WHOLE model —
+/// transformer + the three text encoders (group_size 64) — after the dense load, matching the fork's
+/// `nn.quantize` over every quantizable Linear so a Q4/Q8 consumer gets the full memory saving. The
+/// VAE stays dense (its decode quality dominates the final image; matches the other DiT families'
 /// quantize-the-heavy-parts convention). An fp32 precision override is rejected (the validated dense
 /// path is bf16/f32 internal).
-pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Generator>> {
+    let id = variant.id();
     if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "sd3_5_large: only the default dense precision is wired (the CLIP encoders run f32 and \
-             the T5 promotes internally; drop the precision override)"
-                .into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: only the default dense precision is wired (the CLIP encoders run f32 and the T5 \
+             promotes internally; drop the precision override)"
+        )));
     }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
         WeightsSource::File(_) => {
-            return Err(Error::Msg(
-                "sd3_5_large expects a snapshot directory (transformer/ text_encoder{,_2,_3}/ \
-                 tokenizer{,_2,_3}/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
+            return Err(Error::Msg(format!(
+                "{id} expects a snapshot directory (transformer/ text_encoder{{,_2,_3}}/ \
+                 tokenizer{{,_2,_3}}/ vae/), not a single .safetensors file"
+            )))
         }
     };
-    let arch = Sd3Variant::Large.arch();
+    let arch = variant.arch();
     let mut transformer = loader::load_transformer(root, &arch)?;
     let mut encoders = loader::load_text_encoders(root)?;
     let vae = loader::load_vae(root)?;
@@ -84,13 +123,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         encoders.quantize(bits)?;
     }
     if !spec.adapters.is_empty() {
-        return Err(Error::Msg(
-            "sd3_5_large: LoRA/LoKr adapters are a later epic story (T1–T4); none are wired yet"
-                .into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: LoRA/LoKr adapters are a later epic story (T1–T4); none are wired yet"
+        )));
     }
     Ok(Box::new(Sd3Large {
-        descriptor: descriptor(),
+        variant,
+        descriptor: variant.descriptor(),
         clip_tokenizer: loader::load_clip_tokenizer(root)?,
         t5_tokenizer: loader::load_t5_tokenizer(root)?,
         encoders,
@@ -112,9 +151,14 @@ impl Sd3Large {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
 
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS_LARGE) as usize;
+        // Per-variant sampling recipe: Large = 28 steps / guidance 3.5 (true-CFG); Large-Turbo = 4
+        // steps / guidance 1.0 (distilled, guidance-baked → CFG off). The pipeline below skips the
+        // uncond forward whenever guidance == 1.0, so Turbo runs ONE forward per step.
+        let steps = req.steps.unwrap_or_else(|| self.variant.default_steps()) as usize;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE_LARGE);
+        let guidance = req
+            .guidance
+            .unwrap_or_else(|| self.variant.default_guidance());
 
         // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
         // prompt (empty string when unset), used only when CFG is active (guidance != 1.0).
@@ -177,8 +221,9 @@ const SIZE_MULTIPLE: u32 = 16;
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded weights.
 pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let caps = &desc.capabilities;
+    let id = desc.id;
     if req.prompt.is_empty() {
-        return Err(Error::Msg("sd3_5_large: prompt must not be empty".into()));
+        return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     if req.count == 0 || req.count > caps.max_count {
         return Err(Error::Msg(format!(
@@ -206,20 +251,21 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         )));
     }
     if req.guidance.is_some() && !caps.supports_guidance {
-        return Err(Error::Msg(
-            "sd3_5_large: guidance is not supported on this variant".into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: guidance is not supported on this variant (distilled Turbo bakes guidance in — \
+             CFG off)"
+        )));
     }
     if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
-        return Err(Error::Msg(
-            "sd3_5_large: negative prompt is not supported on this variant".into(),
-        ));
+        return Err(Error::Msg(format!(
+            "{id}: negative prompt is not supported on this variant"
+        )));
     }
     for c in &req.conditioning {
         let kind = c.kind();
         if !caps.accepts(kind) {
             return Err(Error::Msg(format!(
-                "sd3_5_large does not accept {kind:?} conditioning (txt2img only)"
+                "{id} does not accept {kind:?} conditioning (txt2img only)"
             )));
         }
     }
@@ -227,8 +273,12 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 }
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both the true-CFG
+// Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
+mlx_gen::register_generators! {
+    descriptor => load,
+    turbo_descriptor => load_turbo,
+}
 
 #[cfg(test)]
 mod tests {
@@ -298,6 +348,65 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+    }
+
+    #[test]
+    fn turbo_descriptor_is_distilled_cfg_off() {
+        // E6: Large-Turbo registers its own id, is NOT true-CFG, and rejects guidance / negative
+        // prompt (guidance is baked into the distilled weights — CFG off).
+        let d = turbo_descriptor();
+        assert_eq!(d.id, "sd3_5_large_turbo");
+        assert_eq!(d.family, "sd3");
+        assert_eq!(d.modality, Modality::Image);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+    }
+
+    #[test]
+    fn turbo_recipe_defaults() {
+        // The distilled few-step / guidance-baked recipe: 4 steps, guidance 1.0 (CFG off).
+        assert_eq!(Sd3Variant::LargeTurbo.default_steps(), 4);
+        assert_eq!(Sd3Variant::LargeTurbo.default_guidance(), 1.0);
+        // And Large stays true-CFG at 28 steps / guidance 3.5.
+        assert_eq!(Sd3Variant::Large.default_steps(), 28);
+        assert_eq!(Sd3Variant::Large.default_guidance(), 3.5);
+    }
+
+    #[test]
+    fn turbo_rejects_guidance_and_negative_prompt() {
+        // On Turbo, supplying guidance or a negative prompt is a validation error (CFG-off variant).
+        let d = turbo_descriptor();
+        let with_guidance = GenerationRequest {
+            prompt: "a fox".into(),
+            guidance: Some(3.5),
+            ..Default::default()
+        };
+        assert!(validate_request(&d, &with_guidance).is_err());
+        let with_neg = GenerationRequest {
+            prompt: "a fox".into(),
+            negative_prompt: Some("blurry".into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&d, &with_neg).is_err());
+        // A plain txt2img request (no guidance/neg) passes.
+        let plain = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&d, &plain).is_ok());
+    }
+
+    #[test]
+    fn turbo_load_rejects_single_file_source() {
+        let spec = LoadSpec::new(WeightsSource::File("/tmp/sd3.safetensors".into()));
+        let err = load_turbo(&spec)
+            .err()
+            .expect("expected an error")
+            .to_string();
+        assert!(err.contains("snapshot directory"), "got: {err}");
+        // The error is namespaced to the Turbo id (not the Large id).
+        assert!(err.contains("sd3_5_large_turbo"), "got: {err}");
     }
 
     #[test]
