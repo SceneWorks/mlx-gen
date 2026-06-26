@@ -18,13 +18,12 @@
 //!
 //! ## Memory budget
 //! Peak per chunk ≈ `weights + 8 GB · (out_megapixels · frames_in_chunk)` (spike anchor). The sizer
-//! picks the largest valid chunk under the machine's MLX memory limit × 0.85 (matching the wan
-//! `auto_tiling_budgeted` / `preflight_denoise_memory_guard` convention), falls back to per-frame
-//! (`T=1`) when even 8 frames won't fit, and reports an over-budget condition catchably when a single
-//! frame won't fit (extreme HD — see the spatial-tiling follow-up).
+//! picks the largest valid chunk under [`mlx_gen::memory::safe_budget_gib`] — the machine's MLX memory
+//! limit × 0.85 *clamped by the Metal per-single-buffer cap* `maxBufferLength` (sc-8135) — falls back
+//! to per-frame (`T=1`) when even 8 frames won't fit, and reports an over-budget condition catchably
+//! when a single frame won't fit (extreme HD — see the spatial-tiling follow-up).
 
 use mlx_gen::Image;
-use mlx_rs::memory::get_memory_limit;
 
 /// Default temporal chunk = 16 pixel frames (latentT=4 = exactly one `(4,3,3)` window).
 pub const DEFAULT_CHUNK_FRAMES: i32 = 16;
@@ -42,8 +41,6 @@ pub const MAX_CHUNK_FRAMES: i32 = 64;
 /// Budget cost-model slope (spike sc-4812): peak ≈ weights + `GB_PER_MPX_FRAME · out_Mpx · frames`.
 const GB_PER_MPX_FRAME: f64 = 8.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
-/// Fraction of the MLX memory limit treated as safe (matches wan's guards).
-const SAFE_FRAC: f64 = 0.85;
 
 /// Pixel dims must be multiples of this (VAE /8 · DiT patch /2) — also the spatial-tile alignment.
 pub const SPATIAL_ALIGN: i32 = 16;
@@ -52,24 +49,12 @@ pub const MIN_TILE_PX: i32 = 256;
 /// Spatial-tile overlap (px, multiple of [`SPATIAL_ALIGN`]) for the feather blend (sc-5201).
 pub const SPATIAL_OVERLAP: i32 = 64;
 
-/// The safe peak-GB budget: this machine's MLX memory limit × [`SAFE_FRAC`]. Shared by the temporal
-/// chunk sizer and the spatial tile sizer.
-///
-/// A `0` limit means MLX has no device memory limit set (unset/unknown) — without a floor that would
-/// compute a `0` budget and silently route *every* job to the smallest tile (the slowest path) for no
-/// reason (sc-6894). Treat `0`/sub-1-GiB as unknown and fall back to a conservative default so sizing
-/// stays sane; a real (≥ 1 GiB) limit is used as-is.
+/// The safe peak-GB budget — [`mlx_gen::memory::safe_budget_gib`], which clamps the MLX limit × 0.85
+/// by the Metal per-single-buffer cap (`maxBufferLength`, sc-8135) so a budget-sized tile never admits
+/// a single allocation that would trip MLX's per-buffer OOM. Re-exported here for the call sites that
+/// used the old `video::safe_budget_gib` path.
 pub fn safe_budget_gib() -> f64 {
-    /// Fallback budget when the MLX limit is unset (≈ a small Apple-Silicon tier — conservative, so
-    /// the sizer tiles more rather than risking OOM on an unknown machine).
-    const UNKNOWN_BUDGET_GIB: f64 = 8.0;
-    let lim_gib = get_memory_limit() as f64 / GIB;
-    let lim_gib = if lim_gib < 1.0 {
-        UNKNOWN_BUDGET_GIB
-    } else {
-        lim_gib
-    };
-    lim_gib * SAFE_FRAC
+    mlx_gen::memory::safe_budget_gib()
 }
 
 /// Round `t` up to a valid chunk length: a multiple of [`TEMPORAL_MULT`], floored at
@@ -425,6 +410,52 @@ mod tests {
             plan_chunk_size_with(wb, 4096, 4096, 108.0),
             ChunkPlan::OverBudget { .. }
         ));
+    }
+
+    #[test]
+    fn budget_cap_clamp_forces_fitting_tiling_at_4x() {
+        // sc-8135: a high-RAM Mac with no user GPU cap — the MLX memory limit defaults to ≈ 1.5× the
+        // device working set, so `limit × 0.85` (≈ 127.5 GiB) sits ABOVE the Metal per-single-buffer cap
+        // `maxBufferLength` (≈ 80 GiB). Without the clamp that oversized budget sizes a tile whose peak
+        // (and thus its single largest allocation) exceeds the cap → MLX `metal::malloc` OOM. The clamp
+        // drops the budget to the cap, forcing spatial tiling with tiles that fit under it.
+        let weights = (7.3 * GIB) as usize;
+        let raw = 150.0 * mlx_gen::memory::SAFE_FRAC; // 1.5×WSS limit × 0.85 on a 128 GB Mac
+        let cap = 80.0; // maxBufferLength
+        let safe = mlx_gen::memory::clamp_budget_to_cap(raw, Some(cap));
+        assert_eq!(safe, cap, "the cap clamps the oversized raw budget");
+
+        // 4096² single frame now exceeds the clamped budget → OverBudget → spatial tiling kicks in.
+        assert!(matches!(
+            plan_chunk_size_with(weights, 4096, 4096, safe),
+            ChunkPlan::OverBudget { .. }
+        ));
+
+        // The budget-sized tile's modeled per-frame peak (weights + 8·mpx) fits under the cap.
+        let tile = plan_spatial_tile_px(weights, safe);
+        let mpx = (tile * tile) as f64 / 1e6;
+        let peak = (weights as f64 / GIB) + GB_PER_MPX_FRAME * mpx;
+        assert!(
+            peak <= cap + 1e-6,
+            "tile peak {peak} GiB exceeds cap {cap} GiB"
+        );
+
+        // …and a 4096² frame is actually split into multiple tiles (not one full-size pass).
+        let overlap = SPATIAL_OVERLAP.min(tile / 2);
+        assert!(
+            plan_spatial_tiles(4096, 4096, tile, overlap).len() > 1,
+            "expected tiling, got a single tile"
+        );
+
+        // Contrast — the UNCLAMPED budget (the sc-8135 bug premise) sizes a tile whose peak exceeds
+        // the cap, admitting a single allocation that would trip MLX's per-buffer OOM.
+        let bad_tile = plan_spatial_tile_px(weights, raw);
+        let bad_peak =
+            (weights as f64 / GIB) + GB_PER_MPX_FRAME * ((bad_tile * bad_tile) as f64 / 1e6);
+        assert!(
+            bad_peak > cap,
+            "without the clamp the tile peak {bad_peak} GiB would fit the cap {cap} GiB — regression premise changed"
+        );
     }
 
     #[test]
