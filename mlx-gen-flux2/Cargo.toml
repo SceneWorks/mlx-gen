@@ -21,7 +21,7 @@ inventory = { workspace = true }
 # (sc-6030) consumes mlx-llm's `ContiguousKvCache` + `sample` instead of a hand-rolled copy (sc-7160).
 # Pin must equal every other mlx-llm pin in the worker graph (mlx-gen-joycaption + the worker) so
 # cargo unifies ONE mlx-llm — one `Array`, one `core-llm`. See mlx-gen-joycaption/Cargo.toml.
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "6c052ba6bbb81be0b95bd5e4ba650d25edb62896" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 # Read safetensors JSON headers (keys + shapes only) for the single-file→diffusers converter's
 # base-validation guard (sc-3136). Already in the workspace lock tree (via `tokenizers`).
 serde_json = "1"

@@ -21,9 +21,9 @@ inventory = { workspace = true }
 # hand-rolled copies (sc-7159); the bespoke dual-path / multimodal-MRoPE / think-interleave runtime
 # stays here. Pin must equal every other mlx-llm pin in the worker graph (mlx-gen-joycaption +
 # mlx-gen-flux2 + the worker) so cargo unifies ONE mlx-llm — one `Array`, one `core-llm`.
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "6c052ba6bbb81be0b95bd5e4ba650d25edb62896" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 
 [dev-dependencies]
 # The cache-equivalence parity test reads `KvCache::offset()` on the shared cache directly, so the
 # integration-test crate needs the trait in scope (same pin as the library dependency above).
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "6c052ba6bbb81be0b95bd5e4ba650d25edb62896" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }

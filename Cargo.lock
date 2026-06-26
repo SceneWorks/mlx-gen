@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#a49ca6d9738d5e0786f29634d57c8d1bd1939c38"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
 dependencies = [
  "inventory",
  "minijinja",
@@ -928,7 +928,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?rev=6c052ba6bbb81be0b95bd5e4ba650d25edb62896#6c052ba6bbb81be0b95bd5e4ba650d25edb62896"
+source = "git+https://github.com/SceneWorks/mlx-llm?rev=7041411f395e43c542770d1cfb3c3945c8c9a875#7041411f395e43c542770d1cfb3c3945c8c9a875"
 dependencies = [
  "core-llm",
  "half",

@@ -15,7 +15,7 @@ mlx-gen = { path = ".." }
 # pins so cargo unifies ONE mlx-llm — one `Array`, one `core-llm` — across the worker dependency
 # graph (the worker also depends on mlx-llm directly for prompt-refine). Both mlx-gen and mlx-llm
 # build the identical pmetal `mlx-rs`, so there is a single MLX build and one `Array` type.
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "6c052ba6bbb81be0b95bd5e4ba650d25edb62896" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 # Link-time self-registration into mlx-gen's captioner registry.
 inventory = { workspace = true }
 
