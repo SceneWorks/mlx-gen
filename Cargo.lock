@@ -591,6 +591,7 @@ version = "0.0.0"
 dependencies = [
  "inventory",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "sceneworks-gen-core",
  "thiserror",
  "tokenizers",

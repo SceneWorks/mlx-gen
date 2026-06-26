@@ -36,6 +36,11 @@ resolver = "2"
 # (cargo install still falls through to the cache). Resolver-only change; no Rust API moved. Guarded
 # by mlx-gen-qwen-image/tests/bf16_matmul_sweep.
 mlx-rs = { package = "pmetal-mlx-rs", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
+# The mlx-sys C-binding layer (pmetal-mlx-sys), same git rev as mlx-rs's path dep so cargo unifies on
+# ONE build (two distinct sources would yield two `mlx_sys` crates → link/symbol drift). Added as a
+# direct core dep so core can query MLX device properties not surfaced through mlx-rs (sc-8135: the
+# Metal per-single-buffer cap `maxBufferLength`, via the `device_info` C API).
+mlx-sys = { package = "pmetal-mlx-sys", git = "https://github.com/michaeltrefry/mlx-rs", rev = "38e1cc1730a11b1e40c2c8ecda01606763a12d51" }
 # Backend-neutral contract layer (epic 3720). Workspace member; mlx-gen re-exports it so the old
 # `mlx_gen::…` paths keep resolving. Family crates depend on it for `gen_core::Result` at the
 # contract boundary.
@@ -79,6 +84,7 @@ readme = "README.md"
 [dependencies]
 # Shared pins live in [workspace.dependencies] above (F-151).
 mlx-rs = { workspace = true }
+mlx-sys = { workspace = true }
 sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 inventory = { workspace = true }
