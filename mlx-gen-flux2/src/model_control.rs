@@ -20,10 +20,10 @@
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, run_flow_sampler,
-    Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
-    TimestepConvention, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, gen_core, require_base_dir,
+    require_control, run_flow_sampler, Capabilities, Conditioning, ConditioningKind, ControlBranch,
+    Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
 };
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
@@ -105,21 +105,18 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
              override (Q4/Q8 = spec.quantize)"
         )));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{FLUX2_DEV_CONTROL_ID} expects a FLUX.2-dev snapshot directory (tokenizer/ \
-                 text_encoder/ transformer/ vae/), not a single .safetensors file"
-            )))
-        }
-    };
-    let control = spec.control.as_ref().ok_or_else(|| {
-        Error::Msg(format!(
-            "{FLUX2_DEV_CONTROL_ID} requires the FLUX.2-dev-Fun-Controlnet-Union weights — set \
-             LoadSpec::control (e.g. with_control(WeightsSource::File(...)))"
-        ))
-    })?;
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
+    // required. The model id + labels keep the messages aligned with the hand-written originals.
+    let root = require_base_dir(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "a FLUX.2-dev snapshot directory",
+    )?;
+    let control = require_control(
+        spec,
+        FLUX2_DEV_CONTROL_ID,
+        "FLUX.2-dev-Fun-Controlnet-Union",
+    )?;
 
     let mut transformer = loader::load_control_transformer_dev(root, control)?;
     let mut text_encoder = loader::load_text_encoder_dev(root)?;
@@ -156,29 +153,6 @@ impl Flux2DevControl {
             .prompt_embeds(&input_ids, &attention_mask)?;
         let ids = prepare_text_ids(embeds.shape()[1] as usize);
         Ok((embeds, ids))
-    }
-
-    /// Extract the (required) control image + its `control_context_scale` from the request. The
-    /// Fun-Controlnet-Union is a *union* ControlNet (pose / canny / depth / … share one VAE-encoded
-    /// control path), so any [`mlx_gen::ControlKind`] is accepted — the pose skeleton is the
-    /// validated use. A single control image is supported.
-    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
-        let mut found = None;
-        for c in &req.conditioning {
-            if let Conditioning::Control { image, scale, .. } = c {
-                if found.is_some() {
-                    return Err(Error::Msg(format!(
-                        "{FLUX2_DEV_CONTROL_ID}: a single control image is supported"
-                    )));
-                }
-                found = Some((image, *scale));
-            }
-        }
-        found.ok_or_else(|| {
-            Error::Msg(format!(
-                "{FLUX2_DEV_CONTROL_ID} requires a Control conditioning (the pose/union skeleton)"
-            ))
-        })
     }
 
     /// The optional img2img init image (a single `Reference`) + its strength (the per-reference
@@ -344,6 +318,17 @@ impl Flux2DevControl {
     }
 }
 
+/// The Fun-Controlnet-Union is a *union* ControlNet (pose / canny / depth / … share one VAE-encoded
+/// control path), so the input-agnostic default [`AcceptedControlKinds::Any`] applies and all the
+/// control boilerplate (resolve/validate-present + the load helpers above) comes from the shared
+/// trait (sc-8241). The default message bodies already match this variant's wording, so no override
+/// is needed.
+impl ControlBranch for Flux2DevControl {
+    fn model_id(&self) -> &'static str {
+        FLUX2_DEV_CONTROL_ID
+    }
+}
+
 impl Generator for Flux2DevControl {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -351,17 +336,9 @@ impl Generator for Flux2DevControl {
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Shared capability floor (size/count/guidance/negative/accepted conditioning + multiple-of-16),
-        // then the control-specific requirement that a Control conditioning is present.
+        // then the shared control-present check (sc-8241's `ControlBranch::require_control_present`).
         validate_request(&self.descriptor, req)?;
-        if !req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::Control { .. }))
-        {
-            return Err(gen_core::Error::Msg(format!(
-                "{FLUX2_DEV_CONTROL_ID} requires a Control conditioning (the pose/union skeleton)"
-            )));
-        }
+        self.require_control_present(req)?;
         Ok(())
     }
 
@@ -383,6 +360,7 @@ mlx_gen::register_generators! { descriptor_dev_control => load_dev_control }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::WeightsSource;
 
     #[test]
     fn descriptor_is_flux2_dev_control() {

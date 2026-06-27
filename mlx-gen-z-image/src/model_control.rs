@@ -17,10 +17,10 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    Capabilities, Conditioning, ConditioningKind, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
+    require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Result,
 };
 use mlx_rs::Dtype;
 
@@ -94,21 +94,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => return Err(Error::Msg(
-            "z_image_turbo_control expects a base snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ vae/) as `weights`, not a single .safetensors file"
-                .into(),
-        )),
-    };
-    let control = spec.control.as_ref().ok_or_else(|| {
-        Error::Msg(
-            "z_image_turbo_control requires the Fun-Controlnet-Union weights — set \
-             LoadSpec::control (e.g. with_control(WeightsSource::File(...)))"
-                .into(),
-        )
-    })?;
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
+    // required. The model id + labels keep the messages byte-identical to the hand-written originals.
+    let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
+    let control = require_control(spec, MODEL_ID, "Fun-Controlnet-Union")?;
 
     // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
     // before the overlay would replace the control Linears with QuantizedLinear that can't accept
@@ -137,30 +126,18 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl ZImageTurboControl {
-    /// Extract the (required) control image + its `control_context_scale` from the request. The
-    /// Fun-Controlnet-Union is a *union* ControlNet (pose/canny/depth share one VAE-encoded control
-    /// path), so any [`mlx_gen::ControlKind`] is accepted — the pose skeleton is the validated use.
-    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
-        let mut found = None;
-        for c in &req.conditioning {
-            if let Conditioning::Control { image, scale, .. } = c {
-                if found.is_some() {
-                    return Err(Error::Msg(
-                        "z_image_turbo_control: a single control image is supported".into(),
-                    ));
-                }
-                found = Some((image, *scale));
-            }
-        }
-        found.ok_or_else(|| {
-            Error::Msg(
-                "z_image_turbo_control requires a Control conditioning (the pose/union skeleton)"
-                    .into(),
-            )
-        })
+/// The Fun-Controlnet-Union is a *union* ControlNet (pose/canny/depth share one VAE-encoded control
+/// path), so the input-agnostic default [`AcceptedControlKinds::Any`] applies and all the control
+/// boilerplate (resolve/validate-present + the load helpers above) comes from the shared trait
+/// (sc-8241). The default message bodies already match this variant's hand-written wording, so no
+/// override is needed.
+impl ControlBranch for ZImageTurboControl {
+    fn model_id(&self) -> &'static str {
+        MODEL_ID
     }
+}
 
+impl ZImageTurboControl {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
@@ -269,18 +246,9 @@ impl Generator for ZImageTurboControl {
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Shared capability checks (size/count/guidance/negative/accepted conditioning), then the
-        // control-specific requirement that a Control conditioning is present.
+        // shared control-present check (sc-8241's `ControlBranch::require_control_present`).
         validate_request(&self.descriptor.capabilities, req)?;
-        if !req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::Control { .. }))
-        {
-            return Err(gen_core::Error::Msg(
-                "z_image_turbo_control requires a Control conditioning (the pose/union skeleton)"
-                    .into(),
-            ));
-        }
+        self.require_control_present(req)?;
         Ok(())
     }
 
@@ -302,6 +270,7 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::WeightsSource;
 
     #[test]
     fn descriptor_is_z_image_turbo_control() {

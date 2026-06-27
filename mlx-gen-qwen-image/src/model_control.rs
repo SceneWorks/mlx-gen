@@ -17,9 +17,9 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    Capabilities, Conditioning, ConditioningKind, ControlKind, Error, GenerationOutput,
-    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    Precision, Progress, Quant, Result, WeightsSource,
+    require_base_dir, require_control, AcceptedControlKinds, Capabilities, ConditioningKind,
+    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator,
+    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
@@ -96,22 +96,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p,
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "qwen_image_control expects a base snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ vae/) as `weights`, not a single .safetensors file"
-                    .into(),
-            )),
-        };
-    let control = spec.control.as_ref().ok_or_else(|| {
-        Error::Msg(
-            "qwen_image_control requires the InstantX Qwen-Image-ControlNet-Union weights — set \
-             LoadSpec::control (e.g. with_control(WeightsSource::File(...)))"
-                .into(),
-        )
-    })?;
+    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
+    // required. The model id + labels keep the messages byte-identical to the hand-written originals.
+    let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
+    let control = require_control(spec, MODEL_ID, "InstantX Qwen-Image-ControlNet-Union")?;
 
     // Base + control applied dense first, THEN quantize together (the overlay-then-quantize ordering,
     // matching the Z-Image control port): quantizing before loading the control branch would not let
@@ -144,30 +132,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-impl QwenImageControl {
-    /// Extract the required pose control image + its scale. v1 is **pose-only**: a non-`Pose`
-    /// `ControlKind` (canny/depth/other) is rejected rather than silently treated as pose, even
-    /// though the Union weights support it.
-    fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
-        let mut found = None;
-        for c in &req.conditioning {
-            if let Conditioning::Control { image, kind, scale } = c {
-                if *kind != ControlKind::Pose {
-                    return Err(Error::Msg(format!(
-                        "qwen_image_control v1 supports pose control only, got {kind:?}"
-                    )));
-                }
-                if found.is_some() {
-                    return Err(Error::Msg(
-                        "qwen_image_control: a single control image is supported".into(),
-                    ));
-                }
-                found = Some((image, *scale));
-            }
-        }
-        found.ok_or_else(|| {
-            Error::Msg("qwen_image_control requires a Control (pose skeleton) conditioning".into())
-        })
+/// v1 is **pose-only**: a non-`Pose` `ControlKind` (canny/depth/other) is rejected rather than
+/// silently treated as pose, even though the InstantX Union weights support it. That restriction +
+/// Qwen's "(pose skeleton)" message wording are the only deviations from the shared default; the
+/// rest of the control boilerplate (resolve/validate-present + the load helpers above) comes from
+/// the shared trait (sc-8241). The default `unsupported_kind_message` ("v1 supports pose control
+/// only, got {kind:?}") already matches this variant's hand-written wording.
+impl ControlBranch for QwenImageControl {
+    fn model_id(&self) -> &'static str {
+        MODEL_ID
+    }
+
+    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+        AcceptedControlKinds::Only(vec![ControlKind::Pose])
+    }
+
+    fn missing_control_message(&self) -> String {
+        format!("{MODEL_ID} requires a Control (pose skeleton) conditioning")
     }
 }
 
@@ -178,16 +159,10 @@ mlx_gen::impl_generator!(QwenImageControl {
 
 impl QwenImageControl {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
+        // Shared capability floor, then the shared control-present check (sc-8241's
+        // `ControlBranch::require_control_present`, which uses Qwen's "(pose skeleton)" message).
         validate_request(&self.descriptor.capabilities, req)?;
-        if !req
-            .conditioning
-            .iter()
-            .any(|c| matches!(c, Conditioning::Control { .. }))
-        {
-            return Err(Error::Msg(
-                "qwen_image_control requires a Control (pose skeleton) conditioning".into(),
-            ));
-        }
+        self.require_control_present(req)?;
         Ok(())
     }
 
@@ -279,6 +254,7 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_gen::WeightsSource;
 
     #[test]
     fn descriptor_is_qwen_image_control() {

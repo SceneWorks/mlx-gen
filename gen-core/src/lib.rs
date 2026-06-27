@@ -11,6 +11,7 @@
 //! `mlx_rs::Array` or candle tensor. See epic 3720 (the unified-contract roadmap, Phase 0).
 
 pub mod caption;
+pub mod control;
 pub mod error;
 pub mod face;
 pub mod generator;
@@ -33,6 +34,7 @@ pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
+pub use control::{require_base_dir, require_control, AcceptedControlKinds, ControlBranch};
 pub use error::{Error, Result};
 pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{

@@ -46,6 +46,9 @@ pub mod tokenizer;
 pub mod train;
 
 // Moved-verbatim contract modules — re-exported from gen-core at their old paths.
+pub mod control {
+    pub use gen_core::control::*;
+}
 pub mod generator {
     pub use gen_core::generator::*;
 }
@@ -69,6 +72,7 @@ pub use caption::{
     CaptionCapabilities, CaptionFinishReason, CaptionOptions, CaptionOutput, CaptionRequest,
     CaptionSampling, Captioner, CaptionerDescriptor,
 };
+pub use control::{require_base_dir, require_control, AcceptedControlKinds, ControlBranch};
 pub use decoder::LatentDecoder;
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
