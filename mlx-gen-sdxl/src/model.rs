@@ -144,7 +144,10 @@ pub fn descriptor() -> ModelDescriptor {
                 s.extend(curated_scheduler_names());
                 s
             },
-            supported_guidance_methods: vec![],
+            // Plain CFG, now the shared `gen_core::guidance::cfg` over `MlxLatentOps` (epic 7434 P3,
+            // sc-7443); the dual-forward `denoise_core` combine is byte-identical to the retired hand
+            // form. Shared by Kolors/InstantID/PuLID via `denoise_core`.
+            supported_guidance_methods: vec!["cfg"],
             min_size: 512,
             max_size: 2048,
             max_count: 8,

@@ -180,7 +180,8 @@ impl LatentOps for MlxLatentOps {
         if scale == 1.0 {
             return Ok(x.clone());
         }
-        ge(multiply(x, scalar(scale)))
+        let s = ge(scalar(scale).as_dtype(x.dtype()))?;
+        ge(multiply(x, s))
     }
 
     fn add(&self, a: &Array, b: &Array) -> gen_core::Result<Array> {
@@ -194,11 +195,13 @@ impl LatentOps for MlxLatentOps {
     fn axpy(&self, a: f32, x: &Array, b: f32, y: &Array) -> gen_core::Result<Array> {
         // Byte-parity with apply_step's a_x==1 branch: emit `x + y·b` (multiply-by-one elided), so a
         // migrated engine's default step is bit-identical to the legacy `flow_match_euler_step`.
-        let by = ge(multiply(y, scalar(b)))?;
+        let sb = ge(scalar(b).as_dtype(y.dtype()))?;
+        let by = ge(multiply(y, sb))?;
         if a == 1.0 {
             return ge(add(x, &by));
         }
-        let ax = ge(multiply(x, scalar(a)))?;
+        let sa = ge(scalar(a).as_dtype(x.dtype()))?;
+        let ax = ge(multiply(x, sa))?;
         ge(add(&ax, &by))
     }
 
@@ -1259,6 +1262,42 @@ mod guidance_ops_tests {
         )
         .unwrap();
         assert!(max_abs(&got, &want) < 1e-4, "cfg over MLX != hand combine");
+    }
+
+    /// sc-7443 enabler: with the dtype-preserving `MlxLatentOps::axpy`/`scale`, gen-core `cfg` over a
+    /// half-precision (fp16 / bf16) cond/uncond pair reproduces the bespoke engine combine
+    /// `uncond + scalar(scale).as_dtype(eps)·(cond − uncond)` (the SDXL/Chroma/Z-Image form) **byte-for-byte
+    /// AND keeps the result in the input dtype** — no f32 promotion. This is the N1 proof the unified
+    /// combine is a drop-in for the half-precision image cohort. (Without the dtype-preserving change the
+    /// f32 `scalar()` would promote the result to f32 and the dtype assert below would fail.)
+    #[test]
+    fn cfg_half_precision_is_byte_identical_and_preserves_dtype() {
+        let ops = MlxLatentOps;
+        let (cond_f32, uncond_f32) = pair();
+        let cfg_scale = 7.5f32;
+        for dt in [Dtype::Float16, Dtype::Bfloat16] {
+            let cond = cond_f32.as_dtype(dt).unwrap();
+            let uncond = uncond_f32.as_dtype(dt).unwrap();
+            // Bespoke engine combine: the scale cast to the eps dtype (SDXL `denoise_core` form).
+            let cfg_s = scalar(cfg_scale).as_dtype(dt).unwrap();
+            let want = add(
+                &uncond,
+                multiply(subtract(&cond, &uncond).unwrap(), &cfg_s).unwrap(),
+            )
+            .unwrap();
+            // The unified gen-core path (what sc-7443 routes the cohort through).
+            let got = cfg(&ops, &cond, &uncond, cfg_scale).unwrap();
+            assert_eq!(
+                got.dtype(),
+                dt,
+                "{dt:?}: cfg must preserve dtype (no f32 promotion)"
+            );
+            assert_eq!(
+                max_abs(&got, &want),
+                0.0,
+                "{dt:?}: gen-core cfg != bespoke half-precision combine"
+            );
+        }
     }
 
     /// gen-core `cfg_rescale` over MLX == the bespoke Lens formula (per-token channel-axis rescale).

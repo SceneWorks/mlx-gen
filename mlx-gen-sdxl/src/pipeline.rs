@@ -11,8 +11,11 @@ use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, round, subt
 use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
+use mlx_gen::gen_core;
 use mlx_gen::image::resize_lanczos_u8;
-use mlx_gen::{CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, Progress, Result};
+use mlx_gen::{
+    CancelFlag, DiffusionSampler, Error, Image, LatentDecoder, MlxLatentOps, Progress, Result,
+};
 
 use crate::inpaint::InpaintBlend;
 use crate::sampler::{AncestralEuler, EulerSampler};
@@ -416,15 +419,13 @@ fn denoise_core(
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
             let eps_neg = row(1)?;
-            // `eps_neg + cfg·(eps_text − eps_neg)`. The reference's `cfg_weight` is a python float that
-            // weak-casts to the eps dtype, so CFG runs in the compute dtype — cast the scalar to the
-            // eps dtype here too. An f32 `cfg` would promote an fp16 eps to f32, and the sampler step
-            // (which keys off `eps.dtype()`) would then run f32, silently leaving the latents f32.
-            let cfg_s = scalar(cfg).as_dtype(eps_text.dtype())?;
-            add(
-                &eps_neg,
-                &multiply(&subtract(&eps_text, &eps_neg)?, &cfg_s)?,
-            )?
+            // `eps_neg + cfg·(eps_text − eps_neg)` via the shared gen-core `cfg` over `MlxLatentOps`
+            // (epic 7434 P3, sc-7443). The dtype-preserving `MlxLatentOps::axpy` casts the scale to the
+            // eps dtype, so CFG runs in the compute dtype (fp16) byte-identically to the retired hand
+            // combine — an f32 scale would promote fp16 eps to f32, and the sampler step (which keys off
+            // `eps.dtype()`) would then run f32, silently leaving the latents f32. (Byte-equivalence
+            // proven by `guidance_ops_tests::cfg_half_precision_is_byte_identical_and_preserves_dtype`.)
+            gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?
         } else {
             eps
         };
