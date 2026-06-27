@@ -128,7 +128,7 @@ mod tests {
 
     /// L2 norm over Bernini's per-frame [`APG_DIMS`], keepdims (test helper / clamp inspector).
     fn l2_norm(a: &Array) -> Array {
-        sqrt(&multiply(a, a).unwrap().sum_axes(APG_DIMS, true).unwrap()).unwrap()
+        sqrt(multiply(a, a).unwrap().sum_axes(APG_DIMS, true).unwrap()).unwrap()
     }
 
     fn randish(seed: i32) -> Array {
@@ -157,9 +157,7 @@ mod tests {
         }
         fn update(&mut self, diff: &Array) -> Array {
             let ra = match &self.running {
-                Some(r) => {
-                    add(diff, &multiply(r, Array::from_f32(self.momentum)).unwrap()).unwrap()
-                }
+                Some(r) => add(diff, multiply(r, Array::from_f32(self.momentum)).unwrap()).unwrap(),
                 None => diff.clone(),
             };
             self.running = Some(ra.clone());
@@ -181,12 +179,12 @@ mod tests {
             let dn = l2_norm(&diff);
             let scale = minimum(
                 Array::from_f32(1.0),
-                &divide(Array::from_f32(norm_threshold), &dn).unwrap(),
+                divide(Array::from_f32(norm_threshold), &dn).unwrap(),
             )
             .unwrap();
             diff = multiply(&diff, &scale).unwrap();
         }
-        let bn = maximum(&l2_norm(base), Array::from_f32(1e-12)).unwrap();
+        let bn = maximum(l2_norm(base), Array::from_f32(1e-12)).unwrap();
         let v1 = divide(base, &bn).unwrap();
         let coeff = multiply(&diff, &v1)
             .unwrap()
@@ -196,7 +194,7 @@ mod tests {
         let orthogonal = subtract(&diff, &parallel).unwrap();
         add(
             &orthogonal,
-            &multiply(&parallel, Array::from_f32(eta)).unwrap(),
+            multiply(&parallel, Array::from_f32(eta)).unwrap(),
         )
         .unwrap()
     }
@@ -215,7 +213,7 @@ mod tests {
             eta,
             norm_threshold,
         );
-        add(uncond, &multiply(&nd, Array::from_f32(scale)).unwrap()).unwrap()
+        add(uncond, multiply(&nd, Array::from_f32(scale)).unwrap()).unwrap()
     }
     fn legacy_chain(
         uncond: &Array,
@@ -235,7 +233,7 @@ mod tests {
                 eta,
                 norm_thresholds[i],
             );
-            result = add(&result, &multiply(&nd, Array::from_f32(scales[i])).unwrap()).unwrap();
+            result = add(&result, multiply(&nd, Array::from_f32(scales[i])).unwrap()).unwrap();
         }
         result
     }
@@ -247,7 +245,7 @@ mod tests {
     ) -> Array {
         let dims: Vec<i32> = (1..delta.ndim() as i32).collect();
         let ref_norm_sq = maximum(
-            &multiply(reference, reference)
+            multiply(reference, reference)
                 .unwrap()
                 .sum_axes(&dims, true)
                 .unwrap(),
@@ -255,7 +253,7 @@ mod tests {
         )
         .unwrap();
         let coeff = divide(
-            &multiply(delta, reference)
+            multiply(delta, reference)
                 .unwrap()
                 .sum_axes(&dims, true)
                 .unwrap(),
@@ -265,8 +263,8 @@ mod tests {
         let parallel = multiply(&coeff, reference).unwrap();
         let orthogonal = subtract(delta, &parallel).unwrap();
         add(
-            &multiply(&parallel, Array::from_f32(parallel_scale)).unwrap(),
-            &multiply(&orthogonal, Array::from_f32(orthogonal_scale)).unwrap(),
+            multiply(&parallel, Array::from_f32(parallel_scale)).unwrap(),
+            multiply(&orthogonal, Array::from_f32(orthogonal_scale)).unwrap(),
         )
         .unwrap()
     }
@@ -357,7 +355,7 @@ mod tests {
         let cond = multiply(randish(5), Array::from_f32(100.0)).unwrap();
         let zero = Array::zeros::<f32>(&[4, 2, 2, 2]).unwrap();
         let nd = normalized_guidance(&cond, &zero, 1.0, None, 1.0, 2.0).unwrap();
-        let m = mlx_rs::ops::max(&l2_norm(&nd), None).unwrap().item::<f32>();
+        let m = mlx_rs::ops::max(l2_norm(&nd), None).unwrap().item::<f32>();
         assert!(m <= 2.0 + 1e-3, "clamped norm {m} must be ≤ threshold 2.0");
     }
 
