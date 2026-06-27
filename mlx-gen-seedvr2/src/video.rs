@@ -49,6 +49,17 @@ pub const MIN_TILE_PX: i32 = 256;
 /// Spatial-tile overlap (px, multiple of [`SPATIAL_ALIGN`]) for the feather blend (sc-5201).
 pub const SPATIAL_OVERLAP: i32 = 64;
 
+/// Largest output edge (px) the SeedVR2 **VAE decoder** reconstructs faithfully in a single pass.
+/// This is a *correctness* cap, not a memory one: above it the decoder silently corrupts/blurs its
+/// output (sc-8228 — a Metal large-tensor limit; not precision, fp32 also fails). Real-weight
+/// encode→decode round-trip fidelity (cos vs input): 1280² 0.996, **1536² 0.9955 (good)**, 1792²
+/// 0.989 (detail loss begins), 2048² **0.803 (−88% sharpness, broken)**. So 1536 is the highest
+/// validated-safe edge (= 192² latent). The reference (mflux `VAEUtil.decode`) sidesteps this by
+/// always tiling the decode at 512²; we keep one resident model + tile the whole pass instead, but
+/// must force that path on this cap even when the memory budget would permit a single pass (sc-8261).
+/// `1536 = 96 · SPATIAL_ALIGN`, so it is a valid tile edge.
+pub const VAE_SAFE_DECODE_EDGE_PX: i32 = 1536;
+
 /// The safe peak-GB budget — [`mlx_gen::memory::safe_budget_gib`], which clamps the MLX limit × 0.85
 /// by the Metal per-single-buffer cap (`maxBufferLength`, sc-8135) so a budget-sized tile never admits
 /// a single allocation that would trip MLX's per-buffer OOM. Re-exported here for the call sites that
@@ -248,13 +259,16 @@ pub fn plan_spatial_tiles(h: i32, w: i32, tile: i32, overlap: i32) -> Vec<Spatia
 
 /// Largest square spatial-tile edge (px, multiple of [`SPATIAL_ALIGN`], ≥ [`MIN_TILE_PX`]) whose
 /// per-frame (T=1) peak `weights + 8 GB · (tile²·1e-6)` fits `safe_gib`. Floors at `MIN_TILE_PX` — the
-/// smallest tile we drop to (tiling still bounds peak as far as the model allows).
+/// smallest tile we drop to (tiling still bounds peak as far as the model allows). The memory-sized
+/// edge is also clamped *down* to [`VAE_SAFE_DECODE_EDGE_PX`] so each tile decodes within the VAE's
+/// correctness limit (sc-8261), even on a high-RAM machine whose budget would size a larger tile.
 pub fn plan_spatial_tile_px(weights_bytes: usize, safe_gib: f64) -> i32 {
     let weights_gib = weights_bytes as f64 / GIB;
     let avail = (safe_gib - weights_gib).max(0.0);
     let max_area_px2 = avail / (GB_PER_MPX_FRAME * 1e-6); // = tile² (px²)
     let edge = (max_area_px2.max(0.0).sqrt() as i32) / SPATIAL_ALIGN * SPATIAL_ALIGN;
-    edge.max(MIN_TILE_PX)
+    // MIN_TILE_PX (256) ≤ VAE_SAFE_DECODE_EDGE_PX (1536), so the clamp bounds are always valid.
+    edge.clamp(MIN_TILE_PX, VAE_SAFE_DECODE_EDGE_PX)
 }
 
 /// Per-pixel feather weights `(th·tw)` for a tile, tapering linearly to ~0 over `overlap` px on each
@@ -447,15 +461,30 @@ mod tests {
             "expected tiling, got a single tile"
         );
 
-        // Contrast — the UNCLAMPED budget (the sc-8135 bug premise) sizes a tile whose peak exceeds
-        // the cap, admitting a single allocation that would trip MLX's per-buffer OOM.
-        let bad_tile = plan_spatial_tile_px(weights, raw);
-        let bad_peak =
-            (weights as f64 / GIB) + GB_PER_MPX_FRAME * ((bad_tile * bad_tile) as f64 / 1e6);
-        assert!(
-            bad_peak > cap,
-            "without the clamp the tile peak {bad_peak} GiB would fit the cap {cap} GiB — regression premise changed"
+        // The sc-8135 *budget* clamp is asserted above (`safe == cap`). At SeedVR2 image scales the
+        // sc-8261 VAE-correctness cap (`VAE_SAFE_DECODE_EDGE_PX`) is tighter than the memory-sized tile,
+        // so it now bounds the tile edge regardless of the budget — i.e. even the UNCLAMPED raw budget
+        // yields a VAE-safe tile (belt-and-suspenders; the budget clamp still governs the OverBudget
+        // decision and larger-footprint engines). Verify the cap dominates here.
+        let raw_tile = plan_spatial_tile_px(weights, raw);
+        assert_eq!(
+            raw_tile, VAE_SAFE_DECODE_EDGE_PX,
+            "VAE cap should bound the tile even under the unclamped budget"
         );
+    }
+
+    #[test]
+    fn spatial_tile_never_exceeds_vae_cap() {
+        // sc-8261: however generous the budget, no spatial tile decodes past the VAE correctness edge.
+        for safe in [40.0, 80.0, 200.0, 1000.0] {
+            let tile = plan_spatial_tile_px((7.3 * GIB) as usize, safe);
+            assert!(
+                tile <= VAE_SAFE_DECODE_EDGE_PX,
+                "tile {tile} exceeds VAE cap {VAE_SAFE_DECODE_EDGE_PX} at safe={safe}"
+            );
+            assert!(tile >= MIN_TILE_PX);
+            assert_eq!(tile % SPATIAL_ALIGN, 0);
+        }
     }
 
     #[test]
