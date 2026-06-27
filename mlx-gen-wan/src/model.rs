@@ -107,6 +107,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 32; cap the long edge at 1280 (max_area 704×1280).
+            supported_guidance_methods: vec![],
             min_size: 32,
             max_size: 1280,
             max_count: 1,
@@ -516,6 +517,7 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
+            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,
@@ -986,6 +988,7 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             samplers: wan_samplers(),
             schedulers: Vec::new(),
             // H/W align to patch×vae_stride = 16 (z16 VAE, spatial stride 8); long edge cap 1280.
+            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

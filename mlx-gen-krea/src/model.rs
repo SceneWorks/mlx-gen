@@ -65,6 +65,7 @@ pub fn descriptor() -> ModelDescriptor {
             // point. The native distilled loop stays the byte-exact default (`req.sampler == None`).
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
+            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,

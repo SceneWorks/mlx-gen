@@ -95,6 +95,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             // Its native shifted-Euler loop is its only valid sampler. See `t2i::denoise`/`it2i_denoise`.
             samplers: Vec::new(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

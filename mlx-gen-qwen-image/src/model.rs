@@ -60,6 +60,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Euler path; any name outside the menu is rejected in `validate_request`.
             samplers: qwen_samplers(),
             schedulers: qwen_schedulers(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

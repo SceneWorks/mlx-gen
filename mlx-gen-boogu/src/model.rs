@@ -78,6 +78,7 @@ pub fn descriptor() -> ModelDescriptor {
             // (its DMD distillation sampler is not an ODE — see `descriptor_turbo`).
             samplers: curated_sampler_names(),
             schedulers: curated_scheduler_names(),
+            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,

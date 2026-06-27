@@ -541,6 +541,7 @@ pub fn descriptor() -> ModelDescriptor {
             supports_lokr: false,
             samplers: vec!["unipc"],
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

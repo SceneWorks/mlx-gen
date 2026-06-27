@@ -69,6 +69,7 @@ pub fn descriptor() -> ModelDescriptor {
             // native logit-normal Euler is its only valid sampler. See `pipeline::run_denoise`.
             samplers: Vec::new(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: RES_MIN,
             max_size: RES_MAX,
             max_count: MAX_COUNT,

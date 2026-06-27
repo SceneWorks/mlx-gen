@@ -68,6 +68,25 @@ pub struct GenerationRequest {
     pub scheduler: Option<String>,
     pub scheduler_shift: Option<f32>,
 
+    /// Guidance method — how the conditional and unconditional model predictions are combined (epic
+    /// 7434, the fourth orthogonal sampling layer). `"cfg"` (plain) | `"cfg_rescale"` (Lin et al.
+    /// per-token norm-rescale) | `"apg"` (adaptive-projected guidance) | `"cfg_pp"` (CFG++ — renoise
+    /// from the unconditional branch). `None` ⇒ the engine's default guidance path (the N1 no-op).
+    /// Gated per-model-per-backend by [`Capabilities::supported_guidance_methods`]; an unadvertised
+    /// value is rejected here at the contract boundary, and dropped-to-default with a worker event by
+    /// the N3 fallback layer (P5).
+    pub guidance_method: Option<String>,
+    /// APG projection mix η (`apg` only): recombine as `orthogonal + η·parallel` against the
+    /// conditional base. `η = 1` with no momentum and `norm_threshold = 0` reduces APG to plain CFG.
+    /// `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_eta: Option<f32>,
+    /// APG momentum (`apg` only): `running = diff + momentum·running`, the buffer persisting across
+    /// denoise steps (0 ⇒ no momentum). `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_momentum: Option<f32>,
+    /// APG norm-threshold (`apg` only): clamp the guidance delta to `‖diff‖ ≤ norm_threshold`
+    /// (`0` disables the clamp). `None` ⇒ the engine default. Ignored by non-APG methods.
+    pub guidance_norm_threshold: Option<f32>,
+
     // --- Conditioning ---
     pub conditioning: Vec<Conditioning>,
     /// img2img strength when a single `Reference` is supplied without its own strength.
@@ -181,6 +200,10 @@ impl Default for GenerationRequest {
             sampler: None,
             scheduler: None,
             scheduler_shift: None,
+            guidance_method: None,
+            guidance_eta: None,
+            guidance_momentum: None,
+            guidance_norm_threshold: None,
             conditioning: Vec::new(),
             strength: None,
             control_scale: None,
@@ -463,6 +486,10 @@ pub struct Capabilities {
     pub supports_lokr: bool,
     pub samplers: Vec<&'static str>,
     pub schedulers: Vec<&'static str>,
+    /// The guidance methods this model+backend honors (epic 7434), e.g. `["cfg", "cfg_rescale"]`.
+    /// Empty ⇒ only the engine's implicit default path (no selectable guidance axis). Per-model-
+    /// per-backend, like [`samplers`](Self::samplers) / [`schedulers`](Self::schedulers).
+    pub supported_guidance_methods: Vec<&'static str>,
     pub min_size: u32,
     pub max_size: u32,
     pub max_count: u32,
@@ -545,6 +572,14 @@ impl Capabilities {
                 return Err(Error::Msg(format!(
                     "{id}: unsupported scheduler {s:?} (supported: {:?})",
                     self.schedulers
+                )));
+            }
+        }
+        if let Some(m) = &req.guidance_method {
+            if !self.supported_guidance_methods.contains(&m.as_str()) {
+                return Err(Error::Msg(format!(
+                    "{id}: unsupported guidance_method {m:?} (supported: {:?})",
+                    self.supported_guidance_methods
                 )));
             }
         }
