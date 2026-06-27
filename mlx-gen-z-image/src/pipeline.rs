@@ -238,6 +238,87 @@ pub fn denoise_control_with_progress(
     )
 }
 
+/// [`denoise_control_with_progress`] with **classifier-free guidance** for the **base** (non-distilled)
+/// Z-Image ControlNet variant (sc-8251). The Turbo control loop runs a single cond forward (Turbo is
+/// guidance-distilled → CFG-free); the base control variant is built on the undistilled base DiT, so it
+/// composes the same real CFG as [`denoise_cfg_with_progress`] **on top of** the control branch: each
+/// step runs the control DiT **twice** — once on the prompt conditioning (`cap_feats`) and once on the
+/// negative/uncond conditioning (`neg_cap_feats`) — both threading the **same** (loop-constant) f32
+/// `control_context` + `control_context_scale`, and combines the two velocities as
+/// `v = v_uncond + guidance·(v_cond − v_uncond)` before the Euler step (the diffusers `ZImagePipeline`
+/// CFG combine; `cfg_normalization=False` default, so no per-step rescale).
+///
+/// The control embedding (`c_emb`) is derived from `control_context` independently of the caption, so
+/// each branch gets its own cached [`ControlPrepared`] (cond + uncond captions, identical control
+/// context) built once and reused every step (F-042). `guidance == 1.0` (or `neg_cap_feats == None`)
+/// collapses to a single cond forward — byte-identical to [`denoise_control_with_progress`] — so a base
+/// control request with `guidance=1` costs exactly what the Turbo control loop does. `start_step` is `0`
+/// for txt2img+control and [`init_time_step`] for img2img+control, mirroring the other control loop.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_control_cfg_with_progress(
+    transformer: &ZImageControlTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    control_context: &Array,
+    control_context_scale: f32,
+    start_step: usize,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    // Cond (and, when CFG is active, uncond) control prep — patchify metadata + RoPE freqs + the
+    // embedded constant control context — depend only on the loop-constant latent dims + caption +
+    // control context, so build each once and reuse across steps (F-042).
+    let sh = latents.shape();
+    let prep =
+        transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), cap_feats, control_context)?;
+    let cfg_on = guidance != 1.0;
+    let neg_prep = match (cfg_on, neg_cap_feats) {
+        (true, Some(neg)) => {
+            Some(transformer.prepare_control((sh[0], sh[1], sh[2], sh[3]), neg, control_context)?)
+        }
+        _ => None,
+    };
+    let g = Array::from_slice(&[guidance], &[1]);
+    // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base CFG loop; the
+    // delta vs `denoise_cfg_with_progress` is that each forward runs the control branch (constant
+    // control context + scale threaded through every step, the fork's `ZImageControl._control_predict`).
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let v_cond =
+            transformer.forward_with_control(&prep, x, timestep, control_context_scale, None)?;
+        match &neg_prep {
+            Some(np) => {
+                let v_uncond = transformer.forward_with_control(
+                    np,
+                    x,
+                    timestep,
+                    control_context_scale,
+                    None,
+                )?;
+                // v = v_uncond + guidance·(v_cond − v_uncond).
+                let delta = v_cond.subtract(&v_uncond)?;
+                Ok(v_uncond.add(&delta.multiply(&g)?)?)
+            }
+            None => Ok(v_cond),
+        }
+    };
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::OneMinusSigma,
+        &scheduler.sigmas[start..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
+}
+
 /// img2img init image → packed clean latents `[16, 1, H/8, W/8]` (f32). Port of the fork's
 /// `LatentCreator.encode_image` ∘ `ZImageLatentCreator.pack_latents`: PIL-LANCZOS scale to the
 /// target dims, normalize `[0,255] → [-1,1]` as NCHW, VAE-encode (mean → latent space), pack.

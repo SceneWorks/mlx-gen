@@ -76,7 +76,12 @@ fn base_turbo_and_control_all_coexist() {
         .map(|r| (r.descriptor)().id)
         .filter(|id| id.starts_with("z_image"))
         .collect();
-    for want in ["z_image", "z_image_turbo", "z_image_turbo_control"] {
+    for want in [
+        "z_image",
+        "z_image_turbo",
+        "z_image_turbo_control",
+        "z_image_control",
+    ] {
         assert!(ids.contains(&want), "missing {want} in {ids:?}");
     }
 }
