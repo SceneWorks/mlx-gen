@@ -44,8 +44,8 @@ pub use cfgpp::{
 };
 pub use latent_ops::{CpuLatentOps, LatentOps};
 pub use model_sampling::{
-    denoise, DiscreteModelSampling, EdmModelSampling, FlowModelSampling, ModelSampling,
-    PredictionType,
+    cfgpp_denoise, denoise, DiscreteModelSampling, EdmModelSampling, FlowModelSampling,
+    ModelSampling, PredictionType,
 };
 pub use schedulers::{
     beta_sigmas, ddim_uniform_sigmas, exponential_sigmas, karras_sigmas, normal_sigmas,

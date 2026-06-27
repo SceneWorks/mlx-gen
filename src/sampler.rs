@@ -331,6 +331,60 @@ pub fn run_curated_sampler(
     Ok(out)
 }
 
+/// The CFG++ twin of [`run_curated_sampler`] (epic 7434, sc-8256). Drives a
+/// [`gen_core::sampling::CfgPpSampler`] — which lands each step on the GUIDED `x0` but renoises from the
+/// UNCONDITIONAL `x0` — over the engine's `predict_pair` closure, which surfaces the `(guided, uncond)`
+/// raw-model pair the plain CFG path collapses into one output. `base_sampler_name` is the BASE solver
+/// the user selected (`euler`/`ddim` → `euler_cfg++`, `dpmpp_2m` → `dpmpp_2m_cfg++`); a base with no
+/// paper-validated CFG++ form, or `None`, falls back to `euler_cfg++` (N3 — never hard-fail over the
+/// knob). The engine routes here ONLY when `req.guidance_method == "cfg_pp"` and the base solver
+/// supports it, so the default path ([`run_curated_sampler`]) is byte-untouched.
+///
+/// Cancellation, the per-step `eval` boundary, and progress mirror [`run_curated_sampler`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn run_cfgpp_sampler(
+    base_sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict_pair: impl FnMut(&Array, f32) -> Result<(Array, Array)>,
+) -> Result<Array> {
+    use gen_core::sampling::{
+        base_supports_cfgpp, cfgpp_denoise as gc_cfgpp_denoise, cfgpp_sampler_for, CfgPpSampler,
+        Solver,
+    };
+
+    let ops = MlxLatentOps;
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    // N3: route the chosen base to its CFG++ variant; a base with no CFG++ form (or None) → euler_cfg++.
+    let base = base_sampler_name
+        .and_then(Solver::from_name)
+        .filter(|solver| base_supports_cfgpp(*solver))
+        .unwrap_or(Solver::Euler);
+    let sampler: Box<dyn CfgPpSampler<MlxLatentOps>> = cfgpp_sampler_for::<MlxLatentOps>(base)
+        .expect("base_supports_cfgpp(Euler) holds, so a sampler always resolves");
+
+    let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        ge(mlx_rs::transforms::eval([x]))?;
+        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+        on_progress(Progress::Step { current, total });
+        gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
+            predict_pair(xin, t).map_err(Into::into)
+        })
+    };
+
+    let out = sampler
+        .sample(&ops, &mut denoise_fn, latents, sigmas)
+        .map_err(crate::Error::from)?;
+    mlx_rs::transforms::eval([&out])?;
+    Ok(out)
+}
+
 /// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
 /// [`run_curated_sampler`] wrapper for the FLOW cohort (FLUX / Qwen / Chroma / Z-Image / Boogu / LTX /
 /// Wan). `conv` selects whether the model is fed the raw sigma ([`TimestepConvention::Sigma`]) or

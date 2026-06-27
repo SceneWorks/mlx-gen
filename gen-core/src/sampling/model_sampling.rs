@@ -132,6 +132,37 @@ where
     ops.axpy(k_x, x, k_out, &raw)
 }
 
+/// The CFG++ twin of [`denoise`]: compute BOTH the guided and unconditional `x0` from one model call
+/// that returns the `(guided_raw, uncond_raw)` pair. Used by the [`super::cfgpp::CfgPpSampler`] variants
+/// (sc-8256), which land on the guided `x0` but renoise from the unconditional one — so the engine must
+/// surface the negative branch it would otherwise discard. The `c_in` input scaling and the
+/// prediction-type `x0` recombination are identical to [`denoise`] and applied to each branch (the
+/// guidance combine lives inside `run_model_pair`, exactly as the plain CFG combine lives inside
+/// [`denoise`]'s `run_model`).
+pub fn cfgpp_denoise<L, M>(
+    ops: &L,
+    ms: &dyn ModelSampling,
+    x: &L::Latent,
+    sigma: f32,
+    mut run_model_pair: M,
+) -> Result<(L::Latent, L::Latent)>
+where
+    L: LatentOps,
+    M: FnMut(&L::Latent, f32) -> Result<(L::Latent, L::Latent)>,
+{
+    let s = ms.input_scale(sigma);
+    let x_in = if s == 1.0 {
+        x.clone()
+    } else {
+        ops.scale(x, s)?
+    };
+    let (guided_raw, uncond_raw) = run_model_pair(&x_in, ms.timestep(sigma))?;
+    let (k_x, k_out) = ms.denoised_coeffs(sigma);
+    let guided_x0 = ops.axpy(k_x, x, k_out, &guided_raw)?;
+    let uncond_x0 = ops.axpy(k_x, x, k_out, &uncond_raw)?;
+    Ok((guided_x0, uncond_x0))
+}
+
 // =================================================================================================
 // FLOW / CONST — rectified-flow (FLUX / Qwen / Z-Image / Boogu). The byte-equivalence anchor.
 // =================================================================================================
