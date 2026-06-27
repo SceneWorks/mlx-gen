@@ -8,6 +8,9 @@ use mlx_gen::{
 
 pub const FLUX1_SCHNELL_ID: &str = "flux1_schnell";
 pub const FLUX1_DEV_ID: &str = "flux1_dev";
+/// FLUX.1-dev **Fun-Controlnet-Union** variant (sc-8238/sc-8239): the dev base + the Shakker
+/// `FLUX.1-dev-ControlNet-Union-Pro-2.0` control branch, registered as its own generator by E2.
+pub const FLUX1_DEV_CONTROL_ID: &str = "flux1_dev_control";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;

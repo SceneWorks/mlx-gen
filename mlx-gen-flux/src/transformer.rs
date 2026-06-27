@@ -155,6 +155,12 @@ impl FluxTransformer {
         })
     }
 
+    /// Number of base double (joint) blocks (FLUX.1 = 19). Drives the ControlNet residual injection
+    /// interval `ceil(num_double_blocks / num_residuals)` in the control branch (sc-8238).
+    pub fn num_double_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Quantize every transformer Linear to Q4/Q8 in place (group_size 64), matching the
     /// quantizable FLUX transformer leaves hit by the fork's generic `nn.quantize` predicate.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
@@ -214,6 +220,74 @@ impl FluxTransformer {
         height: u32,
         injector: Option<&dyn DitImageInjector>,
     ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            None,
+        )
+    }
+
+    /// As [`forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
+    /// (sc-8238) — the Shakker FLUX.1-dev ControlNet-Union-Pro-2.0 path. `control = (residuals, scale)`
+    /// is the (already-computed, pre-injection) control-branch output: one residual per control double
+    /// block, added to the base **image** stream after base double block `i` at the diffusers interval
+    /// `ceil(num_double_blocks / num_residuals)`, scaled by `scale`. With `control = None` this is
+    /// byte-identical to [`forward_injected`].
+    ///
+    /// Crucially this is **compose-ready** (constraint 2): the per-block `injector` seam (PuLID /
+    /// XLabs IP-Adapter) is consulted at the SAME points it is in [`forward_injected`], so a future
+    /// epic can stack identity + control in one denoise (`injector = Some(..)` AND `control = Some(..)`).
+    /// The control residual is added AFTER the injector's `after_double` residual, matching the
+    /// diffusers FLUX ControlNet order (the controlnet sample is added to the post-block hidden state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Array], f32)>,
+    ) -> Result<Array> {
+        self.forward_inner(
+            hidden_states,
+            prompt_embeds,
+            pooled_prompt_embeds,
+            sigma,
+            guidance,
+            width,
+            height,
+            injector,
+            control,
+        )
+    }
+
+    /// Shared body behind [`forward_injected`] and [`forward_control`]. `injector` is the per-block
+    /// identity seam (PuLID/IP-Adapter); `control = (double_residuals, scale)` is the FLUX.1 ControlNet
+    /// per-double-block residual injection. Both are independently optional — `injector = None,
+    /// control = None` is byte-identical to the plain `forward`; `Some`/`Some` composes them.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &self,
+        hidden_states: &Array,
+        prompt_embeds: &Array,
+        pooled_prompt_embeds: &Array,
+        sigma: f32,
+        guidance: f32,
+        width: u32,
+        height: u32,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Array], f32)>,
+    ) -> Result<Array> {
         let mut hidden = self.x_embedder.forward(hidden_states)?;
         let mut encoder = self.context_embedder.forward(prompt_embeds)?;
         let text_embeddings = self.time_text_embed.forward(
@@ -226,6 +300,27 @@ impl FluxTransformer {
             (height / 16) as usize,
             (width / 16) as usize,
         )?;
+
+        // ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
+        // `interval = ceil(num_double_blocks / num_control_residuals)`, and after base double block `i`
+        // we add `controlnet_block_samples[i / interval]` (scaled). The Shakker Union-Pro-2.0 ships 6
+        // control double blocks → interval `ceil(19/6) = 4`. An empty residual slice is treated as
+        // "no control" (the `pub` entry guards against `len()-1` underflow). The few residuals are
+        // pre-scaled once before the 19-block loop rather than per block.
+        let control = control.filter(|(res, _)| !res.is_empty());
+        let scaled_control = match control {
+            Some((res, scale)) => {
+                let s = scalar(scale);
+                let interval = control_residual_interval(self.blocks.len(), res.len());
+                Some((
+                    res.iter()
+                        .map(|r| Ok(multiply(r, &s)?))
+                        .collect::<Result<Vec<_>>>()?,
+                    interval,
+                ))
+            }
+            None => None,
+        };
 
         for (i, block) in self.blocks.iter().enumerate() {
             // The image-query (XLabs IP-Adapter) seam is consulted inside the block's attention; the
@@ -245,6 +340,12 @@ impl FluxTransformer {
                     hidden = add(&hidden, &r)?;
                 }
             }
+            // Fun-Controlnet-Union residual (sc-8238), added AFTER the identity injector so the two
+            // compose: `hidden = hidden + controlnet_block_samples[i / interval]·scale`.
+            if let Some((res, interval)) = &scaled_control {
+                let idx = (i / interval).min(res.len() - 1);
+                hidden = add(&hidden, &res[idx])?;
+            }
         }
 
         let txt_seq = encoder.shape()[1];
@@ -258,6 +359,9 @@ impl FluxTransformer {
         // injected block.
         let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
         let mut joint = concatenate_axis(&[&encoder, &hidden], 1)?;
+        // The Shakker Union-Pro-2.0 checkpoint has 0 control SINGLE blocks, so there is no
+        // single-stream control residual (diffusers `controlnet_single_block_samples = None`); the
+        // single-block injector seam below is the identity path, unchanged.
         for (i, block) in self.single_blocks.iter().enumerate() {
             joint = block.forward(&joint, &text_embeddings, &rope)?;
             if let Some(inj) = injector {
@@ -408,14 +512,14 @@ impl FluxTransformer {
     }
 }
 
-struct TimeTextEmbed {
+pub(crate) struct TimeTextEmbed {
     timestep: MlpEmbedder,
     text: MlpEmbedder,
     guidance: Option<MlpEmbedder>,
 }
 
 impl TimeTextEmbed {
-    fn from_weights(w: &Weights, prefix: &str, supports_guidance: bool) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str, supports_guidance: bool) -> Result<Self> {
         Ok(Self {
             timestep: MlpEmbedder::from_weights(w, &join(prefix, "timestep_embedder"))?,
             text: MlpEmbedder::from_weights(w, &join(prefix, "text_embedder"))?,
@@ -430,7 +534,7 @@ impl TimeTextEmbed {
         })
     }
 
-    fn forward(&self, sigma_step: f32, pooled: &Array, guidance: f32) -> Result<Array> {
+    pub(crate) fn forward(&self, sigma_step: f32, pooled: &Array, guidance: f32) -> Result<Array> {
         // Match the fork's bf16 conditioning path (sc-2787). `time_step`/`guidance` are cast to the
         // model precision (bf16) BEFORE the sinusoidal `time_proj` (so they carry bf16 rounding —
         // `Transformer.compute_text_embeddings` does `.astype(config.precision)`); the pooled CLIP
@@ -449,7 +553,7 @@ impl TimeTextEmbed {
         Ok(out.as_dtype(bf16)?)
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         self.timestep.quantize(bits)?;
         self.text.quantize(bits)?;
         if let Some(guidance) = self.guidance.as_mut() {
@@ -483,7 +587,7 @@ impl MlpEmbedder {
     }
 }
 
-struct JointBlock {
+pub(crate) struct JointBlock {
     norm1: AdaLayerNormZero,
     norm1_context: AdaLayerNormZero,
     attn: JointAttention,
@@ -492,7 +596,7 @@ struct JointBlock {
 }
 
 impl JointBlock {
-    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+    pub(crate) fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
             norm1: AdaLayerNormZero::from_weights(w, &join(prefix, "norm1"), 6)?,
             norm1_context: AdaLayerNormZero::from_weights(w, &join(prefix, "norm1_context"), 6)?,
@@ -514,7 +618,7 @@ impl JointBlock {
         })
     }
 
-    fn forward(
+    pub(crate) fn forward(
         &self,
         hidden: &Array,
         encoder: &Array,
@@ -570,7 +674,7 @@ impl JointBlock {
         Ok((encoder, hidden))
     }
 
-    fn quantize(&mut self, bits: i32) -> Result<()> {
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
         self.norm1.quantize(bits)?;
         self.norm1_context.quantize(bits)?;
         self.attn.quantize(bits)?;
@@ -884,25 +988,30 @@ impl FeedForward {
     }
 }
 
-struct FluxRope {
+pub(crate) struct FluxRope {
     theta: f32,
     axes_dim: [i32; 3],
 }
 
-struct RopeTable {
+pub(crate) struct RopeTable {
     cos: Array,
     sin: Array,
 }
 
 impl FluxRope {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             theta: 10000.0,
             axes_dim: [16, 56, 56],
         }
     }
 
-    fn forward(&self, txt_seq: usize, latent_h: usize, latent_w: usize) -> Result<RopeTable> {
+    pub(crate) fn forward(
+        &self,
+        txt_seq: usize,
+        latent_h: usize,
+        latent_w: usize,
+    ) -> Result<RopeTable> {
         let total = (txt_seq + latent_h * latent_w) as i32;
         // Per-axis positions (the fork's `ids[..., i]`): axis 0 is all-zero; axis 1 = latent row (h),
         // axis 2 = latent col (w); text tokens sit at position 0 on every axis.
@@ -1018,7 +1127,7 @@ fn time_proj(time_steps: &Array) -> Result<Array> {
     mlx_gen::nn::timestep_sincos(time_steps, 256, 10000.0, 0.0)
 }
 
-fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
+pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
     let weight = w.require(&format!("{prefix}.weight"))?.clone();
     let bias = if has_bias {
         Some(w.require(&format!("{prefix}.bias"))?.clone())
@@ -1030,6 +1139,15 @@ fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLin
 
 fn scalar(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
+}
+
+/// ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
+/// `interval = ceil(num_double_blocks / num_residuals)`. After base double block `i` the controlnet
+/// residual `controlnet_block_samples[i / interval]` is added. For FLUX.1 (19 double blocks) and the
+/// Shakker Union-Pro-2.0 (6 control residuals) this is `ceil(19/6) = 4` (sc-8238). `num_residuals = 0`
+/// would never reach here (the caller filters an empty residual slice), so it is clamped to 1.
+pub(crate) fn control_residual_interval(num_double_blocks: usize, num_residuals: usize) -> usize {
+    num_double_blocks.div_ceil(num_residuals.max(1))
 }
 
 // ---- LoRA/LoKr adapter routing (sc-2657) ------------------------------------------------------
@@ -1405,6 +1523,28 @@ mod tests {
         let r = FluxRope::new().forward(5, 4, 3).unwrap();
         assert_eq!(r.cos.shape(), &[17, 64]);
         assert_eq!(r.sin.shape(), &[17, 64]);
+    }
+
+    // ---- sc-8238: FLUX.1 Fun-Controlnet-Union residual injection interval --------------------------
+
+    #[test]
+    fn control_residual_interval_matches_diffusers_ceil() {
+        // FLUX.1 = 19 double blocks; Shakker Union-Pro-2.0 = 6 control residuals → ceil(19/6) = 4.
+        assert_eq!(control_residual_interval(19, 6), 4);
+        // The injected residual index `i / interval` for the 19 base blocks lands in [0, 5] (the 6
+        // residuals) with the last group covering the tail — never out of range.
+        let interval = control_residual_interval(19, 6);
+        for i in 0..19usize {
+            let idx = (i / interval).min(6 - 1);
+            assert!(idx < 6, "block {i} -> residual {idx} out of range");
+        }
+        // Block 18 (last) maps to residual 18/4 = 4 (clamped within 6) — exercises the tail.
+        assert_eq!((18usize / interval).min(5), 4);
+        // Degenerate guards: a single residual covers all blocks; 0 residuals clamps to interval = N.
+        assert_eq!(control_residual_interval(19, 1), 19);
+        assert_eq!(control_residual_interval(19, 0), 19);
+        // num_double_blocks accessor reports the canonical FLUX.1 count via a dummy transformer.
+        assert_eq!(test_transformer(19, 38).num_double_blocks(), 19);
     }
 
     // ---- sc-2963: the compiled elementwise glue is bit-identical to the eager glue ---------------

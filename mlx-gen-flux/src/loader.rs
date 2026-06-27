@@ -9,6 +9,7 @@ use mlx_gen::{Error, Result, WeightsSource};
 use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 use crate::config::{FluxTokenizerKind, FluxVariant};
+use crate::control_transformer::{FluxControlNet, FluxControlNetConfig, FluxControlTransformer};
 use crate::image_encoder::FluxIpImageEncoder;
 use crate::ip_adapter::FluxIpAdapter;
 use crate::text_encoder::{ClipTextEncoder, T5TextEncoder};
@@ -58,6 +59,29 @@ pub fn load_t5_encoder(root: &Path) -> Result<T5TextEncoder> {
 pub fn load_transformer(root: &Path, variant: FluxVariant) -> Result<FluxTransformer> {
     let w = Weights::from_dir(root.join("transformer"))?;
     FluxTransformer::from_weights(&w, "", &FluxTransformerConfig::for_variant(variant))
+}
+
+/// Load the FLUX.1-dev base transformer + the Shakker Fun-Controlnet-Union control branch and assemble
+/// the [`FluxControlTransformer`] (sc-8238). `root` is the FLUX.1-dev snapshot dir (the base
+/// `transformer/`); `control` is the Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single
+/// `diffusion_pytorch_model.safetensors` `File`, or a `Dir`). The control checkpoint reuses the base
+/// FLUX block key names (it is a partial copy of the FLUX transformer — `transformer_blocks.{i}.*` incl.
+/// `attn.to_out.0`), so the shared [`JointBlock`](crate::transformer) loader reads it un-aliased.
+pub fn load_control_transformer_dev(
+    root: &Path,
+    control: &WeightsSource,
+) -> Result<FluxControlTransformer> {
+    let base = load_transformer(root, FluxVariant::Dev)?;
+    let control_weights = match control {
+        WeightsSource::File(p) => Weights::from_file(p)?,
+        WeightsSource::Dir(p) => Weights::from_dir(p)?,
+    };
+    let branch = FluxControlNet::from_weights(
+        &control_weights,
+        "",
+        &FluxControlNetConfig::shakker_union_pro_2_0(),
+    )?;
+    Ok(FluxControlTransformer::new(base, branch))
 }
 
 /// Load the XLabs FLUX IP-Adapter (epic 3621) from a directory containing the adapter weights and a
