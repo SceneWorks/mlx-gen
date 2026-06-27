@@ -18,10 +18,13 @@
 //! E1 story wires the seam and exposes [`Flux1DevControl::generate_with_injector`] for it; the worker
 //! wiring + the registered descriptor are E2 (sc-8239).
 //!
-//! ## Scope note (E1 vs E2)
-//! This file ships a descriptor + an `inventory` registration so the engine is testable end-to-end and
-//! E2 has a concrete entry to build the worker `ModelDescriptor` onto. E2 (sc-8239) owns the
-//! capability-surface finalization and the per-mode (canny/depth/pose) real-weight smokes.
+//! ## Scope note (E1 + E2)
+//! E1 (sc-8238) shipped the engine + a descriptor STUB. E2 (sc-8239) finalized the capability surface:
+//! [`descriptor_dev_control`] now mirrors FLUX.2's `flux2_dev_control` shape, the [`ControlBranch`] impl
+//! pins the accepted control kinds to pose/canny/depth (input-agnostic — no mode index, S0 sc-8237), and
+//! `tests/control_real_weights.rs` carries one `#[ignore]` real-weight Metal smoke per mode. The model
+//! resolves through the core registry as `flux1_dev_control` (`mlx_gen::load`); the SceneWorks worker
+//! exposure + manifest re-pin are the driver/manifest stories (sc-8243/sc-8244), not this crate.
 
 use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
@@ -30,8 +33,8 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
     require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
+    ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
@@ -49,10 +52,16 @@ use crate::config::{FluxVariant, DEFAULT_GUIDANCE};
 /// Shakker recommends ~0.7 for Union-Pro-2.0; the request's per-control `scale` wins when set.
 const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 
-/// The control variant's identity + capabilities. The guidance-distilled dev base (embedded guidance,
-/// no negative prompt / true-CFG) plus a required `Control` conditioning (the pose/canny/depth hint).
-/// Mac-only, like every FLUX.1 variant. (E2 owns the final capability surface; this is the E1 stub the
-/// engine + tests build against.)
+/// The control variant's identity + capabilities (E2 sc-8239, finalized). Mirrors FLUX.2's
+/// `flux2_dev_control` descriptor (`mlx_gen_flux2::descriptor_dev_control`): the guidance-distilled dev base
+/// (embedded guidance, no negative prompt / true-CFG, no KV cache, mac-only) declaring a required
+/// `Control` conditioning (the structural hint). It diverges from FLUX.2 only where the engines do:
+/// FLUX.2 also declares a `Reference` (an img2img init the FLUX.2 fork seeds from) — the FLUX.1 Shakker
+/// control path has no img2img-init seam, so it declares `Control` alone. Neither declares a `Depth`
+/// `ConditioningKind`: depth is a *control image* (a `ControlKind::Depth` carried by
+/// `Conditioning::Control`), not the separate `Conditioning::Depth` map. The accepted control kinds
+/// (pose/canny/depth) live on the [`ControlBranch`] impl below, not in the descriptor — they gate
+/// `resolve_control`, not capability introspection.
 pub fn descriptor_dev_control() -> ModelDescriptor {
     ModelDescriptor {
         id: FLUX1_DEV_CONTROL_ID,
@@ -300,17 +309,45 @@ impl Flux1DevControl {
     }
 }
 
-/// The Shakker Union-Pro-2.0 is an *input-agnostic* union ControlNet (pose / canny / depth share one
-/// VAE-encoded control path — the 2.0 checkpoint dropped the 1.0 discrete `control_mode` index), so the
-/// default [`AcceptedControlKinds::Any`] applies and the control boilerplate (resolve/validate-present +
-/// the load helpers) comes from the shared trait (sc-8241).
+/// The control kinds the Shakker Union-Pro-2.0 checkpoint admits: pose / canny / depth (input-agnostic
+/// — the kind is metadata, not a forward branch). Exposed as a free function so the policy is unit
+/// testable without a loaded generator (the [`ControlBranch::accepted_control_kinds`] method delegates
+/// here).
+fn accepted_control_kinds() -> AcceptedControlKinds {
+    AcceptedControlKinds::Only(vec![
+        ControlKind::Pose,
+        ControlKind::Canny,
+        ControlKind::Depth,
+    ])
+}
+
+/// The Shakker Union-Pro-2.0 is an *input-agnostic* union ControlNet: pose / canny / depth all share
+/// one VAE-encoded control path (the 2.0 checkpoint dropped the 1.0 discrete `control_mode` index — S0
+/// sc-8237 verified the whole Fun-Controlnet-Union family selects the control kind purely by which
+/// preprocessor produced the control image, NOT by a mode index). The control kind therefore never
+/// branches the forward; it is metadata only.
+///
+/// We accept exactly the three kinds Union-Pro-2.0 documents support
+/// ([`AcceptedControlKinds::Only`] of `Pose`/`Canny`/`Depth`) rather than the bare
+/// [`AcceptedControlKinds::Any`]: this rejects an unmodelled `ControlKind::Other(..)` at
+/// `resolve_control` with a clear message instead of silently feeding an unsupported hint through the
+/// VAE-encode path. All control boilerplate (resolve/validate-present + the load helpers) still comes
+/// from the shared trait (sc-8241).
 impl ControlBranch for Flux1DevControl {
     fn model_id(&self) -> &'static str {
         FLUX1_DEV_CONTROL_ID
     }
 
     fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        AcceptedControlKinds::Any
+        accepted_control_kinds()
+    }
+
+    fn unsupported_kind_message(&self, kind: &ControlKind) -> String {
+        // The trait default wording ("v1 supports pose control only") is Qwen-v1 specific. Union-Pro-2.0
+        // supports pose/canny/depth — say so.
+        format!(
+            "{FLUX1_DEV_CONTROL_ID} supports pose/canny/depth control (Fun-Controlnet-Union), got {kind:?}"
+        )
     }
 }
 
@@ -358,6 +395,44 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.supports_kv_cache);
         assert!(d.capabilities.mac_only);
+    }
+
+    #[test]
+    fn descriptor_mirrors_flux2_dev_control_shape() {
+        // The finalized FLUX.1 control descriptor mirrors the FLUX.2 `flux2_dev_control` capability
+        // shape (guidance-distilled dev base: guidance on, no negative/true-CFG/KV-cache, mac-only,
+        // LoRA/LoKr on, Q4/Q8) and declares a required `Control` conditioning. Neither declares a
+        // standalone `Depth` `ConditioningKind` — depth is a `ControlKind::Depth` control image.
+        let d = descriptor_dev_control();
+        assert!(d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_kv_cache);
+        assert!(d.capabilities.mac_only);
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert!(d.capabilities.accepts(ConditioningKind::Control));
+        assert!(!d.capabilities.accepts(ConditioningKind::Depth));
+    }
+
+    #[test]
+    fn accepted_control_kinds_are_pose_canny_depth() {
+        // Input-agnostic Union (S0 sc-8237): no discrete mode index; we accept exactly the three kinds
+        // Shakker Union-Pro-2.0 documents (pose/canny/depth) and reject an unmodelled `Other(..)`.
+        let policy = accepted_control_kinds();
+        assert_eq!(
+            policy,
+            AcceptedControlKinds::Only(vec![
+                ControlKind::Pose,
+                ControlKind::Canny,
+                ControlKind::Depth,
+            ])
+        );
+        assert!(policy.accepts(&ControlKind::Pose));
+        assert!(policy.accepts(&ControlKind::Canny));
+        assert!(policy.accepts(&ControlKind::Depth));
+        assert!(!policy.accepts(&ControlKind::Other("scribble".into())));
     }
 
     #[test]
