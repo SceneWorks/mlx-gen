@@ -7,16 +7,15 @@
 //! 1. **Timestep convention** — Lens feeds the transformer the *shifted sigma* directly (the
 //!    reference `timestep / 1000`, where `scheduler.timesteps = shifted_sigma · 1000`), **not** the
 //!    `1 − sigma` other mlx-gen DiTs use. [`timesteps`] returns those shifted sigmas.
-//! 2. **Norm-rescaled CFG** — [`cfg_rescale`]: `comb = uncond + g·(cond − uncond)`, then rescale
-//!    `comb` to carry `cond`'s per-token norm (`comb · ‖cond‖ / ‖comb‖` along the channel axis).
+//! 2. **Norm-rescaled CFG** — `comb = uncond + g·(cond − uncond)`, then rescale `comb` to carry
+//!    `cond`'s per-token norm (`comb · ‖cond‖ / ‖comb‖` along the channel axis). This now lives in the
+//!    backend-neutral `gen_core::guidance::cfg_rescale` (epic 7434), wired in from the
+//!    [`pipeline`](crate::pipeline) (`cfg_rescale`).
 //!
 //! The denoise step itself is the core flow-match Euler step ([`FlowMatchEuler::step`]).
 
-use mlx_rs::ops::{add, gt, maximum, multiply, ones_like, sqrt, subtract, sum_axes, which};
-use mlx_rs::Array;
-
 use mlx_gen::scheduler::compute_mu;
-use mlx_gen::{FlowMatchEuler, Result};
+use mlx_gen::FlowMatchEuler;
 
 /// Per-variant sampling defaults (`num_steps`, `guidance_scale`).
 #[derive(Clone, Copy, Debug)]
@@ -48,27 +47,4 @@ pub fn lens_schedule(num_steps: usize, latent_h: usize, latent_w: usize) -> Flow
 /// sigma directly, the reference `timestep / 1000`).
 pub fn timesteps(schedule: &FlowMatchEuler) -> Vec<f32> {
     schedule.sigmas[..schedule.num_steps()].to_vec()
-}
-
-/// Norm-rescaled classifier-free guidance (the reference per-step CFG).
-///
-/// `cond`/`uncond`: `[B, seq, C]` predictions. Returns
-/// `comb · (‖cond‖ / ‖comb‖)` per token (channel-axis L2 norm), with `comb = uncond + g·(cond −
-/// uncond)`; where `‖comb‖ = 0` the scale is `1` (matching the reference `torch.where`).
-pub fn cfg_rescale(cond: &Array, uncond: &Array, guidance: f32) -> Result<Array> {
-    let g = Array::from_f32(guidance);
-    let comb = add(uncond, &multiply(&subtract(cond, uncond)?, &g)?)?;
-
-    let norm = |x: &Array| -> Result<Array> {
-        Ok(sqrt(&sum_axes(&multiply(x, x)?, &[-1], true)?)?) // [B, seq, 1]
-    };
-    let cond_norm = norm(cond)?;
-    let comb_norm = norm(&comb)?;
-
-    let denom = maximum(&comb_norm, Array::from_f32(1e-12))?;
-    let ratio = mlx_rs::ops::divide(&cond_norm, &denom)?;
-    // scale = where(comb_norm > 0, cond_norm / max(comb_norm, 1e-12), 1).
-    let positive = gt(&comb_norm, Array::from_f32(0.0))?;
-    let scale = which(&positive, &ratio, &ones_like(&comb_norm)?)?;
-    Ok(multiply(&comb, &scale)?)
 }

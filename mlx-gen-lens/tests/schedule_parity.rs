@@ -10,8 +10,10 @@
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core::guidance::cfg_rescale;
 use mlx_gen::weights::Weights;
-use mlx_gen_lens::schedule::{cfg_rescale, lens_schedule, timesteps};
+use mlx_gen::MlxLatentOps;
+use mlx_gen_lens::schedule::{lens_schedule, timesteps};
 
 const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -75,12 +77,67 @@ fn lens_schedule_matches_reference() {
         assert!(d_step < 1e-4, "n={n} step peak_rel {d_step:.3e}");
     }
 
-    // (d) norm-rescaled CFG (guidance 5.0).
+    // (d) norm-rescaled CFG (guidance 5.0) — the migrated path: the shared per-token
+    // `gen_core::guidance::cfg_rescale` over the MLX ops (epic 7434 P3, sc-7441), the exact call the
+    // pipeline now makes. Still gated against the vendor `LensPipeline` golden `cfg_out`.
     let cond = g.require("cfg_cond").unwrap().clone();
     let uncond = g.require("cfg_uncond").unwrap().clone();
-    let got_cfg = cfg_rescale(&cond, &uncond, 5.0).unwrap();
+    let got_cfg = cfg_rescale(&MlxLatentOps, &cond, &uncond, 5.0, &[], &[-1]).unwrap();
     let d_cfg = peak_rel(&got_cfg, g.require("cfg_out").unwrap());
     eprintln!("cfg: peak_rel {d_cfg:.3e}");
     assert!(d_cfg < 1e-4, "cfg peak_rel {d_cfg:.3e}");
     eprintln!("ALL PASS");
+}
+
+/// The exact bespoke Lens `cfg_rescale` retired in sc-7441 (was `schedule.rs:58-74`), inlined here as
+/// the N1 byte-equivalence reference for [`migrated_cfg_rescale_is_byte_identical`].
+fn legacy_cfg_rescale(cond: &Array, uncond: &Array, guidance: f32) -> Array {
+    use mlx_rs::ops::{
+        add, divide, gt, maximum, multiply, ones_like, sqrt, subtract, sum_axes, which,
+    };
+    let g = Array::from_f32(guidance);
+    let diff = subtract(cond, uncond).unwrap();
+    let scaled = multiply(&diff, &g).unwrap();
+    let comb = add(uncond, &scaled).unwrap();
+    let norm = |x: &Array| {
+        let sq = multiply(x, x).unwrap();
+        let summed = sum_axes(&sq, &[-1], true).unwrap();
+        sqrt(&summed).unwrap()
+    };
+    let cond_norm = norm(cond);
+    let comb_norm = norm(&comb);
+    let denom = maximum(&comb_norm, Array::from_f32(1e-12)).unwrap();
+    let ratio = divide(&cond_norm, &denom).unwrap();
+    let positive = gt(&comb_norm, Array::from_f32(0.0)).unwrap();
+    let ones = ones_like(&comb_norm).unwrap();
+    let scale = which(&positive, &ratio, &ones).unwrap();
+    multiply(&comb, &scale).unwrap()
+}
+
+/// sc-7441 (epic 7434 P3) — the Lens CFG migration is a **bit-identical** drop-in: the shared
+/// `gen_core::guidance::cfg_rescale` over the MLX [`MlxLatentOps`] (per-token `[-1]`) must reproduce
+/// the retired bespoke `schedule::cfg_rescale` exactly on representative `[B, seq, C]` predictions.
+/// Weight-free (no golden needed) — proves N1 over the op graph itself, not just the vendor parity.
+#[test]
+fn migrated_cfg_rescale_is_byte_identical() {
+    let (b, seq, c) = (2usize, 37usize, 128usize);
+    let n = b * seq * c;
+    // Deterministic, non-trivial cond/uncond (spans signs/magnitudes; no RNG → reproducible).
+    let cond_v: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.013).sin() * 1.7 - 0.3)
+        .collect();
+    let uncond_v: Vec<f32> = (0..n)
+        .map(|i| (i as f32 * 0.021 + 1.0).cos() * 0.9)
+        .collect();
+    let shape = [b as i32, seq as i32, c as i32];
+    let cond = Array::from_slice(&cond_v, &shape);
+    let uncond = Array::from_slice(&uncond_v, &shape);
+
+    for &g in &[1.0f32, 5.0] {
+        let legacy = legacy_cfg_rescale(&cond, &uncond, g);
+        let migrated = cfg_rescale(&MlxLatentOps, &cond, &uncond, g, &[], &[-1]).unwrap();
+        let d = max_abs(&migrated, &legacy);
+        eprintln!("g={g}: migrated-vs-legacy max|Δ| = {d:e}");
+        assert_eq!(d, 0.0, "g={g} migration not bit-identical: max|Δ| = {d:e}");
+    }
 }

@@ -17,7 +17,7 @@
 //!   encode (`encode_prompt`).
 //! - **Joint CFG batch.** Each step runs the DiT once over `B·2` (here `B = 1`): `hidden = [x; x]`,
 //!   `encoder_features = [pos; neg]`. The output splits `cond, uncond`; the per-step guidance is the
-//!   **norm-rescaled** CFG ([`schedule::cfg_rescale`]).
+//!   **norm-rescaled** CFG (`cfg_rescale`, delegating to the shared `gen_core::guidance`).
 //! - **Timestep.** The transformer is fed the *shifted sigma* directly (the reference `timestep /
 //!   1000`, where `scheduler.timesteps = sigma · 1000`) — i.e. [`schedule::timesteps`].
 //! - **Latents.** `[B, latent_h · latent_w, 128]`, `latent_{h,w} = {height,width} / 16`; the denoise
@@ -26,17 +26,18 @@
 use mlx_rs::ops::{concatenate_axis, split, split_sections};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::gen_core;
 use mlx_gen::scheduler::compute_mu;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Image, Progress, Quant, Result,
-    TimestepConvention,
+    resolve_flow_schedule, run_flow_sampler, CancelFlag, Error, Image, MlxLatentOps, Progress,
+    Quant, Result, TimestepConvention,
 };
 use mlx_gen_flux2::{load_vae, Flux2Vae};
 
 use crate::config::GptOssConfig;
 use crate::dit::{LensDitConfig, LensTransformer};
-use crate::schedule::{self, cfg_rescale, lens_schedule};
+use crate::schedule::{self, lens_schedule};
 use crate::text::{LensTokenizer, TXT_OFFSET};
 use crate::text_encoder::encoder::LensTextEncoder;
 use crate::vae;
@@ -44,6 +45,23 @@ use crate::vae;
 /// The VAE downsample factor (`vae_scale_factor`): a Lens latent cell maps to a 16×16 pixel tile
 /// (Flux.2's 8× conv VAE composed with the 2× DiT patchify).
 pub const VAE_SCALE_FACTOR: u32 = 16;
+
+/// Norm-rescaled classifier-free guidance for Lens — the per-token (channel-axis `[-1]`) geometry of
+/// `[B, seq, C]` predictions, delegating to the backend-neutral [`gen_core::guidance::cfg_rescale`]
+/// (epic 7434 P3, sc-7441). Replaces the bespoke `schedule::cfg_rescale`: the math now lives once in
+/// gen-core, with the MLX [`MlxLatentOps`] supplying the ops. Byte-identical to the retired function
+/// (same combine op-order, `1e-12` floor, `where(‖comb‖>0, …, 1)` guard). `shape` is unused on the
+/// MLX backend (the `Array` carries its own shape), so an empty slice is passed.
+fn cfg_rescale(cond: &Array, uncond: &Array, guidance: f32) -> Result<Array> {
+    Ok(gen_core::guidance::cfg_rescale(
+        &MlxLatentOps,
+        cond,
+        uncond,
+        guidance,
+        &[],
+        &[-1],
+    )?)
+}
 
 /// Default harmony-preamble date (`Current date:`). The preamble is the first [`TXT_OFFSET`] tokens,
 /// which are **sliced off** before the DiT conditioning, so its `date` line never reaches the image
@@ -258,7 +276,7 @@ impl LensPipeline {
     /// per-generation `sampler` (integration method) + `scheduler` (σ schedule) knobs. Lens is
     /// rectified-flow (FLOW prediction) fed the **raw shifted sigma** as its timestep
     /// ([`TimestepConvention::Sigma`]); each step's velocity is the norm-rescaled joint-CFG combination
-    /// (one DiT forward over `[pos; neg]`, [`schedule::cfg_rescale`]) — the body of the legacy loop, now
+    /// (one DiT forward over `[pos; neg]`, `cfg_rescale`) — the body of the legacy loop, now
     /// driven by the curated solver.
     ///
     /// - `sampler_name`: a curated solver name (`euler` / `heun` / `dpmpp_2m` / `uni_pc` / …). `None`,
