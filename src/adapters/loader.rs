@@ -880,6 +880,202 @@ pub fn apply_lora_bfl(
     Ok(report)
 }
 
+// ---- BFL / ComfyUI fused→split LyCORIS LoKr / LoHa (sc-8345) --------------------------------------
+
+/// One BFL/ComfyUI LyCORIS destination: a split diffusers `target_path` plus the row-slice that carves
+/// this destination's rows out of the *fused* reconstructed `[out,in]` delta (`None` = a plain rename,
+/// the whole delta). Unlike [`BflTarget`] — which slices the raw LoRA up/down *factors* before the
+/// residual transpose — a LyCORIS adapter reconstructs the full Kronecker/Hadamard delta first and
+/// then slices its rows, so only the out-dim (`up`) slice is relevant here.
+#[derive(Clone, Debug)]
+struct BflLycorisTarget {
+    target_path: String,
+    out_slice: Option<LoraRowSlice>,
+}
+
+/// Build a `prefixed-module-path → [split target, …]` map from a host's [`BflTarget`] list, keyed by
+/// the module path *as a LyCORIS file spells it* — every `up_key` minus its `.lora_up.weight` /
+/// `.lora_B.weight` factor suffix, i.e. the `lora_unet_<flat>` / `diffusion_model.<dotted>` /
+/// `base_model.model.<dotted>` BFL spellings. A fused qkv source maps to its three split targets (each
+/// carrying its own out-dim slice); a rename maps to one target with no slice. The LyCORIS analog of
+/// [`bfl_index`] (which keys by full factor key + role because LoRA slices factors, not the delta).
+fn bfl_lycoris_module_map(targets: &[BflTarget]) -> BTreeMap<String, Vec<BflLycorisTarget>> {
+    let mut map: BTreeMap<String, Vec<BflLycorisTarget>> = BTreeMap::new();
+    for t in targets {
+        for up in &t.up_keys {
+            let Some(module) = up
+                .strip_suffix(".lora_up.weight")
+                .or_else(|| up.strip_suffix(".lora_B.weight"))
+            else {
+                continue;
+            };
+            let entry = map.entry(module.to_string()).or_default();
+            // The same module key appears under both the `lora_up` and `lora_B` spellings; keep one
+            // entry per destination.
+            if entry.iter().all(|e| e.target_path != t.target_path) {
+                entry.push(BflLycorisTarget {
+                    target_path: t.target_path.clone(),
+                    out_slice: t.up_slice.clone(),
+                });
+            }
+        }
+    }
+    map
+}
+
+/// The LyCORIS module path a key belongs to — `key` minus a trailing `.lokr_*` / `.hada_*` / `.alpha`
+/// factor suffix — or `None` if `key` is not a LyCORIS factor key.
+fn lycoris_module_of(key: &str) -> Option<&str> {
+    if let Some(module) = key.strip_suffix(".alpha") {
+        return Some(module);
+    }
+    LOKR_TP_SUFFIXES
+        .iter()
+        .chain(LOHA_TP_SUFFIXES.iter())
+        .find_map(|suffix| key.strip_suffix(suffix))
+}
+
+/// `true` if any LyCORIS factor key in `w` names a module in the BFL map — i.e. the file uses the
+/// BFL/ComfyUI fused naming a host's `bfl_targets()` covers. A diffusers/bare/standard-kohya LyCORIS
+/// file (modules like `transformer.…` or a `lora_unet_<diffusers-flat>` that resolves through the
+/// kohya table) shares none of these spellings, so it is never misrouted here and stays on the
+/// existing third-party/peft path. Empty map (a host with no BFL surface — every engine but FLUX.1/
+/// FLUX.2) ⇒ always `false`.
+fn is_bfl_lycoris(w: &Weights, map: &BTreeMap<String, Vec<BflLycorisTarget>>) -> bool {
+    if map.is_empty() {
+        return false;
+    }
+    w.keys()
+        .any(|k| lycoris_module_of(k).is_some_and(|module| map.contains_key(module)))
+}
+
+/// Install grouped LyCORIS deltas onto a host's BFL fused→split targets (sc-8345). For each source
+/// module the `reconstruct` closure rebuilds the FULL fused `[out,in]` delta (the host-fused qkv shape,
+/// with the format's `alpha/rank` scale already baked in); each destination then row-slices its share
+/// out of that delta and stacks it as an [`Adapter::Lokr`] residual at the user `scale`. The fused
+/// `out` is the SUM of the destinations' out dims (3·inner for a qkv split, Σdims for FLUX.1's qkv+mlp,
+/// the target's own out for a rename), so it is derived from the resolved targets rather than parsed
+/// from the slice. A module absent from `map` is surfaced in `unmatched_paths`, never silently dropped.
+fn install_bfl_lycoris<I, F>(
+    host: &mut impl AdaptableHost,
+    map: &BTreeMap<String, Vec<BflLycorisTarget>>,
+    groups: I,
+    scale: f32,
+) -> Result<ApplyReport>
+where
+    I: IntoIterator<Item = (String, F)>,
+    F: FnOnce(&[i32]) -> Result<Array>,
+{
+    let mut report = ApplyReport::default();
+    for (module, reconstruct) in groups {
+        let Some(targets) = map.get(&module) else {
+            report.unmatched_paths.push(module);
+            continue;
+        };
+        // Fused reconstruction shape: rows = Σ destination out dims, cols = the shared in dim. Resolve
+        // each destination's base shape up front (the mutable apply borrow comes after reconstruction).
+        let mut fused_out = 0i32;
+        let mut in_dim: Option<i32> = None;
+        let mut resolvable = true;
+        for tgt in targets {
+            let parts: Vec<&str> = tgt.target_path.split('.').collect();
+            match host.adaptable_mut(&parts).map(|lin| lin.base_shape()) {
+                Some(shape) if shape.len() == 2 => {
+                    fused_out += shape[0];
+                    in_dim.get_or_insert(shape[1]);
+                }
+                _ => {
+                    resolvable = false;
+                    break;
+                }
+            }
+        }
+        let (Some(in_dim), true) = (in_dim, resolvable) else {
+            // A destination that didn't resolve (or a non-2-D linear) — surface the module rather than
+            // install a partial, mis-shaped delta.
+            report.unmatched_paths.push(module);
+            continue;
+        };
+        let delta = reconstruct(&[fused_out, in_dim])?;
+        for tgt in targets {
+            let parts: Vec<&str> = tgt.target_path.split('.').collect();
+            let Some(lin) = host.adaptable_mut(&parts) else {
+                report.unmatched_paths.push(tgt.target_path.clone());
+                continue;
+            };
+            let piece = match &tgt.out_slice {
+                Some(slice) => slice.apply(&delta)?,
+                None => delta.clone(),
+            };
+            lin.push(Adapter::Lokr {
+                delta: piece,
+                scale,
+            });
+            report.applied += 1;
+        }
+    }
+    Ok(report)
+}
+
+/// Install a metadata-stamped (peft) LoKr file in BFL/ComfyUI fused naming (sc-8345). Same Kronecker
+/// reconstruction + `alpha/rank` fold as [`apply_lokr`], but the fused qkv source is rebuilt at the
+/// host-fused shape and row-sliced into the split targets via [`install_bfl_lycoris`].
+fn apply_lokr_bfl(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+    map: &BTreeMap<String, Vec<BflLycorisTarget>>,
+) -> Result<ApplyReport> {
+    let file = parse_lokr(w)?;
+    let (alpha, rank) = (file.alpha, file.rank);
+    let groups = file.groups.into_iter().map(|(module, factors)| {
+        (module, move |base: &[i32]| {
+            reconstruct_lokr_delta(
+                alpha,
+                rank,
+                base,
+                factors.get("lokr_w1"),
+                factors.get("lokr_w1_a"),
+                factors.get("lokr_w1_b"),
+                factors.get("lokr_w2"),
+                factors.get("lokr_w2_a"),
+                factors.get("lokr_w2_b"),
+                Dtype::Bfloat16,
+            )
+        })
+    });
+    install_bfl_lycoris(host, map, groups, scale)
+}
+
+/// Install a third-party LyCORIS **LoKr** file in BFL/ComfyUI fused naming (sc-8345). Per-module
+/// lycoris scale + tucker-capable Kronecker reconstruction (same as [`apply_lokr_thirdparty`]), fused→
+/// split via [`install_bfl_lycoris`].
+fn apply_lokr_thirdparty_bfl(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+    map: &BTreeMap<String, Vec<BflLycorisTarget>>,
+) -> Result<ApplyReport> {
+    let groups = parse_lokr_thirdparty(w)?
+        .into_iter()
+        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, Dtype::Bfloat16)));
+    install_bfl_lycoris(host, map, groups, scale)
+}
+
+/// Install a third-party LyCORIS **LoHa** file in BFL/ComfyUI fused naming (sc-8345). Hadamard
+/// reconstruction (same as [`apply_loha_thirdparty`]), fused→split via [`install_bfl_lycoris`].
+fn apply_loha_thirdparty_bfl(
+    host: &mut impl AdaptableHost,
+    w: &Weights,
+    scale: f32,
+    map: &BTreeMap<String, Vec<BflLycorisTarget>>,
+) -> Result<ApplyReport> {
+    let groups = parse_loha_thirdparty(w)?
+        .into_iter()
+        .map(|(module, g)| (module, move |base: &[i32]| g.delta(base, Dtype::Bfloat16)));
+    install_bfl_lycoris(host, map, groups, scale)
+}
+
 /// Load and install every adapter in `specs` onto `host`, stacking in order. Each spec's file is
 /// read, dispatched to the LoKr or PEFT-LoRA loader by its [`AdapterKind`], applied at `spec.scale`,
 /// and its [`ApplyReport`] merged into the combined result — unmatched target paths are surfaced,
@@ -957,6 +1153,7 @@ pub fn apply_adapter_specs_autoprefix(
     // build each lazily and only once, the first time it is needed across `specs`.
     let mut kohya: Option<BTreeMap<String, String>> = None;
     let mut bfl: Option<Vec<BflTarget>> = None;
+    let mut bfl_lyc: Option<BTreeMap<String, Vec<BflLycorisTarget>>> = None;
     let mut combined = ApplyReport::default();
     for spec in specs {
         // Load + classify the file once: the dispatch chain below (and the fallback that used to
@@ -965,7 +1162,23 @@ pub fn apply_adapter_specs_autoprefix(
         // them up to four times per spec (F-004).
         let w = Weights::from_file(&spec.path)?;
         let is_lokr_w = is_lokr(&w);
-        // BFL / ComfyUI fused→split naming (sc-2743) is the orthogonal axis to kohya flattening and
+        // A LyCORIS file (peft/metadata LoKr, keyed third-party LoKr, or LoHa) can ship in BFL/ComfyUI
+        // fused naming on a FLUX host; detect that up front so the three LyCORIS arms below route to the
+        // fused→split appliers (sc-8345). Non-FLUX hosts have an empty BFL surface ⇒ never matches.
+        let is_lokr_keys_w = !is_lokr_w && is_lokr_keys(&w);
+        let is_loha_keys_w = is_loha_keys(&w);
+        let is_bfl_lycoris_file = if is_lokr_w || is_lokr_keys_w || is_loha_keys_w {
+            if bfl.is_none() {
+                bfl = Some(host.bfl_targets());
+            }
+            if bfl_lyc.is_none() {
+                bfl_lyc = Some(bfl_lycoris_module_map(bfl.as_ref().unwrap()));
+            }
+            is_bfl_lycoris(&w, bfl_lyc.as_ref().unwrap())
+        } else {
+            false
+        };
+        // BFL / ComfyUI fused→split LoRA naming (sc-2743) is the orthogonal axis to kohya flattening and
         // shares the `lora_unet_` prefix, so it must be detected BEFORE `is_kohya`. (LoKr first.)
         let is_bfl_file = if is_lokr_w {
             false
@@ -975,15 +1188,24 @@ pub fn apply_adapter_specs_autoprefix(
             }
             is_bfl(&w, bfl.as_ref().unwrap())
         };
-        let report = if !is_lokr_w && is_lokr_keys(&w) {
-            // Third-party LyCORIS LoKr (sc-3642): `lokr_*` keys, no `networkType` stamp. Detect by
-            // keys and route BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the
-            // `lora_unet_` prefix, so is_kohya would otherwise claim it and apply nothing.
-            apply_lokr_thirdparty(host, &w, spec.scale)?
-        } else if is_loha_keys(&w) {
-            // Third-party LyCORIS LoHa (sc-3643): `hada_*` keys. Same reasoning — route before
-            // is_bfl/is_kohya (a kohya-flattened LoHa also carries the `lora_unet_` prefix).
-            apply_loha_thirdparty(host, &w, spec.scale)?
+        let report = if is_lokr_keys_w {
+            // Third-party LyCORIS LoKr (sc-3642): `lokr_*` keys, no `networkType` stamp. Route to the
+            // fused→split applier when BFL/ComfyUI-named (sc-8345), else the bare/diffusers/kohya path.
+            // Detected BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the `lora_unet_`
+            // prefix, so is_kohya would otherwise claim it and apply nothing.
+            if is_bfl_lycoris_file {
+                apply_lokr_thirdparty_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
+            } else {
+                apply_lokr_thirdparty(host, &w, spec.scale)?
+            }
+        } else if is_loha_keys_w {
+            // Third-party LyCORIS LoHa (sc-3643): `hada_*` keys. Same reasoning — BFL fused→split when
+            // BFL-named (sc-8345), else the bare/diffusers/kohya path.
+            if is_bfl_lycoris_file {
+                apply_loha_thirdparty_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
+            } else {
+                apply_loha_thirdparty(host, &w, spec.scale)?
+            }
         } else if is_bfl_file {
             apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
         } else if !is_lokr_w && is_kohya(&w) {
@@ -998,7 +1220,15 @@ pub fn apply_adapter_specs_autoprefix(
             // already excluded third-party LoKr/LoHa keys, so call the leaf appliers directly with the
             // already-loaded `w` instead of re-reading the file via `apply_adapter_specs` (F-004).
             match spec.kind {
-                AdapterKind::Lokr => apply_lokr(host, &w, spec.scale)?,
+                AdapterKind::Lokr => {
+                    // metadata-stamped LoKr — BFL fused→split when BFL/ComfyUI-named (sc-8345), else
+                    // the bare dotted-path applier.
+                    if is_bfl_lycoris_file {
+                        apply_lokr_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
+                    } else {
+                        apply_lokr(host, &w, spec.scale)?
+                    }
+                }
                 AdapterKind::Lora => {
                     if is_lokr_w {
                         // The file's metadata is authoritative; a kind/metadata mismatch is a caller
@@ -1056,6 +1286,7 @@ mod tests {
     use super::*;
     use crate::adapters::{AdaptableLinear, Adapter};
     use crate::runtime::{AdapterKind, AdapterSpec};
+    use mlx_rs::ops::indexing::TryIndexOp;
     use mlx_rs::ops::{all_close, array_eq};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1504,6 +1735,365 @@ mod tests {
         let report = apply_lokr(&mut host, &w, 1.0).unwrap();
         assert_eq!(report.applied, 0);
         assert_eq!(report.unmatched_paths, vec!["missing.path".to_string()]);
+    }
+
+    // ---- BFL/ComfyUI fused→split LyCORIS (sc-8345) ------------------------------------------------
+
+    /// A host with a BFL surface: the three split attention projections (`to_q/to_k/to_v`, the fused-
+    /// qkv destinations) plus a rename destination (`to_out`), and a `bfl_targets()` mapping the fused
+    /// `diffusion_model.double_blocks.0.img_attn.{qkv,proj}` BFL names onto them — the minimal shape of
+    /// a FLUX `Flux2Transformer` for the LyCORIS fused→split path.
+    struct BflHost {
+        mods: HashMap<String, AdaptableLinear>,
+    }
+    impl BflHost {
+        fn new() -> Self {
+            let mut mods = HashMap::new();
+            // qkv splits: each [out=2, in=3] → the fused source is [6, 3].
+            for dst in ["to_q", "to_k", "to_v"] {
+                mods.insert(
+                    format!("transformer_blocks.0.attn.{dst}"),
+                    AdaptableLinear::dense(Array::from_slice(&[0.0f32; 6], &[2, 3]), None),
+                );
+            }
+            // rename dest: [out=4, in=4].
+            mods.insert(
+                "transformer_blocks.0.attn.to_out".to_string(),
+                AdaptableLinear::dense(Array::from_slice(&[0.0f32; 16], &[4, 4]), None),
+            );
+            Self { mods }
+        }
+    }
+    impl AdaptableHost for BflHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            self.mods.get_mut(&path.join("."))
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            self.mods.keys().cloned().collect()
+        }
+        fn bfl_targets(&self) -> Vec<BflTarget> {
+            let block_keys = |module: &str| {
+                (
+                    vec![
+                        format!("diffusion_model.{module}.lora_B.weight"),
+                        format!("diffusion_model.{module}.lora_up.weight"),
+                    ],
+                    vec![
+                        format!("diffusion_model.{module}.lora_A.weight"),
+                        format!("diffusion_model.{module}.lora_down.weight"),
+                    ],
+                    vec![format!("diffusion_model.{module}.alpha")],
+                )
+            };
+            let mut out = Vec::new();
+            let (up, down, alpha) = block_keys("double_blocks.0.img_attn.qkv");
+            for (idx, dst) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+                out.push(BflTarget {
+                    target_path: format!("transformer_blocks.0.attn.{dst}"),
+                    up_keys: up.clone(),
+                    down_keys: down.clone(),
+                    alpha_keys: alpha.clone(),
+                    up_slice: Some(LoraRowSlice::Chunk {
+                        n: 3,
+                        index: idx as i32,
+                    }),
+                    down_slice: Some(LoraRowSlice::ChunkIfDivisible {
+                        n: 3,
+                        index: idx as i32,
+                    }),
+                });
+            }
+            let (up, down, alpha) = block_keys("double_blocks.0.img_attn.proj");
+            out.push(BflTarget {
+                target_path: "transformer_blocks.0.attn.to_out".to_string(),
+                up_keys: up,
+                down_keys: down,
+                alpha_keys: alpha,
+                up_slice: None,
+                down_slice: None,
+            });
+            out
+        }
+    }
+
+    /// A `networkType=lokr` file in BFL/ComfyUI fused naming (`diffusion_model.…img_attn.qkv` fused,
+    /// `…img_attn.proj` renamed) must apply onto a FLUX-shaped host: the fused qkv delta is rebuilt at
+    /// `[6,3]` and row-sliced into `to_q/to_k/to_v`, and the proj rename lands whole on `to_out`. Before
+    /// sc-8345 every target surfaced as unmatched (the strict apply errored). Exercises the full
+    /// `apply_adapters_strict` dispatch, not just the leaf applier.
+    #[test]
+    fn bfl_named_lokr_fused_qkv_and_rename_resolve() {
+        // Fused qkv LoKr: kron(w1[3,1], w2[2,3]) → [6,3].
+        let qkv_w1 = Array::from_slice(&[1.0f32, 0.5, -0.25], &[3, 1]);
+        let qkv_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        // Proj rename LoKr: kron(w1[2,2], w2[2,2]) → [4,4].
+        let proj_w1 = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2]);
+        let proj_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), "1.0".to_string());
+        meta.insert("rank".to_string(), "1".to_string());
+        let path = tmp("bfl_lokr_fused.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w1",
+                    &qkv_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2",
+                    &qkv_w2,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w1",
+                    &proj_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w2",
+                    &proj_w2,
+                ),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+
+        let mut host = BflHost::new();
+        let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lokr);
+        let report =
+            apply_adapters_strict(&mut host, std::slice::from_ref(&spec), "flux2_klein_9b")
+                .unwrap();
+        assert_eq!(report.applied, 4);
+        assert!(report.unmatched_paths.is_empty());
+
+        // The fused qkv delta, reconstructed independently at the fused shape, row-sliced into thirds.
+        let full = reconstruct_lokr_delta(
+            1.0,
+            1.0,
+            &[6, 3],
+            Some(&qkv_w1),
+            None,
+            None,
+            Some(&qkv_w2),
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        for (idx, dst) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let lin = host
+                .adaptable_mut(&["transformer_blocks", "0", "attn", dst])
+                .unwrap();
+            let Adapter::Lokr { delta, scale } = &lin.adapters()[0] else {
+                panic!("expected a LoKr adapter on {dst}");
+            };
+            assert_eq!(*scale, 1.0);
+            let start = idx as i32 * 2;
+            let want = full.try_index((start..start + 2, ..)).unwrap();
+            assert!(
+                all_close(delta, &want, 1e-5, 1e-5, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "qkv split {dst} delta mismatch"
+            );
+        }
+
+        // Proj rename lands whole on to_out.
+        let proj_full = reconstruct_lokr_delta(
+            1.0,
+            1.0,
+            &[4, 4],
+            Some(&proj_w1),
+            None,
+            None,
+            Some(&proj_w2),
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        let lin = host
+            .adaptable_mut(&["transformer_blocks", "0", "attn", "to_out"])
+            .unwrap();
+        let Adapter::Lokr { delta, .. } = &lin.adapters()[0] else {
+            panic!("expected a LoKr adapter on to_out");
+        };
+        assert!(all_close(delta, &proj_full, 1e-5, 1e-5, false)
+            .unwrap()
+            .item::<bool>());
+    }
+
+    /// A bare diffusers-named LoKr (split `to_q` directly, no BFL fused name) on the SAME BFL host must
+    /// still route through the ordinary `apply_lokr` path, NOT the fused→split one — `is_bfl_lycoris`
+    /// keys only off the BFL spellings, so non-BFL LyCORIS is untouched by sc-8345.
+    #[test]
+    fn bare_diffusers_lokr_on_bfl_host_stays_on_plain_path() {
+        // kron(w1[2,1], w2[1,3]) → [2,3], the shape of the split to_q.
+        let w1 = Array::from_slice(&[1.0f32, 0.5], &[2, 1]);
+        let w2 = Array::from_slice(&[0.1f32, 0.2, 0.3], &[1, 3]);
+        let mut meta = HashMap::new();
+        meta.insert("networkType".to_string(), "lokr".to_string());
+        meta.insert("alpha".to_string(), "1.0".to_string());
+        meta.insert("rank".to_string(), "1".to_string());
+        let path = tmp("bare_lokr_on_bfl_host.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("transformer_blocks.0.attn.to_q.lokr_w1", &w1),
+                ("transformer_blocks.0.attn.to_q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        let mut host = BflHost::new();
+        let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lokr);
+        let report =
+            apply_adapter_specs_autoprefix(&mut host, std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.unmatched_paths.is_empty());
+        let lin = host
+            .adaptable_mut(&["transformer_blocks", "0", "attn", "to_q"])
+            .unwrap();
+        assert!(matches!(lin.adapters()[0], Adapter::Lokr { .. }));
+    }
+
+    /// A third-party LyCORIS LoKr (no `networkType` stamp — detected by `lokr_*` keys) in BFL fused
+    /// naming routes through the fused→split applier too (sc-8345). Both-full factors ⇒ lycoris scale 1.
+    #[test]
+    fn bfl_named_thirdparty_lokr_fused_qkv_resolves() {
+        // kron(w1[3,1], w2[2,3]) → [6,3]; both factors full ⇒ scale 1.0.
+        let qkv_w1 = Array::from_slice(&[1.0f32, 0.5, -0.25], &[3, 1]);
+        let qkv_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
+        let proj_w1 = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0], &[2, 2]);
+        let proj_w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let path = tmp("bfl_tp_lokr_fused.safetensors");
+        // NO `networkType` metadata → is_lokr() false, is_lokr_keys() true (the third-party path).
+        Array::save_safetensors(
+            vec![
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w1",
+                    &qkv_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2",
+                    &qkv_w2,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w1",
+                    &proj_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w2",
+                    &proj_w2,
+                ),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let mut host = BflHost::new();
+        let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora); // kind irrelevant — keys route it
+        let report =
+            apply_adapters_strict(&mut host, std::slice::from_ref(&spec), "flux2_klein_9b")
+                .unwrap();
+        assert_eq!(report.applied, 4);
+        assert!(report.unmatched_paths.is_empty());
+
+        let full = reconstruct_lokr_delta_scaled(
+            1.0,
+            &[6, 3],
+            Some(&qkv_w1),
+            None,
+            None,
+            Some(&qkv_w2),
+            None,
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        for (idx, dst) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let lin = host
+                .adaptable_mut(&["transformer_blocks", "0", "attn", dst])
+                .unwrap();
+            let Adapter::Lokr { delta, .. } = &lin.adapters()[0] else {
+                panic!("expected a LoKr adapter on {dst}");
+            };
+            let start = idx as i32 * 2;
+            let want = full.try_index((start..start + 2, ..)).unwrap();
+            assert!(all_close(delta, &want, 1e-5, 1e-5, false)
+                .unwrap()
+                .item::<bool>());
+        }
+    }
+
+    /// A third-party LyCORIS LoHa (`hada_*` keys) in BFL fused naming routes through the fused→split
+    /// applier (sc-8345); the Hadamard delta is rebuilt at the fused shape, then row-sliced.
+    #[test]
+    fn bfl_named_loha_fused_qkv_resolves() {
+        // (w1_a@w1_b) ⊙ (w2_a@w2_b) at [6,3], rank r=1 ⇒ scale 1.0.
+        let w1_a = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[6, 1]);
+        let w1_b = Array::from_slice(&[1.0f32, -1.0, 0.5], &[1, 3]);
+        let w2_a = Array::from_slice(&[0.6f32, 0.5, 0.4, 0.3, 0.2, 0.1], &[6, 1]);
+        let w2_b = Array::from_slice(&[0.2f32, 0.4, -0.2], &[1, 3]);
+        let path = tmp("bfl_loha_fused.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.hada_w1_a",
+                    &w1_a,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.hada_w1_b",
+                    &w1_b,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.hada_w2_a",
+                    &w2_a,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.hada_w2_b",
+                    &w2_b,
+                ),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let mut host = BflHost::new();
+        let spec = AdapterSpec::new(path, 1.0, AdapterKind::Lora);
+        let report =
+            apply_adapters_strict(&mut host, std::slice::from_ref(&spec), "flux2_klein_9b")
+                .unwrap();
+        // Only the fused qkv is present → the three splits; proj/to_out untouched (no factors for it).
+        assert_eq!(report.applied, 3);
+        assert!(report.unmatched_paths.is_empty());
+
+        let full = reconstruct_loha_delta(
+            1.0,
+            &[6, 3],
+            &w1_a,
+            &w1_b,
+            &w2_a,
+            &w2_b,
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        for (idx, dst) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let lin = host
+                .adaptable_mut(&["transformer_blocks", "0", "attn", dst])
+                .unwrap();
+            let Adapter::Lokr { delta, .. } = &lin.adapters()[0] else {
+                panic!("expected an installed delta on {dst}");
+            };
+            let start = idx as i32 * 2;
+            let want = full.try_index((start..start + 2, ..)).unwrap();
+            assert!(all_close(delta, &want, 1e-5, 1e-5, false)
+                .unwrap()
+                .item::<bool>());
+        }
     }
 
     /// The load-time connector stacks a mixed LoRA + LoKr spec list and is equivalent to calling

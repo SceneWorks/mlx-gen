@@ -2171,6 +2171,102 @@ mod tests {
         }
     }
 
+    /// sc-8345 regression: a metadata LoKr in BFL/ComfyUI `diffusion_model.` fused naming — the exact
+    /// convention from the reported `flux2_klein_9b_edit` failure ("112 adapter target(s) matched no
+    /// module") — must now resolve on the real `Flux2Transformer`. The fused img-qkv reconstructs at the
+    /// fused shape and row-slices into to_q/to_k/to_v; the `img_attn.proj` rename lands whole on to_out.
+    /// `apply_flux2_adapters` goes through the strict no-silent-drop policy, so the `.unwrap()` itself
+    /// proves zero unmatched (pre-fix it would Err); correctness of each slice is checked against an
+    /// independent reconstruct-then-slice (LoKr can't be expressed as a per-split file the way LoRA can).
+    #[test]
+    fn bfl_named_lokr_resolves_on_real_transformer() {
+        use crate::adapters::apply_flux2_adapters;
+        use mlx_gen::adapters::{reconstruct_lokr_delta, Adapter};
+        use mlx_gen::runtime::{AdapterKind, AdapterSpec};
+        use mlx_rs::ops::indexing::TryIndexOp;
+        use mlx_rs::Dtype;
+
+        // tiny_transformer linears are all [1,1] → the fused img-qkv source is [3,1], proj is [1,1].
+        let qkv_w1 = Array::from_slice(&[1.0f32, 0.5, -0.25], &[3, 1]);
+        let qkv_w2 = Array::from_slice(&[2.0f32], &[1, 1]);
+        let proj_w1 = Array::from_slice(&[0.3f32], &[1, 1]);
+        let proj_w2 = Array::from_slice(&[1.5f32], &[1, 1]);
+        let meta = std::collections::HashMap::from([
+            ("networkType".to_string(), "lokr".to_string()),
+            ("alpha".to_string(), "1.0".to_string()),
+            ("rank".to_string(), "1".to_string()),
+        ]);
+        let path = tmp("flux2_bfl_lokr_diffmodel.safetensors");
+        Array::save_safetensors(
+            vec![
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w1",
+                    &qkv_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.qkv.lokr_w2",
+                    &qkv_w2,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w1",
+                    &proj_w1,
+                ),
+                (
+                    "diffusion_model.double_blocks.0.img_attn.proj.lokr_w2",
+                    &proj_w2,
+                ),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+
+        let mut t = tiny_transformer();
+        let report = apply_flux2_adapters(
+            &mut t,
+            &[AdapterSpec {
+                path,
+                scale: 0.7,
+                kind: AdapterKind::Lokr,
+                pass_scales: None,
+                moe_expert: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(report.applied, 4, "3 qkv splits + 1 proj rename");
+        assert!(report.unmatched_paths.is_empty());
+
+        let full = reconstruct_lokr_delta(
+            1.0,
+            1.0,
+            &[3, 1],
+            Some(&qkv_w1),
+            None,
+            None,
+            Some(&qkv_w2),
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap();
+        for (idx, dst) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            let segs = ["transformer_blocks", "0", "attn", dst];
+            let lin = AdaptableHost::adaptable_mut(&mut t, &segs).unwrap();
+            let Adapter::Lokr { delta, scale } = &lin.adapters()[0] else {
+                panic!("expected a LoKr adapter at {dst}");
+            };
+            assert_eq!(*scale, 0.7);
+            let start = idx as i32;
+            let want = full.try_index((start..start + 1, ..)).unwrap();
+            assert!(
+                mlx_rs::ops::all_close(delta, &want, 1e-5, 1e-5, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "qkv split {dst} delta mismatch"
+            );
+        }
+    }
+
     /// sc-2743: BFL plain renames resolve across all three prefix conventions — `base_model.model.`
     /// globals (`img_in`→`x_embedder`, `final_layer.linear`→`proj_out`), a `diffusion_model.` dotted
     /// block (`…img_attn.proj`→`to_out`), and a `base_model.model.` dotted single block
