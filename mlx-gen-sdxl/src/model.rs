@@ -30,9 +30,9 @@ use crate::inpaint::{preprocess_mask, InpaintBlend};
 use crate::ip_adapter::IpImageEncoder;
 use crate::loader;
 use crate::pipeline::{
-    decode_image, denoise, denoise_curated, denoise_inpaint, denoise_ip, denoise_multi_control,
-    encode_conditioning, encode_init_latents, preprocess_control_image, text_time_ids,
-    ControlContext, Denoiser,
+    decode_image, denoise, denoise_cfgpp, denoise_curated, denoise_inpaint, denoise_ip,
+    denoise_multi_control, encode_conditioning, encode_init_latents, preprocess_control_image,
+    text_time_ids, ControlContext, Denoiser,
 };
 use crate::sampler::{AncestralEuler, EulerSampler};
 use crate::text_encoder::ClipTextEncoder;
@@ -144,10 +144,11 @@ pub fn descriptor() -> ModelDescriptor {
                 s.extend(curated_scheduler_names());
                 s
             },
-            // Plain CFG, now the shared `gen_core::guidance::cfg` over `MlxLatentOps` (epic 7434 P3,
-            // sc-7443); the dual-forward `denoise_core` combine is byte-identical to the retired hand
-            // form. Shared by Kolors/InstantID/PuLID via `denoise_core`.
-            supported_guidance_methods: vec!["cfg"],
+            // Plain CFG (the shared `gen_core::guidance::cfg` over `MlxLatentOps`, epic 7434 P3 sc-7443;
+            // byte-identical to the retired hand form, shared by Kolors/InstantID/PuLID via
+            // `denoise_core`), plus CFG++ (`cfg_pp`, sc-8256) on the curated path — gated at dispatch to a
+            // CFG++-compatible base solver (euler/ddim/dpmpp_2m) + an active guidance gap.
+            supported_guidance_methods: vec!["cfg", "cfg_pp"],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
@@ -548,23 +549,50 @@ impl Sdxl {
                     (full_sigmas, init)
                 };
                 let ip = ip_tokens.as_ref().map(|t| (t, ip_scale));
-                let latents = denoise_curated(
-                    &self.unet,
-                    Some(sampler_name),
-                    &ms,
-                    &run_sigmas,
-                    init,
-                    &conditioning,
-                    &pooled,
-                    &time_ids,
-                    cfg,
-                    seed,
-                    &req.cancel,
-                    on_progress,
-                    &control_ctxs,
-                    ip,
-                    None,
-                )?;
+                // CFG++ (sc-8256): opt-in via `guidance_method == "cfg_pp"`, only with a CFG++-compatible
+                // base solver (euler/ddim/dpmpp_2m) and an active guidance gap (`cfg > 1`). Anything else
+                // — including `cfg_pp` on an incompatible sampler — falls back to the plain curated path
+                // (N3, never a hard-fail), so the default is byte-untouched.
+                let want_cfgpp = req.guidance_method.as_deref() == Some("cfg_pp")
+                    && cfg > 1.0
+                    && Solver::from_name(sampler_name)
+                        .is_some_and(mlx_gen::gen_core::sampling::base_supports_cfgpp);
+                let latents = if want_cfgpp {
+                    denoise_cfgpp(
+                        &self.unet,
+                        Some(sampler_name),
+                        &ms,
+                        &run_sigmas,
+                        init,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        cfg,
+                        &req.cancel,
+                        on_progress,
+                        &control_ctxs,
+                        ip,
+                        None,
+                    )?
+                } else {
+                    denoise_curated(
+                        &self.unet,
+                        Some(sampler_name),
+                        &ms,
+                        &run_sigmas,
+                        init,
+                        &conditioning,
+                        &pooled,
+                        &time_ids,
+                        cfg,
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                        &control_ctxs,
+                        ip,
+                        None,
+                    )?
+                };
                 on_progress(Progress::Decoding);
                 images.push(decode_image(&self.vae, &latents, pid_ref)?);
                 continue;

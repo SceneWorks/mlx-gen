@@ -570,6 +570,101 @@ pub fn denoise_curated(
     )
 }
 
+/// CFG++ denoise (epic 7434 P3, sc-8256) — the [`denoise_curated`] twin that routes through
+/// [`mlx_gen::run_cfgpp_sampler`]. Same U-Net forward + CFG combine, but it surfaces the unconditional
+/// branch (`eps_neg`) alongside the guided combine so the CFG++ solver can land on the guided `x0` while
+/// renoising from the unconditional one (Chung et al.). Selected only when `guidance_method == "cfg_pp"`,
+/// a CFG++-compatible base sampler is chosen, AND CFG is active (`cfg > 1`) — CFG++ is meaningless
+/// without a guidance gap (the caller guarantees `cfg_on`). `base_sampler_name` is the base solver
+/// (`euler`/`ddim`/`dpmpp_2m`); the guided combine reuses the shared `gen_core::guidance::cfg`, so at
+/// matched `cfg` the guided trajectory anchor is byte-identical to the plain path.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfgpp(
+    unet: &UNet2DConditionModel,
+    base_sampler_name: Option<&str>,
+    ms: &mlx_gen::DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Array,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    cfg: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    ip: Option<(&Array, f32)>,
+    control_encoder: Option<&Array>,
+) -> Result<Array> {
+    let _compile_glue = crate::CompileGlueGuard::enable();
+    let cn_enc = control_encoder.unwrap_or(conditioning);
+    mlx_gen::run_cfgpp_sampler(
+        base_sampler_name,
+        ms,
+        sigmas,
+        latents,
+        cancel,
+        on_progress,
+        |x_in, timestep| {
+            // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
+            let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
+            let x_unet = concatenate_axis(&[&x16, &x16], 0)?;
+            let combined: Option<ControlResiduals> = {
+                let mut acc: Option<ControlResiduals> = None;
+                for cc in controls {
+                    let res = cc.controlnet.forward(
+                        &x_unet,
+                        &cc.cond_embed,
+                        timestep,
+                        cn_enc,
+                        pooled,
+                        time_ids,
+                        cc.scale,
+                    )?;
+                    acc = Some(match acc {
+                        None => res,
+                        Some(prev) => prev.add(&res)?,
+                    });
+                }
+                acc
+            };
+            let eps = match (ip, combined.as_ref()) {
+                (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                    res,
+                )?,
+                (Some((tokens, scale)), None) => unet.forward_with_ip(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    (tokens, scale),
+                )?,
+                (None, Some(res)) => unet.forward_with_control(
+                    &x_unet,
+                    timestep,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    res,
+                )?,
+                (None, None) => unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
+            };
+            // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
+            let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
+            let eps_text = row(0)?;
+            let eps_neg = row(1)?;
+            let guided = gen_core::guidance::cfg(&MlxLatentOps, &eps_text, &eps_neg, cfg)?;
+            Ok((guided, eps_neg))
+        },
+    )
+}
+
 /// Seed the global RNG and sample the prior latents `[1, height/8, width/8, 4]` (NHWC, f32).
 pub fn seeded_prior(sampler: &EulerSampler, seed: u64, width: u32, height: u32) -> Result<Array> {
     random::seed(seed)?;
