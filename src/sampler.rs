@@ -22,9 +22,10 @@
 //! world, sc-2908 / sc-2909); the Qwen-specific Lightning sigma schedule is built in
 //! `mlx-gen-qwen-image` and wrapped in this same sampler (deduped in sc-2950).
 
-use mlx_rs::ops::{add, multiply, subtract};
+use mlx_rs::ops::{add, divide, gt, maximum, minimum, multiply, sqrt, subtract, sum_axes, which};
 use mlx_rs::{random, Array, Dtype};
 
+use gen_core::guidance::GuidanceOps;
 use gen_core::sampling::{
     LatentOps, LcmPolicy, LightningPolicy, SamplerPolicy, StepCoeffs, StepDtype, TcdPolicy,
     TimestepConvention,
@@ -205,6 +206,56 @@ impl LatentOps for MlxLatentOps {
         // Reuse the legacy per-step subkey derivation (D6) — same trajectory determinism guarantees.
         // `StepRng::normal` already returns `crate::Result`, which `?` lifts into `gen_core::Error`.
         Ok(StepRng::new(seed).normal(x.shape(), step)?)
+    }
+}
+
+/// The guidance-axis op extension (epic 7434 P2, sc-7439) over `mlx_rs::Array` — the twin of the
+/// [`LatentOps`] impl above, backing the backend-neutral [`gen_core::guidance`] library (cfg /
+/// cfg_rescale / full APG) on the MLX backend. These are the exact `mlx_rs::ops` Lens `cfg_rescale`
+/// and Bernini APG already use, now behind the shared trait so the math lives once in gen-core.
+///
+/// The reductions return the **keepdims** tensor (reduced shape, e.g. `[B,seq,1]`), not a physical
+/// full-shape broadcast: MLX broadcasts it natively in the library's downstream elementwise ops, so
+/// this is the cheaper equivalent of `CpuLatentOps`'s broadcast-back reference. The `shape` argument
+/// is therefore unused on MLX (the `Array` carries its own shape); `axes` may be negative
+/// (`sum_axes` accepts `[-1]` per-token and `[0,2,3]` per-frame alike). All ops stay lazy — no
+/// `eval` boundary is introduced here (the engine's denoise loop owns per-step `eval`).
+impl GuidanceOps for MlxLatentOps {
+    fn mul(&self, a: &Array, b: &Array) -> gen_core::Result<Array> {
+        ge(multiply(a, b))
+    }
+
+    fn div(&self, a: &Array, b: &Array) -> gen_core::Result<Array> {
+        ge(divide(a, b))
+    }
+
+    fn clamp_min(&self, x: &Array, s: f32) -> gen_core::Result<Array> {
+        ge(maximum(x, scalar(s)))
+    }
+
+    fn clamp_max(&self, x: &Array, s: f32) -> gen_core::Result<Array> {
+        ge(minimum(x, scalar(s)))
+    }
+
+    fn select_positive(&self, sel: &Array, a: &Array, b: &Array) -> gen_core::Result<Array> {
+        let positive = ge(gt(sel, scalar(0.0)))?;
+        ge(which(&positive, a, b))
+    }
+
+    fn norm_over(&self, x: &Array, _shape: &[usize], axes: &[i32]) -> gen_core::Result<Array> {
+        let sq = ge(multiply(x, x))?;
+        ge(sqrt(&ge(sum_axes(&sq, axes, true))?))
+    }
+
+    fn dot_over(
+        &self,
+        a: &Array,
+        b: &Array,
+        _shape: &[usize],
+        axes: &[i32],
+    ) -> gen_core::Result<Array> {
+        let prod = ge(multiply(a, b))?;
+        ge(sum_axes(&prod, axes, true))
     }
 }
 
@@ -1169,5 +1220,103 @@ mod tests {
                 "{name} (v-pred/EDM) produced non-finite output"
             );
         }
+    }
+}
+
+/// Real-backend (MLX `Array`) parity for the gen-core guidance library over [`MlxLatentOps`]
+/// (sc-7439). Proves the trait impl reproduces the bespoke Lens/Bernini MLX combine and the
+/// `apg @ eta=1/nt=0/no-momentum == cfg` invariant on real `Array`, not just `CpuLatentOps`.
+#[cfg(test)]
+mod guidance_ops_tests {
+    use super::*;
+    use gen_core::guidance::{cfg, cfg_rescale, normalized_guidance};
+
+    fn t(data: &[f32], shape: &[i32]) -> Array {
+        Array::from_slice(data, shape)
+    }
+
+    fn max_abs(a: &Array, b: &Array) -> f32 {
+        mlx_rs::ops::max(subtract(a, b).unwrap().abs().unwrap(), None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    /// A [B=1, seq=2, C=3] cond/uncond pair (per-token channel-axis geometry, the Lens case).
+    fn pair() -> (Array, Array) {
+        let cond = t(&[3.0, 4.0, 0.0, 1.0, 2.0, 2.0], &[1, 2, 3]);
+        let uncond = t(&[0.5, -1.0, 0.25, 0.1, 0.3, -0.2], &[1, 2, 3]);
+        (cond, uncond)
+    }
+
+    #[test]
+    fn cfg_matches_hand_combine() {
+        let ops = MlxLatentOps;
+        let (cond, uncond) = pair();
+        let got = cfg(&ops, &cond, &uncond, 4.0).unwrap();
+        let want = add(
+            &uncond,
+            multiply(subtract(&cond, &uncond).unwrap(), scalar(4.0)).unwrap(),
+        )
+        .unwrap();
+        assert!(max_abs(&got, &want) < 1e-4, "cfg over MLX != hand combine");
+    }
+
+    /// gen-core `cfg_rescale` over MLX == the bespoke Lens formula (per-token channel-axis rescale).
+    #[test]
+    fn cfg_rescale_matches_lens_formula() {
+        let ops = MlxLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        let got = cfg_rescale(&ops, &cond, &uncond, 2.0, &shape, &[-1]).unwrap();
+        // Hand-rolled Lens reference (mlx-gen-lens/src/schedule.rs): comb rescaled to ‖cond‖/‖comb‖.
+        let comb = add(
+            &uncond,
+            multiply(subtract(&cond, &uncond).unwrap(), scalar(2.0)).unwrap(),
+        )
+        .unwrap();
+        let norm =
+            |x: &Array| sqrt(sum_axes(multiply(x, x).unwrap(), &[-1], true).unwrap()).unwrap();
+        let cond_norm = norm(&cond);
+        let comb_norm = norm(&comb);
+        let ratio = divide(&cond_norm, maximum(&comb_norm, scalar(1e-12)).unwrap()).unwrap();
+        // comb_norm > 0 for this pair, so the where-guard is a no-op → want = comb · ratio.
+        let want = multiply(&comb, &ratio).unwrap();
+        assert!(
+            max_abs(&got, &want) < 1e-4,
+            "cfg_rescale over MLX != Lens formula"
+        );
+    }
+
+    /// The Bernini invariant on real `Array`: APG at eta=1, nt=0, no momentum == plain CFG.
+    #[test]
+    fn apg_reduces_to_cfg_on_mlx() {
+        let ops = MlxLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        let got =
+            normalized_guidance(&ops, &cond, &uncond, 4.0, None, 1.0, 0.0, &shape, &[-1]).unwrap();
+        let want = cfg(&ops, &cond, &uncond, 4.0).unwrap();
+        assert!(
+            max_abs(&got, &want) < 1e-4,
+            "apg(eta=1,nt=0) over MLX != cfg"
+        );
+    }
+
+    /// eta=0 ⇒ the APG delta is orthogonal to the conditional base: (nd · cond) per token ≈ 0.
+    #[test]
+    fn apg_eta0_is_orthogonal_on_mlx() {
+        let ops = MlxLatentOps;
+        let (cond, uncond) = pair();
+        let shape = [1usize, 2, 3];
+        // scale=1 so nd is recovered as (got − uncond); eta=0, nt=0.
+        let got =
+            normalized_guidance(&ops, &cond, &uncond, 1.0, None, 0.0, 0.0, &shape, &[-1]).unwrap();
+        let nd = subtract(&got, &uncond).unwrap();
+        let dot = sum_axes(multiply(&nd, &cond).unwrap(), &[-1], true).unwrap();
+        let zeros = Array::zeros::<f32>(dot.shape()).unwrap();
+        assert!(
+            max_abs(&dot, &zeros) < 1e-3,
+            "eta=0 not orthogonal to cond on MLX"
+        );
     }
 }
