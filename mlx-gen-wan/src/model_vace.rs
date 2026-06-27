@@ -95,6 +95,7 @@ pub fn descriptor_vace() -> ModelDescriptor {
             // + legacy aliases; VACE advertises native solvers only (no `run_flow_sampler` fold-ins).
             samplers: crate::model::wan_native_samplers(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 16,
             max_size: 1280,
             max_count: 1,

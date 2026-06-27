@@ -81,6 +81,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Scheduler axis (epic 7114): the static-shift schedule is the byte-exact default (an unset
             // `req.scheduler`); a curated name re-shapes the σ schedule over the same `shift=3.0`.
             schedulers: curated_scheduler_names(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

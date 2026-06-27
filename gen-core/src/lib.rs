@@ -14,6 +14,7 @@ pub mod caption;
 pub mod error;
 pub mod face;
 pub mod generator;
+pub mod guidance;
 pub mod image_embed;
 pub mod imageops;
 pub mod json_constraint;

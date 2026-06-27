@@ -179,6 +179,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: curated_sampler_names(),
             schedulers: Vec::new(),
             // height/width must be divisible by 64 (stage-1 runs at //2//32).
+            supported_guidance_methods: vec![],
             min_size: 64,
             max_size: 1280,
             max_count: 1,

@@ -59,6 +59,7 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: curated_sampler_names(),
             // Curated scheduler menu (epic 7114), as the base turbo variant — static-shift default.
             schedulers: curated_scheduler_names(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

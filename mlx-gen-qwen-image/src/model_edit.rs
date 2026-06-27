@@ -65,6 +65,7 @@ pub fn descriptor() -> ModelDescriptor {
             // Curated unified-framework integrator menu (epic 7114 P3) + the `lightning` profile.
             samplers: qwen_samplers(),
             schedulers: qwen_schedulers(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

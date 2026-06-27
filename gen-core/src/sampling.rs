@@ -32,12 +32,16 @@ use crate::Result;
 // until P3/P4 migrate them per-engine, so the legacy layer is shimmed here, not removed.
 // =================================================================================================
 
+pub mod cfgpp;
 pub mod latent_ops;
 pub mod model_sampling;
 pub mod schedulers;
 pub mod solvers;
 pub mod unified;
 
+pub use cfgpp::{
+    base_supports_cfgpp, cfgpp_sampler_for, CfgPpDenoiseFn, CfgPpSampler, Dpmpp2mCfgPp, EulerCfgPp,
+};
 pub use latent_ops::{CpuLatentOps, LatentOps};
 pub use model_sampling::{
     denoise, DiscreteModelSampling, EdmModelSampling, FlowModelSampling, ModelSampling,

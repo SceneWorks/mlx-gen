@@ -212,6 +212,7 @@ impl Sd3Variant {
                     s.push("linear");
                     s
                 },
+                supported_guidance_methods: vec![],
                 min_size: 256,
                 max_size: 1440,
                 max_count: 8,

@@ -85,6 +85,7 @@ pub fn descriptor() -> ModelDescriptor {
             // (the byte-exact default); a named curated solver → `SvdPipeline::denoise_curated`.
             samplers: curated_sampler_names(),
             schedulers: Vec::new(),
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 1024,
             max_count: 1,

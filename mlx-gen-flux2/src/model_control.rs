@@ -68,6 +68,7 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
                 s.push("flow_match_euler");
                 s
             },
+            supported_guidance_methods: vec![],
             min_size: 256,
             max_size: 2048,
             max_count: 8,

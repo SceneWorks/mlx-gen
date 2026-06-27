@@ -95,6 +95,7 @@ pub fn descriptor() -> ModelDescriptor {
                 s.extend(curated_scheduler_names());
                 s
             },
+            supported_guidance_methods: vec![],
             min_size: 512,
             max_size: 2048,
             max_count: 8,
