@@ -13,10 +13,10 @@
 //! overlay-then-quantize ordering). Identity comes from a character LoRA on the **base**
 //! (`spec.adapters`); the control branch is never an adapter target.
 //!
-//! v1 is **pose-only** (the 2512-Fun Union also supports canny/hed/depth/mlsd/scribble/gray, deferred
-//! to sc-8250) and **base pose-from-prompt** (composing with the edit model is a later reach). Pose
-//! parity vs the fork's `pipeline_qwenimage_control` is gated by `tests/control_real_weights.rs`
-//! (`#[ignore]`, M-series).
+//! Accepts the three structural control signals — **pose/canny/depth** — which the 2512-Fun Union
+//! admits via one input-agnostic VACE control path (no mode index; sc-8250). **Base pose-from-prompt**
+//! (composing with the edit model is a later reach). Pose parity vs the fork's
+//! `pipeline_qwenimage_control` is gated by `tests/control_real_weights.rs` (`#[ignore]`, M-series).
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -136,23 +136,41 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
-/// v1 is **pose-only**: a non-`Pose` `ControlKind` (canny/depth/other) is rejected rather than
-/// silently treated as pose, even though the 2512-Fun Union weights support it (sc-8250). That restriction +
-/// Qwen's "(pose skeleton)" message wording are the only deviations from the shared default; the
-/// rest of the control boilerplate (resolve/validate-present + the load helpers above) comes from
-/// the shared trait (sc-8241). The default `unsupported_kind_message` ("v1 supports pose control
-/// only, got {kind:?}") already matches this variant's hand-written wording.
+/// The 2512-Fun-Controlnet-Union VACE checkpoint is input-agnostic: pose, canny, and depth differ
+/// only by the preprocessor-produced control image (no mode index — sc-8250). Spelled out as
+/// `Only([Pose, Canny, Depth])` so a free-form `ControlKind::Other` is rejected rather than silently
+/// coerced into the union path. A free function so the policy is unit-testable without a loaded model.
+fn accepted_kinds() -> AcceptedControlKinds {
+    AcceptedControlKinds::Only(vec![
+        ControlKind::Pose,
+        ControlKind::Canny,
+        ControlKind::Depth,
+    ])
+}
+
+/// The 2512-Fun Union admits the three structural control signals — pose/canny/depth share one
+/// VACE control path, so all are accepted (sc-8250); only a free-form `ControlKind::Other` is
+/// rejected. The control boilerplate (resolve/validate-present + the load helpers above) comes from
+/// the shared trait (sc-8241).
 impl ControlBranch for QwenImageControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
     }
 
     fn accepted_control_kinds(&self) -> AcceptedControlKinds {
-        AcceptedControlKinds::Only(vec![ControlKind::Pose])
+        accepted_kinds()
+    }
+
+    /// Fun-Union accepts pose/canny/depth; only the catch-all `Other` reaches this rejection, so the
+    /// default Qwen "pose control only" wording is replaced with the union family's actual surface.
+    fn unsupported_kind_message(&self, kind: &ControlKind) -> String {
+        format!(
+            "{MODEL_ID}: 2512-Fun-Controlnet-Union accepts pose/canny/depth control, got {kind:?}"
+        )
     }
 
     fn missing_control_message(&self) -> String {
-        format!("{MODEL_ID} requires a Control (pose skeleton) conditioning")
+        format!("{MODEL_ID} requires a Control (pose/canny/depth) conditioning")
     }
 }
 
@@ -269,6 +287,19 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.accepts(ConditioningKind::Control));
         assert!(d.capabilities.supports_lora);
+    }
+
+    #[test]
+    fn accepts_pose_canny_depth_via_control_branch() {
+        // The 2512-Fun Union is input-agnostic: pose, canny, and depth are all accepted (they differ
+        // only by the preprocessor-produced control image, no mode index — sc-8250). A free-form
+        // `Other` kind is rejected. This is exactly the `accepted_control_kinds()` policy the
+        // `ControlBranch` impl returns.
+        let accepted = accepted_kinds();
+        assert!(accepted.accepts(&ControlKind::Pose));
+        assert!(accepted.accepts(&ControlKind::Canny));
+        assert!(accepted.accepts(&ControlKind::Depth));
+        assert!(!accepted.accepts(&ControlKind::Other("scribble".into())));
     }
 
     #[test]
