@@ -175,3 +175,99 @@ fn seedvr2_q8_loads_and_generates() {
     assert_eq!(out.pixels.len(), 128 * 128 * 3);
     eprintln!("Q8 generate ok: {}x{}", out.width, out.height);
 }
+
+/// A deterministic sharp RGB image (`size²`): a fine high-frequency pattern so a faithful upscale
+/// keeps lots of edge energy and the (sc-8228) decoder collapse is unmistakable. No external fixture.
+fn sharp_image(size: u32) -> Image {
+    let n = (size * size * 3) as usize;
+    let mut px = Vec::with_capacity(n);
+    for y in 0..size {
+        for x in 0..size {
+            // high-freq checker XOR a slow gradient → broadband content (not a degenerate checker).
+            let checker = if ((x / 2) ^ (y / 2)) & 1 == 0 {
+                220u8
+            } else {
+                35u8
+            };
+            let grad = ((x + y) * 255 / (2 * size)) as u8;
+            px.push(checker);
+            px.push(grad);
+            px.push(checker ^ grad);
+        }
+    }
+    Image {
+        width: size,
+        height: size,
+        pixels: px,
+    }
+}
+
+/// Mean + variance of a u8 buffer (used for a non-degenerate sanity floor on the output).
+fn mean_var(px: &[u8]) -> (f64, f64) {
+    let n = px.len() as f64;
+    let mean = px.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let var = px.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+    (mean, var)
+}
+
+/// sc-8262 / sc-8228 regression: at a target past the VAE decoder's correctness cap, `generate`
+/// (the auto path) MUST route through spatial tiling — never the single full-resolution decode that
+/// corrupts the output (sc-8228). We assert the auto render matches an explicitly force-tiled render
+/// of the same input/seed (cosine high) and is non-degenerate. Pre-fix `generate` single-passed the
+/// full 2048² decode (real-weight pixel cosine vs the tiled/reference render ≈ 0.95, lapvar collapsed);
+/// post-fix it tiles (cosine ≥ 0.99). The 0.985 gate sits cleanly between. Real-weight, skips without
+/// the checkpoint. (The pure budget/tile-size guard is `video::tests::spatial_tile_never_exceeds_vae_cap`.)
+#[test]
+fn seedvr2_generate_tiles_above_vae_cap() {
+    let Some(snap) = raw_dir() else {
+        eprintln!("SKIP: raw checkpoint absent");
+        return;
+    };
+    let pipe = Seedvr2Pipeline::load(
+        &snap,
+        "seedvr2_ema_3b_fp16.safetensors",
+        &DitConfig::seedvr2_3b(),
+        Dtype::Bfloat16,
+    )
+    .expect("load 3B from raw checkpoint");
+
+    let cap = mlx_gen_seedvr2::video::VAE_SAFE_DECODE_EDGE_PX;
+    let target = cap + 512; // 2048 — comfortably past the cap so the auto path must tile.
+    let lr = sharp_image((target / 2) as u32);
+    let cancel = mlx_gen::CancelFlag::new();
+
+    // Auto path (what the worker calls). Post-fix this tiles on the VAE cap.
+    let auto = pipe
+        .generate(&lr, target, target, 99, 0.0, &cancel)
+        .expect("auto generate");
+    assert_eq!((auto.width, auto.height), (target as u32, target as u32));
+
+    // Cap-independent reference: a tiny memory budget forces the spatial tiler regardless of the cap.
+    let tiled = pipe
+        .generate_budgeted(&lr, target, target, 99, 0.0, 8.0, &cancel)
+        .expect("forced-tiled generate");
+
+    let auto_f = Array::from_slice(
+        &auto.pixels.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        &[auto.pixels.len() as i32],
+    );
+    let tiled_f = Array::from_slice(
+        &tiled.pixels.iter().map(|&v| v as f32).collect::<Vec<_>>(),
+        &[tiled.pixels.len() as i32],
+    );
+    let cos = cosine(&auto_f, &tiled_f);
+    eprintln!("auto-vs-forced-tiled cosine @ {target}² = {cos:.4}");
+
+    // Non-degenerate: a collapsed/uniform decode would have near-zero variance.
+    let (_m, var) = mean_var(&auto.pixels);
+    eprintln!("auto output pixel variance = {var:.1}");
+    assert!(
+        var > 100.0,
+        "auto {target}² output looks degenerate (var {var:.1})"
+    );
+    assert!(
+        cos > 0.985,
+        "auto {target}² generate diverged from the tiled reference (cos {cos:.4}) — the VAE \
+         correctness cap is not routing the large decode through tiling (sc-8228 regression)"
+    );
+}

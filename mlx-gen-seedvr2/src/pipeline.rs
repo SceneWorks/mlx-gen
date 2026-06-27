@@ -225,10 +225,16 @@ impl Seedvr2Pipeline {
         safe_gib: f64,
         cancel: &CancelFlag,
     ) -> Result<Image> {
-        if matches!(
+        // Tile when EITHER the memory budget is exceeded (sc-6067) OR the output edge is past the VAE
+        // decoder's correctness limit (sc-8228/sc-8261): above ~1536² the decoder corrupts its output
+        // in a single pass, so a 2048² upscale that *fits* memory must still be tiled. The spatial
+        // tiler caps every tile at `VAE_SAFE_DECODE_EDGE_PX` (see `plan_spatial_tile_px`).
+        let over_budget = matches!(
             video::plan_chunk_size_with(self.weights_bytes, height, width, safe_gib),
             ChunkPlan::OverBudget { .. }
-        ) {
+        );
+        let over_vae_cap = width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX;
+        if over_budget || over_vae_cap {
             return self.generate_tiled(image, width, height, seed, softness, safe_gib, cancel);
         }
 
@@ -440,6 +446,12 @@ impl Seedvr2Pipeline {
         let n = frames.len() as i32;
         if n == 0 {
             return Ok(Vec::new());
+        }
+        // VAE-decoder correctness cap (sc-8228/sc-8261): the Chunked / PerFrame branches below decode
+        // at the full `width×height` per frame, which corrupts above ~1536² regardless of memory. Above
+        // the cap, force the per-frame spatial tiler (tiles capped at `VAE_SAFE_DECODE_EDGE_PX`).
+        if width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX {
+            return self.generate_video_tiled(frames, width, height, seed, softness, cancel);
         }
         let chunk = match (
             chunk_override,
