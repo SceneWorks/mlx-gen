@@ -133,6 +133,69 @@ pub fn denoise(
     )
 }
 
+/// Flow-match Euler denoise loop with **classifier-free guidance** for the **base** (non-distilled)
+/// Z-Image model (sc-8320). Unlike [`denoise_with_progress`] (which runs a single cond forward — the
+/// distilled Turbo path is guidance-free), the base is an undistilled foundation model that supports
+/// real CFG: each step runs the DiT **twice** — once on the prompt conditioning (`cap_feats`) and once
+/// on the negative/uncond conditioning (`neg_cap_feats`) — and combines the two velocities as
+/// `v = v_uncond + guidance·(v_cond − v_uncond)` before the Euler step (the diffusers `ZImagePipeline`
+/// CFG combine; `cfg_normalization=False` default, so no per-step rescale). The cond + uncond
+/// conditionings are loop-constant, so each gets its own cached [`Prepared`] built once.
+///
+/// `guidance == 1.0` (or `neg_cap_feats == None`) collapses to a single cond forward — identical to the
+/// Turbo loop — so a base request with `guidance=1` costs the same as Turbo. `start_step` mirrors the
+/// base loop (`0` for txt2img, [`init_time_step`] for img2img).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg_with_progress(
+    transformer: &ZImageTransformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cap_feats: &Array,
+    neg_cap_feats: Option<&Array>,
+    guidance: f32,
+    start_step: usize,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    // Cond (and, when CFG is active, uncond) patchify metadata + RoPE freqs depend only on the
+    // loop-constant latent dims + caption — build each once and reuse across steps (F-042).
+    let sh = latents.shape();
+    let prep = transformer.prepare((sh[0], sh[1], sh[2], sh[3]), cap_feats)?;
+    let cfg_on = guidance != 1.0;
+    let neg_prep = match (cfg_on, neg_cap_feats) {
+        (true, Some(neg)) => Some(transformer.prepare((sh[0], sh[1], sh[2], sh[3]), neg)?),
+        _ => None,
+    };
+    let g = Array::from_slice(&[guidance], &[1]);
+    // Same FLOW / `1 - sigma` convention + unified curated-sampler routing as the base loop; the only
+    // delta is the per-step CFG combine of two velocities.
+    let predict = |x: &Array, timestep: f32| -> Result<Array> {
+        let v_cond = transformer.forward_with(&prep, x, timestep)?;
+        match &neg_prep {
+            Some(np) => {
+                let v_uncond = transformer.forward_with(np, x, timestep)?;
+                // v = v_uncond + guidance·(v_cond − v_uncond).
+                let delta = v_cond.subtract(&v_uncond)?;
+                Ok(v_uncond.add(&delta.multiply(&g)?)?)
+            }
+            None => Ok(v_cond),
+        }
+    };
+    let start = start_step.min(scheduler.sigmas.len().saturating_sub(1));
+    run_flow_sampler(
+        sampler_name,
+        TimestepConvention::OneMinusSigma,
+        &scheduler.sigmas[start..],
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
+}
+
 /// [`denoise_with_progress`] for the ControlNet variant: each step predicts the velocity with the
 /// [`ZImageControlTransformer`], passing the (constant) `control_context` + `control_context_scale`
 /// to every forward (the fork's `ZImageControl._control_predict`). Same Euler step, progress, and
@@ -250,6 +313,34 @@ pub(crate) fn encode_prompt(
     let num_valid: i32 = host_i32(&attention_mask)?.iter().sum();
     if num_valid == 0 {
         return Err(Error::Msg(format!("{id}: empty prompt")));
+    }
+    let enc = text_encoder.forward(&input_ids, &attention_mask)?;
+    slice_valid(&enc, num_valid)
+}
+
+/// Negative/unconditional caption → `cap_feats` (f32) for the base model's CFG path (sc-8320). Unlike
+/// [`encode_prompt`], an **empty** caption is legitimate here — it is the unconditional embedding the
+/// CFG uncond branch consumes. The Qwen instruct chat template wraps even an empty string into its
+/// role-marker tokens (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`), so the tokenization is
+/// never genuinely size-0; the guard is retained as defense-in-depth against a degenerate template,
+/// surfacing as a typed error rather than a host-readback panic on a size-0 array.
+pub(crate) fn encode_uncond(
+    tokenizer: &TextTokenizer,
+    text_encoder: &TextEncoder,
+    negative: &str,
+) -> Result<Array> {
+    let t = tokenizer.tokenize(negative)?;
+    let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
+    if input_ids.shape()[1] == 0 {
+        return Err(Error::Msg(
+            "z_image: negative conditioning tokenized to an empty sequence".into(),
+        ));
+    }
+    let num_valid: i32 = host_i32(&attention_mask)?.iter().sum();
+    if num_valid == 0 {
+        return Err(Error::Msg(
+            "z_image: negative conditioning has no valid tokens".into(),
+        ));
     }
     let enc = text_encoder.forward(&input_ids, &attention_mask)?;
     slice_valid(&enc, num_valid)

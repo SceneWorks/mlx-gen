@@ -23,6 +23,7 @@ pub mod feed_forward;
 pub mod final_layer;
 pub mod loader;
 pub mod model;
+pub mod model_base;
 pub mod model_control;
 pub mod pipeline;
 pub mod rope_embedder;
@@ -42,12 +43,15 @@ pub use loader::{
     load_control_transformer, load_text_encoder, load_tokenizer, load_transformer, load_vae,
 };
 pub use model::{descriptor, load, ZImageTurbo, MODEL_ID};
-// The control variant registers itself via `inventory`; its `descriptor`/`load`/`MODEL_ID` clash
-// with the base model's, so reach them through the `model_control` module path (consumers use the
-// registry id `"z_image_turbo_control"`).
+// The base (`z_image`, sc-8320) and control (`z_image_turbo_control`) variants each register
+// themselves via `inventory`; their `descriptor`/`load`/`MODEL_ID` items share the names of the
+// turbo model's, so reach them through their module paths (consumers use the registry ids
+// `"z_image"` / `"z_image_turbo_control"`). The base reuses the identical `ZImageTransformer` — only
+// the scheduler shift (6.0 vs 3.0), default steps (50 vs 4), and the CFG path differ.
+pub use model_base::ZImage;
 pub use model_control::ZImageTurboControl;
 pub use pipeline::{
-    add_noise_by_interpolation, create_noise, decoded_to_image, denoise,
+    add_noise_by_interpolation, create_noise, decoded_to_image, denoise, denoise_cfg_with_progress,
     denoise_control_with_progress, denoise_with_progress, encode_control_context,
     encode_init_latents, init_time_step, pack_latents, preprocess_init_image, slice_valid,
     unpack_latents,
