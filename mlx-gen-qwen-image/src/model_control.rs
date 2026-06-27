@@ -1,19 +1,22 @@
-//! `QwenImageControl` — the Qwen-Image **ControlNet (strict pose)** variant (epic 3401), registered
-//! as its own `Generator` (`qwen_image_control`) via the InstantX `Qwen-Image-ControlNet-Union`
-//! checkpoint (DWPose-trained, Apache-2.0).
+//! `QwenImageControl` — the Qwen-Image **ControlNet (strict pose)** variant (epic 3401 / sc-8267),
+//! registered as its own `Generator` (`qwen_image_control`) via the alibaba-pai
+//! `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (a VACE-style Fun-Controlnet-Union, Apache-2.0,
+//! ungated — it **replaces** the retired InstantX `Qwen-Image-ControlNet-Union` on the Qwen path).
 //!
-//! Identical to [`crate::model::QwenImage`] (T2I) except it also loads a [`QwenControlNet`] control
-//! branch and `generate` threads a VAE-encoded pose skeleton through it: each denoise step the
-//! control branch emits 5 per-block residuals that are injected into the frozen base 60-layer MMDiT
-//! (`interval = 12`, scaled by the request's control scale). [`load`] needs the base snapshot
-//! (`spec.weights`) **and** the control checkpoint (`spec.control`); it applies both dense, then
-//! quantizes base + control together (Q4/Q8, transformer-only — the fork's overlay-then-quantize
-//! ordering). Identity comes from a character LoRA on the **base** (`spec.adapters`); the control
-//! branch is never an adapter target.
+//! Identical to [`crate::model::QwenImage`] (T2I) except it also loads a [`QwenFunControlBranch`]
+//! VACE control branch and `generate` threads a VAE-encoded pose skeleton through it: each denoise
+//! step the control branch computes 5 per-block hints from the post-embedder streams + the (constant)
+//! 132-ch packed control context, which the frozen base 60-layer MMDiT adds into its image stream at
+//! `control_layers = [0, 12, 24, 36, 48]` scaled by the request's control scale. [`load`] needs the
+//! base snapshot (`spec.weights`) **and** the control checkpoint (`spec.control`); it applies both
+//! dense, then quantizes base + control together (Q4/Q8, transformer-only — the fork's
+//! overlay-then-quantize ordering). Identity comes from a character LoRA on the **base**
+//! (`spec.adapters`); the control branch is never an adapter target.
 //!
-//! v1 is **pose-only** (the InstantX Union also supports canny/depth, rejected here) and **base
-//! pose-from-prompt** (composing with the edit model is a later reach). Parity vs the diffusers
-//! `QwenImageControlNetPipeline` is gated by `tests/control_real_weights.rs` (`#[ignore]`, M-series).
+//! v1 is **pose-only** (the 2512-Fun Union also supports canny/hed/depth/mlsd/scribble/gray, deferred
+//! to sc-8250) and **base pose-from-prompt** (composing with the edit model is a later reach). Pose
+//! parity vs the fork's `pipeline_qwenimage_control` is gated by `tests/control_real_weights.rs`
+//! (`#[ignore]`, M-series).
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
@@ -23,11 +26,11 @@ use mlx_gen::{
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
-use crate::control_transformer::QwenControlNet;
+use crate::control_transformer::QwenFunControlBranch;
 use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{
-    create_noise, decode_and_collect, denoise_control_with_progress, encode_init_latents,
+    create_noise, decode_and_collect, denoise_control_with_progress, encode_fun_control_context,
     encode_prompt, negative_or_fallback, qwen_samplers, qwen_schedulers, resolve_run_params,
     PID_BACKBONE,
 };
@@ -76,7 +79,7 @@ pub struct QwenImageControl {
     tokenizer: TextTokenizer,
     text_encoder: QwenTextEncoder,
     transformer: QwenTransformer,
-    controlnet: QwenControlNet,
+    controlnet: QwenFunControlBranch,
     vae: QwenVae,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845); see [`crate::model::QwenImage`].
     pid: Option<PidEngine>,
@@ -84,11 +87,11 @@ pub struct QwenImageControl {
 
 /// Construct a [`QwenImageControl`] from a [`LoadSpec`].
 ///
-/// `spec.weights` must be a base `Qwen/Qwen-Image` snapshot directory and `spec.control` (required)
-/// the InstantX `Qwen-Image-ControlNet-Union` checkpoint (a single `.safetensors` `File`, or a
-/// `Dir`). Base + control load dense (bf16); `spec.quantize` (Q4/Q8) then quantizes both transformers
-/// (group_size 64). The text encoder + VAE stay dense (the fork's transformer-only quant scope —
-/// see [`crate::model::load`]).
+/// `spec.weights` must be a base `Qwen/Qwen-Image-2512` snapshot directory and `spec.control`
+/// (required) the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (a single
+/// `.safetensors` `File`, or a `Dir`). Base + control load dense (bf16); `spec.quantize` (Q4/Q8) then
+/// quantizes both transformers (group_size 64). The text encoder + VAE stay dense (the fork's
+/// transformer-only quant scope — see [`crate::model::load`]).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -100,7 +103,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
     // required. The model id + labels keep the messages byte-identical to the hand-written originals.
     let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
-    let control = require_control(spec, MODEL_ID, "InstantX Qwen-Image-ControlNet-Union")?;
+    let control = require_control(spec, MODEL_ID, "Qwen-Image-2512-Fun-Controlnet-Union")?;
 
     // Base + control applied dense first, THEN quantize together (the overlay-then-quantize ordering,
     // matching the Z-Image control port): quantizing before loading the control branch would not let
@@ -134,7 +137,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 /// v1 is **pose-only**: a non-`Pose` `ControlKind` (canny/depth/other) is rejected rather than
-/// silently treated as pose, even though the InstantX Union weights support it. That restriction +
+/// silently treated as pose, even though the 2512-Fun Union weights support it (sc-8250). That restriction +
 /// Qwen's "(pose skeleton)" message wording are the only deviations from the shared default; the
 /// rest of the control boilerplate (resolve/validate-present + the load helpers above) comes from
 /// the shared trait (sc-8241). The default `unsupported_kind_message` ("v1 supports pose control
@@ -195,10 +198,11 @@ impl QwenImageControl {
             )?)
         };
 
-        // VAE-encode + pack the pose skeleton to the control latent `[1, seq, 64]` (constant across
-        // steps + the batch). Same encode/pack as an init image (the diffusers control path encodes
-        // the control image with the VAE and `_pack_latents` 2×2, identical to the noise packing).
-        let control_cond = encode_init_latents(&self.vae, control_image, req.width, req.height)?;
+        // VAE-encode + pack the pose skeleton to the 132-ch control context `[1, seq, 132]` (constant
+        // across steps + the batch). The 2512-Fun control path VAE-encodes the control image and
+        // concatenates a zero mask + zero inpaint latent before packing 2×2 (pose-only layout).
+        let control_cond =
+            encode_fun_control_context(&self.vae, control_image, req.width, req.height)?;
 
         // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): the partially-denoised x_k at the
         // achieved σ (truncated schedule) when use_pid + pid_capture_sigma; else the clean σ=0 path.
@@ -273,7 +277,10 @@ mod tests {
         // is a hard requirement (it fails here before touching the missing base snapshot).
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("Qwen-Image-ControlNet-Union"), "got: {err}");
+        assert!(
+            err.contains("Qwen-Image-2512-Fun-Controlnet-Union"),
+            "got: {err}"
+        );
     }
 
     #[test]

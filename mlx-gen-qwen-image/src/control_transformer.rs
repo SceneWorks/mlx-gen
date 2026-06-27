@@ -1,77 +1,94 @@
-//! Qwen-Image **ControlNet-Union** control transformer (epic 3401 / sc-3568). Port of the InstantX
-//! `Qwen-Image-ControlNet-Union` `QwenImageControlNetModel`: a small partial copy of the base Qwen
-//! MMDiT (the checkpoint ships `num_layers = 5`) that ingests the VAE-encoded control image (here a
-//! DWPose skeleton) and emits one per-block residual, injected into the frozen base transformer at
-//! `interval = ceil(60 / 5) = 12` (see [`crate::transformer::QwenTransformer::forward_control`]).
+//! Qwen-Image **2512-Fun-Controlnet-Union** control branch (sc-8267). Port of the alibaba-pai
+//! `Qwen-Image-2512-Fun-Controlnet-Union` `QwenImageControlTransformer2DModel` (the `VideoX-Fun`
+//! VACE family — same shape as the FLUX.2 / Z-Image Fun-Controlnet-Union branches), which **replaces**
+//! the retired InstantX `Qwen-Image-ControlNet-Union` shape on the Qwen control path.
 //!
-//! Unlike the Z-Image Fun-Controlnet-Union (which *threads* a control state through the base blocks
-//! at fixed places), the Qwen Union follows the standard diffusers ControlNet shape: it is an
-//! **independent** mini-transformer with its own `img_in`/`txt_in`/`txt_norm`/`time_text_embed` and a
-//! zero-init `controlnet_x_embedder`; each of its blocks' output is projected by a zero-init
-//! `controlnet_blocks[i]` Linear into a residual. The 5 residuals are returned (pre-scale) for the
-//! base transformer to add. No condition-type embedding (the checkpoint has `extra_condition_channels
-//! = 0` and no control-type embed).
+//! Unlike the InstantX ControlNet (an independent mini-transformer with a zero-init
+//! `controlnet_x_embedder` ADDed onto `img_in(x)`, emitting per-block residuals the base ADDs at a
+//! fixed interval), the 2512-Fun branch is **VACE-style**: a `control_img_in` patch embedder
+//! (`132 → inner`) feeds a control state `c` threaded through N control blocks that reuse the base
+//! block math (and the base modulation / RoPE / timestep), seeded at block 0 by
+//! `c = before_proj(c) + img_embed`. Each control block emits a hint via a zero-init `after_proj`;
+//! the base transformer adds `hints[n]·control_context_scale` into its image stream **after** the
+//! base block at `control_layers[n]` (`[0, 12, 24, 36, 48]` — 5 hints across the 60-layer MMDiT).
+//! `control_context_scale = 0` is byte-identical to the base forward (`+0`).
 //!
-//! The block math is the *same* [`QwenTransformerBlock`] as the base (identical on-disk keys), so the
-//! loader reuses the base block remap. Adapters (the character-identity LoRA) target the **base**
-//! transformer only — the control branch is never an adapter target (mirrors the Z-Image control
-//! port and the fork, which trains LoRA on the base).
+//! The 132-channel control context is `concat([control_latents(16) | mask(1) | inpaint_latent(16)])`
+//! packed 2×2 → `33·4 = 132` (the fork's `pipeline_qwenimage_control._prepare`: VAE-encode the
+//! control image, a `1 − mask` channel, and an inpaint latent). v1 is **pose-only** (no mask / no
+//! inpaint image), so the layout reduces to `[control_latents | 0 | 0]` — see
+//! [`crate::pipeline::encode_fun_control_context`].
+//!
+//! The control blocks are the *same* [`QwenTransformerBlock`] as the base (identical on-disk keys),
+//! so the loader reuses the base block remap. Adapters (the character-identity LoRA) target the
+//! **base** transformer only — the control branch is never an adapter target (mirrors the FLUX.2 /
+//! Z-Image control ports and the fork, which train LoRA on the base).
 
-use mlx_rs::fast::rms_norm;
 use mlx_rs::ops::add;
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
-use crate::transformer::time_text_embed::TimeTextEmbed;
-use crate::transformer::{linear_from, QwenRope3d, QwenTransformerBlock, QwenTransformerConfig};
+use crate::transformer::{linear_from, QwenTransformerBlock, QwenTransformerConfig};
 
-/// The InstantX `Qwen-Image-ControlNet-Union` config (`config.json`): a 5-block partial copy of the
-/// base 60-layer MMDiT, identical inner dims (24 heads × 128 = 3072), `in_channels = 64`,
-/// `extra_condition_channels = 0`.
-pub struct QwenControlNetConfig {
-    pub num_layers: usize,
+/// The alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` config (`config/qwenimage_control.yaml`):
+/// `control_layers = [0, 12, 24, 36, 48]` (5 full dual-stream control blocks injected across the base
+/// 60-layer MMDiT), `control_in_dim = 132`, otherwise the base Qwen-Image shape (24 heads × 128).
+pub struct QwenFunControlConfig {
+    /// Base double-block indices each control block injects its hint into (`control_layers`).
+    pub control_layers: Vec<usize>,
+    /// Packed control-context channels (`control_img_in` in-features). 132 for the shipped Union
+    /// (`[control_latents(16) | mask(1) | inpaint(16)]` × 2×2 patch).
+    pub control_in_dim: i32,
     pub num_heads: i32,
     pub head_dim: i32,
-    pub txt_norm_eps: f32,
 }
 
-impl QwenControlNetConfig {
-    /// The shipped InstantX Union: `num_layers = 5`, otherwise the base Qwen-Image shape.
-    pub fn qwen_image_union() -> Self {
+impl QwenFunControlConfig {
+    /// The shipped 2512-Fun Union: 5 control layers at `[0, 12, 24, 36, 48]`, `control_in_dim = 132`.
+    pub fn qwen_image_2512_fun() -> Self {
         let base = QwenTransformerConfig::qwen_image();
         Self {
-            num_layers: 5,
+            control_layers: vec![0, 12, 24, 36, 48],
+            control_in_dim: 132,
             num_heads: base.num_heads,
             head_dim: base.head_dim,
-            txt_norm_eps: base.txt_norm_eps,
         }
     }
 }
 
-/// The Qwen ControlNet-Union control transformer (the trainable branch). Holds its own input
-/// projections + 5 dual-stream blocks + 5 zero-init residual projections; emits the per-block
-/// residuals for the base transformer.
-pub struct QwenControlNet {
-    img_in: AdaptableLinear,
-    txt_norm_w: Array,
-    txt_in: AdaptableLinear,
-    time_text_embed: TimeTextEmbed,
-    /// Zero-init projection of the packed control latent (`64 → inner_dim`), added to `img_in(x)`.
-    controlnet_x_embedder: AdaptableLinear,
+/// The Qwen 2512-Fun control branch (the trainable VACE branch). Holds the `control_img_in` patch
+/// embedder, N control blocks (each a full base dual-stream block) with a zero-init `after_proj`
+/// hint projection, and a zero-init `before_proj` on block 0 that seeds the control state from the
+/// base image stream. Emits one hint per control layer for the base transformer to inject.
+pub struct QwenFunControlBranch {
+    /// `control_img_in`: 132 → inner_dim. Bias-carrying patch embedder for the packed control context.
+    control_img_in: AdaptableLinear,
+    /// The N control blocks (same math as the base dual-stream block; reuse the base RoPE / temb).
     blocks: Vec<QwenTransformerBlock>,
-    /// Zero-init per-block residual projections (`inner_dim → inner_dim`).
-    controlnet_blocks: Vec<AdaptableLinear>,
-    rope: QwenRope3d,
-    eps: f32,
+    /// Zero-init per-block hint projection (`inner_dim → inner_dim`), one per control block.
+    after_proj: Vec<AdaptableLinear>,
+    /// Zero-init `before_proj` on control block 0 (`inner_dim → inner_dim`): `c = before_proj(c) + x`.
+    before_proj: AdaptableLinear,
+    /// Base block indices each control hint injects into (`control_layers`); `places[n]` is the base
+    /// index for hint `n`.
+    places: Vec<usize>,
 }
 
-impl QwenControlNet {
-    /// Load from the InstantX Union checkpoint (already remapped to the base block's internal key
-    /// names by the loader). `prefix` is empty for the real single-file checkpoint.
-    pub fn from_weights(w: &Weights, prefix: &str, cfg: &QwenControlNetConfig) -> Result<Self> {
+impl QwenFunControlBranch {
+    /// Load from the 2512-Fun checkpoint (already remapped to the base block's internal key names by
+    /// the loader). `prefix` is empty for the real single-file checkpoint; a non-empty prefix is used
+    /// by synthetic fixtures. Keys: `control_img_in.{weight,bias}`, `control_blocks.{i}.*` (a base
+    /// block + `after_proj` for every `i`, plus `before_proj` on `i == 0`).
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: &QwenFunControlConfig) -> Result<Self> {
+        if !cfg.control_layers.contains(&0) {
+            return Err(Error::Msg(
+                "qwen 2512-fun control: control_layers must contain 0 (before_proj lives on block 0)"
+                    .into(),
+            ));
+        }
         let p = |s: &str| {
             if prefix.is_empty() {
                 s.to_string()
@@ -79,98 +96,142 @@ impl QwenControlNet {
                 format!("{prefix}.{s}")
             }
         };
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        let mut controlnet_blocks = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
+        let n = cfg.control_layers.len();
+        let mut blocks = Vec::with_capacity(n);
+        let mut after_proj = Vec::with_capacity(n);
+        for i in 0..n {
             blocks.push(QwenTransformerBlock::from_weights(
                 w,
-                &p(&format!("transformer_blocks.{i}")),
+                &p(&format!("control_blocks.{i}")),
                 cfg.num_heads,
                 cfg.head_dim,
             )?);
-            controlnet_blocks.push(linear_from(w, &p(&format!("controlnet_blocks.{i}")), true)?);
+            after_proj.push(linear_from(
+                w,
+                &p(&format!("control_blocks.{i}.after_proj")),
+                true,
+            )?);
         }
         Ok(Self {
-            img_in: linear_from(w, &p("img_in"), true)?,
-            txt_norm_w: w.require(&p("txt_norm.weight"))?.clone(),
-            txt_in: linear_from(w, &p("txt_in"), true)?,
-            time_text_embed: TimeTextEmbed::from_weights(w, &p("time_text_embed"))?,
-            controlnet_x_embedder: linear_from(w, &p("controlnet_x_embedder"), true)?,
+            control_img_in: linear_from(w, &p("control_img_in"), true)?,
             blocks,
-            controlnet_blocks,
-            rope: QwenRope3d::qwen_image(),
-            eps: cfg.txt_norm_eps,
+            after_proj,
+            before_proj: linear_from(w, &p("control_blocks.0.before_proj"), true)?,
+            places: cfg.control_layers.clone(),
         })
     }
 
-    /// Number of control residuals (= control layers); drives the base injection interval.
-    pub fn num_residuals(&self) -> usize {
-        self.controlnet_blocks.len()
+    /// Number of control hints (= control layers); drives the base injection sites.
+    pub fn num_hints(&self) -> usize {
+        self.blocks.len()
     }
 
-    /// Quantize the control transformer's Linears to Q4/Q8 (group_size 64), mirroring
-    /// [`crate::transformer::QwenTransformer::quantize`] over the control branch. Same transformer-only
-    /// scope as T2I/Edit.
+    /// The hint index injected at base block `idx`, or `None`. Mirrors the fork's
+    /// `control_layers_mapping`.
+    pub fn hint_index(&self, idx: usize) -> Option<usize> {
+        self.places.iter().position(|&p| p == idx)
+    }
+
+    /// Quantize the control branch Linears to Q4/Q8 (group_size 64), mirroring
+    /// [`crate::transformer::QwenTransformer::quantize`]. Same transformer-only scope as T2I/Edit.
+    /// `control_img_in` (132 in-features = `% 64 != 0`) stays dense, matching the fork's
+    /// `nn.quantize` predicate and the FLUX.2 Fun `control_img_in` (260 in-features) handling.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.img_in.quantize(bits, None)?;
-        self.txt_in.quantize(bits, None)?;
-        self.controlnet_x_embedder.quantize(bits, None)?;
-        self.time_text_embed.quantize(bits)?;
+        self.before_proj.quantize(bits, None)?;
         for block in &mut self.blocks {
             block.quantize(bits)?;
         }
-        for cb in &mut self.controlnet_blocks {
-            cb.quantize(bits, None)?;
+        for ap in &mut self.after_proj {
+            ap.quantize(bits, None)?;
         }
         Ok(())
     }
 
-    /// Run the control branch → the per-block residuals (pre-scale), one per control layer.
+    /// Run the VACE control stack → the per-block hints (pre-scale), one per control layer. The fork's
+    /// `forward_control`: `c = control_img_in(control_context)`; block 0 seeds `c = before_proj(c) +
+    /// img_embed`; each control block runs the *base* block math (reusing the base modulation /
+    /// RoPE / timestep) and threads its own `encoder_hidden_states` to the next; `hint[i] =
+    /// after_proj(c_after_block_i)`.
     ///
-    /// `hidden_states`: the current packed **noise** latents `[B, img_seq, 64]` (the controlnet sees
-    /// the same latents the base does this step). `control_cond`: the packed VAE-encoded control image
-    /// `[B, img_seq, 64]` (constant across steps). `encoder_hidden_states`: text features `[B, txt_seq,
-    /// joint_attention_dim]`. `timestep`: the scheduler sigma (same as the base forward). The
-    /// returned residuals align 1:1 with the noise token sequence (control pose is a single grid, so
-    /// no `cond_grids` / `zero_cond_t`).
-    pub fn forward(
+    /// `img_embed`: post-`img_in` base image stream `[B, img_seq, inner]`. `control_context`: the
+    /// packed 132-ch control context `[B, img_seq, 132]` (constant across steps). `encoder_embed`:
+    /// post-`txt_in` base text stream `[B, txt_seq, inner]` (seeds the control stack's text branch).
+    /// `text_emb`/RoPE/`mask`/`modulate_index` are the base double-stream conditioning (the control
+    /// blocks reuse them). The threaded text is local to the control stack — only the image-stream
+    /// hints leave.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control(
         &self,
-        hidden_states: &Array,
-        control_cond: &Array,
-        encoder_hidden_states: &Array,
-        timestep: f32,
-        latent_h: usize,
-        latent_w: usize,
+        img_embed: &Array,
+        encoder_embed: &Array,
+        control_context: &Array,
+        text_emb: &Array,
+        img_cos: &Array,
+        img_sin: &Array,
+        txt_cos: &Array,
+        txt_sin: &Array,
+        mask: Option<&Array>,
+        modulate_index: Option<&Array>,
     ) -> Result<Vec<Array>> {
-        let b = hidden_states.shape()[0];
-        let txt_seq = encoder_hidden_states.shape()[1];
-
-        // `img_in(x) + controlnet_x_embedder(control_cond)` (diffusers
-        // `hidden_states = hidden_states + self.controlnet_x_embedder(controlnet_cond)`).
-        let mut hidden = add(
-            &self.img_in.forward(hidden_states)?,
-            &self.controlnet_x_embedder.forward(control_cond)?,
+        // c = control_img_in(control_context); seed block 0 with `before_proj(c) + img_embed`.
+        let mut c = add(
+            &self
+                .before_proj
+                .forward(&self.control_img_in.forward(control_context)?)?,
+            img_embed,
         )?;
-        let encoder = rms_norm(encoder_hidden_states, &self.txt_norm_w, self.eps)?;
-        let mut encoder = self.txt_in.forward(&encoder)?;
-
-        let ts = Array::from_slice(&vec![timestep; b as usize], &[b]);
-        let text_emb = self.time_text_embed.forward(&ts)?;
-
-        // Single-grid RoPE (pose control is one image; no reference / zero_cond_t path).
-        let (img_cos, img_sin, txt_cos, txt_sin) =
-            self.rope.forward(latent_h, latent_w, txt_seq as usize)?;
-
-        let mut residuals = Vec::with_capacity(self.blocks.len());
-        for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
-            let (e, h) = block.forward(
-                &hidden, &encoder, &text_emb, &img_cos, &img_sin, &txt_cos, &txt_sin, None, None,
+        let mut encoder = encoder_embed.clone();
+        let mut hints = Vec::with_capacity(self.blocks.len());
+        for (block, ap) in self.blocks.iter().zip(&self.after_proj) {
+            let (e, new_c) = block.forward(
+                &c,
+                &encoder,
+                text_emb,
+                img_cos,
+                img_sin,
+                txt_cos,
+                txt_sin,
+                mask,
+                modulate_index,
             )?;
             encoder = e;
-            hidden = h;
-            // residual[i] = controlnet_blocks[i](hidden_after_block_i) (diffusers zero-init proj).
-            residuals.push(cn.forward(&hidden)?);
+            // hint[i] = after_proj(c_after_block_i) (zero-init projection; the fork's `c_skip`).
+            hints.push(ap.forward(&new_c)?);
+            c = new_c;
         }
-        Ok(residuals)
+        Ok(hints)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_config_matches_fork() {
+        // The alibaba-pai `config/qwenimage_control.yaml`: 5 control layers across the 60-block MMDiT
+        // (interval 12) + a 132-channel control context. Mirrors the verified checkpoint header
+        // (`control_blocks.{0..4}` + `control_img_in` 132→3072).
+        let cfg = QwenFunControlConfig::qwen_image_2512_fun();
+        assert_eq!(cfg.control_layers, vec![0, 12, 24, 36, 48]);
+        assert_eq!(cfg.control_in_dim, 132);
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.head_dim, 128);
+    }
+
+    #[test]
+    fn from_weights_rejects_layers_without_zero() {
+        // `before_proj` lives on control block 0, so `0` must be a control layer — the loader guards
+        // this before any tensor lookup (so an empty Weights still trips it).
+        let cfg = QwenFunControlConfig {
+            control_layers: vec![12, 24],
+            ..QwenFunControlConfig::qwen_image_2512_fun()
+        };
+        let w = Weights::empty();
+        let err = QwenFunControlBranch::from_weights(&w, "", &cfg)
+            .err()
+            .expect("expected a guard error")
+            .to_string();
+        assert!(err.contains("control_layers must contain 0"), "got: {err}");
     }
 }

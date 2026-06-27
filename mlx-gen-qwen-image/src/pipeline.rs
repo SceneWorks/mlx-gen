@@ -21,7 +21,7 @@ use mlx_gen::{
     TimestepConvention,
 };
 
-use crate::control_transformer::QwenControlNet;
+use crate::control_transformer::QwenFunControlBranch;
 use crate::sampler::{lightning_sigmas, LIGHTNING_SHIFT};
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::QwenTransformer;
@@ -245,6 +245,41 @@ pub fn encode_init_latents(vae: &QwenVae, image: &Image, width: u32, height: u32
     pack_latents(&latent, width, height) // [1, (h/16)·(w/16), 64]
 }
 
+/// Pack an arbitrary-channel latent `[1, C, h/8, w/8]` → `[1, (h/16)·(w/16), C·4]` (the 2×2 patch
+/// pack, generalized over the channel count). Port of the fork's `_pack_latents` used for the
+/// 33-channel control context — `pack_latents` hardcodes `C = LATENT_CHANNELS`, this does not.
+fn pack_latents_c(latents: &Array, channels: i32, width: u32, height: u32) -> Result<Array> {
+    let (lh, lw) = ((height / 16) as i32, (width / 16) as i32);
+    let p = PATCH as i32;
+    let x = latents.reshape(&[1, channels, lh, p, lw, p])?;
+    let x = x.transpose_axes(&[0, 2, 4, 1, 3, 5])?;
+    Ok(x.reshape(&[1, lh * lw, channels * p * p])?)
+}
+
+/// Build the packed **2512-Fun** control context `[1, seq, 132]` from the pose/union control image —
+/// the fork's `pipeline_qwenimage_control`: VAE-encode the control image → 16-ch latent, concatenated
+/// (on the channel axis) with a 1-channel mask and a 16-channel inpaint latent, then 2×2-packed
+/// (`33 · 4 = 132 = control_in_dim`). v1 is **pose-only** (no inpaint image / mask), where the fork's
+/// `1 − ones` mask is `0` and the inpaint latent is `0`, so the layout reduces to
+/// `[control_latents | 0(1) | 0(16)]`. The result is constant across denoise steps + the batch.
+pub fn encode_fun_control_context(
+    vae: &QwenVae,
+    image: &Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
+    let image_nchw = preprocess_init_image(image, width, height)?; // [1, 3, H, W]
+    let control_latents = vae.encode(&image_nchw)?.squeeze_axes(&[2])?; // [1, 16, H/8, W/8]
+    let (lh8, lw8) = ((height / 8) as i32, (width / 8) as i32);
+    // Pose-only: zero mask (1ch) + zero inpaint latent (16ch). Concatenated on the channel axis →
+    // 33 channels, then 2×2-packed → 132.
+    let mask = mlx_rs::ops::zeros::<f32>(&[1, 1, lh8, lw8])?;
+    let inpaint = mlx_rs::ops::zeros::<f32>(&[1, LATENT_CHANNELS, lh8, lw8])?;
+    let ctx = concatenate_axis(&[&control_latents, &mask, &inpaint], 1)?; // [1, 33, H/8, W/8]
+    let packed = pack_latents_c(&ctx, LATENT_CHANNELS * 2 + 1, width, height)?; // [1, seq, 132]
+    Ok(packed)
+}
+
 /// Qwen-Image's flow-match sigma schedule: `linspace(1, 1/n, n)` run through the exponential
 /// time-shift (`mu` from image area) **and** the terminal-sigma rescale, with a trailing `0`.
 /// Port of `LinearScheduler._get_sigmas` (the `requires_sigma_shift` + `sigma_shift_terminal`
@@ -387,18 +422,18 @@ pub fn denoise_with_progress(
     )
 }
 
-/// Qwen-Image **ControlNet** (strict pose) denoise loop (epic 3401 / sc-3572). Like
-/// [`denoise_with_progress`], but each step first runs the control branch
-/// ([`QwenControlNet::forward`]) over the current latents + the (constant) packed control image to
-/// get the per-block residuals, then runs the base transformer with those residuals injected
-/// ([`QwenTransformer::forward_control`]) scaled by `control_scale`. Under true CFG the control
-/// branch runs once per guidance branch (positive + negative), mirroring diffusers; the Lightning
+/// Qwen-Image **2512-Fun-Controlnet-Union** (pose) denoise loop (sc-8267 — replaces the InstantX
+/// loop). Like [`denoise_with_progress`], but each step runs the base transformer with the VACE
+/// control branch threaded in ([`QwenTransformer::forward_control`]): the branch computes its 5
+/// per-block hints from the post-embedder streams + the (constant) packed 132-ch control context,
+/// which the base adds into its image stream at `control_layers` scaled by `control_scale`. Under
+/// true CFG the control forward runs once per guidance branch (positive + negative); the Lightning
 /// CFG-off path (`neg_embeds = None`) runs it once. `control_scale = 0` reproduces the base T2I
-/// forward (the residuals are zeroed at the injection).
+/// forward (the zero-init `after_proj` + `+0` injection).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_control_with_progress(
     transformer: &QwenTransformer,
-    controlnet: &QwenControlNet,
+    controlnet: &QwenFunControlBranch,
     sampler_name: Option<&str>,
     sigmas: &[f32],
     seed: u64,
@@ -417,11 +452,11 @@ pub fn denoise_control_with_progress(
     // by the RAII guard (F-006) instead of leaking the process-global toggle on.
     let _compile_glue = crate::transformer::CompileGlueGuard::enable();
     let (lh, lw) = ((height / 16) as usize, (width / 16) as usize);
-    // Each step runs the control branch then injects its residuals into the base forward, scaled by
-    // `control_scale` (`= 0` reproduces base T2I). Under true CFG the control branch runs once per
-    // guidance branch. Control is pose-only T2I (no img2img-with-control path; F-122).
+    // Each step runs the base forward with the VACE control branch + the (constant) 132-ch control
+    // context injected, scaled by `control_scale` (`= 0` reproduces base T2I). Under true CFG the
+    // control forward runs once per guidance branch. Control is pose-only T2I (no img2img-with-control
+    // path; F-122).
     let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-        let pos_res = controlnet.forward(latents, control_cond, pos_embeds, sigma, lh, lw)?;
         let pos = transformer.forward_control(
             latents,
             pos_embeds,
@@ -430,12 +465,11 @@ pub fn denoise_control_with_progress(
             lh,
             lw,
             &[],
-            Some(&pos_res),
+            Some((controlnet, control_cond)),
             control_scale,
         )?;
         match neg_embeds {
             Some(neg) => {
-                let neg_res = controlnet.forward(latents, control_cond, neg, sigma, lh, lw)?;
                 let neg = transformer.forward_control(
                     latents,
                     neg,
@@ -444,7 +478,7 @@ pub fn denoise_control_with_progress(
                     lh,
                     lw,
                     &[],
-                    Some(&neg_res),
+                    Some((controlnet, control_cond)),
                     control_scale,
                 )?;
                 compute_guided_noise(&pos, &neg, guidance)

@@ -31,7 +31,7 @@ pub mod vae;
 pub mod vl_tokenizer;
 
 pub use adapters::apply_qwen_adapters;
-pub use control_transformer::{QwenControlNet, QwenControlNetConfig};
+pub use control_transformer::{QwenFunControlBranch, QwenFunControlConfig};
 pub use image_processor::{ImageInput, ProcessedImage, QwenImageProcessor};
 pub use loader::{
     load_controlnet, load_text_encoder, load_tokenizer, load_transformer, load_transformer_edit,
