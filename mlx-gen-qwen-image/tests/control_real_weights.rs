@@ -1,32 +1,30 @@
-//! epic 3401 / sc-3574: real-weights validation of the Qwen-Image **ControlNet-Union** (strict
-//! pose) port.
+//! epic 3401 / sc-8267: real-weights validation of the Qwen-Image **2512-Fun-Controlnet-Union**
+//! (strict pose) port — the VACE-style alibaba-pai control branch that **replaces** the retired
+//! InstantX `Qwen-Image-ControlNet-Union` shape.
 //!
-//! `#[ignore]`d — needs the real `Qwen/Qwen-Image` base snapshot (env `QWEN_IMAGE_SNAPSHOT`, else
-//! the HF cache) and the InstantX `Qwen-Image-ControlNet-Union` checkpoint (env `QWEN_CONTROL_WEIGHTS`,
-//! else the HF cache). Gates, smallest-footprint first:
-//!  - **controlnet load + forward** (`control_loads_and_emits_residuals`): loads ONLY the ~1.6 GB
-//!    control branch, runs it on random inputs, asserts 5 finite, non-zero residuals of the right
-//!    shape. Validates the loader (sc-3569) + the control transformer forward (sc-3568) cheaply.
-//!  - **scale-0 self-consistency** (`scale_zero_matches_base`): loads the base 60-layer MMDiT too,
-//!    and asserts `forward_control(residuals, scale = 0)` is **bit-identical** to the plain
-//!    `forward` — proving the injection seam (sc-3571) is inert at scale 0 and the base parity path
-//!    is untouched.
-//!  - **scale-1 changes output** (`scale_one_changes_output`): with real residuals at scale 1 the
+//! `#[ignore]`d — needs the real `Qwen/Qwen-Image-2512` base snapshot (env `QWEN_IMAGE_SNAPSHOT`,
+//! else the HF cache) and the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (env
+//! `QWEN_CONTROL_WEIGHTS`, else the HF cache — the `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`).
+//! Gates, smallest-footprint first:
+//!  - **control load + forward** (`control_loads_and_emits_hints`): loads ONLY the control branch,
+//!    drives it through the base `forward_control` (the branch computes its hints inline), and
+//!    asserts a finite, non-degenerate output of the right shape. Validates the loader (sc-8267) +
+//!    the VACE control forward cheaply (still needs the base for the inline injection).
+//!  - **scale-0 self-consistency** (`scale_zero_matches_base`): asserts
+//!    `forward_control(branch, scale = 0)` is **bit-identical** to the plain `forward` — proving the
+//!    VACE injection seam is inert at scale 0 (the zero-init `after_proj` + `+0` injection) and the
+//!    base parity path is untouched.
+//!  - **scale-1 changes output** (`scale_one_changes_output`): with the real branch at scale 1 the
 //!    output differs from base — the pose actually takes effect.
+//!  - **public pose generate** (`public_generate_runs`): end-to-end smoke of the public
+//!    `qwen_image_control` API on a synthetic pose skeleton (encode prompt, build the 132-ch control
+//!    context, run the control denoise loop, decode → a valid non-degenerate image).
 //!
-//!  - **residual parity vs diffusers** (`residuals_match_diffusers`): the meaningful numeric gate —
-//!    feeds the exact inputs the diffusers `QwenImageControlNetModel` saw (from
-//!    `tools/dump_qwen_control_residuals.py`) to the Rust `QwenControlNet` and compares the 5
-//!    per-block residuals (peak-rel, cross-backend mlx-vs-torch floor). Isolates the control branch
-//!    from all pipeline plumbing; only loads the ~1.6 GB control model. Skipped when the golden is
-//!    absent.
+//! A numeric residual/image golden vs the fork's `pipeline_qwenimage_control` (a
+//! `dump_qwen_fun_control_*.py` analog of the InstantX dump tooling) is a follow-up (tracked on
+//! sc-8267); this suite proves the loader/forward/injection seam + pose effect end-to-end.
 //!
-//! A coarser full-pipeline image gate vs `QwenImageControlNetPipeline` (`e2e_matches_diffusers_golden`,
-//! `tools/dump_qwen_control_golden.py`) is also provided but is fragile against raw-diffusers
-//! pipeline differences (noise/scheduler/template were matched to the mflux fork, not diffusers) —
-//! prefer the residual gate for correctness.
-//!
-//! Run (the scale-0 gate loads the ~40 GB base transformer):
+//! Run (the scale gates load the ~40 GB base transformer):
 //!   cargo test -p mlx-gen-qwen-image --release --test control_real_weights -- --ignored --nocapture
 
 use std::path::PathBuf;
@@ -41,41 +39,45 @@ use mlx_rs::{random, Array, Dtype};
 const WIDTH: u32 = 512;
 const HEIGHT: u32 = 512;
 const TXT_SEQ: i32 = 64;
+/// Packed control-context channels (`control_in_dim`): `[control_latents(16) | mask(1) | inpaint(16)]`
+/// × 2×2 patch = 132.
+const CONTROL_IN_DIM: i32 = 132;
 
-const GOLDEN: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/qwen_control_golden.safetensors"
-);
-const RESIDUALS_GOLDEN: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../tools/golden/qwen_control_residuals.safetensors"
-);
-
-/// Base `Qwen/Qwen-Image` snapshot dir (env override, else the HF cache).
+/// Base `Qwen/Qwen-Image-2512` snapshot dir (env override, else the HF cache).
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("QWEN_IMAGE_SNAPSHOT") {
         return PathBuf::from(p);
     }
     let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
+    // Prefer the 2512 base (the sc-8271 default); fall back to the legacy Qwen-Image snapshot dir.
+    for repo in ["models--Qwen--Qwen-Image-2512", "models--Qwen--Qwen-Image"] {
+        let snaps = PathBuf::from(&home)
+            .join(".cache/huggingface/hub")
+            .join(repo)
+            .join("snapshots");
+        if let Ok(rd) = std::fs::read_dir(&snaps) {
+            if let Some(p) = rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+            {
+                return p;
+            }
+        }
+    }
+    panic!("no Qwen-Image base snapshot in the HF cache (set QWEN_IMAGE_SNAPSHOT)");
 }
 
-/// InstantX `Qwen-Image-ControlNet-Union` checkpoint (env `QWEN_CONTROL_WEIGHTS`, else the HF cache
-/// — the single `diffusion_pytorch_model.safetensors`).
+/// alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (env `QWEN_CONTROL_WEIGHTS`, else
+/// the HF cache — the `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors`).
 fn control_source() -> WeightsSource {
     if let Ok(p) = std::env::var("QWEN_CONTROL_WEIGHTS") {
         return WeightsSource::File(PathBuf::from(p));
     }
     let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--InstantX--Qwen-Image-ControlNet-Union/snapshots");
+    let snaps = PathBuf::from(home).join(
+        ".cache/huggingface/hub/models--alibaba-pai--Qwen-Image-2512-Fun-Controlnet-Union/snapshots",
+    );
     let file = std::fs::read_dir(&snaps)
         .expect("control HF cache snapshots dir")
         .filter_map(|e| e.ok())
@@ -87,7 +89,17 @@ fn control_source() -> WeightsSource {
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
         })
-        .find(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+        // Prefer the -2602 distilled checkpoint when present, else any control .safetensors.
+        .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+        .min_by_key(|p| {
+            // -2602 sorts first (a 0 key); otherwise 1.
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains("2602") {
+                0
+            } else {
+                1
+            }
+        })
         .expect("a control .safetensors");
     WeightsSource::File(file)
 }
@@ -122,96 +134,39 @@ fn geom() -> (usize, usize, i32) {
 }
 
 #[test]
-#[ignore = "needs the InstantX Qwen-Image-ControlNet-Union checkpoint in the HF cache"]
-fn control_loads_and_emits_residuals() {
+#[ignore = "needs the base Qwen snapshot (~40 GB) + the 2512-Fun control checkpoint in the HF cache"]
+fn control_loads_and_emits_hints() {
     let (lh, lw, seq) = geom();
-    let cn = loader::load_controlnet(&control_source()).expect("load controlnet");
-    assert_eq!(
-        cn.num_residuals(),
-        5,
-        "InstantX Union ships 5 control layers"
-    );
+    let cn = loader::load_controlnet(&control_source()).expect("load control branch");
+    assert_eq!(cn.num_hints(), 5, "2512-Fun Union ships 5 control layers");
 
+    // The VACE branch computes its hints inline inside `base.forward_control`, so drive it through
+    // the base (also exercises the injection seam). control_context is the packed 132-ch tensor.
+    let base = loader::load_transformer(&snapshot()).expect("load base transformer");
     let latents = randn(&[1, seq, 64], 1);
-    let control = randn(&[1, seq, 64], 2);
+    let control_ctx = randn(&[1, seq, CONTROL_IN_DIM], 2);
     let embeds = randn(&[1, TXT_SEQ, 3584], 3)
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
 
-    let residuals = cn
-        .forward(&latents, &control, &embeds, 0.5, lh, lw)
-        .expect("forward");
-    assert_eq!(residuals.len(), 5);
-    for (i, r) in residuals.iter().enumerate() {
-        assert_eq!(r.shape(), &[1, seq, 3072], "residual {i} shape");
-        let m = max_abs(r);
-        assert!(
-            m.is_finite() && m > 0.0,
-            "residual {i} must be finite + non-zero, got {m}"
-        );
-    }
-}
-
-/// Peak-relative error `max|a-b| / max|b|`.
-fn peak_rel(a: &Array, b: &Array) -> f32 {
-    let n = b.shape().iter().product::<i32>();
-    let a = a.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let b = b.reshape(&[n]).unwrap().as_dtype(Dtype::Float32).unwrap();
-    let (a, b) = (a.as_slice::<f32>(), b.as_slice::<f32>());
-    let peak = b.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let max_d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-    if peak == 0.0 {
-        max_d
-    } else {
-        max_d / peak
-    }
-}
-
-/// **Residual-isolation parity vs diffusers** (sc-3574, the meaningful numeric gate): feed the exact
-/// inputs the diffusers `QwenImageControlNetModel` saw (from `dump_qwen_control_residuals.py`) to the
-/// Rust `QwenControlNet` and compare the 5 per-block residuals. Isolates the control branch from all
-/// pipeline plumbing. Cross-backend (mlx mixed-precision vs torch bf16) → peak-rel at the Qwen floor,
-/// not bit-exact. Only loads the ~1.6 GB control model.
-#[test]
-#[ignore = "needs tools/golden/qwen_control_residuals.safetensors from dump_qwen_control_residuals.py"]
-fn residuals_match_diffusers() {
-    if !PathBuf::from(RESIDUALS_GOLDEN).exists() {
-        eprintln!("skipping: {RESIDUALS_GOLDEN} absent (run tools/dump_qwen_control_residuals.py)");
-        return;
-    }
-    let g = mlx_gen::weights::Weights::from_file(RESIDUALS_GOLDEN).expect("residuals golden");
-    let lh: usize = g.metadata("lh").unwrap().parse().unwrap();
-    let lw: usize = g.metadata("lw").unwrap().parse().unwrap();
-    let sigma: f32 = g.metadata("sigma").unwrap().parse().unwrap();
-    let nres: usize = g.metadata("num_residuals").unwrap().parse().unwrap();
-
-    let hidden = g.require("hidden_states").unwrap().clone();
-    let control = g.require("controlnet_cond").unwrap().clone();
-    // Both sides use bf16 embeds (the golden stores the bf16-rounded values as f32).
-    let embeds = g
-        .require("encoder_hidden_states")
-        .unwrap()
-        .as_dtype(Dtype::Bfloat16)
-        .unwrap();
-
-    let cn = loader::load_controlnet(&control_source()).expect("load controlnet");
-    let residuals = cn
-        .forward(&hidden, &control, &embeds, sigma, lh, lw)
+    let out = base
+        .forward_control(
+            &latents,
+            &embeds,
+            None,
+            0.7,
+            lh,
+            lw,
+            &[],
+            Some((&cn, &control_ctx)),
+            0.8,
+        )
         .expect("control forward");
-    assert_eq!(residuals.len(), nres, "residual count");
-
-    let mut worst = 0f32;
-    for (i, r) in residuals.iter().enumerate() {
-        let golden = g.require(&format!("residual_{i}")).unwrap().clone();
-        let rel = peak_rel(r, &golden);
-        eprintln!("residual {i}: peak-rel {rel:.4}");
-        worst = worst.max(rel);
-    }
-    // Cross-backend floor: mlx f32-latent mixed precision vs torch bf16. The base Qwen e2e sits at a
-    // similar few-% peak-rel; gate generously and surface the actuals above.
+    assert_eq!(out.shape(), &[1, seq, 64], "velocity shape");
+    let m = max_abs(&out);
     assert!(
-        worst < 0.06,
-        "worst residual peak-rel {worst:.4} exceeds the 6% cross-backend floor"
+        m.is_finite() && m > 0.0,
+        "output must be finite + non-zero, got {m}"
     );
 }
 
@@ -220,10 +175,10 @@ fn residuals_match_diffusers() {
 fn scale_zero_matches_base() {
     let (lh, lw, seq) = geom();
     let base = loader::load_transformer(&snapshot()).expect("load base transformer");
-    let cn = loader::load_controlnet(&control_source()).expect("load controlnet");
+    let cn = loader::load_controlnet(&control_source()).expect("load control branch");
 
     let latents = randn(&[1, seq, 64], 10);
-    let control = randn(&[1, seq, 64], 11);
+    let control_ctx = randn(&[1, seq, CONTROL_IN_DIM], 11);
     let embeds = randn(&[1, TXT_SEQ, 3584], 12)
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
@@ -232,9 +187,6 @@ fn scale_zero_matches_base() {
     let base_out: Array = base
         .forward(&latents, &embeds, None, sigma, lh, lw, &[])
         .expect("base forward");
-    let residuals = cn
-        .forward(&latents, &control, &embeds, sigma, lh, lw)
-        .expect("cn forward");
     let ctrl_out = base
         .forward_control(
             &latents,
@@ -244,12 +196,12 @@ fn scale_zero_matches_base() {
             lh,
             lw,
             &[],
-            Some(&residuals),
+            Some((&cn, &control_ctx)),
             0.0,
         )
         .expect("control forward scale 0");
 
-    // scale 0 ⇒ `hidden + residual*0 == hidden`: bit-identical to the base T2I forward.
+    // scale 0 ⇒ `hidden + hint*0 == hidden`: bit-identical to the base T2I forward.
     assert_eq!(
         max_abs_diff(&base_out, &ctrl_out),
         0.0,
@@ -262,10 +214,10 @@ fn scale_zero_matches_base() {
 fn scale_one_changes_output() {
     let (lh, lw, seq) = geom();
     let base = loader::load_transformer(&snapshot()).expect("load base transformer");
-    let cn = loader::load_controlnet(&control_source()).expect("load controlnet");
+    let cn = loader::load_controlnet(&control_source()).expect("load control branch");
 
     let latents = randn(&[1, seq, 64], 20);
-    let control = randn(&[1, seq, 64], 21);
+    let control_ctx = randn(&[1, seq, CONTROL_IN_DIM], 21);
     let embeds = randn(&[1, TXT_SEQ, 3584], 22)
         .as_dtype(Dtype::Bfloat16)
         .unwrap();
@@ -274,9 +226,6 @@ fn scale_one_changes_output() {
     let base_out: Array = base
         .forward(&latents, &embeds, None, sigma, lh, lw, &[])
         .expect("base forward");
-    let residuals = cn
-        .forward(&latents, &control, &embeds, sigma, lh, lw)
-        .expect("cn forward");
     let ctrl_out = base
         .forward_control(
             &latents,
@@ -286,7 +235,7 @@ fn scale_one_changes_output() {
             lh,
             lw,
             &[],
-            Some(&residuals),
+            Some((&cn, &control_ctx)),
             1.0,
         )
         .expect("control forward scale 1");
@@ -298,12 +247,12 @@ fn scale_one_changes_output() {
 }
 
 #[test]
-#[ignore = "needs the base Qwen-Image snapshot (~40 GB) + control checkpoint + text encoder (~14 GB)"]
+#[ignore = "needs the base Qwen snapshot (~40 GB) + control checkpoint + text encoder (~14 GB)"]
 fn public_generate_runs() {
-    // End-to-end smoke of the public `qwen_image_control` API (sc-3572): encode prompt, VAE-encode +
-    // pack the (synthetic) skeleton, run the control denoise loop, decode. No golden — asserts a
-    // valid, non-degenerate image at the requested size (the numeric-vs-diffusers gate is
-    // `e2e_matches_diffusers_golden`). 2 steps to keep it runnable.
+    // End-to-end smoke of the public `qwen_image_control` API (sc-8267): encode prompt, VAE-encode +
+    // build the 132-ch control context from the (synthetic) skeleton, run the control denoise loop,
+    // decode. No golden — asserts a valid, non-degenerate image at the requested size. 2 steps to
+    // keep it runnable.
     let (w, h) = (512u32, 512u32);
     let skeleton = Image {
         width: w,
@@ -342,86 +291,4 @@ fn public_generate_runs() {
         img.pixels.iter().any(|&p| p != first),
         "decoded image is flat (degenerate render)"
     );
-}
-
-#[test]
-#[ignore = "needs tools/golden/qwen_control_golden.safetensors from dump_qwen_control_golden.py"]
-fn e2e_matches_diffusers_golden() {
-    if !PathBuf::from(GOLDEN).exists() {
-        eprintln!("skipping: {GOLDEN} absent (run tools/dump_qwen_control_golden.py)");
-        return;
-    }
-    let g = mlx_gen::weights::Weights::from_file(GOLDEN).expect("golden");
-
-    // The golden records the seed/size/steps/guidance/scale + a (skeleton) control image; drive the
-    // public `qwen_image_control` API and compare the decoded image to the diffusers reference.
-    let seed: u64 = g
-        .metadata("seed")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(42);
-    let scale: f32 = g
-        .metadata("control_scale")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1.0);
-    let prompt = g
-        .metadata("prompt")
-        .unwrap_or("a person, photorealistic")
-        .to_string();
-    let skeleton = g
-        .require("control_image_rgb8")
-        .expect("control image in golden");
-    let sh = skeleton.shape();
-    let (h, w) = (sh[0] as u32, sh[1] as u32);
-    let pixels: Vec<u8> = skeleton
-        .as_dtype(Dtype::Uint8)
-        .unwrap()
-        .as_slice::<u8>()
-        .to_vec();
-    let control_image = Image {
-        width: w,
-        height: h,
-        pixels,
-    };
-
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot())).with_control(control_source());
-    let gen = mlx_gen::load("qwen_image_control", &spec).expect("load qwen_image_control");
-    let req = GenerationRequest {
-        prompt,
-        seed: Some(seed),
-        width: w,
-        height: h,
-        count: 1,
-        conditioning: vec![Conditioning::Control {
-            image: control_image,
-            kind: ControlKind::Pose,
-            scale,
-        }],
-        ..Default::default()
-    };
-    let out = gen
-        .generate(&req, &mut |_p: Progress| {})
-        .expect("generate");
-    let GenerationOutput::Images(images) = out else {
-        panic!("expected images")
-    };
-    let got = &images[0];
-    let golden_img = g.require("image_rgb8").expect("golden image");
-    let gsh = golden_img.shape();
-    assert_eq!((gsh[0] as u32, gsh[1] as u32), (h, w), "golden image size");
-    let golden_px: Vec<u8> = golden_img
-        .as_dtype(Dtype::Uint8)
-        .unwrap()
-        .as_slice::<u8>()
-        .to_vec();
-    // Cross-build (mixed-precision MLX vs bf16 torch) floor: compare with the established Qwen
-    // pixel-difference tolerance (% of pixels with |Δ| > 8, like the other e2e gates).
-    let over: usize = got
-        .pixels
-        .iter()
-        .zip(&golden_px)
-        .filter(|(a, b)| (**a as i32 - **b as i32).abs() > 8)
-        .count();
-    let pct = 100.0 * over as f32 / golden_px.len() as f32;
-    eprintln!("control e2e px>8: {pct:.3}%");
-    assert!(pct < 2.0, "control e2e px>8 {pct:.3}% exceeds 2% floor");
 }

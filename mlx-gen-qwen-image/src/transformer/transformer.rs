@@ -18,6 +18,7 @@ use mlx_gen::Result;
 
 use super::time_text_embed::TimeTextEmbed;
 use super::{linear_from, AdaLayerNormContinuous, QwenRope3d, QwenTransformerBlock};
+use crate::control_transformer::QwenFunControlBranch;
 
 pub struct QwenTransformerConfig {
     pub in_channels: i32,
@@ -180,13 +181,13 @@ impl QwenTransformer {
         )
     }
 
-    /// [`forward`](Self::forward) with optional ControlNet residual injection (epic 3401). Identical
-    /// to the T2I/Edit forward, plus: after base block `i` the residual
-    /// `controlnet_residuals[i / interval]` (scaled by `control_scale`) is added to the image stream,
-    /// where `interval = ceil(num_layers / num_residuals)` — the diffusers
-    /// `QwenImageTransformer2DModel` `index_block // interval_control` pattern (60 base blocks, 5
-    /// control residuals → interval 12). `controlnet_residuals = None` is **byte-identical** to the
-    /// plain forward (the T2I/Edit parity path is unchanged).
+    /// [`forward`](Self::forward) with the **2512-Fun-Controlnet-Union** VACE control branch (sc-8267).
+    /// Identical to the T2I/Edit forward, plus: the control branch's per-block hints are computed once
+    /// from the post-embedder image + text streams (reusing the base modulation / RoPE / timestep),
+    /// and after base block `control_layers[n]` the hint `hints[n]·control_scale` is added to the
+    /// image stream — the fork's `QwenImageControlTransformer2DModel.forward`. `control = None` is
+    /// **byte-identical** to the plain forward (the T2I/Edit parity path is unchanged), as is
+    /// `control_scale = 0` (the zero-init `after_proj` + `+0` injection).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_control(
         &self,
@@ -197,7 +198,7 @@ impl QwenTransformer {
         latent_h: usize,
         latent_w: usize,
         cond_grids: &[(usize, usize)],
-        controlnet_residuals: Option<&[Array]>,
+        control: Option<(&QwenFunControlBranch, &Array)>,
         control_scale: f32,
     ) -> Result<Array> {
         let b = hidden_states.shape()[0];
@@ -233,32 +234,35 @@ impl QwenTransformer {
             self.rope.forward_multi(&shapes, txt_seq as usize)?;
         let mask = build_joint_mask(encoder_hidden_states_mask, b, img_seq)?;
 
-        // Treat an empty residual slice as "no control" — `forward_control` is `pub`, and a
-        // `Some(&[])` would underflow `res.len() - 1` (usize) and panic when picking the group index
-        // below. Internal callers always pass the 5 residuals (F-116).
-        let controlnet_residuals = controlnet_residuals.filter(|r| !r.is_empty());
-
-        // ControlNet residual injection interval (epic 3401): `ceil(num_layers / num_residuals)`,
-        // matching diffusers `int(np.ceil(len(transformer_blocks) / len(controlnet_block_samples)))`.
-        let interval = controlnet_residuals.map(|r| {
-            let n = self.blocks.len();
-            let k = r.len().max(1);
-            n.div_ceil(k)
-        });
-        // Pre-scale the (few, ~5) control residuals once, before the 60-block loop (F-115): the
-        // `control_scale` scalar and each `res[idx]·scale` product used to be rebuilt inside the loop
-        // — the same scalar 60×, the same 5 products ~12× each. The injected value is unchanged.
-        let scaled_residuals = match controlnet_residuals {
-            Some(res) => {
+        // VACE control hints (sc-8267): computed once from the post-embedder image + text streams,
+        // before the base block loop (the fork's `forward_control`), then injected per block. The
+        // hints are pre-scaled by `control_scale` once (the scalar is the same across all 5 hints and
+        // 60 blocks); `control = None` or `control_scale = 0` → no injection (byte-identical base).
+        let scaled_hints = match control {
+            Some((branch, cc)) => {
+                let hints = branch.forward_control(
+                    &hidden,
+                    &encoder,
+                    cc,
+                    &text_emb,
+                    &img_cos,
+                    &img_sin,
+                    &txt_cos,
+                    &txt_sin,
+                    mask.as_ref(),
+                    modulate_index.as_ref(),
+                )?;
                 let scale = Array::from_slice(&[control_scale], &[1]);
                 Some(
-                    res.iter()
-                        .map(|r| Ok(multiply(r, &scale)?))
+                    hints
+                        .iter()
+                        .map(|h| Ok(multiply(h, &scale)?))
                         .collect::<Result<Vec<_>>>()?,
                 )
             }
             None => None,
         };
+
         for (i, block) in self.blocks.iter().enumerate() {
             let (e, h) = block.forward(
                 &hidden,
@@ -272,13 +276,13 @@ impl QwenTransformer {
                 modulate_index.as_ref(),
             )?;
             encoder = e;
-            // After each base block, add the pre-scaled control residual for this block's group —
-            // diffusers `hidden_states = hidden_states + controlnet_block_samples[i // interval]`.
-            hidden = match (&scaled_residuals, interval) {
-                (Some(res), Some(interval)) => {
-                    let idx = (i / interval).min(res.len() - 1);
-                    add(&h, &res[idx])?
-                }
+            // After base block `i`, add the pre-scaled hint for this block (if `i` is a control layer)
+            // — the fork's `hidden_states = hidden_states + hints[block_id] * context_scale`.
+            hidden = match (&scaled_hints, control) {
+                (Some(hints), Some((branch, _))) => match branch.hint_index(i) {
+                    Some(n) => add(&h, &hints[n])?,
+                    None => h,
+                },
                 _ => h,
             };
         }

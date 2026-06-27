@@ -21,7 +21,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result, WeightsSource};
 use mlx_rs::Array;
 
-use crate::control_transformer::{QwenControlNet, QwenControlNetConfig};
+use crate::control_transformer::{QwenFunControlBranch, QwenFunControlConfig};
 use crate::text_encoder::vision::{VisionConfig, VisionTransformer};
 use crate::text_encoder::{QwenTextEncoder, QwenTextEncoderConfig, QwenVisionLanguageEncoder};
 use crate::transformer::{QwenTransformer, QwenTransformerConfig};
@@ -120,19 +120,20 @@ pub fn load_transformer_edit(root: &Path) -> Result<QwenTransformer> {
     QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image_edit())
 }
 
-/// Load the InstantX `Qwen-Image-ControlNet-Union` control transformer (epic 3401). The checkpoint
-/// is a single `diffusion_pytorch_model.safetensors` (`File`) or a dir of shards (`Dir`). Its block
-/// keys (`transformer_blocks.{i}.attn.to_out.0`, `…img_mod.1`, `…img_mlp.net.0.proj`, …) are the
-/// same diffusers names as the base, so we apply the same [`remap_transformer_keys`]; the control
-/// top-level modules (`img_in`/`txt_in`/`txt_norm`/`time_text_embed`/`controlnet_x_embedder`/
-/// `controlnet_blocks.{i}`) match 1:1 and pass through unchanged.
-pub fn load_controlnet(control: &WeightsSource) -> Result<QwenControlNet> {
+/// Load the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` VACE control branch (sc-8267 — this
+/// **replaces** the retired InstantX `Qwen-Image-ControlNet-Union`). The checkpoint is a single
+/// `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors` (`File`) or a dir of shards (`Dir`). Its
+/// control-block keys (`control_blocks.{i}.attn.to_out.0`, `…img_mod.1`, `…img_mlp.net.0.proj`, …)
+/// are the same diffusers block names as the base, so we apply the same [`remap_transformer_keys`];
+/// the control top-level modules (`control_img_in`, `control_blocks.{i}.{before,after}_proj`) match
+/// 1:1 and pass through unchanged.
+pub fn load_controlnet(control: &WeightsSource) -> Result<QwenFunControlBranch> {
     let mut w = match control {
         WeightsSource::File(p) => Weights::from_file(p)?,
         WeightsSource::Dir(p) => Weights::from_dir(p)?,
     };
     remap_transformer_keys(&mut w);
-    QwenControlNet::from_weights(&w, "", &QwenControlNetConfig::qwen_image_union())
+    QwenFunControlBranch::from_weights(&w, "", &QwenFunControlConfig::qwen_image_2512_fun())
 }
 
 /// Load the causal-Conv3d VAE, applying the diffusers→internal key remap (structural renames +
@@ -337,6 +338,58 @@ mod tests {
         );
         remap_transformer_keys(&mut plain);
         assert_eq!(plain.keys().count(), 1, "unmatched key must not be aliased");
+    }
+
+    /// sc-8267: the 2512-Fun control checkpoint's `control_blocks.{i}` carry the SAME diffusers block
+    /// keys as the base, so `remap_transformer_keys` must alias them (the control block reuses the
+    /// base `QwenTransformerBlock::from_weights`), while the VACE top-level keys (`control_img_in`,
+    /// `control_blocks.{i}.{before,after}_proj`) match the internal names 1:1 and pass through.
+    #[test]
+    fn fun_control_keys_remap() {
+        let renamed = [
+            (
+                "control_blocks.3.attn.to_out.0.weight",
+                "control_blocks.3.attn.attn_to_out.0.weight",
+            ),
+            (
+                "control_blocks.0.img_mod.1.bias",
+                "control_blocks.0.img_mod_linear.bias",
+            ),
+            (
+                "control_blocks.2.img_mlp.net.0.proj.weight",
+                "control_blocks.2.img_ff.mlp_in.weight",
+            ),
+        ];
+        // These VACE control modules carry no diffusers→internal rename — they must survive verbatim.
+        let passthrough = [
+            "control_img_in.weight",
+            "control_img_in.bias",
+            "control_blocks.0.before_proj.weight",
+            "control_blocks.4.after_proj.weight",
+        ];
+
+        let mut w = Weights::empty();
+        for (from, _) in renamed {
+            w.insert(from, mlx_rs::Array::from_slice(&[0f32], &[1]));
+        }
+        for k in passthrough {
+            w.insert(k, mlx_rs::Array::from_slice(&[0f32], &[1]));
+        }
+        remap_transformer_keys(&mut w);
+
+        let keys: std::collections::HashSet<&str> = w.keys().collect();
+        for (from, want) in renamed {
+            assert!(
+                keys.contains(want),
+                "control remap must alias {from} → {want}"
+            );
+        }
+        for k in passthrough {
+            assert!(
+                keys.contains(k),
+                "VACE control key {k} must pass through unchanged"
+            );
+        }
     }
 
     #[test]
