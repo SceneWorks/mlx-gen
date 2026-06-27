@@ -649,6 +649,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-gen-depth"
+version = "0.0.0"
+dependencies = [
+ "mlx-gen",
+ "pmetal-mlx-rs",
+]
+
+[[package]]
 name = "mlx-gen-face"
 version = "0.0.0"
 dependencies = [
