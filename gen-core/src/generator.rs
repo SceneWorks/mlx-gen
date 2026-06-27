@@ -96,6 +96,14 @@ pub struct GenerationRequest {
     /// `vace_layers` entry. `None` ⇒ the diffusers default `1.0`. Only the `wan_vace` model reads it;
     /// other models ignore it. (sc-3441)
     pub control_scale: Option<f32>,
+    /// Image-guidance (true CFG on the **reference/image** condition) for reference-conditioned edit
+    /// models — the identity-strength lever (sc-8273/sc-8278). When `Some(s)` with `s > 1`, the
+    /// denoise extrapolates the with-reference velocity against the reference-dropped
+    /// (image-unconditional) velocity: `v = v_img0 + s·(v_ref − v_img0)`, pulling output toward the
+    /// reference identity *without* pinning composition. `None`/`≤1` ⇒ off (the shipped behavior;
+    /// the reference is plain edit conditioning). Today only the FLUX.2 klein/dev **edit** path reads
+    /// it (non-kv); other models ignore it. The `FLUX2_IMG_GUIDANCE` env var overrides this (debug).
+    pub image_guidance: Option<f32>,
 
     // --- Video (Option; consumed by video models at the follow-on port) ---
     pub frames: Option<u32>,
@@ -207,6 +215,7 @@ impl Default for GenerationRequest {
             conditioning: Vec::new(),
             strength: None,
             control_scale: None,
+            image_guidance: None,
             frames: None,
             fps: None,
             duration: None,

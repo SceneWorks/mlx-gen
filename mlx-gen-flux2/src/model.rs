@@ -712,6 +712,20 @@ impl Flux2 {
         let pid_decoder =
             resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
 
+        // Image-guidance CFG on the reference condition (sc-8273/sc-8278): the identity-strength
+        // lever, off by default so the shipped render is byte-identical. On the klein/dev EDIT path
+        // identity rides ENTIRELY on the concatenated reference tokens; a strong prompt drowns them
+        // (sc-8234: ArcFace 0.60 → 0.38 under a strong scene prompt). With `s > 1` the denoise
+        // extrapolates the with-reference velocity against the reference-dropped (image-unconditional)
+        // velocity: `v = v_img0 + s·(v_ref − v_img0)`, reusing the existing `include_ref=false` forward
+        // (the kv-cache code path). The `FLUX2_IMG_GUIDANCE` env var overrides `req.image_guidance`
+        // (debug). Scoped to the non-kv edit path (a reference present, no KV cache — checked per step).
+        let img_guidance: Option<f32> = std::env::var("FLUX2_IMG_GUIDANCE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .or(req.image_guidance)
+            .filter(|s| *s > 1.0 && reference.is_some());
+
         let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -757,6 +771,16 @@ impl Flux2 {
                     include_ref,
                     cache_ref,
                 )?;
+                // sc-8273 spike: image-guidance CFG (non-kv edit only — the ref-dropped forward must
+                // run without a KV cache in play). Recompute this step with the reference tokens
+                // dropped (`include_ref=false`), then extrapolate toward the with-reference prediction.
+                let v = match img_guidance {
+                    Some(s) if include_ref && cache_ref.is_none() => {
+                        let v_img0 = run(latents, &prompt_embeds, &text_ids, ts, false, None)?;
+                        add(&v_img0, &multiply(&subtract(&v, &v_img0)?, scalar(s))?)?
+                    }
+                    _ => v,
+                };
                 match &negative {
                     Some((neg_embeds, neg_ids)) => {
                         // CFG with the cache mirrors the fork: the same cache feeds both forwards
