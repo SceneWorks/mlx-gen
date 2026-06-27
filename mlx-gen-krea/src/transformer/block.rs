@@ -202,11 +202,13 @@ impl GatedAttention {
 impl AdaptableHost for GatedAttention {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["to_q"] => Some(&mut self.q),
-            ["to_k"] => Some(&mut self.k),
-            ["to_v"] => Some(&mut self.v),
-            ["to_gate"] => Some(&mut self.gate),
-            ["to_out", "0"] => Some(&mut self.o),
+            // Diffusers leaf names (our converter/trainer) and the native Krea-2 names ai-toolkit
+            // keys its LoRAs to (`wq`/`wk`/`wv`/`wo`/`gate`) are interchangeable aliases (sc-8185).
+            ["to_q" | "wq"] => Some(&mut self.q),
+            ["to_k" | "wk"] => Some(&mut self.k),
+            ["to_v" | "wv"] => Some(&mut self.v),
+            ["to_gate" | "gate"] => Some(&mut self.gate),
+            ["to_out", "0"] | ["wo"] => Some(&mut self.o),
             _ => None,
         }
     }
@@ -334,7 +336,8 @@ impl AdaptableHost for TextFusionBlock {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
-            ["ff", rest @ ..] => self.mlp.adaptable_mut(rest),
+            // `ff` (diffusers) ≡ `mlp` (native ai-toolkit) (sc-8185).
+            ["ff" | "mlp", rest @ ..] => self.mlp.adaptable_mut(rest),
             _ => None,
         }
     }
@@ -438,7 +441,8 @@ impl AdaptableHost for SingleStreamBlock {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
             ["attn", rest @ ..] => self.attn.adaptable_mut(rest),
-            ["ff", rest @ ..] => self.mlp.adaptable_mut(rest),
+            // `ff` (diffusers) ≡ `mlp` (native ai-toolkit) (sc-8185).
+            ["ff" | "mlp", rest @ ..] => self.mlp.adaptable_mut(rest),
             _ => None,
         }
     }
@@ -577,5 +581,63 @@ impl AdaptableHost for TextFusionTransformer {
             out.extend(prefixed_paths(&format!("refiner_blocks.{i}"), b));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dense `[out, in]` weight at `key` (values irrelevant — these tests route by shape, never
+    /// forward), so each projection gets a distinct `out` dim we can match on.
+    fn put(w: &mut Weights, key: &str, out: i32, in_: i32) {
+        let n = (out * in_) as usize;
+        w.insert(key, Array::from_slice(&vec![0f32; n], &[out, in_]));
+    }
+
+    /// A `GatedAttention` whose five projections have distinct output dims (q=11, k=12, v=13,
+    /// gate=14, o=15), so [`AdaptableLinear::base_shape`]`()[0]` identifies which projection a path
+    /// resolved to.
+    fn gated() -> GatedAttention {
+        let mut w = Weights::empty();
+        put(&mut w, "to_q.weight", 11, 8);
+        put(&mut w, "to_k.weight", 12, 8);
+        put(&mut w, "to_v.weight", 13, 8);
+        put(&mut w, "to_gate.weight", 14, 8);
+        put(&mut w, "to_out.0.weight", 15, 8);
+        w.insert("norm_q.weight", Array::from_slice(&[0f32; 4], &[4]));
+        w.insert("norm_k.weight", Array::from_slice(&[0f32; 4], &[4]));
+        GatedAttention::from_weights(&w, "", 2, 1, 4, 1e-6).unwrap()
+    }
+
+    /// sc-8185: the native ai-toolkit (ostris) attn leaf names (`wq`/`wk`/`wv`/`wo`/`gate`) must
+    /// route to the *same* projections as the diffusers names our converter/trainer emit — in
+    /// particular `wo` → `to_out.0`. Distinct output dims prove correct routing, not just a match.
+    #[test]
+    fn gated_attention_accepts_native_aitoolkit_aliases() {
+        for (canon, native, out) in [
+            (["to_q"].as_slice(), ["wq"].as_slice(), 11),
+            (["to_k"].as_slice(), ["wk"].as_slice(), 12),
+            (["to_v"].as_slice(), ["wv"].as_slice(), 13),
+            (["to_gate"].as_slice(), ["gate"].as_slice(), 14),
+            (["to_out", "0"].as_slice(), ["wo"].as_slice(), 15),
+        ] {
+            let mut a = gated();
+            assert_eq!(
+                a.adaptable_mut(canon).unwrap().base_shape()[0],
+                out,
+                "canonical {canon:?} routed to the wrong projection"
+            );
+            assert_eq!(
+                a.adaptable_mut(native).unwrap().base_shape()[0],
+                out,
+                "native {native:?} must route to the same projection as {canon:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gated_attention_rejects_unknown_leaf() {
+        assert!(gated().adaptable_mut(&["nope"]).is_none());
     }
 }

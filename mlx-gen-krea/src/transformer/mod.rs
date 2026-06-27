@@ -414,11 +414,14 @@ struct JointInputs {
 impl AdaptableHost for Krea2Transformer {
     fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
         match path {
-            ["transformer_blocks", n, rest @ ..] => self
+            // `transformer_blocks` is the diffusers name our own converter/trainer emit; `blocks` is
+            // the native Krea-2 checkpoint name that ai-toolkit (ostris) keys its LoRAs to (sc-8185).
+            ["transformer_blocks" | "blocks", n, rest @ ..] => self
                 .blocks
                 .get_mut(n.parse::<usize>().ok()?)?
                 .adaptable_mut(rest),
-            ["text_fusion", rest @ ..] => self.text_fusion.adaptable_mut(rest),
+            // `text_fusion` (diffusers) ≡ `txtfusion` (native ai-toolkit) (sc-8185).
+            ["text_fusion" | "txtfusion", rest @ ..] => self.text_fusion.adaptable_mut(rest),
             ["img_in"] => Some(&mut self.img_in),
             ["txt_in", "linear_1"] => Some(&mut self.txt_in_l1),
             ["txt_in", "linear_2"] => Some(&mut self.txt_in_l2),
