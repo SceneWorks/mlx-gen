@@ -22,8 +22,9 @@ use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
     schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiscreteModelSampling, Error,
-    Progress, Result, Scheduler, Solver, WeightsSource,
+    LatentDecoder, PidWeights, Progress, Result, Scheduler, Solver, WeightsSource,
 };
+use mlx_gen_pid::{PidDecoder, PidEngine};
 
 use mlx_gen_face::{Face, FaceAnalysis};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -37,7 +38,7 @@ use mlx_gen_sdxl::{
     apply_sdxl_adapters_with, decode_image, denoise_curated, denoise_ip_multi_control,
     encode_conditioning, load_controlnet, load_text_encoder_1_dtype, load_text_encoder_2_dtype,
     load_tokenizer, load_unet_dtype, load_vae, preprocess_control_image, seeded_prior,
-    text_time_ids, ControlContext, Denoiser, LoraCoverage,
+    text_time_ids, ControlContext, Denoiser, LoraCoverage, PID_BACKBONE,
 };
 
 use mlx_gen::image::resize_lanczos_u8;
@@ -122,6 +123,12 @@ pub struct InstantIdRequest {
     /// re-shapes σ over the schedule. A non-default scheduler alone also engages the curated path.
     pub scheduler: Option<String>,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8370) for this generation: when `true`
+    /// **and** the model was loaded with [`with_pid`](InstantId::with_pid), the final latent is decoded
+    /// by the `sdxl` PiD student (4× SR) instead of the native VAE. `false` (the default) keeps the
+    /// byte-exact VAE decode. The face-restore re-render always stays on the VAE regardless (its
+    /// paste-back assumes a native-resolution crop) — see [`restore_face`](InstantId::restore_face).
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step and between phases (sc-4380;
     /// the engine contract every registry provider honors — see F-096). `Clone` shares the flag,
     /// so the caller keeps a handle to cancel an in-flight generation.
@@ -143,6 +150,7 @@ impl Default for InstantIdRequest {
             sampler: None,
             scheduler: None,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -165,6 +173,11 @@ pub struct InstantId {
     /// `DiscreteModelSampling` source for the curated unified-sampler path (epic 7114, sc-7297).
     alpha_schedule: AlphaSchedule,
     face: Option<FaceAnalysis>,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8370), attached via
+    /// [`with_pid`](Self::with_pid). `Some` ⇒ a `req.use_pid` generation decodes the final SDXL latent
+    /// through the `sdxl` PiD student (4× SR) instead of the native VAE. InstantID composes the SDXL
+    /// VAE, so it shares the same `sdxl` checkpoint as the registered SDXL provider (sc-7848).
+    pid: Option<PidEngine>,
 }
 
 impl InstantId {
@@ -231,6 +244,7 @@ impl InstantId {
                 cfg.beta_end,
             )?,
             face: None,
+            pid: None,
         })
     }
 
@@ -248,6 +262,36 @@ impl InstantId {
     pub fn with_face(mut self, scrfd: &Weights, arcface: &Weights) -> Result<Self> {
         self.face = Some(FaceAnalysis::load(scrfd, arcface)?);
         Ok(self)
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8370). `pid` is the same
+    /// [`PidWeights`] load-spec the registry SDXL provider consumes (`LoadSpec::pid`): a
+    /// `WeightsSource::File` converted `sdxl` student checkpoint + a `WeightsSource::Dir` Gemma-2
+    /// caption-encoder snapshot. InstantID composes the SDXL VAE, so it loads the **same** `sdxl`
+    /// backbone tag — there is no InstantID-specific PiD checkpoint. After this, a request with
+    /// `use_pid = true` decodes through the student (4× SR → 2K/4K) instead of the native VAE; without
+    /// it, `use_pid` errors loudly (the engine never silently falls back). Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is
+    /// loaded; `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid) (never a silent VAE fallback — matches the registry SDXL provider's
+    /// `resolve_pid_decoder` contract). InstantID runs a full denoise (no `from_ldm` early-stop), so the
+    /// latent sits at the clean σ=0; the prompt is the PiD caption and the seed comes from the request.
+    fn pid_decoder_for(&self, req: &InstantIdRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            Error::Msg(
+                "instantid: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(engine.decoder(&req.prompt, 0.0, req.seed)?))
     }
 
     /// Quantize the stack to `bits` (8 or 4) — Q8/Q4 (sc-3116), the same scope as the SDXL provider
@@ -420,9 +464,11 @@ impl InstantId {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        // InstantID is out of sc-7848 scope (a struct API, not a registered SDXL-family generator);
-        // it always uses the native SDXL VAE decode — no PiD overlay.
-        decode_image(&self.vae, &latents, None)
+        // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
+        // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8370).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        decode_image(&self.vae, &latents, pid_ref)
     }
 
     /// Run the InstantID dual-conditioning denoise — the bespoke ancestral default (byte-exact N1) or,
@@ -713,9 +759,11 @@ impl InstantId {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        // InstantID is out of sc-7848 scope (a struct API, not a registered SDXL-family generator);
-        // it always uses the native SDXL VAE decode — no PiD overlay.
-        decode_image(&self.vae, &latents, None)
+        // Decode the final latent: the native SDXL VAE by default, or the `sdxl` PiD student (4× SR)
+        // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8370).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        decode_image(&self.vae, &latents, pid_ref)
     }
 
     /// **Face-restoration pass** (sc-3380): ADetailer-style identity recovery at full-body framing.
@@ -776,9 +824,14 @@ impl InstantId {
             .collect();
 
         // Re-render the crop (IdentityNet only) imposing the reference identity, then downscale back.
+        // Force the native VAE here regardless of the caller's `use_pid` (epic 7840, sc-8370): the
+        // paste-back below assumes the re-render is exactly `side×side` (`resize_lanczos_u8` to the
+        // crop), but a PiD decode would emit it at 4× — so PiD-decoding the crop would corrupt the
+        // resize. The base image keeps whatever decode the top-level generate used.
         let restore_req = InstantIdRequest {
             width: side,
             height: side,
+            use_pid: false,
             ..req.clone()
         };
         let restored = self.generate_with(&restore_req, embedding, &kps, on_progress)?;
