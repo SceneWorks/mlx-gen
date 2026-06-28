@@ -710,6 +710,7 @@ dependencies = [
  "image",
  "mlx-gen",
  "mlx-gen-face",
+ "mlx-gen-pid",
  "mlx-gen-sdxl",
  "pmetal-mlx-rs",
 ]

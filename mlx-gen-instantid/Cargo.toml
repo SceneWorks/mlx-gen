@@ -12,6 +12,9 @@ categories = ["science"]
 mlx-gen = { path = ".." }
 mlx-gen-sdxl = { path = "../mlx-gen-sdxl" }
 mlx-gen-face = { path = "../mlx-gen-face" }
+# Optional PiD super-resolving decoder (epic 7840, sc-8370): InstantID reuses the `sdxl` PiD student
+# (it composes the SDXL VAE latent space), swapping the native VAE decode when a generation opts in.
+mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 
