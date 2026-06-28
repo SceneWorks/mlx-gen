@@ -295,6 +295,22 @@ pub fn parse_lokr_thirdparty(w: &Weights) -> Result<BTreeMap<String, ThirdPartyL
 // (`weightsmeta`) and re-exported at the top of this module so the merge-path providers (sc-3671)
 // resolve third-party keys against their own module tables.
 
+/// Strip a leading [`COMMON_LORA_PREFIXES`] namespace (`transformer.` / `diffusion_model.`) from a
+/// dotted third-party key, so a host whose [`AdaptableHost::adaptable_mut`] routes from the bare
+/// module path still resolves it. The PEFT path passes a detected prefix to the appliers, but the
+/// third-party LoKr/LoHa dotted-fallback path has no equivalent — without this, e.g. ostris
+/// ai-toolkit's Krea-2 LoKr (`diffusion_model.blocks.N.attn.wq…`, sc-8395) matches no target even
+/// though the Krea host already aliases `blocks`/`txtfusion`/`wq…`/`mlp` (sc-8185). Returns the key
+/// unchanged when it carries no such prefix.
+fn strip_common_lora_prefix(raw: &str) -> &str {
+    for prefix in COMMON_LORA_PREFIXES {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+    raw
+}
+
 /// Install a third-party LyCORIS **LoKr** file (LoHa is sc-3643) onto `host`. Reconstructs each
 /// module's Kronecker delta from its per-module factors (full / low-rank / tucker) at the lycoris
 /// scale and stacks it as an [`Adapter::Lokr`] residual at the user `scale` — the same install as
@@ -310,8 +326,10 @@ pub fn apply_lokr_thirdparty(
     let groups = parse_lokr_thirdparty(w)?;
     let mut report = ApplyReport::default();
     for (raw, g) in &groups {
-        // Flattened stem via the table (prefix-agnostic), else the raw key treated as already-dotted.
-        let dotted = resolve_lokr_path(raw, &table).unwrap_or(raw.as_str());
+        // Flattened stem via the table (prefix-agnostic), else the raw key treated as already-dotted
+        // (after stripping a common `transformer.`/`diffusion_model.` namespace — sc-8395).
+        let dotted =
+            resolve_lokr_path(raw, &table).unwrap_or_else(|| strip_common_lora_prefix(raw));
         let parts: Vec<&str> = dotted.split('.').collect();
         match host.adaptable_mut(&parts) {
             Some(lin) => {
@@ -435,7 +453,9 @@ pub fn apply_loha_thirdparty(
     let groups = parse_loha_thirdparty(w)?;
     let mut report = ApplyReport::default();
     for (raw, g) in &groups {
-        let dotted = resolve_lokr_path(raw, &table).unwrap_or(raw.as_str());
+        // Same dotted-fallback prefix strip as the LoKr path (sc-8395).
+        let dotted =
+            resolve_lokr_path(raw, &table).unwrap_or_else(|| strip_common_lora_prefix(raw));
         let parts: Vec<&str> = dotted.split('.').collect();
         match host.adaptable_mut(&parts) {
             Some(lin) => {
@@ -1336,6 +1356,76 @@ mod tests {
         let dir = std::env::temp_dir().join("mlx_gen_loader_test");
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
+    }
+
+    /// Mimics the Krea host's native-dialect routing (sc-8185 aliases `blocks`/`wq…`) but,
+    /// like every `AdaptableHost`, routes from the *bare* module path — it has no
+    /// `diffusion_model.` arm. So it only resolves an ai-toolkit key once the
+    /// `strip_common_lora_prefix` step (sc-8395) removes that namespace.
+    struct BareModuleHost {
+        lin: AdaptableLinear,
+    }
+    impl AdaptableHost for BareModuleHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            match path {
+                ["blocks", "0", "attn", "wq"] => Some(&mut self.lin),
+                _ => None,
+            }
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec!["blocks.0.attn.wq".to_string()]
+        }
+    }
+
+    #[test]
+    fn strip_common_lora_prefix_removes_known_namespaces() {
+        assert_eq!(
+            strip_common_lora_prefix("diffusion_model.blocks.0.attn.wq"),
+            "blocks.0.attn.wq"
+        );
+        assert_eq!(strip_common_lora_prefix("transformer.x.y"), "x.y");
+        // No known prefix → returned unchanged.
+        assert_eq!(
+            strip_common_lora_prefix("blocks.0.attn.wq"),
+            "blocks.0.attn.wq"
+        );
+    }
+
+    #[test]
+    fn thirdparty_lokr_resolves_diffusion_model_prefixed_keys() {
+        // sc-8395: ostris ai-toolkit writes Krea-2 LoKr keys as
+        // `diffusion_model.‹native path›.lokr_w*`. Before the prefix strip the dotted
+        // fallback handed the host `["diffusion_model", …]`, which matches no arm →
+        // "no target modules matched". After the strip it resolves via the bare path.
+        let weight = Array::from_slice(
+            &(0..16).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 4],
+        );
+        // Both factors full ⇒ lycoris forces scale 1; w1[2,2] ⊗ w2[2,2] = ΔW[4,4].
+        let w1 = Array::from_slice(&[0.5f32, 0.6, 0.7, 0.8], &[2, 2]);
+        let w2 = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let path = tmp("krea_aitoolkit_lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.attn.wq.lokr_w1", &w1),
+                ("diffusion_model.blocks.0.attn.wq.lokr_w2", &w2),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(is_lokr_keys(&w));
+
+        let mut host = BareModuleHost {
+            lin: AdaptableLinear::dense(weight, None),
+        };
+        let report = apply_lokr_thirdparty(&mut host, &w, 1.0).unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "the diffusion_model.-prefixed key must resolve after the strip"
+        );
+        assert!(report.unmatched_paths.is_empty());
     }
 
     #[test]
