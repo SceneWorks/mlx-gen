@@ -38,7 +38,7 @@
 //! two is mirrored explicitly).
 
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::{add, divide, matmul, multiply, softmax_axis, split_sections, sum_axes};
+use mlx_rs::ops::{add, clip, divide, matmul, multiply, softmax_axis, split_sections, sum_axes};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
@@ -223,7 +223,16 @@ impl LinearSelfAttn {
             .transpose_axes(&[0, 3, 1, 2])?
             .reshape(&[b, n, inner])?
             .as_dtype(x.dtype())?;
-        self.to_out.forward(&out)
+        let out = self.to_out.forward(&out)?;
+
+        // Reference (`SanaLinearAttnProcessor2_0`) clips `to_out` to fp16's representable range as an
+        // overflow guard — but only when the *input* dtype was fp16 (`if original_dtype ==
+        // torch.float16: hidden_states.clip(-65504, 65504)`). bf16/f32 are left unchanged.
+        if x.dtype() == Dtype::Float16 {
+            Ok(clip(&out, (-65504.0, 65504.0))?)
+        } else {
+            Ok(out)
+        }
     }
 }
 
