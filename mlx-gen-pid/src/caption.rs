@@ -17,23 +17,51 @@ use mlx_gen::Result;
 
 use crate::gemma2::Gemma2;
 
-/// The fixed "Chi-prompt" instruction prefix (`experiment/shared_config.py::_CHI_PROMPT`, joined by
+/// PiD's fixed "Chi-prompt" instruction prefix (`experiment/shared_config.py::_CHI_PROMPT`, joined by
 /// `\n`). The user caption is appended directly after the trailing `"User Prompt: "`.
+///
+/// This is the same Complex-Human-Instruction (CHI) template SANA uses (the two architectures share
+/// the gemma-2-2b-it CHI caption-encoder lineage); they differ **only** in the quoting around
+/// `Enhanced prompt` — PiD's released text uses escaped double-quotes here, SANA's
+/// `complex_human_instruction` list uses single-quotes (see [`crate::caption::CaptionEncoder::with_chi_prompt`]
+/// and `mlx-gen-sana`'s `SANA_CHI_PROMPT`). Because that difference changes the tokenization, the
+/// CHI prompt is parameterized rather than hardcoded — do NOT assume PiD's text for SANA.
 pub const CHI_PROMPT: &str = "Given a user prompt, generate an \"Enhanced prompt\" that provides detailed visual descriptions suitable for image generation. Evaluate the level of detail in the user prompt:\n- If the prompt is simple, focus on adding specifics about colors, shapes, sizes, textures, and spatial relationships to create vivid and concrete scenes.\n- If the prompt is already detailed, refine and enhance the existing details slightly without overcomplicating.\nHere are examples of how to transform or refine prompts:\n- User Prompt: A cat sleeping -> Enhanced: A small, fluffy white cat curled up in a round shape, sleeping peacefully on a warm sunny windowsill, surrounded by pots of blooming red flowers.\n- User Prompt: A busy city street -> Enhanced: A bustling city street scene at dusk, featuring glowing street lamps, a diverse crowd of people in colorful clothing, and a double-decker bus passing by towering glass skyscrapers.\nPlease generate only the enhanced description for the prompt below and avoid including any additional commentary or evaluations:\nUser Prompt: ";
 
 const MODEL_MAX_LENGTH: i32 = 300;
 const PAD_ID: i32 = 0;
 
-/// Gemma-2 caption encoder: tokenizer + Chi-prompt + the released token-selection policy.
+/// Gemma-2 caption encoder: tokenizer + CHI-prompt + the released token-selection policy.
+///
+/// This is the shared SANA-lineage text-conditioning path. PiD and SANA both: prepend a fixed CHI
+/// prompt, tokenize (`add_special_tokens` → leading `<bos>`) and right-pad/truncate to
+/// `num_chi_tokens + 300 − 2`, run the Gemma-2 decoder (encoder/last-hidden mode, with the padding
+/// mask), then gather `select_index = [0] + range(-(300−1), 0)` → `[1, 300, 2304]`. The only knob
+/// that differs is the CHI prompt text, so it is a constructor parameter (see [`Self::with_chi_prompt`]).
 pub struct CaptionEncoder {
     gemma: Gemma2,
     tok: TextTokenizer,
+    chi_prompt: String,
     num_chi_tokens: i32,
 }
 
 impl CaptionEncoder {
-    /// Build from a constructed [`Gemma2`] and the gemma `tokenizer.json` path.
+    /// Build the PiD caption encoder (uses PiD's [`CHI_PROMPT`]) from a constructed [`Gemma2`] and the
+    /// gemma `tokenizer.json` path.
     pub fn new(gemma: Gemma2, tokenizer_json: impl AsRef<Path>) -> Result<Self> {
+        Self::with_chi_prompt(gemma, tokenizer_json, CHI_PROMPT)
+    }
+
+    /// Build the caption encoder with an explicit CHI-prompt prefix — the reuse seam for SANA, which
+    /// shares PiD's entire encoder body but ships a CHI template that differs in quoting (and hence
+    /// tokenization). The `chi_prompt` is the already-joined (`"\n".join(complex_human_instruction)`)
+    /// instruction string; the user caption is appended directly after it.
+    pub fn with_chi_prompt(
+        gemma: Gemma2,
+        tokenizer_json: impl AsRef<Path>,
+        chi_prompt: impl Into<String>,
+    ) -> Result<Self> {
+        let chi_prompt = chi_prompt.into();
         let tok = TextTokenizer::from_file(
             tokenizer_json,
             TokenizerConfig {
@@ -43,12 +71,13 @@ impl CaptionEncoder {
                 pad_to_max_length: false,
             },
         )?;
-        // num_chi_tokens counts the Chi-prompt WITH its special tokens (the reference's
+        // num_chi_tokens counts the CHI-prompt WITH its special tokens (the reference's
         // `tokenizer.encode(chi_prompt_str)` adds the bos).
-        let num_chi_tokens = tok.encode_ids(CHI_PROMPT, true)?.len() as i32;
+        let num_chi_tokens = tok.encode_ids(&chi_prompt, true)?.len() as i32;
         Ok(Self {
             gemma,
             tok,
+            chi_prompt,
             num_chi_tokens,
         })
     }
@@ -64,7 +93,7 @@ impl CaptionEncoder {
         let max_len = self.num_chi_tokens + MODEL_MAX_LENGTH - 2;
         let mut ids = self
             .tok
-            .encode_ids(&format!("{CHI_PROMPT}{caption}"), true)?;
+            .encode_ids(&format!("{}{caption}", self.chi_prompt), true)?;
         ids.truncate(max_len as usize);
         let real = ids.len();
         ids.resize(max_len as usize, PAD_ID);

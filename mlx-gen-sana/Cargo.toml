@@ -12,3 +12,7 @@ categories = ["science"]
 mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
+# SANA's text conditioning REUSES PiD's already-native gemma-2-2b-it CHI caption encoder (epic 8485,
+# sc-8488): the two architectures share the exact Gemma-2 last-hidden CHI text-encoder lineage, so
+# we depend on `mlx-gen-pid` for `Gemma2`/`Gemma2Config`/`CaptionEncoder` rather than duplicating it.
+mlx-gen-pid = { path = "../mlx-gen-pid" }

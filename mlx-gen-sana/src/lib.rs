@@ -16,10 +16,21 @@
 //! `DcAeDecoder::decode` directly (sc-8489 composition). Written for the bf16/fp16 weight path; the
 //! 2-bit Clark Labs quant is intentionally NOT ported.
 
+//! **sc-8488** adds the [`text_encoder`] module: SANA's text conditioning, which **reuses** PiD's
+//! already-native gemma-2-2b-it CHI caption encoder ([`mlx_gen_pid::CaptionEncoder`]) rather than
+//! duplicating it. SANA and PiD share the exact Gemma-2 last-hidden CHI text-encoder lineage; they
+//! differ only in the CHI prompt text (quoting around `Enhanced prompt`), which is parameterized.
+//! [`text_encoder::SanaTextEncoder::encode`] produces the `[1, 300, 2304]` embedding the
+//! [`transformer::SanaTransformer`] trunk's `attn2` cross-attention consumes.
+
 pub mod config;
 pub mod dc_ae;
+pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::DcAeDecoder;
+pub use text_encoder::{
+    Gemma2, Gemma2Config, SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT,
+};
 pub use transformer::SanaTransformer;
