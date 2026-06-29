@@ -49,6 +49,9 @@ use crate::transformer::SanaTransformer;
 /// Registry id for SANA-1.6B 1024px (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = "sana_1600m";
 
+/// Registry id for **SANA-Sprint** 1.6B 1024px (the CFG-free, SCM/TrigFlow few-step variant, sc-8490).
+pub const SPRINT_MODEL_ID: &str = "sana_sprint_1600m";
+
 /// SANA-1.6B's native generation resolution (the model is bucket-trained at 1024²; the catalog
 /// gates the exposed buckets tighter, this is the engine validation range).
 const RES_MIN: u32 = 256;
@@ -107,6 +110,45 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// **SANA-Sprint** identity + capabilities (sc-8490). Same `sana` family / `mlx` backend / image
+/// modality as the base, but the distilled variant is **CFG-free** (the guidance scale is an
+/// *embedded scalar* fed to the trunk, not classifier-free guidance) and **few-step** (1–4, default
+/// 2): so `supports_true_cfg = false`, `supports_negative_prompt = false`, and NO
+/// `supported_guidance_methods` (the epic-7434 cfg/cfg_rescale/apg/cfg_pp combine operators do not
+/// apply — there is no cond/uncond pair). `supports_guidance` stays `true` because the guidance scale
+/// is still an honored request knob (it just modulates the embedded scalar). The SCM/TrigFlow sampler
+/// is a dedicated few-step loop, so the curated epic-7114 sampler/scheduler menu is NOT advertised.
+pub fn sprint_descriptor() -> ModelDescriptor {
+    ModelDescriptor {
+        id: SPRINT_MODEL_ID,
+        family: "sana",
+        backend: "mlx",
+        modality: Modality::Image,
+        capabilities: Capabilities {
+            // Embedded guidance scalar — honored knob, but NOT classifier-free (no uncond forward).
+            supports_negative_prompt: false,
+            supports_guidance: true,
+            supports_true_cfg: false,
+            conditioning: Vec::new(),
+            supports_lora: false,
+            supports_lokr: false,
+            // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
+            // epic-7114 `Solver`; only the engine-default sentinel is advertised.
+            samplers: vec!["default"],
+            schedulers: vec!["default"],
+            // CFG-free: no cfg/cfg_rescale/apg/cfg_pp combine (the guidance axis embedded case).
+            supported_guidance_methods: vec![],
+            min_size: RES_MIN,
+            max_size: RES_MAX,
+            max_count: MAX_COUNT,
+            mac_only: true,
+            supported_quants: &[],
+            supports_kv_cache: false,
+            requires_sigma_shift: false,
+        },
+    }
+}
+
 /// A loaded SANA generator: the composed pipeline plus the cached descriptor.
 pub struct Sana {
     descriptor: ModelDescriptor,
@@ -151,6 +193,43 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     }))
 }
 
+/// Construct a **SANA-Sprint** generator (sc-8490) from a [`LoadSpec`]. Identical snapshot contract to
+/// [`load`] (`transformer/ vae/ text_encoder/`), but the transformer is loaded with the Sprint config
+/// (guidance embedder + rms-norm-across-heads) and driven by the CFG-free SCM few-step pipeline.
+pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let descriptor = sprint_descriptor();
+    let id = descriptor.id;
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{id}: only the default dense precision is wired (drop the precision override)"
+        )));
+    }
+    if spec.quantize.is_some() {
+        return Err(Error::Msg(format!(
+            "{id}: load-time quantization is not supported (the 2-bit quant is not ported)"
+        )));
+    }
+    if !spec.adapters.is_empty() {
+        return Err(Error::Msg(format!(
+            "{id}: LoRA/LoKr adapters are not supported"
+        )));
+    }
+    let root = match &spec.weights {
+        WeightsSource::Dir(p) => p.as_path(),
+        WeightsSource::File(_) => {
+            return Err(Error::Msg(format!(
+                "{id} expects a snapshot directory (transformer/ vae/ text_encoder/), not a \
+                 single .safetensors file"
+            )))
+        }
+    };
+    let pipeline = build_sprint_pipeline(root)?;
+    Ok(Box::new(Sana {
+        descriptor,
+        pipeline,
+    }))
+}
+
 /// Assemble the [`SanaPipeline`] from the snapshot tree — factored out so the load path is a single
 /// `?`-threaded body and the snapshot layout lives in one place. `from_dir` is used for the
 /// transformer/VAE subdirs so a sharded checkpoint loads transparently; the text encoder reuses
@@ -166,6 +245,30 @@ fn build_pipeline(root: &Path) -> Result<SanaPipeline> {
     let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
 
     Ok(SanaPipeline::new(te, trunk, decoder, dcfg))
+}
+
+/// Assemble the **SANA-Sprint** [`SanaPipeline`] from the snapshot tree (sc-8490). Same layout as
+/// [`build_pipeline`], but the transformer loads the Sprint config (so the guidance-embedder +
+/// rms-norm-across-heads weights are required) and the pipeline runs the CFG-free SCM few-step path.
+fn build_sprint_pipeline(root: &Path) -> Result<SanaPipeline> {
+    let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
+    let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
+    let trunk_w = Weights::from_dir(root.join("transformer"))?;
+    let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
+
+    let dcfg = DcAeConfig::sana_f32c32();
+    let vae_w = Weights::from_dir(root.join("vae"))?;
+    let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+
+    let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
+
+    Ok(SanaPipeline::new_sprint(
+        te,
+        trunk,
+        decoder,
+        dcfg,
+        guidance_embeds_scale,
+    ))
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -236,6 +339,7 @@ impl Sana {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
 mlx_gen::register_generators! {
     descriptor => load,
+    sprint_descriptor => load_sprint,
 }
 
 #[cfg(test)]
@@ -332,5 +436,41 @@ mod tests {
             found,
             "sana_1600m must be registered in the gen-core registry"
         );
+    }
+
+    #[test]
+    fn registry_resolves_sana_sprint_descriptor() {
+        // The Sprint variant (sc-8490) must register alongside the base under its own id.
+        let found = gen_core::registry::generators()
+            .map(|reg| (reg.descriptor)())
+            .any(|d| d.id == SPRINT_MODEL_ID);
+        assert!(
+            found,
+            "sana_sprint_1600m must be registered in the gen-core registry"
+        );
+    }
+
+    #[test]
+    fn sprint_descriptor_is_cfg_free_few_step() {
+        let d = sprint_descriptor();
+        assert_eq!(d.id, "sana_sprint_1600m");
+        assert_eq!(d.family, "sana");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        // CFG-free distilled: embedded guidance scalar, NO true CFG / negative prompt / combine ops.
+        assert!(!d.capabilities.supports_true_cfg);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supported_guidance_methods.is_empty());
+        assert!(d.capabilities.conditioning.is_empty());
+        assert!(d.capabilities.mac_only);
+    }
+
+    #[test]
+    fn sprint_load_rejects_quantization() {
+        let spec =
+            LoadSpec::new(WeightsSource::Dir("/nonexistent-sana".into())).with_quant(Quant::Q8);
+        let e = load_sprint(&spec).err().expect("error").to_string();
+        assert!(e.contains("quantization"), "got: {e}");
     }
 }

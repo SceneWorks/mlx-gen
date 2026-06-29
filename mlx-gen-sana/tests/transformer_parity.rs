@@ -68,6 +68,10 @@ fn tiny_config() -> SanaTransformerConfig {
         norm_eps: 1e-6,
         caption_norm_eps: 1e-5,
         attn_eps: 1e-15,
+        // Base SANA tiny config — guidance embedder + qk-norm OFF (these are the Sprint deltas).
+        guidance_embeds: false,
+        guidance_embeds_scale: 0.1,
+        qk_norm: false,
     }
 }
 
@@ -99,6 +103,56 @@ fn trunk_matches_diffusers_tiny() {
     assert!(
         mean < 5e-3,
         "mean_rel {mean} too high — that IS a port bug, not rounding"
+    );
+    assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
+}
+
+/// Tiny SANA-**Sprint** config matching `dump_sana_sprint_golden.py`'s tiny instance (guidance
+/// embedder + qk-norm ON, cross_attention_dim = inner = 16).
+fn tiny_sprint_config() -> SanaTransformerConfig {
+    SanaTransformerConfig {
+        guidance_embeds: true,
+        guidance_embeds_scale: 0.1,
+        qk_norm: true,
+        ..tiny_config()
+    }
+}
+
+/// SANA-Sprint **guidance-embed trunk** parity vs diffusers `SanaTransformer2DModel(guidance_embeds=
+/// True, qk_norm="rms_norm_across_heads")` (sc-8490). Loads the committed tiny golden
+/// (`tests/fixtures/sana_sprint_trunk_golden.safetensors`, ~92 KB from `dump_sana_sprint_golden.py`):
+/// the random-init Sprint trunk + its inputs (latent, caption, the SCM conditioning timestep, the
+/// embedded guidance scalar) + the reference noise prediction. The Rust trunk loaded with the Sprint
+/// config and run through `forward_with_guidance` must reproduce it — a wrong guidance-embed sum or
+/// missing qk-norm wrecks `mean_rel` by orders of magnitude. f32, so the bar is tight.
+#[test]
+fn sprint_trunk_matches_diffusers_tiny() {
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sana_sprint_trunk_golden.safetensors"
+    );
+    let golden = Weights::from_file(golden_path).expect("load tiny Sprint golden");
+
+    let latent = golden.require("input.latent").expect("latent");
+    let caption = golden.require("input.caption").expect("caption");
+    let timestep = golden.require("input.timestep").expect("scm timestep");
+    let guidance = golden.require("input.guidance").expect("guidance scalar");
+    let want = golden.require("output.sample").expect("output");
+
+    let weights = weights_with_w_prefix(&golden);
+    let model = SanaTransformer::from_weights(&weights, tiny_sprint_config())
+        .expect("build Sprint trunk (guidance embedder + qk-norm keys)");
+    let got = model
+        .forward_with_guidance(latent, caption, timestep, Some(guidance))
+        .expect("forward_with_guidance");
+
+    assert_eq!(got.shape(), want.shape(), "shape");
+    let peak = peak_rel(&got, want);
+    let mean = mean_rel(&got, want);
+    println!("SANA-Sprint trunk parity (tiny f32): mean_rel={mean:.6}  peak_rel={peak:.6}");
+    assert!(
+        mean < 5e-3,
+        "mean_rel {mean} too high — that IS a port bug in the guidance-embed / qk-norm path"
     );
     assert!(peak < 5e-2, "peak_rel {peak} above the precision ceiling");
 }

@@ -42,13 +42,15 @@
 
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::{
-    run_flow_sampler, CancelFlag, FlowMatchEuler, Image, Progress, Result, TimestepConvention,
+    run_flow_sampler, CancelFlag, Error, FlowMatchEuler, Image, Progress, Result,
+    TimestepConvention,
 };
 use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
 
 use crate::config::DcAeConfig;
 use crate::dc_ae::DcAeDecoder;
+use crate::scm::ScmScheduler;
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
 
@@ -136,14 +138,148 @@ pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Array)
     decoded_to_image(&decoded_nchw)
 }
 
+// =================================================================================================
+// SANA-Sprint: continuous-time-consistency (SCM/TrigFlow), CFG-free, 1–4 step (sc-8490).
+// =================================================================================================
+
+/// diffusers `SanaSprintPipeline` default `num_inference_steps`.
+pub const SPRINT_DEFAULT_STEPS: usize = 2;
+/// diffusers `SanaSprintPipeline` default `guidance_scale` (embedded, NOT classifier-free).
+pub const SPRINT_DEFAULT_GUIDANCE: f32 = 4.5;
+
+fn arr1(v: f32) -> Array {
+    Array::from_slice(&[v], &[1])
+}
+
+/// One SCM (TrigFlow continuous-time consistency) denoise — the **CFG-free, few-step** SANA-Sprint
+/// loop. A faithful port of the diffusers `SanaSprintPipeline` denoise + `SCMScheduler.step`:
+///
+/// 1. seed the latent and pre-scale by `sigma_data` (the diffusers `latents = latents * sigma_data`);
+/// 2. per step `i` over the angle schedule `t = scheduler.timesteps[i]`:
+///    * `scm_t = sin(t)/(cos(t)+sin(t))`; model input = `(latents / sigma_data) · sqrt(scm_t² + (1−scm_t)²)`;
+///    * ONE trunk forward with the **embedded guidance scalar** (`guidance · guidance_embeds_scale`)
+///      and `timestep = scm_t` (no uncond branch — Sprint is CFG-free);
+///    * recombine the raw output trigonometrically, `· sigma_data`;
+///    * `SCMScheduler.step`: `x0 = cos(s)·x − sin(s)·output`; renoise `x = cos(t')·x0 + sin(t')·noise·sigma_data`
+///      (skipped on the final step / single-step schedule);
+/// 3. return `denoised / sigma_data` (the diffusers `latents = denoised / sigma_data`).
+///
+/// The per-step `eval` boundary + cooperative cancel + monotone progress mirror the unified
+/// [`mlx_gen::run_flow_sampler`] run-loop contract (the epic-7114 seam SCM reuses; its trigflow step
+/// is the consistency parameterization the flow-match `Solver` menu cannot represent).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    mut latents: Array,
+    cond: &Array,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    use mlx_rs::transforms::eval;
+
+    let sd = scheduler.sigma_data;
+    // diffusers: latents = latents * sigma_data (the SCM prior std-dev).
+    latents = multiply(&latents, arr1(sd))?;
+
+    // The embedded guidance scalar (CFG-free): guidance_scale * guidance_embeds_scale, a [1] tensor
+    // fed to the trunk's guidance embedder. Constant across steps.
+    let guidance = arr1(guidance_scale * guidance_embeds_scale);
+
+    let n = scheduler.num_steps();
+    let total = n.max(1) as u32;
+    let mut denoised = latents.clone();
+    // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
+    // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
+    let step_key = |step: usize| -> Result<Array> {
+        let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
+        Ok(random::key(sub)?)
+    };
+
+    for i in 0..n {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
+        // Per-eval compute boundary (MLX is lazy): force the prior step's graph so cancel/progress are
+        // responsive rather than deferred to decode.
+        eval([&latents])?;
+        on_progress(Progress::Step {
+            current: (i as u32 + 1).min(total),
+            total,
+        });
+
+        let s = scheduler.timesteps[i];
+        let t_next = scheduler.timesteps[i + 1];
+        let scm_t = scheduler.scm_timestep(i);
+        let in_scale = scheduler.input_scale(i);
+
+        // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
+        let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
+        let scm_t_arr = arr1(scm_t);
+        let raw = transformer.forward_with_guidance(&lat_in, cond, &scm_t_arr, Some(&guidance))?;
+
+        // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
+        // `lat_in`, NOT the un-scaled latent):
+        //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / sqrt(scm_t²+(1-scm_t)²)
+        //   noise_pred = noise_pred * sigma_data
+        let a = 1.0 - 2.0 * scm_t;
+        let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
+        let model_output = multiply(
+            &divide(
+                &add(&multiply(&lat_in, arr1(a))?, &multiply(&raw, arr1(b))?)?,
+                arr1(in_scale),
+            )?,
+            arr1(sd),
+        )?;
+
+        // SCMScheduler.step (trigflow x0-pred + renoise). `s` = current angle, `t_next` = next angle.
+        // pred_x0 = cos(s)·latents − sin(s)·model_output.
+        let pred_x0 = subtract(
+            &multiply(&latents, arr1(s.cos()))?,
+            &multiply(&model_output, arr1(s.sin()))?,
+        )?;
+        denoised = pred_x0.clone();
+        // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
+        // `if len(self.timesteps) > 1` — here the trailing 0 means t_next == 0 on the last step, sin=0
+        // and a fresh-noise term, so we gate the noise draw on a non-terminal step / multi-step run).
+        latents = if scheduler.is_single_step() {
+            pred_x0
+        } else {
+            let noise = multiply(
+                &random::normal::<f32>(latents.shape(), None, None, Some(&step_key(i)?))?,
+                arr1(sd),
+            )?;
+            add(
+                &multiply(&pred_x0, arr1(t_next.cos()))?,
+                &multiply(&noise, arr1(t_next.sin()))?,
+            )?
+        };
+    }
+
+    // diffusers: latents = denoised / sigma_data (the decode input).
+    let out = divide(&denoised, arr1(sd))?;
+    eval([&out])?;
+    Ok(out)
+}
+
 /// The composed SANA text-to-image pipeline: text encoder + trunk + DC-AE decoder, with the DC-AE
 /// config (for the latent `scaling_factor`). A clean `generate` entrypoint mirroring the sibling
 /// flow-match pipelines (`mlx-gen-sd3`).
+///
+/// `sprint` selects the variant: `false` = base SANA-1.6B (true-CFG flow-match Euler); `true` =
+/// SANA-Sprint (CFG-free SCM/TrigFlow few-step, sc-8490). The trunk must be loaded with the matching
+/// config (`SanaTransformerConfig::sana_sprint_1600m()` for Sprint — its guidance embedder +
+/// rms-norm-across-heads are config-gated).
 pub struct SanaPipeline {
     text_encoder: SanaTextEncoder,
     transformer: SanaTransformer,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
+    sprint: bool,
+    guidance_embeds_scale: f32,
 }
 
 /// One text-to-image request for [`SanaPipeline::generate`]. `None` fields fall back to the diffusers
@@ -181,8 +317,8 @@ impl<'a> SanaGenerateRequest<'a> {
 }
 
 impl SanaPipeline {
-    /// Compose the pipeline from its three already-constructed components plus the DC-AE config
-    /// (used for the latent `scaling_factor`).
+    /// Compose the **base SANA-1.6B** pipeline (true-CFG flow-match) from its three already-constructed
+    /// components plus the DC-AE config (used for the latent `scaling_factor`).
     pub fn new(
         text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
@@ -194,7 +330,36 @@ impl SanaPipeline {
             transformer,
             decoder,
             dc_ae_cfg,
+            sprint: false,
+            guidance_embeds_scale: 0.0,
         }
+    }
+
+    /// Compose the **SANA-Sprint** pipeline (CFG-free SCM/TrigFlow few-step, sc-8490). The
+    /// `transformer` MUST be loaded with [`crate::SanaTransformerConfig::sana_sprint_1600m`] (its
+    /// guidance embedder + rms-norm-across-heads are required for the embedded-guidance forward).
+    /// `guidance_embeds_scale` is the trunk config's `guidance_embeds_scale` (`0.1`), pre-multiplied
+    /// into the guidance scalar before the embedder.
+    pub fn new_sprint(
+        text_encoder: SanaTextEncoder,
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            text_encoder,
+            transformer,
+            decoder,
+            dc_ae_cfg,
+            sprint: true,
+            guidance_embeds_scale,
+        }
+    }
+
+    /// Whether this is a SANA-Sprint (CFG-free few-step) pipeline.
+    pub fn is_sprint(&self) -> bool {
+        self.sprint
     }
 
     /// Run the full prompt→image pipeline. Encodes the prompt (and the negative prompt when CFG is
@@ -214,6 +379,9 @@ impl SanaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        if self.sprint {
+            return self.generate_sprint(req, cancel, on_progress);
+        }
         let steps = req.steps.unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
@@ -250,6 +418,38 @@ impl SanaPipeline {
             &cond,
             uncond.as_ref(),
             guidance,
+            cancel,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+    }
+
+    /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) generate path (sc-8490). Encodes the
+    /// prompt ONCE (no uncond — Sprint is CFG-free), seeds the latent, runs [`denoise_sprint`] over an
+    /// [`ScmScheduler`] (default 2 steps, embedded guidance 4.5), then DC-AE-decodes. The negative
+    /// prompt / curated sampler+scheduler knobs are inapplicable to the SCM loop and ignored.
+    fn generate_sprint(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
+        let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
+        let seed = req.seed.unwrap_or(0);
+
+        let cond = self.text_encoder.encode(req.prompt)?;
+        let scheduler = ScmScheduler::new(steps);
+        let latents = create_noise(seed, req.width, req.height)?;
+        let latents = denoise_sprint(
+            &self.transformer,
+            &scheduler,
+            seed,
+            latents,
+            &cond,
+            guidance,
+            self.guidance_embeds_scale,
             cancel,
             on_progress,
         )?;

@@ -178,20 +178,36 @@ struct LinearSelfAttn {
     to_k: Linear,
     to_v: Linear,
     to_out: Linear,
+    /// Sprint `qk_norm = "rms_norm_across_heads"` (sc-8490): RMSNorm over the full projected query /
+    /// key (the whole `inner_dim`), applied BEFORE the head split and the ReLU. `None` for base SANA.
+    norm_q: Option<Array>,
+    norm_k: Option<Array>,
     heads: i32,
     attn_eps: f32,
+    norm_eps: f32,
 }
 
 impl LinearSelfAttn {
     fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
+        let (norm_q, norm_k) = if cfg.qk_norm {
+            (
+                Some(w.require(&format!("{prefix}.norm_q.weight"))?.clone()),
+                Some(w.require(&format!("{prefix}.norm_k.weight"))?.clone()),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             // attention_bias=false → q/k/v bias-free; to_out.0 carries a bias.
             to_q: Linear::load(w, &format!("{prefix}.to_q"), false)?,
             to_k: Linear::load(w, &format!("{prefix}.to_k"), false)?,
             to_v: Linear::load(w, &format!("{prefix}.to_v"), false)?,
             to_out: Linear::load(w, &format!("{prefix}.to_out.0"), true)?,
+            norm_q,
+            norm_k,
             heads: cfg.num_attention_heads,
             attn_eps: cfg.attn_eps,
+            norm_eps: cfg.norm_eps,
         })
     }
 
@@ -201,13 +217,26 @@ impl LinearSelfAttn {
         let inner = self.to_q.w_t.shape()[1];
         let hd = inner / self.heads;
 
+        // qk_norm = "rms_norm_across_heads": RMSNorm over the full `inner_dim`, BEFORE the head split
+        // (diffusers applies `attn.norm_q(query)` / `attn.norm_k(key)` to the `[B,N,inner]` projection).
+        let q_proj = self.to_q.forward(x)?;
+        let q_proj = match &self.norm_q {
+            Some(g) => rms_norm(&q_proj, g, self.norm_eps)?,
+            None => q_proj,
+        };
+        let k_proj = self.to_k.forward(x)?;
+        let k_proj = match &self.norm_k {
+            Some(g) => rms_norm(&k_proj, g, self.norm_eps)?,
+            None => k_proj,
+        };
+
         // [B,N,inner] → [B, heads, hd, N]  (diffusers: transpose(1,2).unflatten(1,(heads,-1)))
         let to_bh_d_n = |a: Array| -> Result<Array> {
             Ok(a.reshape(&[b, n, self.heads, hd])?
                 .transpose_axes(&[0, 2, 3, 1])?)
         };
-        let q = relu(&to_bh_d_n(self.to_q.forward(x)?)?)?.as_dtype(F32)?; // [B,H,hd,N]
-        let k = relu(&to_bh_d_n(self.to_k.forward(x)?)?)?.as_dtype(F32)?; // [B,H,hd,N]
+        let q = relu(&to_bh_d_n(q_proj)?)?.as_dtype(F32)?; // [B,H,hd,N]
+        let k = relu(&to_bh_d_n(k_proj)?)?.as_dtype(F32)?; // [B,H,hd,N]
         let v = to_bh_d_n(self.to_v.forward(x)?)?.as_dtype(F32)?; // [B,H,hd,N]
 
         // Reference pads value with a ones-row then divides by it. Algebraically identical f32 split:
@@ -245,17 +274,33 @@ struct CrossAttn {
     to_k: Linear,
     to_v: Linear,
     to_out: Linear,
+    /// Sprint `qk_norm = "rms_norm_across_heads"` (sc-8490): RMSNorm over the full projected query /
+    /// key (the whole cross `inner_dim`), applied BEFORE the head split. `None` for base SANA.
+    norm_q: Option<Array>,
+    norm_k: Option<Array>,
     heads: i32,
+    norm_eps: f32,
 }
 
 impl CrossAttn {
     fn load(w: &Weights, prefix: &str, cfg: &SanaTransformerConfig) -> Result<Self> {
+        let (norm_q, norm_k) = if cfg.qk_norm {
+            (
+                Some(w.require(&format!("{prefix}.norm_q.weight"))?.clone()),
+                Some(w.require(&format!("{prefix}.norm_k.weight"))?.clone()),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             to_q: Linear::load(w, &format!("{prefix}.to_q"), true)?,
             to_k: Linear::load(w, &format!("{prefix}.to_k"), true)?,
             to_v: Linear::load(w, &format!("{prefix}.to_v"), true)?,
             to_out: Linear::load(w, &format!("{prefix}.to_out.0"), true)?,
+            norm_q,
+            norm_k,
             heads: cfg.num_cross_attention_heads,
+            norm_eps: cfg.norm_eps,
         })
     }
 
@@ -268,13 +313,26 @@ impl CrossAttn {
         let hd = inner / self.heads;
         let scale = scalar(1.0 / (hd as f32).sqrt());
 
+        // qk_norm = "rms_norm_across_heads": RMSNorm over the full cross `inner_dim`, BEFORE the head
+        // split (diffusers `attn.norm_q(query)` / `attn.norm_k(key)` on the `[B,*,inner]` projection).
+        let q_proj = self.to_q.forward(x)?;
+        let q_proj = match &self.norm_q {
+            Some(g) => rms_norm(&q_proj, g, self.norm_eps)?,
+            None => q_proj,
+        };
+        let k_proj = self.to_k.forward(kv)?;
+        let k_proj = match &self.norm_k {
+            Some(g) => rms_norm(&k_proj, g, self.norm_eps)?,
+            None => k_proj,
+        };
+
         let split_heads = |a: Array, len: i32| -> Result<Array> {
             // [B,len,inner] → [B,heads,len,hd]
             Ok(a.reshape(&[b, len, self.heads, hd])?
                 .transpose_axes(&[0, 2, 1, 3])?)
         };
-        let q = split_heads(self.to_q.forward(x)?, n)?; // [B,H,N,hd]
-        let k = split_heads(self.to_k.forward(kv)?, m)?; // [B,H,M,hd]
+        let q = split_heads(q_proj, n)?; // [B,H,N,hd]
+        let k = split_heads(k_proj, m)?; // [B,H,M,hd]
         let v = split_heads(self.to_v.forward(kv)?, m)?; // [B,H,M,hd]
 
         // Softmax SDPA in f32 (caption seq is short; full attention).
@@ -397,10 +455,16 @@ impl SanaBlock {
 pub struct SanaTransformer {
     cfg: SanaTransformerConfig,
     patch_embed: Conv, // proj: in → inner (kernel/stride = patch_size)
-    // timestep path (AdaLayerNormSingle.emb + .linear)
+    // timestep path (AdaLayerNormSingle.emb + .linear, or — Sprint — the combined
+    // timestep+guidance embedder, see `guidance_embedder`)
     ts_embedder_1: Linear,
     ts_embedder_2: Linear,
     time_linear: Linear, // → 6·inner
+    /// Sprint (sc-8490): the extra guidance embedder (`SanaCombinedTimestepGuidanceEmbeddings`). The
+    /// embedded guidance scalar runs through the same `Timesteps(256)` sincos projection as the
+    /// timestep, then this two-linear MLP, and is summed into the timestep conditioning. `None` for
+    /// base SANA (`AdaLayerNormSingle`).
+    guidance_embedder: Option<(Linear, Linear)>,
     // caption path
     caption_proj_1: Linear,
     caption_proj_2: Linear,
@@ -422,11 +486,30 @@ impl SanaTransformer {
                 &cfg,
             )?);
         }
+        // Sprint's guidance variant (`SanaCombinedTimestepGuidanceEmbeddings`) drops the `.emb.`
+        // nesting AdaLayerNormSingle introduces and adds a parallel `guidance_embedder`.
+        let (ts1_key, ts2_key, guidance_embedder) = if cfg.guidance_embeds {
+            (
+                "time_embed.timestep_embedder.linear_1",
+                "time_embed.timestep_embedder.linear_2",
+                Some((
+                    Linear::load(w, "time_embed.guidance_embedder.linear_1", true)?,
+                    Linear::load(w, "time_embed.guidance_embedder.linear_2", true)?,
+                )),
+            )
+        } else {
+            (
+                "time_embed.emb.timestep_embedder.linear_1",
+                "time_embed.emb.timestep_embedder.linear_2",
+                None,
+            )
+        };
         Ok(Self {
             patch_embed,
-            ts_embedder_1: Linear::load(w, "time_embed.emb.timestep_embedder.linear_1", true)?,
-            ts_embedder_2: Linear::load(w, "time_embed.emb.timestep_embedder.linear_2", true)?,
+            ts_embedder_1: Linear::load(w, ts1_key, true)?,
+            ts_embedder_2: Linear::load(w, ts2_key, true)?,
             time_linear: Linear::load(w, "time_embed.linear", true)?,
+            guidance_embedder,
             caption_proj_1: Linear::load(w, "caption_projection.linear_1", true)?,
             caption_proj_2: Linear::load(w, "caption_projection.linear_2", true)?,
             caption_norm: w.require("caption_norm.weight")?.clone(),
@@ -447,6 +530,22 @@ impl SanaTransformer {
     /// `out_channels == 32` matches the DC-AE f32c32 latent so the output feeds
     /// [`crate::dc_ae::DcAeDecoder::decode`] directly (sc-8489 composition).
     pub fn forward(&self, latent_nchw: &Array, caption: &Array, timestep: &Array) -> Result<Array> {
+        self.forward_with_guidance(latent_nchw, caption, timestep, None)
+    }
+
+    /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint, sc-8490).
+    ///
+    /// * `guidance` — `[B]` (or `[1]`) the CFG-free guidance scalar (already multiplied by the
+    ///   `guidance_embeds_scale` by the caller). `Some` only for a Sprint-config trunk
+    ///   (`guidance_embeds = true`); `None` runs the base AdaLN-single path. Sprint feeds the scale
+    ///   as an embedded conditioning input — it is NOT classifier-free guidance (no uncond forward).
+    pub fn forward_with_guidance(
+        &self,
+        latent_nchw: &Array,
+        caption: &Array,
+        timestep: &Array,
+        guidance: Option<&Array>,
+    ) -> Result<Array> {
         let cfg = &self.cfg;
         let dim = cfg.inner_dim();
         let lsh = latent_nchw.shape();
@@ -462,9 +561,20 @@ impl SanaTransformer {
 
         // 2. Timestep embedding → embedded_timestep [B,dim] and modulation temb [B,6·dim].
         let ts_proj = timestep_sincos(timestep, 256, 10_000.0, 0.0)?.as_dtype(dt)?; // [B,256]
-        let emb = self
+        let timesteps_emb = self
             .ts_embedder_2
             .forward(&silu(&self.ts_embedder_1.forward(&ts_proj)?)?)?; // [B,dim]
+                                                                       // Sprint: conditioning = timesteps_emb + guidance_emb (the guidance scalar through the same
+                                                                       // sincos(256) projection + a parallel MLP). embedded_timestep (the output-modnorm input) is
+                                                                       // this combined conditioning, exactly as diffusers `SanaCombinedTimestepGuidanceEmbeddings`.
+        let emb = match (&self.guidance_embedder, guidance) {
+            (Some((g1, g2)), Some(g)) => {
+                let g_proj = timestep_sincos(g, 256, 10_000.0, 0.0)?.as_dtype(dt)?;
+                let guidance_emb = g2.forward(&silu(&g1.forward(&g_proj)?)?)?;
+                add(&timesteps_emb, &guidance_emb)?
+            }
+            _ => timesteps_emb,
+        };
         let temb = self.time_linear.forward(&silu(&emb)?)?; // [B,6·dim]
 
         // 3. Caption projection + RMSNorm.

@@ -95,6 +95,22 @@ pub struct SanaTransformerConfig {
     pub caption_norm_eps: f32,
     /// Linear-attention denominator epsilon (`1e-15`, matching the DC-AE primitive).
     pub attn_eps: f32,
+    /// **SANA-Sprint** (sc-8490): the transformer carries an extra *guidance embedder* — a
+    /// timestep-embedding-style MLP on the embedded CFG-free guidance scalar, summed into the
+    /// timestep conditioning (`conditioning = timesteps_emb + guidance_emb`). `false` for base
+    /// SANA-1.6B (the trunk is byte-unchanged); `true` for the Sprint distilled variant. When set,
+    /// the trunk's `time_embed.*` keys switch to the `SanaCombinedTimestepGuidanceEmbeddings` layout
+    /// (no `.emb.` nesting; adds `time_embed.guidance_embedder.*`).
+    pub guidance_embeds: bool,
+    /// Sprint `guidance_embeds_scale` (`0.1`) — the pipeline pre-multiplies the guidance scalar by
+    /// this before the embedder. Only consulted when [`Self::guidance_embeds`] is set.
+    pub guidance_embeds_scale: f32,
+    /// **SANA-Sprint** `qk_norm = "rms_norm_across_heads"`: an RMSNorm over the full projected
+    /// query/key (the whole `inner_dim`, applied before the head split and the ReLU) in BOTH `attn1`
+    /// (linear self-attn) and `attn2` (cross-attn). `false` for base SANA-1.6B (`qk_norm = None`),
+    /// `true` for Sprint. When set, the loader requires `attn1.norm_q/k.weight` +
+    /// `attn2.norm_q/k.weight`.
+    pub qk_norm: bool,
 }
 
 impl SanaTransformerConfig {
@@ -119,6 +135,23 @@ impl SanaTransformerConfig {
             norm_eps: 1e-6,
             caption_norm_eps: 1e-5,
             attn_eps: 1e-15,
+            // Base SANA-1.6B has no guidance embedder and no qk-norm — the trunk is byte-unchanged.
+            guidance_embeds: false,
+            guidance_embeds_scale: 0.1,
+            qk_norm: false,
+        }
+    }
+
+    /// `Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers` transformer config (sc-8490): the
+    /// continuous-time-consistency-distilled, CFG-free few-step variant. Same Linear-DiT backbone as
+    /// [`Self::sana_1600m`], plus the Sprint deltas from the HF `transformer/config.json`:
+    /// `guidance_embeds = true`, `guidance_embeds_scale = 0.1`, `qk_norm = "rms_norm_across_heads"`.
+    pub fn sana_sprint_1600m() -> Self {
+        Self {
+            guidance_embeds: true,
+            guidance_embeds_scale: 0.1,
+            qk_norm: true,
+            ..Self::sana_1600m()
         }
     }
 }
