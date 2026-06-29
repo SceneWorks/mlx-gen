@@ -59,3 +59,66 @@ impl DcAeConfig {
         self.block_out_channels.len()
     }
 }
+
+/// SANA Linear-DiT **trunk** configuration (epic 8485, story sc-8487).
+///
+/// Values mirror the diffusers `SanaTransformer2DModel` config for
+/// `Efficient-Large-Model/Sana_1600M_1024px_diffusers` (the 1.6B model Clark Labs ported). Only the
+/// fields the forward needs are modelled; positional embedding is **NoPE** (`interpolation_scale`
+/// is `None` in the real config, so `patch_embed` carries no `pos_embed` and the conv patchify
+/// supplies all locality), and `guidance_embeds`/`qk_norm` are off for SANA-1.6B.
+#[derive(Clone, Debug)]
+pub struct SanaTransformerConfig {
+    /// Latent channels in (DC-AE f32c32 → 32).
+    pub in_channels: i32,
+    /// Latent channels out (== `in_channels` for SANA-1.6B; matches DC-AE decode input).
+    pub out_channels: i32,
+    /// Self-attention heads.
+    pub num_attention_heads: i32,
+    /// Per-head dim of self-attention (`inner_dim = num_attention_heads * attention_head_dim`).
+    pub attention_head_dim: i32,
+    /// Number of `SanaTransformerBlock`s.
+    pub num_layers: i32,
+    /// Cross-attention heads.
+    pub num_cross_attention_heads: i32,
+    /// Per-head dim of cross-attention.
+    pub cross_attention_head_dim: i32,
+    /// Caption (cross-attn KV) embedding channels in (Gemma-2 CHI → 2304).
+    pub caption_channels: i32,
+    /// GLUMBConv Mix-FFN expand ratio (`hidden = int(mlp_ratio * inner_dim)`).
+    pub mlp_ratio: f32,
+    /// Patchify conv kernel/stride (`1` for SANA — DC-AE already did the 32× spatial compression).
+    pub patch_size: i32,
+    /// LayerNorm epsilon for the affine-free norms (`norm1`/`norm2`/`norm_out`).
+    pub norm_eps: f32,
+    /// `caption_norm` RMSNorm epsilon (`1e-5`).
+    pub caption_norm_eps: f32,
+    /// Linear-attention denominator epsilon (`1e-15`, matching the DC-AE primitive).
+    pub attn_eps: f32,
+}
+
+impl SanaTransformerConfig {
+    /// `inner_dim = num_attention_heads * attention_head_dim`.
+    pub fn inner_dim(&self) -> i32 {
+        self.num_attention_heads * self.attention_head_dim
+    }
+
+    /// `Efficient-Large-Model/Sana_1600M_1024px_diffusers` transformer config.
+    pub fn sana_1600m() -> Self {
+        Self {
+            in_channels: 32,
+            out_channels: 32,
+            num_attention_heads: 70,
+            attention_head_dim: 32, // inner_dim = 2240
+            num_layers: 20,
+            num_cross_attention_heads: 20,
+            cross_attention_head_dim: 112, // cross inner = 2240
+            caption_channels: 2304,
+            mlp_ratio: 2.5,
+            patch_size: 1,
+            norm_eps: 1e-6,
+            caption_norm_eps: 1e-5,
+            attn_eps: 1e-15,
+        }
+    }
+}

@@ -8,9 +8,18 @@
 //!
 //! Port target: diffusers `AutoencoderDC` for `mit-han-lab/dc-ae-f32c32-sana-1.0` (the autoencoder
 //! behind SANA-1.6B 1024px). See [`dc_ae`] for the faithful block-by-block port.
+//!
+//! **sc-8487** adds the [`transformer`] module: the SANA **Linear Diffusion Transformer trunk**
+//! (`SanaTransformer2DModel`) — ReLU linear self-attention (reusing the spike's linear-attn kernel),
+//! standard caption cross-attention, GLUMBConv Mix-FFN (3×3 depthwise conv), adaLN-single timestep
+//! modulation, and NoPE. Its `[B, 32, H, W]` output (f32c32 latent channels) feeds [`dc_ae`]'s
+//! `DcAeDecoder::decode` directly (sc-8489 composition). Written for the bf16/fp16 weight path; the
+//! 2-bit Clark Labs quant is intentionally NOT ported.
 
 pub mod config;
 pub mod dc_ae;
+pub mod transformer;
 
-pub use config::{BlockType, DcAeConfig};
+pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::DcAeDecoder;
+pub use transformer::SanaTransformer;
