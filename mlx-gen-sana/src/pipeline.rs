@@ -29,7 +29,8 @@
 //! Base SANA is a **true-CFG** model (the Sprint CFG-free distilled variant is the LATER story
 //! sc-8490). Each step runs the trunk TWICE — cond (prompt) + uncond (negative/empty prompt) — and
 //! combines `pred = uncond + scale · (cond − uncond)` (diffusers `SanaPipeline.__call__` default
-//! `guidance_scale = 4.5`). When `guidance_scale == 1.0` the uncond forward is skipped (CFG off).
+//! `guidance_scale = 4.5`). When `guidance_scale <= 1.0` the uncond forward is skipped (CFG off),
+//! matching diffusers' `do_classifier_free_guidance = guidance_scale > 1.0`.
 //!
 //! ## DC-AE latent scaling
 //!
@@ -81,7 +82,7 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 /// One flow-match Euler denoise with **true CFG** + progress + cooperative cancellation. Each step
 /// runs the SANA trunk twice (cond + uncond) and combines `uncond + scale·(cond − uncond)`; the Euler
 /// step then advances the latents in σ-space. The trunk timestep is `σ·1000`. When `guidance_scale`
-/// is `1.0` the uncond branch is skipped (CFG off, one forward per step).
+/// is `<= 1.0` the uncond branch is skipped (CFG off, one forward per step; diffusers parity).
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfg(
     transformer: &SanaTransformer,
@@ -100,7 +101,7 @@ pub fn denoise_cfg(
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
         let pred_cond = transformer.forward(x, cond, &t)?;
         match uncond {
-            Some(uc) if guidance_scale != 1.0 => {
+            Some(uc) if guidance_scale > 1.0 => {
                 let pred_uncond = transformer.forward(x, uc, &t)?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
@@ -218,9 +219,10 @@ impl SanaPipeline {
         let seed = req.seed.unwrap_or(0);
 
         // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
-        // prompt (empty string when unset), used only when CFG is active (guidance != 1.0).
+        // prompt (empty string when unset), used only when CFG is active. diffusers gates CFG on
+        // `do_classifier_free_guidance = guidance_scale > 1.0`.
         let cond = self.text_encoder.encode(req.prompt)?;
-        let cfg_on = guidance != 1.0;
+        let cfg_on = guidance > 1.0;
         let uncond = if cfg_on {
             let neg = req.negative_prompt.unwrap_or("");
             Some(self.text_encoder.encode(neg)?)

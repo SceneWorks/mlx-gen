@@ -359,11 +359,15 @@ fn pipeline_wires_trunk_scheduler_decode() {
     let decoder = DcAeDecoder::from_weights(&tiny_dcae_weights(&dcfg), dcfg.clone())
         .expect("build tiny dc-ae");
 
-    // Latent grid: pick H=W=4 latent tokens. DC-AE scale here = 2^(stages-1) = 2.
-    let latent_hw = 4;
+    // Latent grid: NON-SQUARE on purpose (latent_h != latent_w) so the NHWC→NCHW transpose
+    // `[0,3,1,2]` in `decode_to_image` is genuinely exercised — a square grid would let a wrong
+    // permutation (e.g. `[0,3,2,1]`) pass undetected. patch_size = 1, so any latent edge is valid.
+    // DC-AE scale here = 2^(stages-1) = 2.
+    let latent_h = 6;
+    let latent_w = 4;
     let scale: i32 = 1 << (dcfg.num_stages() - 1); // 2
     let latents = normal::<f32>(
-        &[1, tcfg.out_channels, latent_hw, latent_hw],
+        &[1, tcfg.out_channels, latent_h, latent_w],
         None,
         None,
         Some(&key(0).unwrap()),
@@ -402,18 +406,23 @@ fn pipeline_wires_trunk_scheduler_decode() {
 
     assert_eq!(
         denoised.shape(),
-        &[1, tcfg.out_channels, latent_hw, latent_hw],
+        &[1, tcfg.out_channels, latent_h, latent_w],
         "denoised latent keeps the trunk in/out channel + spatial shape"
     );
 
     // Decode through the DC-AE (with the scaling_factor un-scale).
     let img = pipeline::decode_to_image(&decoder, &dcfg, &denoised).expect("decode");
-    let exp = (latent_hw * scale) as u32;
-    assert_eq!(img.width, exp, "decoded width = latent_hw · dc_ae_scale");
-    assert_eq!(img.height, exp, "decoded height = latent_hw · dc_ae_scale");
+    let exp_w = (latent_w * scale) as u32;
+    let exp_h = (latent_h * scale) as u32;
+    // NON-SQUARE: width and height differ, so an axis swap in the NHWC→NCHW transpose would land
+    // these on the wrong fields and fail. `decoded_to_image` reports width = NCHW axis-3 (W),
+    // height = NCHW axis-2 (H); with the correct `[0,3,1,2]` they map straight through.
+    assert_ne!(exp_w, exp_h, "test grid must be non-square to catch a swap");
+    assert_eq!(img.width, exp_w, "decoded width = latent_w · dc_ae_scale");
+    assert_eq!(img.height, exp_h, "decoded height = latent_h · dc_ae_scale");
     assert_eq!(
         img.pixels.len(),
-        (exp * exp * 3) as usize,
+        (exp_w * exp_h * 3) as usize,
         "RGB8 pixel buffer is H·W·3"
     );
 
