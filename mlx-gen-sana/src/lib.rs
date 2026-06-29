@@ -23,13 +23,21 @@
 //! [`text_encoder::SanaTextEncoder::encode`] produces the `[1, 300, 2304]` embedding the
 //! [`transformer::SanaTransformer`] trunk's `attn2` cross-attention consumes.
 
+//! **sc-8489 (Phase A — the mlx-gen side)** adds the [`pipeline`] module: the end-to-end native SANA
+//! text-to-image pipeline composing [`SanaTextEncoder`] → [`SanaTransformer`] (flow-match Euler
+//! denoise via the unified epic-7114 sampler, true CFG) → [`DcAeDecoder`] into a clean
+//! [`pipeline::SanaPipeline::generate`] entrypoint. Phase B (the SceneWorks worker `Generator`
+//! adapter/registration) is a separate follow-up PR.
+
 pub mod config;
 pub mod dc_ae;
+pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::DcAeDecoder;
+pub use pipeline::{SanaGenerateRequest, SanaPipeline};
 pub use text_encoder::{
     Gemma2, Gemma2Config, SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT,
 };
