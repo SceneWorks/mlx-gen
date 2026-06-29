@@ -67,6 +67,7 @@ fn tiny_config() -> SanaTransformerConfig {
         patch_size: 1,
         norm_eps: 1e-6,
         caption_norm_eps: 1e-5,
+        attn_qk_norm_eps: 1e-5,
         attn_eps: 1e-15,
         // Base SANA tiny config — guidance embedder + qk-norm OFF (these are the Sprint deltas).
         guidance_embeds: false,

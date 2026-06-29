@@ -67,6 +67,25 @@ fn scm_timestep_and_input_scale_match_diffusers_formula() {
     // At t = π/2: sin=1, cos=0 → scm = 1; input scale = sqrt(1+0) = 1.
     approx(s.scm_timestep(0), 1.0, 1e-5, "scm at pi/2");
     approx(s.input_scale(0), 1.0, 1e-5, "scale at pi/2");
+
+    // INDEPENDENT hard-coded references for the mid-angle (intermediate timestep t = 1.3), computed
+    // OUTSIDE the impl's closed form (Python: sin(1.3)=0.963558, cos(1.3)=0.267499 →
+    // scm = 0.963558 / (0.267499 + 0.963558) = 0.782708;
+    // input_scale = sqrt(0.782708² + 0.217292²) = 0.812310). This makes the test non-circular: the
+    // loop above checks the impl matches the formula, these check the formula matches reality.
+    approx(s.timesteps[1], 1.3, 1e-6, "mid-angle t == 1.3");
+    approx(
+        s.scm_timestep(1),
+        0.782708,
+        1e-5,
+        "scm at t=1.3 (hard-coded)",
+    );
+    approx(
+        s.input_scale(1),
+        0.812310,
+        1e-5,
+        "input_scale at t=1.3 (hard-coded)",
+    );
 }
 
 /// The diffusers `SCMScheduler.step` x0-prediction: `pred_x0 = cos(s)·x − sin(s)·model_output`. Verify

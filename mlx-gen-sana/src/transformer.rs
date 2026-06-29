@@ -184,7 +184,9 @@ struct LinearSelfAttn {
     norm_k: Option<Array>,
     heads: i32,
     attn_eps: f32,
-    norm_eps: f32,
+    /// qk-norm RMSNorm eps (`1e-5`, diffusers `Attention.__init__` default). NOT `cfg.norm_eps`
+    /// (`1e-6`), which governs only the affine-free LayerNorms.
+    qk_norm_eps: f32,
 }
 
 impl LinearSelfAttn {
@@ -207,7 +209,7 @@ impl LinearSelfAttn {
             norm_k,
             heads: cfg.num_attention_heads,
             attn_eps: cfg.attn_eps,
-            norm_eps: cfg.norm_eps,
+            qk_norm_eps: cfg.attn_qk_norm_eps,
         })
     }
 
@@ -221,12 +223,12 @@ impl LinearSelfAttn {
         // (diffusers applies `attn.norm_q(query)` / `attn.norm_k(key)` to the `[B,N,inner]` projection).
         let q_proj = self.to_q.forward(x)?;
         let q_proj = match &self.norm_q {
-            Some(g) => rms_norm(&q_proj, g, self.norm_eps)?,
+            Some(g) => rms_norm(&q_proj, g, self.qk_norm_eps)?,
             None => q_proj,
         };
         let k_proj = self.to_k.forward(x)?;
         let k_proj = match &self.norm_k {
-            Some(g) => rms_norm(&k_proj, g, self.norm_eps)?,
+            Some(g) => rms_norm(&k_proj, g, self.qk_norm_eps)?,
             None => k_proj,
         };
 
@@ -279,7 +281,9 @@ struct CrossAttn {
     norm_q: Option<Array>,
     norm_k: Option<Array>,
     heads: i32,
-    norm_eps: f32,
+    /// qk-norm RMSNorm eps (`1e-5`, diffusers `Attention.__init__` default). NOT `cfg.norm_eps`
+    /// (`1e-6`), which governs only the affine-free LayerNorms.
+    qk_norm_eps: f32,
 }
 
 impl CrossAttn {
@@ -300,7 +304,7 @@ impl CrossAttn {
             norm_q,
             norm_k,
             heads: cfg.num_cross_attention_heads,
-            norm_eps: cfg.norm_eps,
+            qk_norm_eps: cfg.attn_qk_norm_eps,
         })
     }
 
@@ -317,12 +321,12 @@ impl CrossAttn {
         // split (diffusers `attn.norm_q(query)` / `attn.norm_k(key)` on the `[B,*,inner]` projection).
         let q_proj = self.to_q.forward(x)?;
         let q_proj = match &self.norm_q {
-            Some(g) => rms_norm(&q_proj, g, self.norm_eps)?,
+            Some(g) => rms_norm(&q_proj, g, self.qk_norm_eps)?,
             None => q_proj,
         };
         let k_proj = self.to_k.forward(kv)?;
         let k_proj = match &self.norm_k {
-            Some(g) => rms_norm(&k_proj, g, self.norm_eps)?,
+            Some(g) => rms_norm(&k_proj, g, self.qk_norm_eps)?,
             None => k_proj,
         };
 

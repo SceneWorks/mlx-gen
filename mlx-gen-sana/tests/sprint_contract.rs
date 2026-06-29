@@ -79,6 +79,7 @@ fn tiny_sprint_config() -> SanaTransformerConfig {
         patch_size: 1,
         norm_eps: 1e-6,
         caption_norm_eps: 1e-5,
+        attn_qk_norm_eps: 1e-5,
         attn_eps: 1e-15,
         guidance_embeds: true,
         guidance_embeds_scale: 0.1,

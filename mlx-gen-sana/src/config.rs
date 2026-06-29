@@ -93,6 +93,12 @@ pub struct SanaTransformerConfig {
     pub norm_eps: f32,
     /// `caption_norm` RMSNorm epsilon (`1e-5`).
     pub caption_norm_eps: f32,
+    /// **SANA-Sprint** `qk_norm = "rms_norm_across_heads"` RMSNorm epsilon. diffusers builds the
+    /// attn1/attn2 qk-norm via `Attention.__init__` WITHOUT an explicit `eps`, so it falls back to
+    /// that constructor's default `eps = 1e-5` — distinct from [`Self::norm_eps`] (`1e-6`), which
+    /// only governs the affine-free `norm1`/`norm2`/`norm_out` LayerNorms. Only consulted on the
+    /// qk-norm path when [`Self::qk_norm`] is set.
+    pub attn_qk_norm_eps: f32,
     /// Linear-attention denominator epsilon (`1e-15`, matching the DC-AE primitive).
     pub attn_eps: f32,
     /// **SANA-Sprint** (sc-8490): the transformer carries an extra *guidance embedder* — a
@@ -134,6 +140,9 @@ impl SanaTransformerConfig {
             patch_size: 1,
             norm_eps: 1e-6,
             caption_norm_eps: 1e-5,
+            // diffusers builds the (Sprint-only) qk-norm without an explicit eps → Attention's
+            // default 1e-5, distinct from the 1e-6 affine-free LayerNorm eps above.
+            attn_qk_norm_eps: 1e-5,
             attn_eps: 1e-15,
             // Base SANA-1.6B has no guidance embedder and no qk-norm — the trunk is byte-unchanged.
             guidance_embeds: false,
