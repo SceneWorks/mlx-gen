@@ -1,0 +1,14 @@
+[package]
+name = "mlx-gen-sana"
+version = "0.0.0"
+edition = "2021"
+description = "SANA (NVlabs) provider crate for mlx-gen. Spike sc-8486: DC-AE f32 deep-compression decoder."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/mlx-gen"
+keywords = ["mlx", "apple-silicon", "image", "sana", "inference"]
+categories = ["science"]
+
+[dependencies]
+mlx-gen = { path = ".." }
+# Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
+mlx-rs = { workspace = true }

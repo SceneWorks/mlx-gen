@@ -1,5 +1,5 @@
 [workspace]
-members = ["gen-core", "gen-core-testkit", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-clip", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-bernini", "mlx-gen-scail2", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sam3", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma", "mlx-gen-lens", "mlx-gen-seedvr2", "mlx-gen-ideogram", "mlx-gen-boogu", "mlx-gen-krea", "mlx-gen-pid", "mlx-gen-sd3", "mlx-gen-depth"]
+members = ["gen-core", "gen-core-testkit", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-clip", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-bernini", "mlx-gen-scail2", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sam3", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma", "mlx-gen-lens", "mlx-gen-seedvr2", "mlx-gen-ideogram", "mlx-gen-boogu", "mlx-gen-krea", "mlx-gen-pid", "mlx-gen-sd3", "mlx-gen-depth", "mlx-gen-sana"]
 resolver = "2"
 
 # Single source of truth for the deps shared across the root and all 16 member crates (F-151). The
