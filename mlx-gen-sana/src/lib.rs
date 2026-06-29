@@ -31,12 +31,14 @@
 
 pub mod config;
 pub mod dc_ae;
+pub mod model;
 pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::DcAeDecoder;
+pub use model::{descriptor as sana_descriptor, load as load_sana, Sana, MODEL_ID};
 pub use pipeline::{SanaGenerateRequest, SanaPipeline};
 pub use text_encoder::{
     Gemma2, Gemma2Config, SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT,
