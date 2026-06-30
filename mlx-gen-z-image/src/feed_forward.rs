@@ -22,10 +22,12 @@ pub struct FeedForward {
 impl FeedForward {
     /// Load the three projections (no bias) from `{prefix}.w{1,2,3}.weight`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        // Packed-detect (sc-8670): the three SwiGLU projections load packed from a pre-quantized
+        // snapshot or dense otherwise. No biases.
         Ok(Self {
-            w1: AdaptableLinear::dense(w.require(&format!("{prefix}.w1.weight"))?.clone(), None),
-            w2: AdaptableLinear::dense(w.require(&format!("{prefix}.w2.weight"))?.clone(), None),
-            w3: AdaptableLinear::dense(w.require(&format!("{prefix}.w3.weight"))?.clone(), None),
+            w1: crate::quant::lin(w, &format!("{prefix}.w1"), false)?,
+            w2: crate::quant::lin(w, &format!("{prefix}.w2"), false)?,
+            w3: crate::quant::lin(w, &format!("{prefix}.w3"), false)?,
         })
     }
 

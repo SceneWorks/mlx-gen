@@ -49,8 +49,10 @@ pub struct TextEncoder {
 
 impl TextEncoder {
     pub fn from_weights(w: &Weights, prefix: &str, cfg: &ZTextEncoderConfig) -> Result<Self> {
-        let embed_tokens =
-            TokenEmbedding::Dense(w.require(&join(prefix, "embed_tokens.weight"))?.clone());
+        // Packed-detect (sc-8670): the token embedding loads packed from a pre-quantized snapshot
+        // (the table is bf16-native, so the converter's bf16-cast pack is byte-equal to the
+        // load-time `quantize(bits, cast_to_bf16=false)`) or dense otherwise.
+        let embed_tokens = crate::quant::embedding(w, &join(prefix, "embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let lp = join(prefix, &format!("layers.{i}"));

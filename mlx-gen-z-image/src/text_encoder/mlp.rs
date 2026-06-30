@@ -21,16 +21,13 @@ pub struct TextMlp {
 
 impl TextMlp {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let dense = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, name))?.clone(),
-                None,
-            ))
-        };
+        // Packed-detect (sc-8670): the three SwiGLU projections load packed from a pre-quantized
+        // snapshot or dense otherwise. No biases.
+        let lin = |name: &str| crate::quant::lin(w, &join(prefix, name), false);
         Ok(Self {
-            gate: dense("gate_proj.weight")?,
-            up: dense("up_proj.weight")?,
-            down: dense("down_proj.weight")?,
+            gate: lin("gate_proj")?,
+            up: lin("up_proj")?,
+            down: lin("down_proj")?,
         })
     }
 

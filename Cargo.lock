@@ -929,6 +929,7 @@ dependencies = [
  "mlx-gen-pid",
  "pmetal-mlx-rs",
  "sceneworks-gen-core-testkit",
+ "serde_json",
 ]
 
 [[package]]

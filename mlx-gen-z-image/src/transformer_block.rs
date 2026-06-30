@@ -56,10 +56,12 @@ impl ZImageTransformerBlock {
     /// Load a block from weights under `prefix` (e.g. `"transformer.layers.0"`, or `"w"` for
     /// the standalone parity fixture). Keys mirror the Python `tree_flatten` layout.
     pub fn from_weights(w: &Weights, prefix: &str, cfg: ZImageBlockConfig) -> Result<Self> {
-        let ada_w = w
-            .require(&format!("{prefix}.adaLN_modulation.0.weight"))?
-            .clone();
-        let ada_b = w.get(&format!("{prefix}.adaLN_modulation.0.bias")).cloned();
+        // Packed-detect (sc-8670): the adaLN modulation Linear loads packed from a pre-quantized
+        // snapshot or dense otherwise. Its bias is optional (present iff the checkpoint carries it,
+        // and stays dense on the packed path), so probe it before routing through the loader.
+        let ada_has_bias = w
+            .get(&format!("{prefix}.adaLN_modulation.0.bias"))
+            .is_some();
         Ok(Self {
             attention: ZImageAttention::from_weights(
                 w,
@@ -77,7 +79,7 @@ impl ZImageTransformerBlock {
                 .clone(),
             ffn_norm1: w.require(&format!("{prefix}.ffn_norm1.weight"))?.clone(),
             ffn_norm2: w.require(&format!("{prefix}.ffn_norm2.weight"))?.clone(),
-            ada_ln: AdaptableLinear::dense(ada_w, ada_b),
+            ada_ln: crate::quant::lin(w, &format!("{prefix}.adaLN_modulation.0"), ada_has_bias)?,
             eps: cfg.norm_eps,
         })
     }

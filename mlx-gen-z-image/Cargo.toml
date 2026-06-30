@@ -23,6 +23,9 @@ mlx-gen-pid = { path = "../mlx-gen-pid" }
 # Decode training-dataset images (LoRA training, sc-3044). PNG + JPEG cover the SceneWorks dataset
 # formats; the trainer center-crops + hands the Image to the VAE preprocess.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Read/annotate per-component `config.json` with the `quantization` block in the offline
+# pre-quantization converter (`convert.rs`, sc-8670) — matches mlx-gen-flux2.
+serde_json = "1"
 
 [dev-dependencies]
 # Backend-neutral contract conformance suite (sc-4481): the macos-mlx lane runs z_image_turbo

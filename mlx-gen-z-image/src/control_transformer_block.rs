@@ -44,15 +44,16 @@ impl ZImageControlBlock {
         has_before_proj: bool,
     ) -> Result<Self> {
         let base = ZImageTransformerBlock::from_weights(w, prefix, cfg)?;
-        let after_proj = AdaptableLinear::dense(
-            w.require(&format!("{prefix}.after_proj.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.after_proj.bias"))?.clone()),
-        );
+        // Packed-detect (sc-8670): the control projections load packed from a pre-quantized control
+        // snapshot or dense otherwise; both carry a bias. Their in-features (3840) are group-64
+        // divisible, so they pack in a quantized tier.
+        let after_proj = crate::quant::lin(w, &format!("{prefix}.after_proj"), true)?;
         let before_proj = if has_before_proj {
-            Some(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.before_proj.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.before_proj.bias"))?.clone()),
-            ))
+            Some(crate::quant::lin(
+                w,
+                &format!("{prefix}.before_proj"),
+                true,
+            )?)
         } else {
             None
         };

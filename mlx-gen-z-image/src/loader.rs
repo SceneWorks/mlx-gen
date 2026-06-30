@@ -96,21 +96,22 @@ pub fn load_vae(root: &Path) -> Result<Vae> {
 /// disk but `linear{1,2}` internally, and the final layer's adaLN is `Sequential(SiLU, Linear)`
 /// (Linear at index 1 on disk, index 0 internally). Everything else matches directly.
 pub fn remap_transformer_keys(w: &mut Weights) {
+    // Base (suffix-less) renames. Each is aliased across the four tensor suffixes a Linear can carry
+    // so a **pre-quantized** snapshot (sc-8670) remaps intact: `.weight`+`.bias` for the dense case,
+    // plus the packed `.scales`+`.biases` for the quantized case. `alias` is a no-op when the source
+    // key is absent, so a dense snapshot (no `.scales`/`.biases`) and a packed one are both handled
+    // by the same list.
     for (from, to) in [
-        ("t_embedder.mlp.0.weight", "t_embedder.linear1.weight"),
-        ("t_embedder.mlp.0.bias", "t_embedder.linear1.bias"),
-        ("t_embedder.mlp.2.weight", "t_embedder.linear2.weight"),
-        ("t_embedder.mlp.2.bias", "t_embedder.linear2.bias"),
+        ("t_embedder.mlp.0", "t_embedder.linear1"),
+        ("t_embedder.mlp.2", "t_embedder.linear2"),
         (
-            "all_final_layer.2-1.adaLN_modulation.1.weight",
-            "all_final_layer.2-1.adaLN_modulation.0.weight",
-        ),
-        (
-            "all_final_layer.2-1.adaLN_modulation.1.bias",
-            "all_final_layer.2-1.adaLN_modulation.0.bias",
+            "all_final_layer.2-1.adaLN_modulation.1",
+            "all_final_layer.2-1.adaLN_modulation.0",
         ),
     ] {
-        w.alias(from, to);
+        for suffix in [".weight", ".bias", ".scales", ".biases"] {
+            w.alias(&format!("{from}{suffix}"), &format!("{to}{suffix}"));
+        }
     }
 }
 

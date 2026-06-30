@@ -153,19 +153,12 @@ impl ZImageTransformer {
         };
 
         Ok(Self {
-            x_embedder: AdaptableLinear::dense(
-                w.require(&p(&format!("all_x_embedder.{key}.weight")))?
-                    .clone(),
-                Some(
-                    w.require(&p(&format!("all_x_embedder.{key}.bias")))?
-                        .clone(),
-                ),
-            ),
+            // Packed-detect (sc-8670): the image patch embedder + caption projection load packed
+            // from a pre-quantized snapshot or dense otherwise; both carry a bias. `cap_embedder.0`
+            // is the caption RMSNorm scale (1-D) and stays a raw dense `Array`.
+            x_embedder: crate::quant::lin(w, &p(&format!("all_x_embedder.{key}")), true)?,
             cap_norm_w: w.require(&p("cap_embedder.0.weight"))?.clone(),
-            cap_linear: AdaptableLinear::dense(
-                w.require(&p("cap_embedder.1.weight"))?.clone(),
-                Some(w.require(&p("cap_embedder.1.bias"))?.clone()),
-            ),
+            cap_linear: crate::quant::lin(w, &p("cap_embedder.1"), true)?,
             t_embedder: TimestepEmbedder::from_weights(
                 w,
                 &p("t_embedder"),

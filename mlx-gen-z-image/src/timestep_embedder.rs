@@ -17,15 +17,13 @@ pub struct TimestepEmbedder {
 
 impl TimestepEmbedder {
     pub fn from_weights(w: &Weights, prefix: &str, frequency_embedding_size: i32) -> Result<Self> {
-        let dense = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{name}.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.{name}.bias"))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8670): both MLP Linears load packed from a pre-quantized snapshot or
+        // dense otherwise; both carry a bias. (`transformer.quantize` packs the t-embedder MLP, so
+        // a packed tier ships these pre-quantized.)
+        let lin = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), true);
         Ok(Self {
-            linear1: dense("linear1")?,
-            linear2: dense("linear2")?,
+            linear1: lin("linear1")?,
+            linear2: lin("linear2")?,
             frequency_embedding_size,
         })
     }

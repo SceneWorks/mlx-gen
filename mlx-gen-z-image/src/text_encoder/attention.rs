@@ -32,17 +32,14 @@ impl TextAttention {
         num_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self> {
-        let dense = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, name))?.clone(),
-                None,
-            ))
-        };
+        // Packed-detect (sc-8670): the GQA projections load packed from a pre-quantized snapshot or
+        // dense otherwise. Qwen3 attention has no biases.
+        let lin = |name: &str| crate::quant::lin(w, &join(prefix, name), false);
         Ok(Self {
-            q_proj: dense("q_proj.weight")?,
-            k_proj: dense("k_proj.weight")?,
-            v_proj: dense("v_proj.weight")?,
-            o_proj: dense("o_proj.weight")?,
+            q_proj: lin("q_proj")?,
+            k_proj: lin("k_proj")?,
+            v_proj: lin("v_proj")?,
+            o_proj: lin("o_proj")?,
             q_norm: w.require(&join(prefix, "q_norm.weight"))?.clone(),
             k_norm: w.require(&join(prefix, "k_norm.weight"))?.clone(),
             num_heads,

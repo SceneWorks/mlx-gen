@@ -88,16 +88,12 @@ impl ZImageControlTransformer {
             norm_eps: base.cfg.norm_eps,
         };
 
-        let control_x_embedder = AdaptableLinear::dense(
-            control
-                .require(&p(&format!("control_all_x_embedder.{key}.weight")))?
-                .clone(),
-            Some(
-                control
-                    .require(&p(&format!("control_all_x_embedder.{key}.bias")))?
-                    .clone(),
-            ),
-        );
+        // Packed-detect (sc-8670): the control patch embedder loads packed from a pre-quantized
+        // control snapshot or dense otherwise. In practice it stays dense in every tier — its
+        // in-features (33·p²·pf, e.g. 132) is not divisible by the group size 64, so neither the
+        // in-memory `quantize` nor the converter's shape guard packs it.
+        let control_x_embedder =
+            crate::quant::lin(control, &p(&format!("control_all_x_embedder.{key}")), true)?;
 
         let control_layers = (0..CONTROL_LAYERS_PLACES.len())
             .map(|i| {

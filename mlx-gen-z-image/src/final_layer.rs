@@ -19,15 +19,12 @@ pub struct FinalLayer {
 
 impl FinalLayer {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let dense = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{name}.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.{name}.bias"))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8670): both Linears load packed from a pre-quantized snapshot or dense
+        // otherwise; both carry a bias.
+        let lin = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), true);
         Ok(Self {
-            linear: dense("linear")?,
-            ada: dense("adaLN_modulation.0")?,
+            linear: lin("linear")?,
+            ada: lin("adaLN_modulation.0")?,
         })
     }
 

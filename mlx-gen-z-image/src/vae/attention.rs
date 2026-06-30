@@ -25,12 +25,11 @@ pub struct VaeAttention {
 impl VaeAttention {
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
         let g = |s: &str| w.require(&format!("{prefix}.{s}")).cloned();
-        let lin = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                g(&format!("{name}.weight"))?,
-                Some(g(&format!("{name}.bias"))?),
-            ))
-        };
+        // Packed-detect (sc-8670): the mid-block attention QKV/out projections load packed from a
+        // pre-quantized snapshot or dense otherwise; all carry a bias. They are the only quantizable
+        // leaves in the otherwise-conv VAE. The pre-quantized `{base}.{weight,scales,biases,bias}`
+        // pass through the loader's diffusers→internal VAE remap untouched (not conv weights).
+        let lin = |name: &str| crate::quant::lin(w, &format!("{prefix}.{name}"), true);
         Ok(Self {
             gn_w: g("group_norm.weight")?,
             gn_b: g("group_norm.bias")?,

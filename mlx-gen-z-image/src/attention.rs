@@ -54,22 +54,13 @@ impl ZImageAttention {
     ) -> Result<Self> {
         let head_dim = dim / n_heads;
         Ok(Self {
-            to_q: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.to_q.weight"))?.clone(),
-                None,
-            ),
-            to_k: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.to_k.weight"))?.clone(),
-                None,
-            ),
-            to_v: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.to_v.weight"))?.clone(),
-                None,
-            ),
-            to_out: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.to_out.0.weight"))?.clone(),
-                None,
-            ),
+            // Packed-detect (sc-8670): each QKV/out projection loads packed from a pre-quantized
+            // snapshot (`{base}.scales` present) or dense otherwise. No bias on the Z-Image DiT
+            // attention projections.
+            to_q: crate::quant::lin(w, &format!("{prefix}.to_q"), false)?,
+            to_k: crate::quant::lin(w, &format!("{prefix}.to_k"), false)?,
+            to_v: crate::quant::lin(w, &format!("{prefix}.to_v"), false)?,
+            to_out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), false)?,
             norm_q: w.get(&format!("{prefix}.norm_q.weight")).cloned(),
             norm_k: w.get(&format!("{prefix}.norm_k.weight")).cloned(),
             n_heads,
