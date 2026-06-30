@@ -81,15 +81,13 @@ impl Drop for CompileGlueGuard {
 
 /// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
 /// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole
-/// model can be Q8-quantized in place without touching the forward.
+/// model can be Q8-quantized in place without touching the forward. Routes through
+/// [`crate::quant::lin`], which **auto-detects** a pre-quantized (packed) snapshot via
+/// `{prefix}.scales` and loads it packed with no dense transient (sc-8670); a dense snapshot loads
+/// dense exactly as before. The post-load `transformer.quantize(bits)` is a no-op on an
+/// already-packed module, so the same path serves both pre-quantized tiers and dense control loads.
 pub(crate) fn linear_from(w: &Weights, prefix: &str, has_bias: bool) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.clone();
-    let bias = if has_bias {
-        Some(w.require(&format!("{prefix}.bias"))?.clone())
-    } else {
-        None
-    };
-    Ok(AdaptableLinear::dense(weight, bias))
+    crate::quant::lin(w, prefix, has_bias)
 }
 
 /// Join a module prefix with a leaf name, tolerating an empty prefix.

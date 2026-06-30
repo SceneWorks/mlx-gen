@@ -18,6 +18,9 @@ inventory = { workspace = true }
 # backbone, so `decode_and_collect` routes through a `mlx_gen_pid::PidDecoder` when `req.use_pid` is
 # set. `mlx-gen-pid` depends only on core (no dep on this crate), so the dependency is acyclic.
 mlx-gen-pid = { path = "../mlx-gen-pid" }
+# Offline pre-quantization converter (sc-8670): annotate the packed tier's `config.json` with the
+# `quantization` block (HF/diffusers-compat; the loader auto-detects via `{base}.scales`).
+serde_json = "1"
 
 [dev-dependencies]
 # Encode the PiD-vs-VAE real-weight smoke output to PNG for eyeball comparison (sc-7845;

@@ -18,12 +18,14 @@
 
 pub mod adapters;
 pub mod control_transformer;
+pub mod convert;
 pub mod image_processor;
 pub mod loader;
 pub mod model;
 pub mod model_control;
 pub mod model_edit;
 pub mod pipeline;
+pub mod quant;
 pub mod sampler;
 pub mod text_encoder;
 pub mod transformer;
