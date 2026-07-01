@@ -11,8 +11,10 @@
 pub mod adapters;
 pub mod beta;
 pub mod config;
+pub mod convert;
 pub mod loader;
 pub mod model;
+pub mod quant;
 pub mod text;
 pub mod transformer;
 

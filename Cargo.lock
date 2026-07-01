@@ -636,6 +636,7 @@ dependencies = [
  "mlx-gen-pid",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]

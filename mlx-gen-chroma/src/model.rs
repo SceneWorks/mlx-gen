@@ -55,7 +55,8 @@ pub fn load_flash(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
-            "{}: only dense bf16 is wired for the Chroma port (quant = sc-3841)",
+            "{}: only bf16 compute is wired for the Chroma port (drop the precision override; Q4/Q8 \
+             load via a pre-quantized packed tier or `spec.quantize`, orthogonal to precision)",
             variant.id()
         )));
     }
@@ -76,8 +77,14 @@ pub fn load_chroma(variant: ChromaVariant, spec: &LoadSpec) -> Result<Chroma> {
     let mut transformer = loader::load_transformer(root, cfg)?;
     let vae = loader::load_vae(root)?;
 
-    // Load-time Q4/Q8 over the DiT's heavy block linears (sc-3841). T5/VAE stay f32 (their quant is a
-    // measurably-0% memory-only win and not wired here).
+    // Q4/Q8 over the DiT's heavy block linears (sc-3841 / sc-8777). Two paths, both correct:
+    //   * **Pre-quantized packed tier** (the hosted Q4/Q8 turnkeys): the block Linears load already
+    //     quantized via `crate::quant::lin` (packed-detect on `{base}.scales`), so `spec.quantize` is
+    //     `None` and this `.quantize()` is skipped — no dense transient.
+    //   * **Dense snapshot + `spec.quantize`**: the block Linears load dense, then this `.quantize()`
+    //     packs them in place (byte-identical to the packed tier). If a packed base ever reaches here
+    //     it no-ops (`AdaptableLinear::quantize` only acts on a dense base).
+    // T5/VAE stay f32 in every tier (their quant is a measurably-0% memory-only win and not wired).
     if let Some(q) = spec.quantize {
         transformer.quantize(q.bits())?;
     }
