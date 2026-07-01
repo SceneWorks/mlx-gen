@@ -270,14 +270,25 @@ pub fn encode_fun_control_context(
 ) -> Result<Array> {
     let image_nchw = preprocess_init_image(image, width, height)?; // [1, 3, H, W]
     let control_latents = vae.encode(&image_nchw)?.squeeze_axes(&[2])?; // [1, 16, H/8, W/8]
+    fun_control_context_from_latents(&control_latents, width, height)
+}
+
+/// Build the packed **2512-Fun** 132-ch control context from an already VAE-encoded control latent
+/// `[1, 16, H/8, W/8]` — the channel-order/fill + 2×2 pack half of
+/// [`encode_fun_control_context`], split out so the sc-8335 numeric golden can byte-confirm it
+/// against the fork's `pipeline_qwenimage_control._pack_latents([control_latents | mask | inpaint])`
+/// with a synthetic latent (no VAE). Pose-only: zero mask (1ch) + zero inpaint latent (16ch)
+/// concatenated on the channel axis → 33 channels, then 2×2-packed → 132.
+pub fn fun_control_context_from_latents(
+    control_latents: &Array,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
     let (lh8, lw8) = ((height / 8) as i32, (width / 8) as i32);
-    // Pose-only: zero mask (1ch) + zero inpaint latent (16ch). Concatenated on the channel axis →
-    // 33 channels, then 2×2-packed → 132.
     let mask = mlx_rs::ops::zeros::<f32>(&[1, 1, lh8, lw8])?;
     let inpaint = mlx_rs::ops::zeros::<f32>(&[1, LATENT_CHANNELS, lh8, lw8])?;
-    let ctx = concatenate_axis(&[&control_latents, &mask, &inpaint], 1)?; // [1, 33, H/8, W/8]
-    let packed = pack_latents_c(&ctx, LATENT_CHANNELS * 2 + 1, width, height)?; // [1, seq, 132]
-    Ok(packed)
+    let ctx = concatenate_axis(&[control_latents, &mask, &inpaint], 1)?; // [1, 33, H/8, W/8]
+    pack_latents_c(&ctx, LATENT_CHANNELS * 2 + 1, width, height) // [1, seq, 132]
 }
 
 /// Qwen-Image's flow-match sigma schedule: `linspace(1, 1/n, n)` run through the exponential
