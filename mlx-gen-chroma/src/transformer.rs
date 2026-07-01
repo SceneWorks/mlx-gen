@@ -54,17 +54,19 @@ fn timestep_embedding(timesteps: &Array, dim: usize, downscale_freq_shift: f64) 
     mlx_gen::nn::timestep_sincos(timesteps, dim, MAX_PERIOD, downscale_freq_shift)
 }
 
-/// A dense `nn.Linear` (`[out, in]` weight + bias) wrapping the core [`AdaptableLinear`] — so it can
-/// be quantized (sc-3841) and carry LoRA/LoKr adapters (sc-3842). The forward runs f32 activations
-/// over the bf16 (or quantized) weight; mlx promotes.
-struct Lin(AdaptableLinear);
+/// A dense-or-packed `nn.Linear` (`[out, in]` weight + bias) wrapping the core [`AdaptableLinear`] —
+/// so it can be quantized (sc-3841) and carry LoRA/LoKr adapters (sc-3842). The forward runs f32
+/// activations over the bf16 (or quantized) weight; mlx promotes.
+///
+/// Loads through [`crate::quant::lin`], which **packed-detects** via `{prefix}.scales`: a
+/// pre-quantized (Q4/Q8) turnkey's block Linears load as already-quantized bases directly (no dense
+/// transient — sc-8777), while a dense snapshot (and the always-dense embedders/Approximator) load
+/// dense exactly as before. Every Chroma Linear carries a bias, so `bias = true` throughout.
+pub(crate) struct Lin(AdaptableLinear);
 
 impl Lin {
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
-        Ok(Self(AdaptableLinear::dense(
-            w.require(&format!("{prefix}.weight"))?.clone(),
-            Some(w.require(&format!("{prefix}.bias"))?.clone()),
-        )))
+        Ok(Self(crate::quant::lin(w, prefix, true)?))
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {

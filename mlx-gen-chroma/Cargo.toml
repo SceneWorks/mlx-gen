@@ -22,6 +22,9 @@ mlx-gen-pid = { path = "../mlx-gen-pid" }
 mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 inventory = { workspace = true }
+# Offline pre-quantization converter (sc-8777): annotate the packed transformer `config.json` with a
+# `quantization` block (HF/diffusers-compat; the Rust loader auto-detects via `.scales` and ignores it).
+serde_json = "1"
 
 [dev-dependencies]
 # PNG dump of the Rust render for visual inspection in the e2e parity test.
