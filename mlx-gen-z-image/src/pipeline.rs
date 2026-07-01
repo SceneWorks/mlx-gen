@@ -10,7 +10,7 @@ use mlx_gen::array::host_i32;
 // The img2img leaves (start-step / init-image preprocess / noise-interp blend) are shared in core;
 // re-export so the crate's public surface (`mlx_gen_z_image::…`) and internal callers are unchanged.
 pub use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
-use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::tokenizer::{TextTokenizer, TokenizerOutput};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Conditioning, Error, FlowMatchEuler, GenerationRequest, Image,
     LatentDecoder, Progress, Result, TimestepConvention,
@@ -401,16 +401,30 @@ pub(crate) fn encode_prompt(
 
 /// Negative/unconditional caption → `cap_feats` (f32) for the base model's CFG path (sc-8320). Unlike
 /// [`encode_prompt`], an **empty** caption is legitimate here — it is the unconditional embedding the
-/// CFG uncond branch consumes. The Qwen instruct chat template wraps even an empty string into its
-/// role-marker tokens (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`), so the tokenization is
-/// never genuinely size-0; the guard is retained as defense-in-depth against a degenerate template,
-/// surfacing as a typed error rather than a host-readback panic on a size-0 array.
+/// CFG uncond branch consumes.
+///
+/// An empty negative prompt must NOT go through [`TextTokenizer::tokenize`]: gen-core short-circuits an
+/// empty prompt to a `[1, 0]` sequence **before** the chat template is applied
+/// (`pad_to_max_length = false`), so it would trip the size-0 guard below and error — the exact trap
+/// fixed on the candle backend by candle sc-8646; this is the MLX twin (sc-8958). Instead render the
+/// QwenInstruct scaffolding around `""` via [`TextTokenizer::encode_chat_ids`]
+/// (`<|im_start|>user\n<|im_end|>\n<|im_start|>assistant\n`); every
+/// templated token is valid, so the attention mask is all-ones — identical to the non-padded `tokenize`
+/// output for a real caption. A non-empty negative prompt takes the ordinary `tokenize` path.
 pub(crate) fn encode_uncond(
     tokenizer: &TextTokenizer,
     text_encoder: &TextEncoder,
     negative: &str,
 ) -> Result<Array> {
-    let t = tokenizer.tokenize(negative)?;
+    let t = if negative.is_empty() {
+        // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)` (Qwen adds no BOS/EOS,
+        // so the ids equal the templated tokens). Mask is all-ones: every scaffolding token is valid.
+        let ids = tokenizer.encode_chat_ids("", true)?;
+        let mask = vec![1; ids.len()];
+        TokenizerOutput { ids, mask }
+    } else {
+        tokenizer.tokenize(negative)?
+    };
     let (input_ids, attention_mask) = mlx_gen::tokenizer::to_arrays(&t);
     if input_ids.shape()[1] == 0 {
         return Err(Error::Msg(

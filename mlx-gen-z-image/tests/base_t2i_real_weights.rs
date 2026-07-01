@@ -105,6 +105,35 @@ fn base_t2i_cfg_renders_coherent_image() {
 
 #[test]
 #[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
+fn base_t2i_cfg_no_negative_renders_coherent_image() {
+    // Regression (sc-8958, MLX twin of candle sc-8646): CFG on (guidance 4.0) with an **unset**
+    // negative prompt. The uncond branch
+    // encodes the empty string; before the fix this errored `z_image: negative conditioning tokenized
+    // to an empty sequence` because gen-core's tokenizer short-circuits an empty prompt before the chat
+    // template is applied. Must render coherently now (the empty uncond goes through the template).
+    let Some(snap) = base_snapshot() else {
+        eprintln!(
+            "skip base_t2i_cfg_no_negative_renders_coherent_image: no Tongyi-MAI/Z-Image snapshot"
+        );
+        return;
+    };
+    let spec = LoadSpec::new(WeightsSource::Dir(snap));
+
+    let req = GenerationRequest {
+        prompt: "a red fox sitting in a snowy forest, photorealistic, sharp focus".into(),
+        negative_prompt: None,
+        guidance: Some(4.0),
+        width: 1024,
+        height: 1024,
+        steps: Some(28),
+        seed: Some(42),
+        ..Default::default()
+    };
+    render_and_check(&spec, &req, "cfg_no_negative");
+}
+
+#[test]
+#[ignore = "needs the real Tongyi-MAI/Z-Image base snapshot (set BASE_ZIMAGE_SNAPSHOT or populate the HF cache)"]
 fn base_t2i_cfg_off_renders_coherent_image() {
     let Some(snap) = base_snapshot() else {
         eprintln!("skip base_t2i_cfg_off_renders_coherent_image: no Tongyi-MAI/Z-Image snapshot");
