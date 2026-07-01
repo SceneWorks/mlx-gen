@@ -27,8 +27,14 @@
 use std::path::Path;
 
 use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
+use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
+use crate::config::NeoChatConfig;
+use crate::distill::{
+    merge_distill_into_map, resolve_distill_lora, DISTILL_LORA_FILE, DISTILL_LORA_REPO,
+    DISTILL_MERGED_MARKER,
+};
 use crate::quant::GROUP_SIZE;
 
 /// The single packed weight file the turnkey ships (replaces the source's 8 dense shards). The
@@ -132,6 +138,91 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     Ok(())
 }
 
+/// Assemble a pre-merged **`sensenova_u1_8b_fast`** tier in `dst_root` (sc-8775): the dense source with
+/// the 8-step distill LoRA merged into the generation path *before* packing, so the merge is baked
+/// into the on-disk weights and the loader never re-merges (which it could not — a packed base is
+/// quantized). This is a **distinct checkpoint** from the base tiers ([`prequantize_turnkey`]): the
+/// gen-path `*_mot_gen` projections and the two `fm_modules.fm_head.{0,2}` Linears carry the distilled
+/// deltas; everything else is byte-identical to the base.
+///
+/// `bits`: `4`/`8` → merge then [`quantize_map`] the backbone (same [`is_backbone_linear`] scope as the
+/// base converter) → one packed `model.safetensors`. `0` → merge then save the **dense** map (a merged
+/// bf16 checkpoint — NOT a verbatim source mirror like the base bf16 tier, since the merge changes
+/// weights). Every tier gets the [`DISTILL_MERGED_MARKER`] so [`crate::model::load_fast`] skips the
+/// load-time merge, plus the same config/tokenizer/license assets as the base converter.
+///
+/// The distill LoRA is resolved by [`resolve_distill_lora`] (env override / co-located in `src_root` /
+/// HF cache). Full coverage (`7 · num_hidden_layers + 2`) is asserted, so a stale/mismatched LoRA
+/// fails loudly rather than merging a subset.
+pub fn prequantize_fast_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
+    std::fs::create_dir_all(dst_root)?;
+
+    // Merge the distill LoRA into the flat dense map (before any quantize), asserting full coverage
+    // against the config — the same `7·layers + 2` the loader's `load_fast` asserts at merge time.
+    let cfg = NeoChatConfig::from_dir(src_root)?;
+    let lora_path = resolve_distill_lora(src_root)?;
+    let lora = Weights::from_file(&lora_path)?;
+    let mut map = load_dir_map(src_root)?;
+    let applied = merge_distill_into_map(&mut map, &lora)?;
+    let expected = cfg.llm.num_hidden_layers * 7 + 2;
+    if applied != expected {
+        return Err(Error::Msg(format!(
+            "sensenova_u1_8b_fast convert: distill LoRA merged {applied} targets, expected \
+             {expected} (7·{} gen-path linears + 2 fm_head) — wrong LoRA file ({DISTILL_LORA_FILE} \
+             from {DISTILL_LORA_REPO})?",
+            cfg.llm.num_hidden_layers
+        )));
+    }
+
+    // Pack the backbone (Q4/Q8) or keep the merged map dense (bf16 tier), then write one file. The
+    // `is_backbone_linear` predicate + `quantize_map` shape guard keep the merged fm_head + heads +
+    // norms + vision dense exactly as the base converter does.
+    let out = if bits == 0 {
+        map
+    } else {
+        quantize_map(map, bits, GROUP_SIZE, is_backbone_linear)?
+    };
+    save_map(&dst_root.join(PACKED_WEIGHTS_FILE), &out)?;
+
+    // Provenance marker (the loader keys off existence) + the shared config/tokenizer/license assets.
+    write_merge_marker(dst_root, &lora_path, bits, applied)?;
+    for name in ASSET_FILES {
+        copy_asset(src_root, dst_root, name)?;
+    }
+    for required in ["config.json", "tokenizer.json"] {
+        if !dst_root.join(required).exists() {
+            return Err(Error::Msg(format!(
+                "sensenova_u1_8b_fast convert: source snapshot {} is missing {required} — the \
+                 turnkey cannot load without it",
+                src_root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Write the [`DISTILL_MERGED_MARKER`] provenance file into a pre-merged fast tier. The loader only
+/// checks its existence; the body records which LoRA was baked in, the tier's bit-width, and how many
+/// targets merged, so a hosted tier is self-describing/auditable.
+fn write_merge_marker(dst_root: &Path, lora_path: &Path, bits: i32, applied: usize) -> Result<()> {
+    let tier = if bits == 0 {
+        "bf16".to_string()
+    } else {
+        format!("q{bits}")
+    };
+    let lora_name = lora_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| DISTILL_LORA_FILE.to_string());
+    let body = format!(
+        "{{\n  \"distill_merged\": true,\n  \"tier\": \"{tier}\",\n  \"lora_repo\": \
+         \"{DISTILL_LORA_REPO}\",\n  \"lora_file\": \"{lora_name}\",\n  \"targets_merged\": \
+         {applied}\n}}\n"
+    );
+    std::fs::write(dst_root.join(DISTILL_MERGED_MARKER), body)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +320,32 @@ mod tests {
             .get("language_model.model.layers.0.input_layernorm.weight")
             .unwrap();
         assert_eq!(n.dtype(), Dtype::Float32, "norm unchanged");
+    }
+
+    /// The fast-tier provenance marker lands under the expected name, is valid JSON, and records the
+    /// tier + LoRA + merge count — so a hosted pre-merged tier is self-describing and
+    /// [`crate::model::load_fast`]'s existence check finds it.
+    #[test]
+    fn merge_marker_writes_named_provenance_json() {
+        let tmp = std::env::temp_dir().join(format!("sn-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let lora = std::path::PathBuf::from("/some/where").join(DISTILL_LORA_FILE);
+        write_merge_marker(&tmp, &lora, 4, 296).unwrap();
+        let marker = tmp.join(DISTILL_MERGED_MARKER);
+        assert!(
+            marker.is_file(),
+            "marker not written at {DISTILL_MERGED_MARKER}"
+        );
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert!(body.contains("\"distill_merged\": true"));
+        assert!(body.contains("\"tier\": \"q4\""));
+        assert!(body.contains(DISTILL_LORA_FILE));
+        assert!(body.contains("\"targets_merged\": 296"));
+        // bits=0 records the bf16 tier.
+        write_merge_marker(&tmp, &lora, 0, 296).unwrap();
+        assert!(std::fs::read_to_string(&marker)
+            .unwrap()
+            .contains("\"tier\": \"bf16\""));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

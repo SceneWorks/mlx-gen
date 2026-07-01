@@ -34,7 +34,7 @@ use mlx_gen::{
 };
 
 use crate::config::NeoChatConfig;
-use crate::distill::resolve_distill_lora;
+use crate::distill::{resolve_distill_lora, DISTILL_MERGED_MARKER};
 use crate::loader::{check_coverage, load_raw};
 use crate::t2i::{smart_resize, StepReporter, T2iModel, T2iOptions};
 use crate::text::load_tokenizer;
@@ -138,10 +138,15 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_inner(spec, false)
 }
 
-/// Construct the 8-step distilled [`SenseNova`] (`sensenova_u1_8b_fast`, sc-3192): the same base
-/// snapshot with the distill LoRA merged into the dense generation path **before** any
-/// quantization, plus the distilled generation defaults. The LoRA is resolved by
-/// [`resolve_distill_lora`] (env override / co-located / HF cache).
+/// Construct the 8-step distilled [`SenseNova`] (`sensenova_u1_8b_fast`, sc-3192), plus the distilled
+/// generation defaults. Two tier shapes load here:
+/// - a **dense base snapshot** (no [`DISTILL_MERGED_MARKER`]): the distill LoRA is resolved by
+///   [`resolve_distill_lora`] (env override / co-located / HF cache) and merged into the dense
+///   generation path **before** any quantization — the original sc-3192 path; and
+/// - a **pre-merged turnkey** (sc-8775: the packed q4/q8 or dense bf16 fast tiers built by
+///   [`crate::convert::prequantize_fast_turnkey`], marked with [`DISTILL_MERGED_MARKER`]): the merge
+///   is already baked into the on-disk weights, so the loader skips it (a packed tier cannot re-merge
+///   — its base is quantized). Either way the distilled 8-NFE / CFG-1.0 defaults apply.
 pub fn load_fast(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_inner(spec, true)
 }
@@ -176,11 +181,17 @@ fn load_inner(spec: &LoadSpec, fast: bool) -> Result<Box<dyn Generator>> {
     // otherwise load silently with whatever subset matches.
     check_coverage(weights.keys(), &cfg).require_no_unexpected(id)?;
     let mut model = T2iModel::from_weights(&weights, &cfg)?;
-    // The fast variant merges the 8-step distill LoRA into the dense generation path. This MUST
-    // precede quantization (the merge seam errors on a quantized base). Assert full coverage —
-    // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA fails
-    // loudly rather than silently merging a subset.
-    if fast {
+    // The fast variant merges the 8-step distill LoRA into the dense generation path — UNLESS the
+    // tier is a **pre-merged** turnkey (sc-8775: the packed/dense fast tiers bake the merge in at
+    // convert time and drop `DISTILL_MERGED_MARKER`). A pre-merged tier must NOT re-merge: for a
+    // packed tier `from_weights` already built quantized Linears, and `merge_dense_delta` errors on a
+    // quantized base — so the marker is what lets the distilled fast defaults ride a packed tier. When
+    // there is no marker (a dense base snapshot), merge at load as before. The merge MUST precede
+    // quantization; assert full coverage (`7·layers` gen-path projections + the 2 FM-head Linears) so
+    // a stale/mismatched LoRA fails loudly rather than silently merging a subset. (Pointing the fast
+    // id at a *packed base* tier — no marker — stays a loud `merge_dense_delta` "base is quantized"
+    // error, never a silent double-merge or half-load.)
+    if fast && !root.join(DISTILL_MERGED_MARKER).exists() {
         let lora_path = resolve_distill_lora(root)?;
         let lora = Weights::from_file(&lora_path)?;
         let applied = model.merge_distill_lora(&lora)?;

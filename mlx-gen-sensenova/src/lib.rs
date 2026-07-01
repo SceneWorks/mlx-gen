@@ -51,8 +51,11 @@ pub mod text;
 pub mod vision;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
-pub use convert::prequantize_turnkey;
-pub use distill::{lora_delta, resolve_distill_lora, DISTILL_LORA_FILE, DISTILL_LORA_REPO};
+pub use convert::{prequantize_fast_turnkey, prequantize_turnkey};
+pub use distill::{
+    lora_delta, merge_distill_into_map, resolve_distill_lora, DISTILL_LORA_FILE, DISTILL_LORA_REPO,
+    DISTILL_MERGED_MARKER,
+};
 pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
 };

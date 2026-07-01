@@ -17,9 +17,18 @@
 //!   SC8771_SRC=<snap> SC8771_BITS=4 \
 //!     cargo test -p mlx-gen-sensenova --release --test prequantize_real_weights -- --ignored --nocapture
 //!
+//! For `SC8771_MODEL=sensenova_u1_8b_fast` (sc-8775) the tier is built by
+//! [`mlx_gen_sensenova::convert::prequantize_fast_turnkey`], which pre-merges the 8-step distill LoRA
+//! into the generation path before packing and drops the `distill_merged.json` marker so
+//! [`mlx_gen_sensenova::model::load_fast`] skips the load-time merge. Unlike the base bf16 tier (a
+//! verbatim source mirror), the **fast** bf16 tier (`SC8771_BITS=0`) is a distinct MERGED checkpoint
+//! and is built here too. The distill LoRA is resolved from `$SENSENOVA_DISTILL_LORA` / co-located /
+//! the HF cache (`sensenova/SenseNova-U1-8B-MoT-LoRAs`).
+//!
 //! Env knobs: SC8771_SRC (source snapshot dir; default the cached SenseNova-U1-8B-MoT snapshot),
-//! SC8771_OUT (tier output dir), SC8771_BITS (4 default / 8 / 0 = dense bf16 mirror), SC8771_MODEL
-//! (registry id: `sensenova_u1_8b` default / `sensenova_u1_8b_fast`), SC8771_KEEP (retain the tier).
+//! SC8771_OUT (tier output dir), SC8771_BITS (4 default / 8 / 0 = bf16 — mirror for base, merged build
+//! for _fast), SC8771_MODEL (registry id: `sensenova_u1_8b` default / `sensenova_u1_8b_fast`),
+//! SC8771_KEEP (retain the tier).
 
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, WeightsSource};
 use mlx_gen_sensenova as _; // force-link the inventory registration for mlx_gen::load.
@@ -65,19 +74,35 @@ fn build_tier_only() {
     let out =
         PathBuf::from(std::env::var("SC8771_OUT").expect("SC8771_OUT (tier output dir) required"));
     let bits = bits_env();
-    if bits == 0 {
+    // The `_fast` tier (sc-8775) pre-merges the distill LoRA, so ALL of its tiers — including bf16 —
+    // are distinct built checkpoints (bf16 = a MERGED dense checkpoint, not a source mirror). The base
+    // bf16 tier, by contrast, is a verbatim source mirror (copy the shards directly, don't pack).
+    let is_fast = model_id().ends_with("_fast");
+    if bits == 0 && !is_fast {
         panic!(
             "SC8771_BITS=0 (dense bf16) is a verbatim mirror of the source — copy the snapshot dir \
-             directly (deref symlinks) rather than running the packer"
+             directly (deref symlinks) rather than running the packer (base tier). For the _fast \
+             tier bf16 IS a distinct merged checkpoint; set SC8771_MODEL=sensenova_u1_8b_fast."
         );
     }
+    let tier = if bits == 0 {
+        "bf16 (merged)".to_string()
+    } else {
+        format!("Q{bits}")
+    };
     println!(
-        "building Q{bits} tier: {} -> {}",
+        "building {tier} tier ({}): {} -> {}",
+        model_id(),
         src.display(),
         out.display()
     );
-    mlx_gen_sensenova::convert::prequantize_turnkey(&src, &out, bits)
-        .expect("prequantize_turnkey succeeds");
+    if is_fast {
+        mlx_gen_sensenova::convert::prequantize_fast_turnkey(&src, &out, bits)
+            .expect("prequantize_fast_turnkey succeeds");
+    } else {
+        mlx_gen_sensenova::convert::prequantize_turnkey(&src, &out, bits)
+            .expect("prequantize_turnkey succeeds");
+    }
     let f = out.join("model.safetensors");
     let sz = std::fs::metadata(&f)
         .expect("missing packed model.safetensors")
@@ -101,28 +126,41 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join(format!("sensenova-tier-q{bits}")));
     let id = model_id();
+    let is_fast = id.ends_with("_fast");
 
-    // Build the packed tier (Q4/Q8). For the dense bf16 tier the source snapshot IS the tier, so we
-    // load `src` directly.
-    let load_root: PathBuf = if bits == 0 {
+    // Build the tier. The base bf16 tier is the source snapshot itself (loaded directly). Every other
+    // tier is built into `out`: the base Q4/Q8 via `prequantize_turnkey`; ALL `_fast` tiers (q4/q8 AND
+    // the MERGED bf16, sc-8775) via `prequantize_fast_turnkey`, which pre-merges the distill LoRA +
+    // drops the marker so `load_fast` skips the load-time merge.
+    let (load_root, built): (PathBuf, bool) = if bits == 0 && !is_fast {
         println!(
-            "dense (bf16) tier: loading source snapshot directly {}",
+            "dense (bf16) base tier: loading source snapshot directly {}",
             src.display()
         );
-        src.clone()
+        (src.clone(), false)
     } else {
+        let kind = if bits == 0 {
+            "merged bf16".to_string()
+        } else {
+            format!("Q{bits}")
+        };
         println!(
-            "building Q{bits} turnkey: {} -> {}",
+            "building {kind} {id} turnkey: {} -> {}",
             src.display(),
             out.display()
         );
-        mlx_gen_sensenova::convert::prequantize_turnkey(&src, &out, bits)
-            .expect("prequantize_turnkey succeeds");
+        if is_fast {
+            mlx_gen_sensenova::convert::prequantize_fast_turnkey(&src, &out, bits)
+                .expect("prequantize_fast_turnkey succeeds");
+        } else {
+            mlx_gen_sensenova::convert::prequantize_turnkey(&src, &out, bits)
+                .expect("prequantize_turnkey succeeds");
+        }
         assert!(
             out.join("model.safetensors").is_file(),
-            "missing packed model.safetensors"
+            "missing built model.safetensors"
         );
-        out.clone()
+        (out.clone(), true)
     };
 
     // Load DIRECTLY from the tier dir. A packed tier packed-detects via `{base}.scales` (no dense
@@ -183,7 +221,7 @@ fn prequantize_turnkey_loads_packed_and_renders() {
         "degenerate render: pixel range {min}..={max} too flat"
     );
 
-    if bits != 0 && std::env::var("SC8771_KEEP").is_err() {
+    if built && std::env::var("SC8771_KEEP").is_err() {
         let _ = std::fs::remove_dir_all(&out);
         println!("  removed {} (set SC8771_KEEP to retain)", out.display());
     }
