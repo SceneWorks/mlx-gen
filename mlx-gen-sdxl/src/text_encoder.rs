@@ -57,24 +57,22 @@ struct ClipEncoderLayer {
 impl ClipEncoderLayer {
     fn from_weights(w: &Weights, prefix: &str, cfg: &ClipTextConfig) -> Result<Self> {
         let g = |name: &str| w.require(&format!("{prefix}.{name}")).cloned();
-        let dense = |wn: &str, bn: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{wn}"))?.clone(),
-                Some(w.require(&format!("{prefix}.{bn}"))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8746): every per-layer Linear (q/k/v/out + mlp fc1/fc2) is quantized in
+        // [`Self::quantize`], all biased — `crate::quant::lin` loads packed-or-dense. The token /
+        // position embeddings (below, on `ClipTextEncoder`) stay dense (gather lookups).
+        let lin = |base: &str| crate::quant::lin(w, &format!("{prefix}.{base}"), true);
         let head_dim = cfg.model_dims / cfg.num_heads;
         Ok(Self {
             ln1_w: g("layer_norm1.weight")?,
             ln1_b: g("layer_norm1.bias")?,
             ln2_w: g("layer_norm2.weight")?,
             ln2_b: g("layer_norm2.bias")?,
-            q: dense("self_attn.q_proj.weight", "self_attn.q_proj.bias")?,
-            k: dense("self_attn.k_proj.weight", "self_attn.k_proj.bias")?,
-            v: dense("self_attn.v_proj.weight", "self_attn.v_proj.bias")?,
-            out: dense("self_attn.out_proj.weight", "self_attn.out_proj.bias")?,
-            linear1: dense("mlp.fc1.weight", "mlp.fc1.bias")?,
-            linear2: dense("mlp.fc2.weight", "mlp.fc2.bias")?,
+            q: lin("self_attn.q_proj")?,
+            k: lin("self_attn.k_proj")?,
+            v: lin("self_attn.v_proj")?,
+            out: lin("self_attn.out_proj")?,
+            linear1: lin("mlp.fc1")?,
+            linear2: lin("mlp.fc2")?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -172,11 +170,10 @@ impl ClipTextEncoder {
         let final_ln_b = w
             .require(&format!("{prefix}.final_layer_norm.bias"))?
             .clone();
+        // TE2's `text_projection` (bias-free) is quantized — packed-detect (sc-8746). The bare
+        // top-level key (no `text_model.` prefix) matches the on-disk layout the converter packs.
         let text_projection = match cfg.projection_dim {
-            Some(_) => Some(AdaptableLinear::dense(
-                w.require("text_projection.weight")?.clone(),
-                None,
-            )),
+            Some(_) => Some(crate::quant::lin(w, "text_projection", false)?),
             None => None,
         };
         Ok(Self {

@@ -30,6 +30,15 @@ pub fn load_tokenizer(root: &Path) -> Result<ClipBpeTokenizer> {
     ClipBpeTokenizer::from_dir(root.join("tokenizer"))
 }
 
+/// `true` when a loaded component is a **pre-quantized** (packed Q4/Q8) snapshot — detected by any
+/// `{base}.scales` key (sc-8746). A packed component must NOT be `cast_all`-ed: its `.weight` are u32
+/// codes and its `.scales`/`.biases` carry the quantization at a fixed dtype, so a blanket
+/// `astype(f16)` would corrupt the codes/scales. The `crate::quant::lin` packed-detect then builds the
+/// quantized module directly (no post-load `.quantize`, which no-ops on an already-quantized base).
+fn is_packed(w: &Weights) -> bool {
+    w.keys().any(|k| k.ends_with(".scales"))
+}
+
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
 /// diffusers snapshots ship the f32 master (`<stem>.safetensors`) and/or an fp16 variant
 /// (`<stem>.fp16.safetensors`); the fp16 file is exactly `astype(f16)` of the f32 master, so for an
@@ -67,7 +76,10 @@ fn load_clip_dtype(
 ) -> Result<ClipTextEncoder> {
     let file = resolve_weight_file(root, subdir, "model", dtype)?;
     let mut w = Weights::from_file(&file)?;
-    w.cast_all(dtype)?;
+    // A packed (pre-quantized) snapshot keeps its on-disk dtypes; only a dense snapshot downcasts.
+    if !is_packed(&w) {
+        w.cast_all(dtype)?;
+    }
     ClipTextEncoder::from_weights(&w, "text_model", cfg)
 }
 
@@ -108,7 +120,10 @@ pub fn load_unet_with_config(
 ) -> Result<UNet2DConditionModel> {
     let file = resolve_weight_file(root, "unet", "diffusion_pytorch_model", dtype)?;
     let mut w = Weights::from_file(&file)?;
-    w.cast_all(dtype)?;
+    // A packed (pre-quantized) snapshot keeps its on-disk dtypes; only a dense snapshot downcasts.
+    if !is_packed(&w) {
+        w.cast_all(dtype)?;
+    }
     UNet2DConditionModel::from_weights(&w, cfg)
 }
 

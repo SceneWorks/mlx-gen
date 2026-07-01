@@ -104,15 +104,12 @@ pub struct TimestepEmbedding {
 impl TimestepEmbedding {
     /// `prefix` is e.g. `time_embedding` or `add_embedding`; leaves are `linear_1`/`linear_2`.
     pub fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let dense = |n: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{n}.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.{n}.bias"))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8746): both MLP Linears are quantized in [`Self::quantize`], so a
+        // pre-quantized snapshot stores their packed triple — `crate::quant::lin` loads packed or
+        // dense automatically.
         Ok(Self {
-            linear1: dense("linear_1")?,
-            linear2: dense("linear_2")?,
+            linear1: crate::quant::lin(w, &format!("{prefix}.linear_1"), true)?,
+            linear2: crate::quant::lin(w, &format!("{prefix}.linear_2"), true)?,
         })
     }
 

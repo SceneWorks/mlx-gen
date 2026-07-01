@@ -19,11 +19,13 @@
 
 pub mod adapters;
 pub mod config;
+pub mod convert;
 pub mod inpaint;
 pub mod ip_adapter;
 pub mod loader;
 pub mod model;
 pub mod pipeline;
+pub mod quant;
 pub mod sampler;
 pub mod text_encoder;
 pub mod tokenizer;

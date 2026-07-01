@@ -52,13 +52,20 @@ impl ResnetBlock2D {
             }
             None => None,
         };
-        // VAE resnets carry no time embedding (`temb_channels=None`).
-        let time_emb_proj = match w.get(&format!("{prefix}.time_emb_proj.weight")) {
-            Some(tw) => Some(AdaptableLinear::dense(
-                tw.clone(),
-                Some(w.require(&format!("{prefix}.time_emb_proj.bias"))?.clone()),
-            )),
-            None => None,
+        // VAE resnets carry no time embedding (`temb_channels=None`). The U-Net's `time_emb_proj` is
+        // quantized (packed-detect, sc-8746); the VAE resnets never reach this crate's quantize path.
+        // Detect presence by the dense `.weight` OR a packed `.scales` (a pre-quantized snapshot has
+        // no dense `.weight` key beyond the u32 codes, but always carries `.scales`).
+        let has_time_proj = w.get(&format!("{prefix}.time_emb_proj.weight")).is_some()
+            || w.get(&format!("{prefix}.time_emb_proj.scales")).is_some();
+        let time_emb_proj = if has_time_proj {
+            Some(crate::quant::lin(
+                w,
+                &format!("{prefix}.time_emb_proj"),
+                true,
+            )?)
+        } else {
+            None
         };
         Ok(Self {
             norm1_w: g("norm1.weight")?,

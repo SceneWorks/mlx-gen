@@ -158,9 +158,20 @@ impl UNet2DConditionModel {
                 Some(w.require("conv_out.bias")?.clone()),
             ),
             // Kolors `encoder_hid_proj` (4096→2048). Auto-detected: absent for SDXL → `None`.
-            encoder_hid_proj: w.get("encoder_hid_proj.weight").map(|wt| {
-                AdaptableLinear::dense(wt.clone(), w.get("encoder_hid_proj.bias").cloned())
-            }),
+            // Packed-detect (sc-8746): quantized in [`Self::quantize`], and Kolors carries a bias, so
+            // load it packed-or-dense via `crate::quant::lin`. Presence is keyed on the dense
+            // `.weight` OR the packed `.scales` (a Q4/Q8 snapshot has no dense weight beyond codes).
+            encoder_hid_proj: if w.get("encoder_hid_proj.weight").is_some()
+                || w.get("encoder_hid_proj.scales").is_some()
+            {
+                Some(crate::quant::lin(
+                    w,
+                    "encoder_hid_proj",
+                    w.get("encoder_hid_proj.bias").is_some(),
+                )?)
+            } else {
+                None
+            },
         })
     }
 

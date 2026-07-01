@@ -47,21 +47,15 @@ struct AttentionMHA {
 
 impl AttentionMHA {
     fn from_weights(w: &Weights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
-        let no_bias = |n: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&format!("{prefix}.{n}.weight"))?.clone(),
-                None,
-            ))
-        };
+        // Packed-detect (sc-8746): q/k/v (bias-free) + to_out.0 (biased) are all quantized in
+        // [`Self::quantize`], so `crate::quant::lin` loads their packed triple or the dense weight.
+        let no_bias = |n: &str| crate::quant::lin(w, &format!("{prefix}.{n}"), false);
         let head_dim = model_dims / num_heads;
         Ok(Self {
             q: no_bias("to_q")?,
             k: no_bias("to_k")?,
             v: no_bias("to_v")?,
-            out: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.to_out.0.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.to_out.0.bias"))?.clone()),
-            ),
+            out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), true)?,
             num_heads,
             head_dim,
             scale: (head_dim as f32).powf(-0.5),
@@ -192,30 +186,27 @@ struct TransformerBlock {
 
 impl TransformerBlock {
     fn from_weights(w: &Weights, prefix: &str, model_dims: i32, num_heads: i32) -> Result<Self> {
-        let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
-        // GEGLU: split `ff.net.0.proj` (weight [2*hidden, D], bias [2*hidden]) into value/gate halves.
-        let proj_w = g("ff.net.0.proj.weight")?;
-        let proj_b = g("ff.net.0.proj.bias")?;
-        let two_h = proj_w.shape()[0];
+        // GEGLU: `ff.net.0.proj` is one `[2*hidden, D]` Linear on disk, row-split into value/gate
+        // halves. Determine `2*hidden` from the packed `.scales` grid (rows) when present, else from
+        // the dense weight — the split rows are identical either way (sc-8746). The packed row-slice
+        // is byte-identical to the dense split-then-quantize (quantization is per-row).
+        let ff_proj = format!("{prefix}.ff.net.0.proj");
+        let two_h = match w.get(&format!("{ff_proj}.scales")) {
+            Some(scales) => scales.shape()[0],
+            None => w.require(&format!("{ff_proj}.weight"))?.shape()[0],
+        };
         if two_h % 2 != 0 {
             return Err(Error::Msg(format!(
                 "sdxl GEGLU: ff.net.0.proj has odd output dim {two_h}; cannot split value/gate halves"
             )));
         }
         let hidden = two_h / 2;
-        let split_row = |a: &Array, lo: i32, hi: i32| -> Result<Array> {
-            let idx = Array::from_slice(&(lo..hi).collect::<Vec<i32>>(), &[hi - lo]);
-            Ok(a.take_axis(&idx, 0)?)
-        };
-        let linear1 = AdaptableLinear::dense(
-            split_row(&proj_w, 0, hidden)?,
-            Some(split_row(&proj_b, 0, hidden)?),
-        );
-        let linear2 = AdaptableLinear::dense(
-            split_row(&proj_w, hidden, two_h)?,
-            Some(split_row(&proj_b, hidden, two_h)?),
-        );
-        let linear3 = AdaptableLinear::dense(g("ff.net.2.weight")?, Some(g("ff.net.2.bias")?));
+        // Value/gate halves (rows `[0:hidden]` / `[hidden:2*hidden]`) — packed or dense.
+        let linear1 = crate::quant::lin_geglu_half(w, &ff_proj, 0, hidden)?;
+        let linear2 = crate::quant::lin_geglu_half(w, &ff_proj, hidden, two_h)?;
+        // FFN output (`ff.net.2`) is a plain quantized Linear.
+        let linear3 = crate::quant::lin(w, &format!("{prefix}.ff.net.2"), true)?;
+        let g = |n: &str| w.require(&format!("{prefix}.{n}")).cloned();
         Ok(Self {
             norm1_w: g("norm1.weight")?,
             norm1_b: g("norm1.bias")?,
@@ -334,15 +325,10 @@ impl Transformer2D {
         Ok(Self {
             norm_w: w.require(&format!("{prefix}.norm.weight"))?.clone(),
             norm_b: w.require(&format!("{prefix}.norm.bias"))?.clone(),
-            proj_in: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.proj_in.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.proj_in.bias"))?.clone()),
-            ),
+            // Packed-detect (sc-8746): SDXL uses linear `proj_in`/`proj_out`, both quantized.
+            proj_in: crate::quant::lin(w, &format!("{prefix}.proj_in"), true)?,
             blocks,
-            proj_out: AdaptableLinear::dense(
-                w.require(&format!("{prefix}.proj_out.weight"))?.clone(),
-                Some(w.require(&format!("{prefix}.proj_out.bias"))?.clone()),
-            ),
+            proj_out: crate::quant::lin(w, &format!("{prefix}.proj_out"), true)?,
         })
     }
 
