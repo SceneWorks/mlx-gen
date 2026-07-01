@@ -20,9 +20,11 @@
 //!    `qwen_image_control` API on a synthetic pose skeleton (encode prompt, build the 132-ch control
 //!    context, run the control denoise loop, decode → a valid non-degenerate image).
 //!
-//! A numeric residual/image golden vs the fork's `pipeline_qwenimage_control` (a
-//! `dump_qwen_fun_control_*.py` analog of the InstantX dump tooling) is a follow-up (tracked on
-//! sc-8267); this suite proves the loader/forward/injection seam + pose effect end-to-end.
+//! The numeric golden vs the authoritative VideoX-Fun reference (`QwenImageControlTransformer2DModel`
+//! `forward_control` + the `_pack_latents` 132-ch context fill) now lives in
+//! `tests/fun_control_parity.rs` (sc-8335 — a committed, CI-runnable, tiny-synthetic golden from
+//! `tools/dump_qwen_fun_control_golden.py`); this suite proves the loader/forward/injection seam +
+//! pose effect end-to-end on real weights.
 //!
 //! Run (the scale gates load the ~40 GB base transformer):
 //!   cargo test -p mlx-gen-qwen-image --release --test control_real_weights -- --ignored --nocapture
