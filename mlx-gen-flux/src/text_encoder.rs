@@ -1,6 +1,7 @@
 //! FLUX.1 prompt text path: CLIP pooled prompt embedding + T5 sequence prompt embedding.
 //! Ports the fork's `flux_text_encoder` modules directly.
 
+use crate::quant::GROUP_SIZE;
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::array::{host_i32, scalar};
 use mlx_gen::nn::gelu_tanh;
@@ -39,8 +40,26 @@ enum TokenEmbedding {
 }
 
 impl TokenEmbedding {
-    fn dense(weight: Array) -> Self {
-        Self::Dense(weight)
+    /// Load `{base}` — **packed** ([`Self::Quantized`]) when `{base}.scales` is present (a
+    /// pre-quantized snapshot; bit-width inferred from the packed shapes at `group_size`), else
+    /// **dense** ([`Self::Dense`]). The embedding analogue of [`crate::quant::lin`] for this local
+    /// enum (sc-8669), so a published Q4/Q8 text encoder loads its token/position/relative-bias
+    /// tables packed with no dense bf16 transient.
+    fn from_weights(w: &Weights, base: &str, group_size: i32) -> Result<Self> {
+        if let Some(scales) = w.get(&format!("{base}.scales")) {
+            let wq = w.require(&format!("{base}.weight"))?.clone();
+            // scales `[vocab, in/gs]` ⇒ `in = scales.cols·gs`; u32 `wq [vocab, in·bits/32]` ⇒ bits.
+            let in_dim = scales.shape()[1] * group_size;
+            let bits = wq.shape()[1] * 32 / in_dim;
+            return Ok(Self::Quantized {
+                wq,
+                scales: scales.clone(),
+                biases: w.require(&format!("{base}.biases"))?.clone(),
+                group_size,
+                bits,
+            });
+        }
+        Ok(Self::Dense(w.require(&format!("{base}.weight"))?.clone()))
     }
 
     fn forward(&self, ids: &Array) -> Result<Array> {
@@ -103,14 +122,16 @@ impl ClipTextEncoder {
             )?);
         }
         Ok(Self {
-            token_embedding: TokenEmbedding::dense(
-                w.require(&p("text_model.embeddings.token_embedding.weight"))?
-                    .clone(),
-            ),
-            position_embedding: TokenEmbedding::dense(
-                w.require(&p("text_model.embeddings.position_embedding.weight"))?
-                    .clone(),
-            ),
+            token_embedding: TokenEmbedding::from_weights(
+                w,
+                &p("text_model.embeddings.token_embedding"),
+                GROUP_SIZE,
+            )?,
+            position_embedding: TokenEmbedding::from_weights(
+                w,
+                &p("text_model.embeddings.position_embedding"),
+                GROUP_SIZE,
+            )?,
             layers,
             final_ln_w: w.require(&p("text_model.final_layer_norm.weight"))?.clone(),
             final_ln_b: w.require(&p("text_model.final_layer_norm.bias"))?.clone(),
@@ -203,12 +224,8 @@ struct ClipAttention {
 
 impl ClipAttention {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let linear = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, &format!("{name}.weight")))?.clone(),
-                Some(w.require(&join(prefix, &format!("{name}.bias")))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8669): loads Q4/Q8 packed when `{name}.scales` is present, else dense.
+        let linear = |name: &str| crate::quant::lin(w, &join(prefix, name), true);
         Ok(Self {
             q: linear("q_proj")?,
             k: linear("k_proj")?,
@@ -268,12 +285,8 @@ struct ClipMlp {
 
 impl ClipMlp {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let linear = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, &format!("{name}.weight")))?.clone(),
-                Some(w.require(&join(prefix, &format!("{name}.bias")))?.clone()),
-            ))
-        };
+        // Packed-detect (sc-8669): loads Q4/Q8 packed when `{name}.scales` is present, else dense.
+        let linear = |name: &str| crate::quant::lin(w, &join(prefix, name), true);
         Ok(Self {
             fc1: linear("fc1")?,
             fc2: linear("fc2")?,
@@ -307,7 +320,7 @@ impl T5TextEncoder {
             blocks.push(T5Block::from_weights(w, &p(&format!("encoder.block.{i}")))?);
         }
         Ok(Self {
-            shared: TokenEmbedding::dense(w.require(&p("shared.weight"))?.clone()),
+            shared: TokenEmbedding::from_weights(w, &p("shared"), GROUP_SIZE)?,
             blocks,
             final_ln_w: w.require(&p("encoder.final_layer_norm.weight"))?.clone(),
         })
@@ -381,12 +394,9 @@ struct T5Attention {
 
 impl T5Attention {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let linear = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, &format!("SelfAttention.{name}.weight")))?
-                    .clone(),
-                None,
-            ))
+        // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
+        let linear = |name: &str| {
+            crate::quant::lin(w, &join(prefix, &format!("SelfAttention.{name}")), false)
         };
         Ok(Self {
             ln_w: w.require(&join(prefix, "layer_norm.weight"))?.clone(),
@@ -394,18 +404,18 @@ impl T5Attention {
             k: linear("k")?,
             v: linear("v")?,
             o: linear("o")?,
-            rel_bias: TokenEmbedding::dense(
-                w.require(&join(
-                    prefix,
-                    "SelfAttention.relative_attention_bias.weight",
-                ))
-                .or_else(|_| {
-                    w.require(
-                        "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
-                    )
-                })?
-                .clone(),
-            ),
+            rel_bias: {
+                // The relative-attention bias lives only on block 0 and is shared across all blocks,
+                // so blocks 1+ fall back to the block-0 key. Packed-detect via `from_weights` picks
+                // up `.scales` on whichever key is present (sc-8669).
+                let own = join(prefix, "SelfAttention.relative_attention_bias");
+                let base = if w.get(&format!("{own}.weight")).is_some() {
+                    own
+                } else {
+                    "encoder.block.0.layer.0.SelfAttention.relative_attention_bias".to_string()
+                };
+                TokenEmbedding::from_weights(w, &base, GROUP_SIZE)?
+            },
         })
     }
 
@@ -453,12 +463,9 @@ struct T5FeedForward {
 
 impl T5FeedForward {
     fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
-        let linear = |name: &str| -> Result<AdaptableLinear> {
-            Ok(AdaptableLinear::dense(
-                w.require(&join(prefix, &format!("DenseReluDense.{name}.weight")))?
-                    .clone(),
-                None,
-            ))
+        // Packed-detect (sc-8669): loads Q4/Q8 packed when `.scales` is present, else dense.
+        let linear = |name: &str| {
+            crate::quant::lin(w, &join(prefix, &format!("DenseReluDense.{name}")), false)
         };
         Ok(Self {
             ln_w: w.require(&join(prefix, "layer_norm.weight"))?.clone(),

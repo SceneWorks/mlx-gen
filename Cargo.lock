@@ -675,6 +675,7 @@ dependencies = [
  "mlx-gen-sdxl",
  "mlx-gen-z-image",
  "pmetal-mlx-rs",
+ "serde_json",
 ]
 
 [[package]]
