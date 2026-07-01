@@ -1033,13 +1033,20 @@ impl Flux2ControlBranch {
         self.places.iter().position(|&p| p == idx)
     }
 
+    /// The number of per-block control hints this branch emits (= the number of control blocks =
+    /// `control_layers.len()`). Exposed for the sc-8978 numeric golden.
+    pub fn num_hints(&self) -> usize {
+        self.blocks.len()
+    }
+
     /// Run the control stack → per-block hints (the fork's `forward_control`). `img_embed`/`txt_embed`
     /// are the post-embedder base streams; `control_context` is the packed 260-ch control context;
     /// `img_mod`/`txt_mod`/`cos`/`sin` are the shared base double-stream modulation + RoPE (the control
     /// blocks reuse the base modulation, per the fork). The threaded `txt` is local to the control
-    /// stack — only the image-stream hints leave.
+    /// stack — only the image-stream hints leave. `pub` so the sc-8978 numeric golden can drive it
+    /// directly against the authoritative VideoX-Fun `Flux2ControlTransformer2DModel.forward_control`.
     #[allow(clippy::too_many_arguments)]
-    fn forward_control(
+    pub fn forward_control(
         &self,
         img_embed: &Array,
         txt_embed: &Array,

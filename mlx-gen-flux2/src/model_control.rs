@@ -25,14 +25,14 @@ use mlx_gen::{
     Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
 };
-use mlx_rs::ops::concatenate_axis;
 use mlx_rs::Array;
 
 use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
 use crate::model::{crop_to_even, match_latent_spatial_size, validate_request};
 use crate::pipeline::{
-    add_noise_by_interpolation, create_noise, init_time_step, pack_latents, patchify_latents,
-    prepare_grid_ids, prepare_text_ids, preprocess_ref_image, schedule_with,
+    add_noise_by_interpolation, create_noise, fun_control_context_from_latents, init_time_step,
+    pack_latents, patchify_latents, prepare_grid_ids, prepare_text_ids, preprocess_ref_image,
+    schedule_with,
 };
 use crate::text_encoder::Qwen3TextEncoder;
 use crate::transformer::Flux2ControlTransformer;
@@ -205,16 +205,13 @@ impl Flux2DevControl {
         let enc = match_latent_spatial_size(&enc, (height / 8) as i32, (width / 8) as i32)?;
         let patchified = patchify_latents(&enc)?; // [1,128,h,w]
         let control_lat = self.vae.bn_normalize_nchw(&patchified)?;
-        let control_packed = pack_latents(&control_lat)?; // [1, seq, 128]
-        let seq = control_packed.shape()[1];
-        // Union pose-only layout: zero mask (1 latent channel × 2×2 patch = 4) + zero inpaint latent
-        // (= in_channels, 128). Concatenated on the channel axis → 260 = CONTROL_IN_DIM.
+        // Union pose-only layout: pack the control latent → [1, seq, 128], then concat a zero mask
+        // (1 latent channel × 2×2 patch = 4) + zero inpaint latent (= in_channels, 128) on the packed
+        // feature axis → 260 = CONTROL_IN_DIM. The pack + channel-fill is `fun_control_context_from_latents`
+        // (byte-golden'd against the fork's `pipeline_flux2_control` in `tests/fun_control_parity.rs`).
         let in_ch = self.config.in_channels as i32;
-        let mask_ch = in_ch / self.config.num_latent_channels as i32; // 128 / 32 = 4 (the 2×2 patch)
-        let zeros = |c: i32| -> Result<Array> { Ok(mlx_rs::ops::zeros::<f32>(&[1, seq, c])?) };
-        let mask = zeros(mask_ch)?;
-        let inpaint = zeros(in_ch)?;
-        let cc = concatenate_axis(&[&control_packed, &mask, &inpaint], 2)?;
+        let num_latent_channels = self.config.num_latent_channels as i32;
+        let cc = fun_control_context_from_latents(&control_lat, in_ch, num_latent_channels)?;
         debug_assert_eq!(
             cc.shape()[2],
             CONTROL_IN_DIM,

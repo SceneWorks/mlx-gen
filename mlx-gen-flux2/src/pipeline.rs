@@ -49,6 +49,34 @@ pub fn pack_latents(latents: &Array) -> Result<Array> {
         .transpose_axes(&[0, 2, 1])?)
 }
 
+/// Build the packed **FLUX.2-dev Fun-Controlnet-Union** 260-ch control context from an already
+/// BN-normalized, 2×2-patchified control latent `[1, in_channels, h, w]` (`h = height/16`,
+/// `w = width/16`) — the pack + channel-fill tail of
+/// [`crate::model_control::Flux2DevControl::encode_control_context`], split out so the sc-8978
+/// numeric golden can byte-confirm it against the fork's `pipeline_flux2_control` with a synthetic
+/// latent (no VAE). Pose/union-only: the control latent is `pack_latents`-flattened to
+/// `[1, seq, in_channels]`, then a zero **mask** (`in_channels / num_latent_channels` = the 2×2 patch
+/// of the single mask channel) and a zero **inpaint** latent (`in_channels`) are concatenated on the
+/// **packed feature axis** — `torch.concat([control_latents, mask_condition, inpaint_latent], dim=2)`
+/// in the reference `prepare` — giving `[1, seq, control_in_dim]`. Note the FLUX.2 order is
+/// pack-*then*-concat (distinct from the Qwen 2512-Fun concat-then-pack): the fork packs each of the
+/// three parts independently, so the 260 channels are `[control(128) | mask(4) | inpaint(128)]`.
+pub fn fun_control_context_from_latents(
+    control_lat: &Array,
+    in_channels: i32,
+    num_latent_channels: i32,
+) -> Result<Array> {
+    let control_packed = pack_latents(control_lat)?; // [1, seq, in_channels]
+    let seq = control_packed.shape()[1];
+    let mask_ch = in_channels / num_latent_channels; // 128 / 32 = 4 (the 2×2 patch of one mask ch)
+    let mask = mlx_rs::ops::zeros::<f32>(&[1, seq, mask_ch])?;
+    let inpaint = mlx_rs::ops::zeros::<f32>(&[1, seq, in_channels])?;
+    Ok(mlx_rs::ops::concatenate_axis(
+        &[&control_packed, &mask, &inpaint],
+        2,
+    )?)
+}
+
 /// Unpack transformer tokens `[B, seq, C]` back to spatial latents `[B, C, lat_h, lat_w]`,
 /// where `lat_h = height/16`, `lat_w = width/16` (the fork's `unpack_latents`). The render path
 /// reshapes inline, so this is `pub` for the `s0_parity` test (the inverse-of-`pack_latents` gate).
