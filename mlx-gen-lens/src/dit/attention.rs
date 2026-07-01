@@ -22,10 +22,15 @@ const RMS_EPS: f32 = 1e-6;
 
 /// Load a biased diffusers `[out, in]` projection as an [`AdaptableLinear`] (the LoRA/LoKr adapter
 /// targets, sc-3174). The dense forward is `x·Wᵀ + b`, identical to the sc-3168 [`super::Linear`].
+///
+/// Packed-detect (sc-8763): routes through [`crate::quant::lin`], so a pre-quantized turnkey loads the
+/// packed triple `{prefix}.{weight,scales,biases}` directly. The dense path is cast to `dtype`; a
+/// packed base carries its own compute dtype (`cast_weights` no-ops on it). The `quantize` after any
+/// adapter merge no-ops on the already-packed base.
 fn load_adaptable(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?;
-    let bias = w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?;
-    Ok(AdaptableLinear::dense(weight, Some(bias)))
+    let mut l = crate::quant::lin(w, prefix, true)?;
+    l.cast_weights(dtype)?;
+    Ok(l)
 }
 
 #[derive(Clone)]

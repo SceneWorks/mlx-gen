@@ -26,9 +26,13 @@ struct GateMlp {
 
 impl GateMlp {
     fn from_weights(w: &Weights, prefix: &str, dtype: Dtype) -> Result<Self> {
+        // Packed-detect (sc-8763): route the bias-less SwiGLU projections through `crate::quant::lin`,
+        // so a pre-quantized turnkey loads the packed triple `{prefix}.{name}.{weight,scales,biases}`
+        // directly. The dense path casts to `dtype` (no-op on a packed base).
         let load = |name: &str| -> Result<AdaptableLinear> {
-            let weight = load_weight(w, &join(prefix, name), dtype)?;
-            Ok(AdaptableLinear::dense(weight, None))
+            let mut l = crate::quant::lin(w, &join(prefix, name), false)?;
+            l.cast_weights(dtype)?;
+            Ok(l)
         };
         Ok(Self {
             w1: load("w1")?,

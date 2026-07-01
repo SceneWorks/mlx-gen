@@ -90,8 +90,10 @@
 
 pub mod adapters;
 pub mod config;
+pub mod convert;
 pub mod dit;
 pub mod pipeline;
+pub(crate) mod quant;
 pub mod reasoner;
 pub mod registry;
 pub mod resolution;
