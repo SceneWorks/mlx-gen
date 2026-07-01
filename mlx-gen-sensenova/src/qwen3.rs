@@ -90,8 +90,18 @@ fn require(w: &Weights, key: &str) -> Result<Array> {
 
 /// A bias-less Linear from a stored `[out, in]` weight, as a quantizable [`AdaptableLinear`]
 /// (dense bf16 forward == the previous `matmul_t`; `quantize` swaps in a `quantized_matmul` base).
+///
+/// Packed-detect (Group-B, sc-8771): routed through the shared [`mlx_gen::quant::lin`], which loads
+/// **packed** (Q4/Q8) when a `{base}.scales` sibling is present (a pre-quantized turnkey) and
+/// **dense** otherwise. Both callers (`AttnPath` / `Mlp`) pass a full `{…}.weight` key, so strip that
+/// suffix to the base the shared loader expects; every backbone projection is bias-less. A packed
+/// snapshot's later `.quantize` call is a no-op on an already-quantized base, so the model loader's
+/// `spec.quantize` path is left untouched.
 fn linear(w: &Weights, key: &str) -> Result<AdaptableLinear> {
-    Ok(AdaptableLinear::dense(require(w, key)?, None))
+    let base = key
+        .strip_suffix(".weight")
+        .ok_or_else(|| Error::Msg(format!("sensenova: linear key must end in .weight: {key}")))?;
+    crate::quant::lin(w, base, false, crate::quant::GROUP_SIZE)
 }
 
 /// The per-path attention weights (one of understanding / generation). The projections are
