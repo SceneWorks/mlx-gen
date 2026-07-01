@@ -92,10 +92,17 @@ impl AdaLayerNormContinuous {
 }
 
 /// Load a biased diffusers `[out, in]` projection as a quantizable [`AdaptableLinear`] (sc-3175).
+///
+/// Packed-detect (sc-8763): routes through [`crate::quant::lin`], so a pre-quantized turnkey loads the
+/// packed triple `{prefix}.{weight,scales,biases}` directly (no dense transient) while a dense snapshot
+/// loads the `[out, in]` weight (+ bias) as before. The later `quantize_dit` no-ops on the packed base.
+/// The `dtype` cast applies only to the dense path (a packed base carries its own compute dtype).
 fn load_biased_adaptable(w: &Weights, prefix: &str, dtype: Dtype) -> Result<AdaptableLinear> {
-    let weight = w.require(&format!("{prefix}.weight"))?.as_dtype(dtype)?;
-    let bias = w.require(&format!("{prefix}.bias"))?.as_dtype(dtype)?;
-    Ok(AdaptableLinear::dense(weight, Some(bias)))
+    let mut l = crate::quant::lin(w, prefix, true)?;
+    // Dense f32-on-disk weights are cast to the working dtype up front (parity with the pre-refactor
+    // `.as_dtype(dtype)`); `cast_weights` is a no-op on a packed base (it carries its own dtype).
+    l.cast_weights(dtype)?;
+    Ok(l)
 }
 
 /// The Lens denoising DiT.

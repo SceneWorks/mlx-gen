@@ -449,6 +449,22 @@ impl Proj {
         }
     }
 
+    /// Build a [`Proj::Quant`] directly from already-packed parts read off a pre-quantized snapshot
+    /// (sc-8763) — the consume-side counterpart to [`into_quantized`](Self::into_quantized). No
+    /// MXFP4 dequant / re-quant happens; the on-disk pack (already `[out, in]`, group-64) is used
+    /// as-is, byte-identical to what `into_quantized` would have produced (per-expert affine quant of
+    /// the dequantized MXFP4 weight — see [`crate::quant::load_packed_experts`]).
+    fn from_packed_parts(p: crate::quant::PackedExpertProj) -> Self {
+        Proj::Quant {
+            wq: p.wq,
+            scales: p.scales,
+            biases: p.biases,
+            b: p.bias,
+            group_size: p.group_size,
+            bits: p.bits,
+        }
+    }
+
     /// The arrays to `eval` so the dense bf16 dequant transient frees once the pack is materialized.
     fn quant_arrays(&self) -> Option<[&Array; 3]> {
         match self {
@@ -464,6 +480,83 @@ impl Proj {
 struct Expert {
     gate_up: Proj,
     down: Proj,
+}
+
+/// The stacked packed triple + dense bias for one MoE expert projection across all `E` experts —
+/// the on-disk representation an offline pre-quantized turnkey stores (sc-8763,
+/// [`crate::convert`]). `weight`/`scales`/`biases` are `[E, out, …]`; `bias` is bf16 `[E, out]`.
+pub(crate) struct StackedExpertPack {
+    pub weight: Array,
+    pub scales: Array,
+    pub biases: Array,
+    pub bias: Array,
+}
+
+/// Offline pre-quantize one MoE expert projection (all `E` experts) from its MXFP4 source
+/// (`blocks` `[E, out, G, 16]` + `scales_u8` `[E, out, G]` + `bias` `[E, out]`) to `bits`-bit MLX
+/// affine (group 64), returning the **stacked** packed triple (sc-8763). Reuses the exact load-time
+/// path — [`dequantize_mxfp4`] then [`Proj::into_quantized`] per expert — so the pack is
+/// byte-identical to what [`GptOssMoe::from_weights`]'s dense-then-quantize branch produces. The
+/// per-expert packs are re-stacked along a fresh leading E axis (`expand_dims(0)` + `concat`), which
+/// [`crate::quant::load_packed_experts`] splits back — valid because affine quant is per-row, so the
+/// stack/split around the per-expert quantize commute.
+pub(crate) fn prequantize_expert_proj(
+    blocks: &Array,
+    scales_u8: &Array,
+    bias: &Array,
+    bits: i32,
+    group_size: i32,
+) -> Result<StackedExpertPack> {
+    // Dequantize MXFP4 → dense `[E, in, out]` (bf16 — the dtype the load path dequants to before
+    // `into_quantized` re-casts to bf16 anyway; f32 would give identical packs after the bf16 cast).
+    let dense = dequantize_mxfp4(blocks, scales_u8, Dtype::Bfloat16)?; // [E, in, out]
+    let e = dense.shape()[0];
+    let per_expert = split(&dense, e, 0)?; // E × [1, in, out]
+    let bias_e = split(bias, e, 0)?; // E × [1, out]
+
+    let mut wq_stack: Vec<Array> = Vec::with_capacity(e as usize);
+    let mut sc_stack: Vec<Array> = Vec::with_capacity(e as usize);
+    let mut bi_stack: Vec<Array> = Vec::with_capacity(e as usize);
+    let mut bs_stack: Vec<Array> = Vec::with_capacity(e as usize);
+    for i in 0..e as usize {
+        let (in_c, out_c) = (per_expert[i].shape()[1], per_expert[i].shape()[2]);
+        // Build the exact `Proj::Dense` the load path builds (`[in, out]` weight + `[out]` bias),
+        // then run the identical `into_quantized` (transpose → bf16 → quantize group 64).
+        let proj = Proj::Dense {
+            w: per_expert[i].reshape(&[in_c, out_c])?,
+            b: bias_e[i].reshape(&[out_c])?,
+        };
+        match proj.into_quantized(bits, group_size)? {
+            Proj::Quant {
+                wq,
+                scales,
+                biases,
+                b,
+                ..
+            } => {
+                // Re-add the leading E axis for stacking.
+                wq_stack.push(wq.expand_dims(0)?);
+                sc_stack.push(scales.expand_dims(0)?);
+                bi_stack.push(biases.expand_dims(0)?);
+                bs_stack.push(b.expand_dims(0)?);
+            }
+            Proj::Dense { .. } => unreachable!("into_quantized always yields Quant"),
+        }
+    }
+    let stack = |v: &[Array]| -> Result<Array> {
+        let refs: Vec<&Array> = v.iter().collect();
+        Ok(concatenate_axis(&refs, 0)?)
+    };
+    let pack = StackedExpertPack {
+        weight: stack(&wq_stack)?,
+        scales: stack(&sc_stack)?,
+        biases: stack(&bi_stack)?,
+        bias: stack(&bs_stack)?,
+    };
+    // Materialize so the dense bf16 dequant transient frees before the next layer (the converter
+    // packs one layer at a time; a live lazy graph would keep the whole 20 B bf16 stack resident).
+    mlx_rs::transforms::eval([&pack.weight, &pack.scales, &pack.biases, &pack.bias])?;
+    Ok(pack)
 }
 
 /// gpt-oss MoE feed-forward: a top-k linear router + 32 **clamped-SwiGLU** experts. Faithful port of
@@ -502,58 +595,78 @@ impl GptOssMoe {
         let (hidden, inter) = (cfg.hidden_size, cfg.intermediate);
         let req = |k: &str| -> Result<Array> { Ok(w.require(k)?.as_dtype(dtype)?) };
 
-        let gate_up = dequantize_mxfp4(
-            w.require(&format!("{prefix}.experts.gate_up_proj_blocks"))?,
-            w.require(&format!("{prefix}.experts.gate_up_proj_scales"))?,
-            dtype,
-        )?; // [E, hidden, 2*inter]
-        let down = dequantize_mxfp4(
-            w.require(&format!("{prefix}.experts.down_proj_blocks"))?,
-            w.require(&format!("{prefix}.experts.down_proj_scales"))?,
-            dtype,
-        )?; // [E, inter, hidden]
-        let gate_up_b = req(&format!("{prefix}.experts.gate_up_proj_bias"))?; // [E, 2*inter]
-        let down_b = req(&format!("{prefix}.experts.down_proj_bias"))?; // [E, hidden]
-
-        // Split the per-expert stacks into individual [.,.] weights (drops the leading E axis).
-        let gu = split(&gate_up, e, 0)?;
-        let gub = split(&gate_up_b, e, 0)?;
-        let dn = split(&down, e, 0)?;
-        let dnb = split(&down_b, e, 0)?;
-        let mut experts = Vec::with_capacity(e as usize);
-        for i in 0..e as usize {
-            let mut expert = Expert {
-                gate_up: Proj::Dense {
-                    w: gu[i].reshape(&[hidden, 2 * inter])?,
-                    b: gub[i].reshape(&[2 * inter])?,
-                },
-                down: Proj::Dense {
-                    w: dn[i].reshape(&[inter, hidden])?,
-                    b: dnb[i].reshape(&[hidden])?,
-                },
-            };
-            if let Some(q) = quant {
-                let (bits, gs) = (q.bits(), mlx_gen::quant::DEFAULT_GROUP_SIZE);
-                expert.gate_up = expert.gate_up.into_quantized(bits, gs)?;
-                expert.down = expert.down.into_quantized(bits, gs)?;
+        // Packed-detect (sc-8763): a **pre-quantized turnkey** stores the experts as the stacked packed
+        // triple `experts.{gate_up,down}_proj.{weight,scales,biases}` (`crate::convert`), which loads
+        // directly with NO MXFP4 dequant + re-quant transient — the memory win realized on disk. A
+        // dense (MXFP4) source has no `experts.gate_up_proj.scales`, so it falls through to the
+        // dequant-then-(optionally)-quantize path below. Both branches yield byte-identical `Proj::Quant`
+        // packs (per-expert affine quant of the dequantized MXFP4 weight).
+        let experts = if crate::quant::has_packed_experts(w, prefix, "gate_up") {
+            let gu = crate::quant::load_packed_experts(w, prefix, "gate_up")?;
+            let dn = crate::quant::load_packed_experts(w, prefix, "down")?;
+            let mut experts = Vec::with_capacity(e as usize);
+            for (gu_e, dn_e) in gu.into_iter().zip(dn) {
+                experts.push(Expert {
+                    gate_up: Proj::from_packed_parts(gu_e),
+                    down: Proj::from_packed_parts(dn_e),
+                });
             }
-            experts.push(expert);
-        }
+            experts
+        } else {
+            let gate_up = dequantize_mxfp4(
+                w.require(&format!("{prefix}.experts.gate_up_proj_blocks"))?,
+                w.require(&format!("{prefix}.experts.gate_up_proj_scales"))?,
+                dtype,
+            )?; // [E, hidden, 2*inter]
+            let down = dequantize_mxfp4(
+                w.require(&format!("{prefix}.experts.down_proj_blocks"))?,
+                w.require(&format!("{prefix}.experts.down_proj_scales"))?,
+                dtype,
+            )?; // [E, inter, hidden]
+            let gate_up_b = req(&format!("{prefix}.experts.gate_up_proj_bias"))?; // [E, 2*inter]
+            let down_b = req(&format!("{prefix}.experts.down_proj_bias"))?; // [E, hidden]
 
-        // Force the packs so the layer's bf16 dequant transient frees before the next layer (the
-        // memory win is only realized if the bf16 stack does not stay alive in the lazy graph).
-        if quant.is_some() {
-            let mut to_eval: Vec<&Array> = Vec::with_capacity(e as usize * 6);
-            for expert in &experts {
-                if let Some(a) = expert.gate_up.quant_arrays() {
-                    to_eval.extend_from_slice(&a);
+            // Split the per-expert stacks into individual [.,.] weights (drops the leading E axis).
+            let gu = split(&gate_up, e, 0)?;
+            let gub = split(&gate_up_b, e, 0)?;
+            let dn = split(&down, e, 0)?;
+            let dnb = split(&down_b, e, 0)?;
+            let mut experts = Vec::with_capacity(e as usize);
+            for i in 0..e as usize {
+                let mut expert = Expert {
+                    gate_up: Proj::Dense {
+                        w: gu[i].reshape(&[hidden, 2 * inter])?,
+                        b: gub[i].reshape(&[2 * inter])?,
+                    },
+                    down: Proj::Dense {
+                        w: dn[i].reshape(&[inter, hidden])?,
+                        b: dnb[i].reshape(&[hidden])?,
+                    },
+                };
+                if let Some(q) = quant {
+                    let (bits, gs) = (q.bits(), mlx_gen::quant::DEFAULT_GROUP_SIZE);
+                    expert.gate_up = expert.gate_up.into_quantized(bits, gs)?;
+                    expert.down = expert.down.into_quantized(bits, gs)?;
                 }
-                if let Some(a) = expert.down.quant_arrays() {
-                    to_eval.extend_from_slice(&a);
-                }
+                experts.push(expert);
             }
-            mlx_rs::transforms::eval(to_eval)?;
-        }
+
+            // Force the packs so the layer's bf16 dequant transient frees before the next layer (the
+            // memory win is only realized if the bf16 stack does not stay alive in the lazy graph).
+            if quant.is_some() {
+                let mut to_eval: Vec<&Array> = Vec::with_capacity(e as usize * 6);
+                for expert in &experts {
+                    if let Some(a) = expert.gate_up.quant_arrays() {
+                        to_eval.extend_from_slice(&a);
+                    }
+                    if let Some(a) = expert.down.quant_arrays() {
+                        to_eval.extend_from_slice(&a);
+                    }
+                }
+                mlx_rs::transforms::eval(to_eval)?;
+            }
+            experts
+        };
 
         Ok(Self {
             router_w: req(&format!("{prefix}.router.weight"))?,
@@ -731,5 +844,81 @@ impl GptOssDecoderLayer {
         )?;
         let normed = rms_norm(&h, &self.post_attn_ln, self.eps)?;
         Ok(add(&h, &self.moe.forward(&normed)?)?)
+    }
+}
+
+#[cfg(test)]
+mod prequant_tests {
+    use super::*;
+    use mlx_rs::ops::eq;
+
+    fn byte_equal(a: &Array, b: &Array) -> bool {
+        a.shape() == b.shape()
+            && a.dtype() == b.dtype()
+            && eq(a, b).unwrap().all(None).unwrap().item::<bool>()
+    }
+
+    /// The offline stacked pack ([`prequantize_expert_proj`]) sliced back per-expert
+    /// ([`crate::quant::load_packed_experts`]-style, axis-0 split) is byte-identical to the load-time
+    /// dense path (`dequantize_mxfp4` → per-expert `Proj::into_quantized`) — the sc-8763 round-trip
+    /// guarantee for the MXFP4→MLX-affine encoder experts. Uses a tiny synthetic MXFP4 tensor
+    /// (`E=2`, `out=4`, `G=2` ⇒ `in=64`, group-aligned).
+    #[test]
+    fn stacked_expert_pack_slice_byte_identical_to_load_time() {
+        let (e, out, g) = (2usize, 4usize, 2usize);
+        let in_c = g * 32; // 64, group-aligned
+                           // Deterministic pseudo-random nibbles + e8m0 scales (127 ⇒ 2^0).
+        let blocks: Vec<u8> = (0..e * out * g * 16)
+            .map(|i| (i * 37 % 256) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..e * out * g).map(|i| (120 + (i % 8)) as u8).collect();
+        let bias: Vec<f32> = (0..e * out).map(|i| (i as f32).cos()).collect();
+        let blocks = Array::from_slice(&blocks, &[e as i32, out as i32, g as i32, 16]);
+        let scales = Array::from_slice(&scales, &[e as i32, out as i32, g as i32]);
+        let bias = Array::from_slice(&bias, &[e as i32, out as i32]);
+
+        let bits = 4;
+        let gs = 64;
+        // Offline stacked pack.
+        let pack = prequantize_expert_proj(&blocks, &scales, &bias, bits, gs).unwrap();
+        let sliced = crate::quant::load_packed_experts_from_stack(
+            &pack.weight,
+            &pack.scales,
+            &pack.biases,
+            &pack.bias,
+        )
+        .unwrap();
+
+        // Load-time reference: dequantize MXFP4 then quantize each expert independently.
+        let dense = dequantize_mxfp4(&blocks, &scales, Dtype::Bfloat16).unwrap(); // [E, in, out]
+        let per = split(&dense, e as i32, 0).unwrap();
+        let bias_e = split(&bias, e as i32, 0).unwrap();
+        for i in 0..e {
+            let proj = Proj::Dense {
+                w: per[i].reshape(&[in_c as i32, out as i32]).unwrap(),
+                b: bias_e[i].reshape(&[out as i32]).unwrap(),
+            };
+            match proj.into_quantized(bits, gs).unwrap() {
+                Proj::Quant {
+                    wq,
+                    scales,
+                    biases,
+                    b,
+                    ..
+                } => {
+                    assert!(byte_equal(&sliced[i].wq, &wq), "expert {i} wq mismatch");
+                    assert!(
+                        byte_equal(&sliced[i].scales, &scales),
+                        "expert {i} scales mismatch"
+                    );
+                    assert!(
+                        byte_equal(&sliced[i].biases, &biases),
+                        "expert {i} biases mismatch"
+                    );
+                    assert!(byte_equal(&sliced[i].bias, &b), "expert {i} bias mismatch");
+                }
+                Proj::Dense { .. } => unreachable!(),
+            }
+        }
     }
 }
