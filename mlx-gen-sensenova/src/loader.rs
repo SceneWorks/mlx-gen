@@ -143,16 +143,36 @@ impl Coverage {
 }
 
 /// Diff a checkpoint's tensor keys against the canonical [`expected_keys`] for `cfg`.
+///
+/// Packed-quant aware (Group-B, sc-8771): a pre-quantized Q4/Q8 turnkey stores each quantized Linear
+/// as the triple `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`. The two extra
+/// sidecars are **not** in [`expected_keys`] (which enumerates the dense layout), so map each
+/// `{base}.scales` / `{base}.biases` back to `{base}.weight` before diffing — a packed decoder-stack
+/// Linear is thus accounted for exactly as its dense counterpart is, and a packed turnkey passes
+/// [`Coverage::require_no_unexpected`] while a genuinely stray tensor still surfaces.
 pub fn check_coverage<'a>(
     present: impl IntoIterator<Item = &'a str>,
     cfg: &NeoChatConfig,
 ) -> Coverage {
     let expected = expected_keys(cfg);
-    let present: BTreeSet<String> = present.into_iter().map(str::to_string).collect();
+    let present: BTreeSet<String> = present.into_iter().map(dequant_sidecar_to_weight).collect();
     Coverage {
         missing: expected.difference(&present).cloned().collect(),
         unexpected: present.difference(&expected).cloned().collect(),
     }
+}
+
+/// Map a packed-quant sidecar key `{base}.scales` / `{base}.biases` to its `{base}.weight` (so a
+/// packed turnkey diffs against the dense [`expected_keys`]); every other key passes through
+/// unchanged. `{base}.weight` is the shared code+dense name, so a packed Linear collapses its triple
+/// onto the single expected `.weight` entry.
+fn dequant_sidecar_to_weight(k: &str) -> String {
+    for suffix in [".scales", ".biases"] {
+        if let Some(base) = k.strip_suffix(suffix) {
+            return format!("{base}.weight");
+        }
+    }
+    k.to_string()
 }
 
 #[cfg(test)]

@@ -38,10 +38,12 @@
 //! `Generator` impl + `inventory` registration land in the following stories (sc-3188 … sc-3194).
 
 pub mod config;
+pub mod convert;
 pub mod distill;
 pub mod fm;
 pub mod loader;
 pub mod model;
+pub(crate) mod quant;
 pub mod qwen3;
 pub mod runtime;
 pub mod t2i;
@@ -49,6 +51,7 @@ pub mod text;
 pub mod vision;
 
 pub use config::{NeoChatConfig, NeoLlmConfig, NeoVisionConfig};
+pub use convert::prequantize_turnkey;
 pub use distill::{lora_delta, resolve_distill_lora, DISTILL_LORA_FILE, DISTILL_LORA_REPO};
 pub use fm::{
     apply_time_schedule, euler_step, patchify, unpatchify, velocity, FmHead, TimestepEmbedder,
