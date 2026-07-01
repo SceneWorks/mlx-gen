@@ -959,15 +959,16 @@ mod first_step_repro {
     use mlx_rs::memory::{clear_cache, get_active_memory, get_peak_memory, reset_peak_memory};
     use std::path::PathBuf;
 
-    /// The base `microsoft/Lens` snapshot (the `LENS_SNAPSHOT` override, else the newest HF-cache
-    /// snapshot with a `transformer/` tree).
+    /// The base Lens snapshot (the `LENS_SNAPSHOT` override, else the newest HF-cache snapshot
+    /// with a `transformer/` tree). The cache lookup targets `SceneWorks/Lens` — the flat-diffusers
+    /// training-base rehost (sc-8797); Microsoft pulled the original `microsoft/Lens` repo.
     fn snapshot() -> Option<PathBuf> {
         if let Ok(p) = std::env::var("LENS_SNAPSHOT") {
             return Some(PathBuf::from(p));
         }
         let home = std::env::var("HOME").ok()?;
         let snaps =
-            PathBuf::from(home).join(".cache/huggingface/hub/models--microsoft--Lens/snapshots");
+            PathBuf::from(home).join(".cache/huggingface/hub/models--SceneWorks--Lens/snapshots");
         std::fs::read_dir(&snaps)
             .ok()?
             .filter_map(|e| e.ok())
@@ -982,7 +983,7 @@ mod first_step_repro {
     /// Load just the Lens DiT at `dtype` (the only component whose activations drive the first-step
     /// working set; the encoder is freed before the train loop and the VAE is idle).
     fn build_dit(dtype: Dtype) -> LensTransformer {
-        let root = snapshot().expect("microsoft/Lens snapshot (HF cache or LENS_SNAPSHOT)");
+        let root = snapshot().expect("SceneWorks/Lens snapshot (HF cache or LENS_SNAPSHOT)");
         let w = Weights::from_dir(root.join("transformer")).unwrap();
         LensTransformer::from_weights(&w, &LensDitConfig::lens(), dtype).unwrap()
     }
@@ -1162,7 +1163,7 @@ mod first_step_repro {
     /// recompute-only). Compares the production paths — dense (SDPA-ckpt on) vs block-checkpointed
     /// (SDPA-ckpt off, block recompute covers attention).
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process"]
     fn checkpointed_grads_match_dense() {
         let mut dit = build_dit(Dtype::Float32);
         let (adapter, params) = build_targets(&mut dit);
@@ -1182,7 +1183,7 @@ mod first_step_repro {
     /// checkpoint on must match the retained backward (flag off). Same decomposed attention,
     /// recomputed instead of retained → expect (near-)bit-identical.
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process"]
     fn attn_ckpt_grads_match_retained() {
         let mut dit = build_dit(Dtype::Float32);
         let (adapter, params) = build_targets(&mut dit);
@@ -1202,7 +1203,7 @@ mod first_step_repro {
     /// is fit to — refit the `PREFLIGHT_F32`/`PREFLIGHT_BF16` constants if this prints materially
     /// different numbers. Plus a block-checkpointed 1024 point (the OOM mitigation).
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process (may SIGKILL at 1024 dense)"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process (may SIGKILL at 1024 dense)"]
     fn first_step_ckpt_sweep() {
         for dtype in [Dtype::Float32, Dtype::Bfloat16] {
             let tag = if dtype == Dtype::Float32 {
@@ -1246,7 +1247,7 @@ mod first_step_repro {
     /// first-step peak below the dense path's. Runs the dense step first (baseline), then the
     /// checkpointed step, and asserts a reduction that fits unified memory.
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process"]
     fn first_step_1024_checkpointed_vs_dense() {
         let mut dit = build_dit(Dtype::Bfloat16);
         let (adapter, params) = build_targets(&mut dit);
@@ -1296,7 +1297,7 @@ mod first_step_repro {
     /// is well below f32 at a mid bucket — a future re-promotion regression would lift the ratio back
     /// toward (or above) 1.0 and trip this. Measured ratio ≈ 0.50 (16.04 vs 31.83 GB at edge 768).
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process"]
     fn bf16_peak_below_f32_no_silent_repromotion() {
         let edge = 768u32; // mid bucket — big enough to expose a re-promotion, cheap enough to run
         let f32_peak = {
@@ -1374,7 +1375,7 @@ mod first_step_repro {
     /// because the bf16 stream WAS silently f32.) Inputs are fed at the run dtype, mirroring inference:
     /// the pipeline casts latents + caption features to the DiT dtype before the forward.
     #[test]
-    #[ignore = "needs real microsoft/Lens weights; run as its own process"]
+    #[ignore = "needs real SceneWorks/Lens weights; run as its own process"]
     fn bf16_forward_matches_f32() {
         let edge = 256u32; // small — the dtype fidelity is resolution-agnostic
         let (x0, _noise, feats, mask, latent) = synth(edge);
