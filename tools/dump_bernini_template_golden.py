@@ -60,23 +60,9 @@ def generate_unified_inputs(prompt, input_image_hw=None, input_video_count=0,
     return json.dumps(s, ensure_ascii=False)
 
 
-# ===== verbatim reference: build_custom_attention_mask (attention_utils.py) =====
-def build_custom_attention_mask(token_type, token_segment_ids):
-    B, L = token_type.shape
-    q_type, k_type = token_type.unsqueeze(2), token_type.unsqueeze(1)
-    q_id, k_id = token_segment_ids.unsqueeze(2), token_segment_ids.unsqueeze(1)
-    causal_mask = torch.tril(torch.ones((L, L), dtype=torch.bool)).unsqueeze(0)
-    k_is_ti = (k_type == 0) | (k_type == 2)
-    k_is_p, k_is_o = (k_type == 1), (k_type == 3)
-    ids_match = q_id == k_id
-    visible_base_ti = causal_mask & k_is_ti
-    fbm = torch.zeros((B, L, L), dtype=torch.bool)
-    fbm = fbm | (((q_type == 0) | (q_type == 2)) & visible_base_ti)
-    fbm = fbm | ((q_type == 1) & (visible_base_ti | (k_is_p & ids_match)))
-    fbm = fbm | ((q_type == 3) & (visible_base_ti | (k_is_o & ids_match)))
-    am = torch.zeros((B, L, L), dtype=torch.float32)
-    am.masked_fill_(~fbm, float("-inf"))
-    return am
+# ===== verbatim reference: build_custom_attention_mask (attention_utils.py) — shared copy =====
+# (F-117: was a condensed-but-equivalent duplicate; hoisted to _bernini_common.py)
+from _bernini_common import build_custom_attention_mask  # noqa: E402
 
 
 # ===== verbatim reference: SYSTEM_PROMPT + Qwen2VLTemplate + BerniniTemplate.encode_messages =====
