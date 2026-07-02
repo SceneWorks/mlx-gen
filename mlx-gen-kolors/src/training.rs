@@ -248,6 +248,11 @@ impl Trainer for KolorsTrainer {
         if req.config.rank == 0 {
             return Err("kolors trainer: rank must be > 0".into());
         }
+        // F-023: steps == 0 makes the `1..=steps` loop empty and the run returns `Canceled`. z-image
+        // checks it; mirror (the sdxl-family comment claiming upstream rejection was false).
+        if req.config.steps == 0 {
+            return Err("kolors trainer: steps must be > 0".into());
+        }
         if !TrainOptimizer::is_supported(&req.config.optimizer) {
             return Err(format!(
                 "kolors trainer: optimizer '{}' is not available on MLX training (supported: \

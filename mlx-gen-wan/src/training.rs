@@ -590,7 +590,13 @@ impl WanMoeTrainer {
             }
             // Dual: high (index 1) on odd steps, low (index 0) on even. Dense: the single expert.
             let ei = if dual && step % 2 == 1 { 1 } else { 0 };
-            let (clean, ctxs) = &cache[((step - 1) as usize) % cache.len()];
+            // F-016: DECOUPLE the expert alternation from the item selection. With the old
+            // `(step-1) % cache.len()` index, step parity and item parity were locked, so an
+            // EVEN-sized dataset gave each expert only half the items for the whole run (expert 1
+            // saw odd-indexed items, expert 0 even-indexed). Advance the item index by one per
+            // `n_experts` steps instead so both experts sweep the full dataset.
+            let n_experts = if dual { 2 } else { 1 };
+            let (clean, ctxs) = &cache[(((step - 1) as usize) / n_experts) % cache.len()];
             let ctx = &ctxs[ei];
             let band = states[ei].band;
             let t = sample_band_timestep(
@@ -641,11 +647,21 @@ impl WanMoeTrainer {
                     st.warmup_updates,
                 );
                 st.opt.set_lr_scaled(mult);
+                // F-017: average by the ACTUAL in-window count, not the full `accum`. The final-step
+                // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
+                // down-scaled that update (halved effective LR on the tail). Mirrors the z-image/lens
+                // F-069 fix. (z-image/lens port of sc-9097's shared floor.)
+                let window = if st.micro.is_multiple_of(accum) {
+                    accum
+                } else {
+                    st.micro % accum
+                };
+                let window = window.max(1);
                 let avg = average_grads(
                     st.accumulated
                         .take()
                         .expect("an update fires only after accumulation"),
-                    accum,
+                    window,
                 )?;
                 let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
                 let clipped: LoraParams = clipped

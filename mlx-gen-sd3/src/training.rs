@@ -424,7 +424,15 @@ impl Sd3LoraTrainer {
         let will_checkpoint =
             matches!(cfg.network_type, NetworkType::Lora) && cfg.gradient_checkpointing;
         if !will_checkpoint {
-            preflight_memory_guard(edge, want_bf16)?;
+            // F-035: select the preflight constants by variant — Medium (2.5B/24-block) was refused
+            // via the Large (8.1B/38-block) constants (~3× overstated). The trainer is built for one
+            // variant; derive it from the registered descriptor id.
+            let variant = if self.descriptor.id == crate::config::SD3_5_MEDIUM_ID {
+                Sd3Variant::Medium
+            } else {
+                Sd3Variant::Large
+            };
+            preflight_memory_guard(edge, want_bf16, variant)?;
         }
 
         // --- prepare → load → cache: VAE-latents + triple-TE conditioning into memory ---
@@ -657,44 +665,52 @@ impl Sd3LoraTrainer {
 /// `img_len + ctx_len` and the context is a fixed 333 tokens (77 CLIP + 256 T5).
 const PREFLIGHT_TXT_TOKENS: f64 = 333.0;
 
+/// `(weights, linear, quad)` conservative initial constants for [`projected_dense_peak_gb`], by
+/// variant. Large = the 8.1B 38-block MMDiT (the historical single set). F-035: Medium is the 2.5B
+/// 24-block MMDiT-X — using Large's constants refused valid Medium dense runs with a ~3× overstated
+/// projection. The Medium resident base + per-token linear term scale ~24/38 of Large (the quad term
+/// is per-block SDPA-segment, unchanged); still conservative-initial estimates, refit from a sweep.
+const PREFLIGHT_F32_LARGE: (f64, f64, f64) = (32.0, 1.20e-2, 3.0e-7);
+const PREFLIGHT_BF16_LARGE: (f64, f64, f64) = (16.0, 6.0e-3, 1.5e-7);
+const PREFLIGHT_F32_MEDIUM: (f64, f64, f64) = (10.0, 7.6e-3, 3.0e-7);
+const PREFLIGHT_BF16_MEDIUM: (f64, f64, f64) = (5.0, 3.8e-3, 1.5e-7);
+
 /// Projected DENSE (non-block-checkpointed) first-step peak memory, in GB, as a function of the
-/// unified token count `s = img_len + ctx_len`, for the 8.1B SD3.5-Large MMDiT. The structure follows
-/// the Krea/z-image `weights + linear·s + quad·s²` decomposition: the constant is the resident MMDiT
-/// base (bf16 ~16 GB / f32 ~32 GB; the encoders are freed before the train loop), the linear term is
-/// the per-token activations across the 38 joint blocks, and the quadratic term is the seq² attention
-/// transient — demoted to a single block's backward transient by the always-on SDPA-segment
-/// checkpointing.
+/// unified token count `s = img_len + ctx_len`. The structure follows the Krea/z-image
+/// `weights + linear·s + quad·s²` decomposition: the constant is the resident MMDiT base (Large bf16
+/// ~16 GB / f32 ~32 GB; Medium ~5 / ~10 GB; the encoders are freed before the train loop), the linear
+/// term is the per-token activations across the joint blocks, and the quadratic term is the seq²
+/// attention transient — demoted to a single block's backward transient by the always-on SDPA-segment
+/// checkpointing. F-035: parameterized by variant — the constants differ between the 8.1B Large (38
+/// blocks) and 2.5B Medium (24 blocks) MMDiT.
 ///
 /// **These constants are a CONSERVATIVE INITIAL ESTIMATE** — they err toward refusing borderline runs
 /// (recommending Gradient Checkpointing) rather than allowing a SIGKILL, and are to be refit from a
 /// real-weight sweep. `projection_is_monotonic_and_conservative` pins the shape.
-fn projected_dense_peak_gb(s: f64, bf16: bool) -> f64 {
-    if bf16 {
-        PREFLIGHT_BF16.0 + PREFLIGHT_BF16.1 * s + PREFLIGHT_BF16.2 * s * s
-    } else {
-        PREFLIGHT_F32.0 + PREFLIGHT_F32.1 * s + PREFLIGHT_F32.2 * s * s
-    }
+fn projected_dense_peak_gb(s: f64, bf16: bool, variant: Sd3Variant) -> f64 {
+    let (f32_c, bf16_c) = match variant {
+        Sd3Variant::Large | Sd3Variant::LargeTurbo => (PREFLIGHT_F32_LARGE, PREFLIGHT_BF16_LARGE),
+        Sd3Variant::Medium => (PREFLIGHT_F32_MEDIUM, PREFLIGHT_BF16_MEDIUM),
+    };
+    let c = if bf16 { bf16_c } else { f32_c };
+    c.0 + c.1 * s + c.2 * s * s
 }
-
-/// `(weights, linear, quad)` conservative initial constants for [`projected_dense_peak_gb`].
-const PREFLIGHT_F32: (f64, f64, f64) = (32.0, 1.20e-2, 3.0e-7);
-const PREFLIGHT_BF16: (f64, f64, f64) = (16.0, 6.0e-3, 1.5e-7);
 
 /// Refuse a run whose dense first step would exceed this machine's memory budget (and thus get
 /// SIGKILLed), returning a catchable, actionable error instead. Only consulted when gradient
 /// checkpointing is OFF.
-fn preflight_memory_guard(edge: u32, bf16: bool) -> Result<()> {
+fn preflight_memory_guard(edge: u32, bf16: bool, variant: Sd3Variant) -> Result<()> {
     let budget_gb = get_memory_limit() as f64 / (1024.0 * 1024.0 * 1024.0);
-    check_preflight_budget(edge, bf16, budget_gb)
+    check_preflight_budget(edge, bf16, budget_gb, variant)
 }
 
 /// The pure guard logic (no MLX global state, so it is unit-testable): refuse if the projected dense
 /// first-step peak exceeds `budget_gb × 0.85`. `edge` is the bucketed training edge; the SD3 unified
 /// token count is `(edge/16)²` (latent /8, patch 2) plus the fixed 333-token context.
-fn check_preflight_budget(edge: u32, bf16: bool, budget_gb: f64) -> Result<()> {
+fn check_preflight_budget(edge: u32, bf16: bool, budget_gb: f64, variant: Sd3Variant) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     let s = tokens_per_side * tokens_per_side + PREFLIGHT_TXT_TOKENS;
-    let projected = projected_dense_peak_gb(s, bf16);
+    let projected = projected_dense_peak_gb(s, bf16, variant);
     let safe = budget_gb * 0.85;
     if projected > safe {
         return Err(format!(
@@ -1186,7 +1202,7 @@ mod tests {
     fn preflight_guard_fires_over_budget_and_passes_under() {
         // A 16 GB-class budget (safe ≈ 13.6 GB): the 16 GB bf16 MMDiT base alone exceeds it → dense
         // 1024 must be refused with an actionable error recommending Gradient Checkpointing.
-        let err = check_preflight_budget(1024, true, 16.0)
+        let err = check_preflight_budget(1024, true, 16.0, Sd3Variant::Large)
             .unwrap_err()
             .to_string();
         assert!(err.contains("Gradient Checkpointing"), "got: {err}");
@@ -1195,8 +1211,8 @@ mod tests {
             "error should name the resolution: {err}"
         );
         // A 128 GB-class budget (safe ≈ 108 GB) comfortably fits dense 1024 in both dtypes.
-        assert!(check_preflight_budget(1024, true, 128.0).is_ok());
-        assert!(check_preflight_budget(1024, false, 128.0).is_ok());
+        assert!(check_preflight_budget(1024, true, 128.0, Sd3Variant::Large).is_ok());
+        assert!(check_preflight_budget(1024, false, 128.0, Sd3Variant::Large).is_ok());
     }
 
     #[test]
@@ -1211,12 +1227,18 @@ mod tests {
     fn projection_is_monotonic_and_conservative() {
         for bf16 in [false, true] {
             let (s512, s768, s1024) = (1024.0 + 333.0, 2304.0 + 333.0, 4096.0 + 333.0);
-            assert!(projected_dense_peak_gb(s512, bf16) < projected_dense_peak_gb(s768, bf16));
-            assert!(projected_dense_peak_gb(s768, bf16) < projected_dense_peak_gb(s1024, bf16));
+            assert!(projected_dense_peak_gb(s512, bf16, Sd3Variant::Large)
+                < projected_dense_peak_gb(s768, bf16, Sd3Variant::Large));
+            assert!(projected_dense_peak_gb(s768, bf16, Sd3Variant::Large)
+                < projected_dense_peak_gb(s1024, bf16, Sd3Variant::Large));
         }
-        assert!(projected_dense_peak_gb(4429.0, true) < projected_dense_peak_gb(4429.0, false));
-        // The bf16 base (no tokens) is ~the resident MMDiT weights (≥ 14 GB).
-        assert!(projected_dense_peak_gb(0.0, true) >= 14.0);
+        assert!(projected_dense_peak_gb(4429.0, true, Sd3Variant::Large)
+            < projected_dense_peak_gb(4429.0, false, Sd3Variant::Large));
+        // The Large bf16 base (no tokens) is ~the resident 8.1B MMDiT weights (≥ 14 GB). Medium's
+        // base is lower (~5 GB) — F-035 parameterized this by variant.
+        assert!(projected_dense_peak_gb(0.0, true, Sd3Variant::Large) >= 14.0);
+        assert!(projected_dense_peak_gb(0.0, true, Sd3Variant::Medium) < 14.0);
+        assert!(projected_dense_peak_gb(0.0, true, Sd3Variant::Medium) >= 4.0);
     }
 }
 
