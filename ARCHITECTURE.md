@@ -1,7 +1,9 @@
 # mlx-gen architecture
 
-Rust-native inference for generative image/video models on Apple MLX, built on
-[`mlx-rs`](https://github.com/oxiglade/mlx-rs). It reimplements the (now frozen) SceneWorks
+Rust-native inference for generative image/video models on Apple MLX, built on the
+[`mlx-rs`](https://crates.io/crates/mlx-rs) API surface but on the SceneWorks `pmetal-mlx-rs`
+fork ([`michaeltrefry/mlx-rs`](https://github.com/michaeltrefry/mlx-rs), rev-pinned in the root
+`Cargo.toml` — its `mlx-sys` builds MLX core 0.31.2 vs upstream's 0.25.1). It reimplements the (now frozen) SceneWorks
 **mflux fork** — the Python MLX inference sidecar — as a single statically-linked Rust
 component. The fork is the **reference spec**, not an upstream: we diverge permanently and
 do not merge back.
@@ -73,6 +75,12 @@ carries an explicit remap in its `from_weights`. Today the Z-Image block keys al
   default Metal device is not thread-safe and SIGSEGVs under cargo's parallel harness.
 
 ## CI
-GitHub Actions on `macos-14` (Apple Silicon — MLX is Apple-Silicon-only and tests eval on
-the Metal GPU, which hosted runners do expose). `mlx-sys` builds MLX from source via cmake;
-the build is cached. Gate: `fmt --check`, `clippy -D warnings`, `cargo test`.
+GitHub Actions (`.github/workflows/ci.yml`), two lanes:
+1. **contract** (Linux `ubuntu-latest`): `gen-core` + `gen-core-testkit` fmt/clippy/test — proves
+   the contract layer is genuinely backend-independent (zero tensor deps).
+2. **test** (`macos-15`, Apple Silicon — MLX is Apple-Silicon-only and tests eval on the Metal GPU,
+   which hosted runners do expose). `mlx-sys` builds MLX from source via cmake; the build is cached.
+   Hosted runners cap at SDK 15, so CI lowers `MACOSX_DEPLOYMENT_TARGET` to 15.0 (the shipping
+   config targets 26.2 for the NAX fast kernels, which needs a macOS-26 self-hosted runner). Gate:
+   `fmt --check`, `clippy -D warnings`, `cargo test`. CI runs cargo with `--locked` so the
+   committed `Cargo.lock` (rev-pinned `core-llm`/`mlx-llm`/`mlx-rs`) governs, not moving refs.

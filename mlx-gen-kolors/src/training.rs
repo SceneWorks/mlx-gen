@@ -44,10 +44,10 @@
 //!     ([`mlx_gen_sdxl::apply_sdxl_adapters`]): LoRA targets the **complete** attention surface
 //!     (down/mid/up `to_q/k/v/to_out.0`) under the PEFT prefix `base_model.model.unet.`; LoKr targets
 //!     the **vendored** surface (down/up attention only — the SDXL LoKr loader keeps `mid_block` out,
-//!     sc-2640) and reconstructs at **f32** (the SDXL/Kolors merge dtype). (Wiring this LoRA into the
-//!     Kolors *inference* registry — which today rejects `spec.adapters` — is a separate follow-on, the
-//!     sc-3874 note; the produced adapter already reloads through the SDXL inference path, validated by
-//!     `tests/trainer_e2e.rs`.)
+//!     sc-2640) and reconstructs at **f32** (the SDXL/Kolors merge dtype). The Kolors inference
+//!     registry applies `spec.adapters` (LoRA/LoKr merged into the dense U-Net before quantization
+//!     since sc-4733), so the produced adapter reloads through the Kolors inference path directly
+//!     (validated by `tests/trainer_e2e.rs`).
 
 use mlx_gen::sampler::AlphaSchedule;
 use mlx_gen::weights::Weights;

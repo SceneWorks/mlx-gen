@@ -12,7 +12,7 @@ A from-scratch Rust reimplementation of the MLX image/video model stack (a diver
 - **Video:** Wan2.2 (text/image/TI2V, incl. VACE and VACE-Fun), Bernini renderer (ByteDance; Wan2.2-A14B dual-expert MoE + source-id rotary + APG guidance), SCAIL-2 (controlled character animation / motion transfer; Wan2.1-14B I2V backbone), LTX-2.3 (text-to-video + audio), Stable Video Diffusion (image-to-video)
 - **Upscaling / restoration:** SeedVR2 (one-step diffusion super-resolution, image and video; 3B/7B)
 - **Identity:** PuLID-FLUX and InstantID, over a native MLX face stack (SCRFD + ArcFace + BiSeNet)
-- **Understanding & utility:** JoyCaption (captioning), SAM2 / SAM3 (segmentation; SAM3 adds open-vocabulary concept segmentation + video tracking), prompt-refine (Llama-3.2-3B-Instruct prompt rewriting, with JSON grammar-constrained decoding)
+- **Understanding & utility:** JoyCaption (captioning), SAM2 / SAM3 (segmentation; SAM3 adds open-vocabulary concept segmentation + video tracking)
 - **Adapters:** LoRA, LoKr (reconstruct + forward-time residual + stacking, quant-safe), ControlNet, IP-Adapter
 - **Training:** native MLX LoRA / LoKr fine-tuning for SDXL, Z-Image, Kolors, Wan2.2, LTX-2.3, and Lens (adamw / adam / rose / prodigy optimizers, dataset + checkpoint plumbing)
 - **Quantization:** group-wise affine Q4 / Q8 (byte-identical to the reference packing)
@@ -71,9 +71,11 @@ fn main() -> mlx_gen::Result<()> {
 
 Discover what is registered at runtime with `mlx_gen::registry::generators()` (SeedVR2 is
 registered here as a `Generator`). The same link-time pattern backs the other entry points:
-`load_trainer` (LoRA/LoKr fine-tuning), `load_captioner` (JoyCaption), and `load_textllm`
-(prompt-refine). The SAM2 / SAM3 segmenters are plain utility APIs used directly, not through the
-registry.
+`load_trainer` (LoRA/LoKr fine-tuning) and `load_captioner` (JoyCaption). The SAM2 / SAM3
+segmenters are plain utility APIs used directly, not through the registry. (Prompt-refine —
+Llama-3.2-3B-Instruct rewriting — is served through the `core-llm` LLM contract and lives in the
+worker / candle-gen; mlx-gen's own `mlx-gen-prompt-refine` crate was retired by the mlx-llm
+engine in sc-7158, and the `load_textllm` registry entry point was removed in sc-7189.)
 
 ## License
 

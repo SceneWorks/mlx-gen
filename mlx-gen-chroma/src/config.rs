@@ -74,7 +74,9 @@ impl ChromaVariant {
     /// Static flow-match time `shift` (diffusers `FlowMatchEulerDiscreteScheduler`,
     /// `use_dynamic_shifting=false`): `σ' = shift·σ / (1 + (shift-1)·σ)`. HD's `scheduler_config.json`
     /// pins `shift=3.0`; Flash pins `1.0`. **Base** ships `use_beta_sigmas=true` (a beta-spaced
-    /// schedule, not linspace) — handled in sc-3840; this `1.0` is a placeholder for Base.
+    /// schedule, not linspace — see [`crate::beta`] and [`Self::use_beta_sigmas`]); the beta schedule
+    /// itself shapes the spacing, so Base's static `shift` is the identity `1.0` (not a placeholder —
+    /// it is the value the reference applies after the beta sigmas).
     pub fn sigma_shift(self) -> f32 {
         match self {
             Self::Hd => 3.0,

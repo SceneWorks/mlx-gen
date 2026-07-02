@@ -1,5 +1,10 @@
 # Handoff — epic 3040 (mlx-gen advanced video modes + SVD)
 
+> **HISTORICAL (2026-07).** This handoff captured an in-flight state of epic 3040. The work it
+> describes — including the "4 more commits not yet pushed/PR'd" SVD S1/S3/S4 slices and the
+> re-PR instructions — has since shipped via PRs #156, #157, and #161. Kept for the design context
+> and the branch/worktree pointers only; do **not** re-PR anything described here as outstanding.
+
 Status as of this handoff. Epic: https://app.shortcut.com/trefry/epic/3040
 
 ## Where the work lives

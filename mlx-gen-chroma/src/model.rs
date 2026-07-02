@@ -185,7 +185,7 @@ impl Chroma {
     /// Run the true-CFG flow-match denoise from a given **packed** initial latent `[1, Si, 64]` →
     /// final packed latent with the **Euler** sampler. Public so the e2e parity test can inject the
     /// reference's initial latents (mlx and torch RNG differ); [`generate`](Self::generate) seeds it
-    /// via `create_noise` and selects the sampler per [`ChromaSamplerKind::from_request`].
+    /// via `create_noise` and selects the sampler per [`resolve_sampler_name`].
     ///
     /// Thin wrapper over [`Self::denoise_with_sampler`] (the single source of truth for the
     /// encode/sigma/RoPE/mask/CFG setup) forcing Euler — the diffusers reference and every committed
@@ -378,7 +378,7 @@ impl Chroma {
     }
 
     /// Test accessor (real-weight e2e, sc-6903): run the denoise with an explicit sampler **name**,
-    /// routed through the production [`ChromaSamplerKind::from_request`] selection. Lets the e2e gate
+    /// routed through the production [`resolve_sampler_name`] selection. Lets the e2e gate
     /// drive the Flash **Heun** path that `generate` runs by default (sc-5392) but the Euler-forced
     /// [`Self::denoise`] goldens never exercise. `sampler = None` reproduces the variant default
     /// (Heun for Flash, Euler otherwise).

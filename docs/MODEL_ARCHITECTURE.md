@@ -1,8 +1,10 @@
 # mlx-gen — generator contract & per-model packaging
 
-**Status: proposal for review.** Defines the public interface every model implements and how
-models are packaged so consumers pull in only what they need. Once agreed, we walk each model
-through the *fitment checklist* (§8) before changing code.
+**Status: adopted.** This is the public interface every model implements and how models are
+packaged so consumers pull in only what they need. (The original "proposal for review" banner was
+retired once the `Generator`/`Trainer`/`Captioner`/`Transform` contracts landed in `gen-core`;
+the per-model topology below reflects the shipped crate set — note FLUX.1 and FLUX.2 ship as
+separate crates, `-flux` and `-flux2`, not the single-family framing an early draft showed.)
 
 Mental model (C# terms): `mlx-gen` is the **abstractions + shared-runtime** package; each model
 is a **provider** package implementing a common interface; a **registry** (link-time, the Rust
@@ -54,7 +56,7 @@ mlx-gen-z-image      provider: depends ONLY on `mlx-gen`; implements Generator; 
 mlx-gen-qwen-image   provider
 mlx-gen-flux         provider  (FLUX.1 + FLUX.2-klein as variants/configs in one family crate)
 mlx-gen-wan / -ltx   provider  (video; follow-on)
-mlx-gen-seedvr2      provider  (Transform, not Generator; see §3.3)
+mlx-gen-seedvr2      provider  (single-image super-resolution; registers as a Generator today — see §3.3)
 ```
 
 - **SceneWorks worker** depends on every provider crate it serves (it needs all families).
@@ -137,11 +139,18 @@ family crate owns its blocks. Config (the pattern proven on `VaeDecoderConfig` /
 
 ### 3.3 `Transform` — non-prompt image→image (designed around SeedVR2)
 
-Restorers/upscalers are **not** `Generator`s — no prompt; the input image *is* the subject.
+Restorers/upscalers are conceptually **not** `Generator`s — no prompt; the input image *is* the
+subject. The `Transform` trait below is the intended home for that image→image contract.
 SeedVR2 (the in-scope utility) is a diffusion-based **single-image** super-resolution model:
 `seed` + input image + target size + `softness` → restored image (1-step, its own
-VAE+transformer, fixed precomputed text embedding — no user prompt). So the contract is
-image→image:
+VAE+transformer, fixed precomputed text embedding — no user prompt).
+
+> **Registration note (review F-103):** there is currently no `register_transform!` macro, and
+> SeedVR2 registers via `register_generators!` as a `Generator` (it accepts the same
+> `GenerationRequest` shape the worker dispatches). Migrating it onto a real `Transform`
+> registration path is a cross-repo change (the `Transform` contract is shared with candle-gen),
+> tracked separately; until then the §2 "Transform, not Generator" framing describes the design
+> intent, not the current registration. The image→image contract is:
 
 ```rust
 pub trait Transform {
@@ -255,8 +264,9 @@ No edits to `mlx-gen` or any other provider crate.
 
 ## 7. Where the contracts strain — settle per model
 
-- **Upscalers / SeedVR2:** `Transform`, not `Generator` (no prompt) — image→image, shape locked
-  in §3.3. A video restorer or latent-space model, if one lands, extends it then.
+- **Upscalers / SeedVR2:** conceptually `Transform` (no prompt) — image→image, shape locked
+  in §3.3 — but currently registered as a `Generator` (see the §3.3 registration note). A video
+  restorer or latent-space model, if one lands, extends the `Transform` path then.
 - **Conditioning variety:** single-ref img2img vs Qwen multi-ref edit vs Redux refs+strengths vs
   ControlNet+scale vs Depth vs Mask → the `Conditioning` enum, gated by `Capabilities`.
 - **Guidance-distilled vs CFG:** Z-Image-turbo (no guidance) vs FLUX/Qwen → `supports_guidance` +

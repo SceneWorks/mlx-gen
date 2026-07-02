@@ -263,8 +263,9 @@ use mlx_rs::Array;
 
 use crate::text_encoder::BooguTextEncoderConfig;
 
-/// Group size the packing uses — the codebase-wide default ([`crate::quant::GROUP_SIZE`], 64), the
-/// same value the auto-detecting loader infers from the packed shapes.
+/// Group size the packing uses — Boogu's [`crate::quant::GROUP_SIZE`], deliberately **32** (NOT the
+/// codebase-wide default of 64: 3360 % 64 ≠ 0, so a 64-group packing would build snapshots the DiT
+/// rejects at load). The auto-detecting loader infers this same value from the packed shapes.
 pub const QUANT_GROUP_SIZE: i32 = crate::quant::GROUP_SIZE;
 
 /// The Linear `…​.weight` keys of an attention module that [`crate::quant::lin`] quantizes
@@ -415,8 +416,8 @@ fn write_quantized_config(
 
 /// Offline one-shot: read the dense `{src_root}/transformer/` (all shards) and write a pre-quantized
 /// `{dst_root}/transformer/diffusion_pytorch_model.safetensors` (packed Q4/Q8) + `config.json` (with
-/// the `quantization` manifest). `group_size` is the mflux/reference default of 64
-/// ([`QUANT_GROUP_SIZE`]).
+/// the `quantization` manifest). `group_size` is Boogu's [`QUANT_GROUP_SIZE`] (**32**, not the
+/// codebase default 64 — see its doc).
 pub fn quantize_transformer(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
     let cfg = BooguConfig::from_snapshot(src_root)?;
     let src = src_root.join("transformer");

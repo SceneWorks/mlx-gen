@@ -16,7 +16,9 @@ Usage:
   python tools/convert_pid.py <input.pth> --dry-run        # report keys, write nothing
   python tools/convert_pid.py --selftest                   # unit-test the key transform (no torch.load)
 
-Run from the reference venv: /Users/michael/Repos/mlx-gen/_vendor/pid/.venv-pid/bin/python
+Run from the reference venv: <repo-root>/_vendor/pid/.venv-pid/bin/python
+(e.g. ~/Repos/mlx-gen/_vendor/pid/.venv-pid/bin/python — the venv is created by the PiD porting
+spike, not committed).
 """
 
 import argparse
