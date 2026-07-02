@@ -5,12 +5,13 @@
 # --------------
 # The pinned fork (pmetal-mlx-rs) loads its Metal kernel library at runtime via a patched
 # resolver (mlx-sys/patches/metallib-search-path.patch -> mlx/backend/metal/device.cpp). The
-# resolution order is:
-#       $PMETAL_METALLIB_PATH  ->  ~/.cache/pmetal/lib/mlx.metallib  ->  colocated mlx.metallib  -> ...
-# For local `cargo test`/`cargo run` binaries (target/{release,debug}/deps/...) there is NO
-# colocated metallib, so the user-cache copy is the SOLE working resolution — it is load-bearing,
-# not just a fallback. Never delete it without immediately replacing it, or MLX cannot load ANY
-# metallib and every Metal op aborts.
+# resolution order (post-sc-7898: own-build wins over the user cache) is:
+#       $PMETAL_METALLIB_PATH  ->  compiled-in METAL_PATH (the build's own metallib)
+#         ->  ~/.cache/pmetal/lib/mlx.metallib (user cache)  ->  colocated mlx.metallib  -> ...
+# Local `cargo test`/`cargo run` binaries (target/{release,debug}/deps/...) have NO compiled-in or
+# colocated metallib, so for them the user-cache copy is the SOLE working resolution — it is
+# load-bearing, not just a fallback. Never delete it without immediately replacing it, or MLX
+# cannot load ANY metallib and every Metal op aborts.
 #
 # THE BUG IT CURES
 # ----------------

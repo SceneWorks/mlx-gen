@@ -2,15 +2,15 @@
 members = ["gen-core", "gen-core-testkit", "mlx-gen-z-image", "mlx-gen-qwen-image", "mlx-gen-sdxl", "mlx-gen-flux", "mlx-gen-flux2", "mlx-gen-clip", "mlx-gen-ltx", "mlx-gen-wan", "mlx-gen-bernini", "mlx-gen-scail2", "mlx-gen-face", "mlx-gen-pulid", "mlx-gen-instantid", "mlx-gen-svd", "mlx-gen-joycaption", "mlx-gen-sam2", "mlx-gen-sam3", "mlx-gen-sensenova", "mlx-gen-kolors", "mlx-gen-chroma", "mlx-gen-lens", "mlx-gen-seedvr2", "mlx-gen-ideogram", "mlx-gen-boogu", "mlx-gen-krea", "mlx-gen-pid", "mlx-gen-sd3", "mlx-gen-depth", "mlx-gen-sana"]
 resolver = "2"
 
-# Single source of truth for the deps shared across the root and all 29 member crates (F-151). The
-# next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of 17 synchronized
-# ones — a missed crate would otherwise produce two distinct `mlx-rs` builds, cross-crate `Array`
-# type-mismatch errors, and a doubled (very expensive) MLX-from-source build. Members opt in with
-# `<dep> = { workspace = true }`.
+# Single source of truth for the deps shared across the root and all 31 member crates (F-151). The
+# next MLX/fork bump (sc-2517/2772/2781 etc.) is now a one-line edit here instead of dozens of
+# synchronized per-crate ones — a missed crate would otherwise produce two distinct `mlx-rs` builds,
+# cross-crate `Array` type-mismatch errors, and a doubled (very expensive) MLX-from-source build.
+# Members opt in with `<dep> = { workspace = true }`.
 [workspace.dependencies]
 # mlx-rs fork pinned to our own GitHub copy by commit SHA (supply-chain capture — immune to the
 # upstream fork being yanked/deleted). `pmetal-mlx-rs` is mlx-rs 0.25 whose mlx-sys builds MLX
-# core v0.31.1 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
+# core v0.31.2 (vs upstream mlx-rs 0.25.3, welded to MLX 0.25.1 — 2–3.6× slower Metal kernels).
 # The mlx-c C layer is a submodule of ml-explore/mlx-c (Apple) at v0.6.0; pmetal's delta is
 # additive Rust bindings only. Aliased as `mlx-rs` so `use mlx_rs::…` is unchanged.
 # SHA e59ffd88 = 1f293623 + the sc-2781 MLX 0.31.1->0.31.2 bump (+ a TEMPORARY mlx-c fft FFTNorm patch

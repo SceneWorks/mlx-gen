@@ -648,7 +648,8 @@ impl DownResBlock {
         })
     }
 
-    /// Returns `(output, cached_convs_consumed)` — the second is used once at build to size the cache.
+    /// Encoder down-stage forward; the conv-cache slots it consumes are counted by
+    /// [`Self::cached_convs`] (used once at build to size the cache).
     fn forward(&self, x: &Array, cache: &mut FeatCache) -> Result<Array> {
         let x_shortcut = self.shortcut.forward(x)?;
         eval(&x_shortcut)?;

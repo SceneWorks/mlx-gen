@@ -50,8 +50,9 @@ use gen_core::{
     Progress,
 };
 
-/// The lax `Progress::Step` monotonicity contract shared by the captioner and text-LLM conformance
-/// checks (6942): at least one step; a constant non-zero `total`; a strictly-increasing `current` in
+/// The lax `Progress::Step` monotonicity contract used by the captioner conformance checks (6942;
+/// the text-LLM checks left with sc-7189): at least one step; a constant non-zero `total`; a
+/// strictly-increasing `current` in
 /// `1..=total`. `id` labels the model, `op` the emitting method (e.g. `"caption()"`) for the
 /// no-events error. Token/phase-based decoders use this rather than the generator's exact-step check.
 pub(crate) fn check_progress_steps(id: &str, op: &str, steps: &[(u32, u32)]) -> Result<(), String> {
