@@ -337,6 +337,28 @@ where
         .into_iter()
         .map(|e| (e.key, e.shape))
         .collect();
+    validate_tensor_set("SD3.5 architecture", &expected, provided)
+}
+
+/// A dim matches if equal or the expected dim is `-1` (wildcard). Rank must match.
+pub(crate) fn shape_matches(expected: &[i64], got: &[i64]) -> bool {
+    expected.len() == got.len() && expected.iter().zip(got).all(|(&e, &g)| e == -1 || e == g)
+}
+
+/// Shared architecture-set validator (F-094c dedup): reports missing, extra (non-arch), and
+/// shape-mismatched keys of `provided` against an `expected` `key → shape` map. `label` names the
+/// component in the error ("SD3.5 architecture", "SD3.5 VAE architecture"). Shapes match via
+/// [`shape_matches`], so an expected dim of `-1` is a wildcard — the transformer and the VAE paths
+/// now share this single implementation, and the VAE path gains the `-1` wildcard support it
+/// previously lacked.
+pub(crate) fn validate_tensor_set<'a, I>(
+    label: &str,
+    expected: &HashMap<String, Vec<i64>>,
+    provided: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = (&'a str, &'a [i64])>,
+{
     let provided: HashMap<&str, &[i64]> = provided.into_iter().collect();
 
     let mut missing: Vec<&String> = expected
@@ -367,7 +389,7 @@ where
     extra.sort();
     bad_shape.sort();
     Err(Error::Msg(format!(
-        "SD3.5 architecture validation FAILED: {} missing, {} extra, {} shape mismatch. \
+        "{label} validation FAILED: {} missing, {} extra, {} shape mismatch. \
          expected {} tensors. missing={:?} extra={:?} shape={:?}",
         missing.len(),
         extra.len(),
@@ -377,11 +399,6 @@ where
         &extra[..extra.len().min(5)],
         &bad_shape[..bad_shape.len().min(5)],
     )))
-}
-
-/// A dim matches if equal or the expected dim is `-1` (wildcard). Rank must match.
-fn shape_matches(expected: &[i64], got: &[i64]) -> bool {
-    expected.len() == got.len() && expected.iter().zip(got).all(|(&e, &g)| e == -1 || e == g)
 }
 
 /// The total number of transformer tensors the validator expects for a given arch — handy for a

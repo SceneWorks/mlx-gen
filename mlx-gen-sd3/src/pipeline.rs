@@ -52,14 +52,15 @@ pub fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
 }
 
 /// Tokenize one prompt for CLIP into a fixed `[1, 77]` int32 id row, padded with the EOS/pad token
-/// (diffusers `padding="max_length", max_length=77`). Empty prompt → a full row of pad ids (the
-/// true-CFG uncond branch passes an empty negative prompt, which diffusers encodes the same way).
+/// (diffusers `padding="max_length", max_length=77`). The **empty** prompt is NOT special-cased:
+/// `ClipBpeTokenizer::tokenize("")` returns `[BOS, EOS]` (BOS is always prepended, EOS always
+/// appended), which after padding is exactly diffusers `tokenizer("", padding="max_length")`. This
+/// is load-bearing for the true-CFG uncond branch of every default (unset-negative) render — an
+/// earlier `is_empty() → Vec::new()` shortcut produced 77×EOS with NO BOS, changing every hidden
+/// state and shifting the pooled-at-argmax EOS selection from index 1 to 0 (F-004; same bug family
+/// as z-image sc-8958).
 fn clip_ids(tokenizer: &ClipBpeTokenizer, prompt: &str) -> Result<Array> {
-    let mut ids = if prompt.is_empty() {
-        Vec::new()
-    } else {
-        tokenizer.tokenize(prompt)?
-    };
+    let mut ids = tokenizer.tokenize(prompt)?;
     if ids.len() > CLIP_MAX_LENGTH {
         ids.truncate(CLIP_MAX_LENGTH);
     }
@@ -76,11 +77,12 @@ pub fn encode_prompt(
     t5_tokenizer: &mlx_gen::tokenizer::TextTokenizer,
     prompt: &str,
 ) -> Result<Sd3Conditioning> {
-    let clip_l_ids = clip_ids(clip_tokenizer, prompt)?;
-    let clip_g_ids = clip_ids(clip_tokenizer, prompt)?;
+    // clip_l and clip_g share ONE BPE tokenizer, so their padded id rows are identical — tokenize
+    // once and reuse for both encoders (F-094b).
+    let clip_row = clip_ids(clip_tokenizer, prompt)?;
     let t5 = t5_tokenizer.tokenize(prompt)?;
     let (t5_ids, _t5_mask) = mlx_gen::tokenizer::to_arrays(&t5);
-    encoders.encode(&clip_l_ids, &clip_g_ids, &t5_ids, None)
+    encoders.encode(&clip_row, &clip_row, &t5_ids, None)
 }
 
 /// One flow-match Euler denoise with **true CFG** + progress + cooperative cancellation. Each step
@@ -140,6 +142,65 @@ pub fn decode_to_image(vae: &Vae, latents: &Array) -> Result<Image> {
 mod tests {
     use super::*;
     use mlx_rs::transforms::eval;
+
+    /// Build a tiny synthetic CLIP BPE tokenizer (no real weights) whose special tokens match the
+    /// real CLIP vocab ids so [`CLIP_PAD_ID`] (= EOS = 49407) behaves identically. Enough vocab to
+    /// tokenize a short ASCII prompt; the empty prompt needs only BOS/EOS. Written to a unique temp
+    /// dir and loaded through the real [`ClipBpeTokenizer::from_dir`] path so this exercises
+    /// production code (matching the crate's `std::env::temp_dir()` test convention — no new dep).
+    fn synthetic_clip_tokenizer() -> ClipBpeTokenizer {
+        let dir = std::env::temp_dir().join(format!("mlx_gen_sd3_clip_tok_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Vocab: the two specials at their real CLIP ids, plus a few `</w>`-terminated word tokens so
+        // a non-empty prompt also tokenizes without an OOV error.
+        let vocab = serde_json::json!({
+            "<|startoftext|>": 49406,
+            "<|endoftext|>": 49407,
+            "a</w>": 320,
+            "fox</w>": 3363,
+        });
+        std::fs::write(dir.join("vocab.json"), vocab.to_string()).unwrap();
+        // merges.txt: a header line + no merges (single-token words need none).
+        std::fs::write(dir.join("merges.txt"), "#version: 0.2\n").unwrap();
+        ClipBpeTokenizer::from_dir(&dir).unwrap()
+    }
+
+    #[test]
+    fn empty_prompt_clip_ids_keep_bos_and_match_tokenize_path() {
+        // F-004 (default-run, no real weights): the empty (uncond) prompt must NOT be special-cased.
+        // `clip_ids("")` must equal the padded `tokenize("")` path and begin with BOS (49406) then
+        // EOS (49407) — NOT 77×EOS-with-no-BOS as the removed `is_empty() → Vec::new()` shortcut did.
+        let tok = synthetic_clip_tokenizer();
+
+        // tokenize("") is [BOS, EOS].
+        assert_eq!(tok.tokenize("").unwrap(), vec![49406, 49407]);
+
+        let ids = clip_ids(&tok, "").unwrap();
+        eval([&ids]).unwrap();
+        let row = ids.as_slice::<i32>();
+        assert_eq!(row.len(), CLIP_MAX_LENGTH);
+        // First slot is BOS, second is EOS, remainder padded with EOS/pad.
+        assert_eq!(row[0], 49406, "empty-prompt uncond row must START with BOS");
+        assert_eq!(row[1], CLIP_PAD_ID, "second id is EOS");
+        assert!(
+            row[2..].iter().all(|&x| x == CLIP_PAD_ID),
+            "the tail is EOS/pad"
+        );
+        // The buggy path would have produced row[0] == EOS (no BOS) — assert we are NOT that.
+        assert_ne!(
+            row[0], CLIP_PAD_ID,
+            "regression: empty-prompt row must not be 77×EOS (missing BOS)"
+        );
+
+        // Equivalence with the general tokenize(...) → pad path applied by hand.
+        let mut expected = tok.tokenize("").unwrap();
+        expected.resize(CLIP_MAX_LENGTH, CLIP_PAD_ID);
+        assert_eq!(
+            row,
+            expected.as_slice(),
+            "clip_ids(\"\") == padded tokenize(\"\")"
+        );
+    }
 
     #[test]
     fn noise_shape_is_batch1_16ch() {

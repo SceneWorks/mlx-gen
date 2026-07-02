@@ -293,6 +293,17 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             "{id}: negative prompt is not supported on this variant"
         )));
     }
+    // F-094a: a negative prompt is only honored when CFG is active (guidance != 1.0, which runs the
+    // uncond forward). An explicit `guidance <= 1.0` alongside a negative prompt would silently
+    // discard the negative — reject the combination with a typed error instead of the silent no-op
+    // (Turbo already rejects `guidance`/`negative_prompt` wholesale via the capability checks above;
+    // this is the true-CFG analogue for a guidance value that disables CFG).
+    if req.negative_prompt.is_some() && req.guidance.is_some_and(|g| g <= 1.0) {
+        return Err(Error::Msg(format!(
+            "{id}: a negative prompt requires guidance > 1.0 (guidance <= 1.0 disables CFG, so the \
+             negative prompt would be ignored); raise guidance or drop the negative prompt"
+        )));
+    }
     for c in &req.conditioning {
         let kind = c.kind();
         if !caps.accepts(kind) {
@@ -381,6 +392,41 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&d, &req).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_negative_prompt_with_cfg_disabling_guidance() {
+        // F-094a: on a true-CFG variant, a negative prompt is only honored when guidance > 1.0. An
+        // explicit guidance <= 1.0 disables CFG, so the negative would be silently dropped — the
+        // combination is now a typed error rather than a silent no-op.
+        let d = descriptor();
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            negative_prompt: Some("blurry".into()),
+            ..Default::default()
+        };
+        // guidance == 1.0 (CFG off) + a negative prompt → rejected.
+        let g1 = GenerationRequest {
+            guidance: Some(1.0),
+            ..base.clone()
+        };
+        let err = validate_request(&d, &g1).unwrap_err().to_string();
+        assert!(err.contains("guidance > 1.0"), "got: {err}");
+        // guidance < 1.0 is likewise rejected with a negative prompt.
+        let g0 = GenerationRequest {
+            guidance: Some(0.5),
+            ..base.clone()
+        };
+        assert!(validate_request(&d, &g0).is_err());
+        // guidance > 1.0 + a negative prompt is fine (CFG on, negative honored).
+        let g2 = GenerationRequest {
+            guidance: Some(4.5),
+            ..base.clone()
+        };
+        assert!(validate_request(&d, &g2).is_ok());
+        // A negative prompt with UNSET guidance is fine — the variant's default guidance (3.5) is
+        // > 1.0, so CFG stays on.
+        assert!(validate_request(&d, &base).is_ok());
     }
 
     #[test]

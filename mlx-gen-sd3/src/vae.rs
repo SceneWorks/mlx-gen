@@ -280,50 +280,14 @@ pub fn validate_vae_arch<'a, I>(arch: &Sd3VaeArch, provided: I) -> Result<()>
 where
     I: IntoIterator<Item = (&'a str, &'a [i64])>,
 {
+    // F-094c: delegate to the shared transformer/VAE validator so the two ~50-line implementations
+    // stay in lockstep — and so the VAE path gains the `-1` shape wildcard the transformer path has
+    // (its inlined copy previously required exact-equal dims).
     let expected: HashMap<String, Vec<i64>> = expected_vae_tensors(arch)
         .into_iter()
         .map(|e| (e.key, e.shape))
         .collect();
-    let provided: HashMap<&str, &[i64]> = provided.into_iter().collect();
-
-    let mut missing: Vec<&String> = expected
-        .keys()
-        .filter(|k| !provided.contains_key(k.as_str()))
-        .collect();
-    let mut extra: Vec<&&str> = provided
-        .keys()
-        .filter(|k| !expected.contains_key(**k))
-        .collect();
-    let mut bad_shape: Vec<String> = provided
-        .iter()
-        .filter_map(|(k, shape)| {
-            expected.get(*k).and_then(|exp| {
-                if exp.len() == shape.len() && exp.iter().zip(*shape).all(|(&e, &g)| e == g) {
-                    None
-                } else {
-                    Some(format!("{k} (expected {exp:?}, got {shape:?})"))
-                }
-            })
-        })
-        .collect();
-
-    if missing.is_empty() && extra.is_empty() && bad_shape.is_empty() {
-        return Ok(());
-    }
-    missing.sort();
-    extra.sort();
-    bad_shape.sort();
-    Err(Error::Msg(format!(
-        "SD3.5 VAE architecture validation FAILED: {} missing, {} extra, {} shape mismatch. \
-         expected {} tensors. missing={:?} extra={:?} shape={:?}",
-        missing.len(),
-        extra.len(),
-        bad_shape.len(),
-        expected.len(),
-        &missing[..missing.len().min(5)],
-        &extra[..extra.len().min(5)],
-        &bad_shape[..bad_shape.len().min(5)],
-    )))
+    crate::convert::validate_tensor_set("SD3.5 VAE architecture", &expected, provided)
 }
 
 /// Build the MLX-side VAE state dict from a diffusers `AutoencoderKL` tensor set (`src`).
@@ -507,6 +471,40 @@ mod tests {
             .collect();
         extra.push(("encoder.bogus.weight", extra_shape.as_slice()));
         assert!(validate_vae_arch(&arch, extra.iter().copied()).is_err());
+    }
+
+    #[test]
+    fn shared_validator_honors_wildcard_on_vae_path() {
+        // F-094c: the VAE path now delegates to the shared `validate_tensor_set` (which uses the
+        // `-1` shape wildcard), so a `-1` expected dim matches any concrete provided dim on the VAE
+        // label — the inlined VAE copy previously required exact-equal dims and lacked this.
+        use std::collections::HashMap;
+        let mut expected: HashMap<String, Vec<i64>> = HashMap::new();
+        expected.insert("decoder.conv_in.weight".into(), vec![512, -1, 3, 3]);
+
+        // A concrete dim in the wildcard slot matches.
+        let ok: Vec<(&str, &[i64])> = vec![("decoder.conv_in.weight", &[512, 16, 3, 3])];
+        crate::convert::validate_tensor_set(
+            "SD3.5 VAE architecture",
+            &expected,
+            ok.iter().copied(),
+        )
+        .unwrap();
+
+        // A non-wildcard dim still has to match exactly.
+        let bad: Vec<(&str, &[i64])> = vec![("decoder.conv_in.weight", &[999, 16, 3, 3])];
+        let err = crate::convert::validate_tensor_set(
+            "SD3.5 VAE architecture",
+            &expected,
+            bad.iter().copied(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("SD3.5 VAE architecture"),
+            "labeled error: {err}"
+        );
+        assert!(err.contains("shape mismatch"), "got: {err}");
     }
 
     /// A tiny synthetic arch keeps the converter/validator testable without multi-GB weights and
