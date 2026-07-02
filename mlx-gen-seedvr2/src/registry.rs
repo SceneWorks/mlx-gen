@@ -173,13 +173,11 @@ impl Seedvr2Generator {
         // take the first clip unconditionally, so `[empty_clip, real_clip]` returned an empty
         // video as success.
         if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
-            on_progress(Progress::Step {
-                current: 1,
-                total: 1,
-            });
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
+            // F-099: `generate_video` reports per-chunk `Step{i, n}` progress itself (per-frame on
+            // the fallback paths) — a minutes-long N-chunk run used to surface a single Step{1,1}.
             let frames = self.pipe.generate_video(
                 clip.frames,
                 req.width as i32,
@@ -188,6 +186,7 @@ impl Seedvr2Generator {
                 softness,
                 None,
                 &req.cancel,
+                on_progress,
             )?;
             on_progress(Progress::Decoding);
             return Ok(GenerationOutput::Video {
@@ -309,7 +308,10 @@ mod tests {
         let nonempty = [frame];
         let clips: Vec<&[Image]> = vec![&[], &nonempty[..]];
         let selected = clips.into_iter().find(|c| !c.is_empty());
-        assert!(selected.is_some(), "the non-empty second clip must be selected");
+        assert!(
+            selected.is_some(),
+            "the non-empty second clip must be selected"
+        );
         assert_eq!(selected.unwrap().len(), 1);
     }
 }

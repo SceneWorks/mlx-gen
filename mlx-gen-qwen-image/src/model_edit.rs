@@ -117,7 +117,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
     let mut transformer = loader::load_transformer_edit(root)?;
     if let Some(q) = spec.quantize {
-        transformer.quantize(q.bits())?;
+        // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
+        // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
+        // requested bits (see `loader::needs_load_time_quant`) — same guard as the T2I loader.
+        if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
+            transformer.quantize(q.bits())?;
+        }
     }
     // LoRA/LoKr (sc-2528): same load-time, post-quantize, residual-over-base path as T2I.
     if !spec.adapters.is_empty() {

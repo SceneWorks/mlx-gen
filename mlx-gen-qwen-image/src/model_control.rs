@@ -112,7 +112,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let mut controlnet = loader::load_controlnet(control)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
-        transformer.quantize(bits)?;
+        // F-076: reject a requested-vs-packed quant-tier mismatch on the base snapshot instead of
+        // silently serving its tier; skip the no-op base quantize when the turnkey is already packed
+        // at the requested bits (see `loader::needs_load_time_quant`). The control checkpoint has no
+        // packed-marker convention (it ships dense), so it always takes the load-time quantize.
+        if loader::needs_load_time_quant(root, bits, MODEL_ID)? {
+            transformer.quantize(bits)?;
+        }
         controlnet.quantize(bits)?;
     }
     // Character-identity LoRA/LoKr targets the base transformer only (the control branch is never an

@@ -135,6 +135,7 @@ fn seedvr2_generate_video_runs_end_to_end() {
             0.0,
             Some(8),
             &mlx_gen::CancelFlag::new(),
+            &mut |_| {},
         )
         .expect("generate_video");
     assert_eq!(out.len(), n, "frame count preserved");

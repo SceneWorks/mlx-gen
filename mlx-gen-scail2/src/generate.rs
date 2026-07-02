@@ -212,8 +212,19 @@ fn apply_clean_history(latent: &Array, history: Option<&Array>) -> Result<Array>
 /// F-039: validate the public `Scail2Job.segment_len` / `segment_overlap` fields. `build_segments`
 /// computes `stride = segment_len - segment_overlap` (so `overlap >= len` underflows `usize`), and
 /// the clean-history VAE encode in segment 2+ shape-errors when `segment_len` isn't `1 + 4k` (the 4×
-/// temporal compression factor). Extracted so the guards have a unit test (generate() needs weights).
-fn validate_segment_params(segment_len: usize, segment_overlap: usize) -> Result<()> {
+/// temporal compression factor). The guards apply only when the clip actually windows
+/// (`total_frames > segment_len`): the single-window path in [`build_segments`] never derives a
+/// stride or a cross-segment history from the window params, so a short-clip job must not be newly
+/// rejected over fields it doesn't use. Extracted so the guards have a unit test (generate() needs
+/// weights).
+fn validate_segment_params(
+    total_frames: usize,
+    segment_len: usize,
+    segment_overlap: usize,
+) -> Result<()> {
+    if total_frames <= segment_len {
+        return Ok(());
+    }
     if segment_len == 0 {
         return Err(Error::Msg("scail2: segment_len must be >= 1".into()));
     }
@@ -288,8 +299,13 @@ pub fn generate(
     // release wraps to a huge stride and silently renders one window). And the clean-history VAE
     // encode in segment 2+ shape-errors when `segment_len` isn't VAE-temporal-aligned (the 4×
     // temporal compression factor: segment_len must be `1 + 4k` so the decoded frame count matches
-    // across overlapping windows). Reject both up front with a typed error.
-    validate_segment_params(job.segment_len, job.segment_overlap)?;
+    // across overlapping windows). Reject both up front with a typed error (windowing jobs only —
+    // a short clip takes the single-window path, which ignores these fields).
+    validate_segment_params(
+        job.driving_frames.len(),
+        job.segment_len,
+        job.segment_overlap,
+    )?;
     // Partition the inference LoRAs (before the 31 GB DiT load, so the gate below fails fast):
     //   * diff-patch ("lightning") files — full-rank `.diff`/`.diff_b` (+ low-rank factors) that the
     //     residual loader can't consume — are merged *in place* into the dense weights below (sc-5684).
@@ -321,6 +337,9 @@ pub fn generate(
     }
     let (tw, th) = (align(job.width), align(job.height));
     let cfg_disabled = job.guidance <= 1.0;
+    // Experimental bf16 compute opt-in (sc-5681; see the DiT block below). Read once here so the
+    // per-segment NaN guard (F-096) keys off the same flag.
+    let compute_bf16 = std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|v| v == "1");
 
     // --- decode + resize all pixel inputs to (tw, th) ---
     let ref_chw = image_to_chw(job.reference.image, tw, th, Interp::Bicubic)?; // [3,H,W]
@@ -409,9 +428,9 @@ pub fn generate(
         // projection), reproduced at L≈42k (832×480·5s) and clean in f32. bf16 was never parity-gated
         // (the gates run f32); f32 is the validated-correct path and the Q4 weights still bound the
         // weight memory. `SCAIL2_COMPUTE_BF16=1` opts back into the (fast, but high-res-unsafe) bf16
-        // path for experiments. A mixed-precision pass to recover bf16 speed at high res is a follow-up.
-        let bf16 = std::env::var("SCAIL2_COMPUTE_BF16").is_ok_and(|v| v == "1");
-        d.set_compute_dtype(if bf16 {
+        // path for experiments (guarded per segment by the F-096 NaN check below). A mixed-precision
+        // pass to recover bf16 speed at high res is a follow-up.
+        d.set_compute_dtype(if compute_bf16 {
             Dtype::Bfloat16
         } else {
             Dtype::Float32
@@ -446,6 +465,23 @@ pub fn generate(
         job.segment_len,
         job.segment_overlap,
     );
+    // F-096: `build_segments` VAE-aligns the single window (`1 + 4k` frames kept) or drops the
+    // trailing partial window (multi-segment), so driving frames past the last window boundary are
+    // silently cut from the output. Surface the drop like the `align` dimension crop above
+    // (sc-6983) rather than reinterpreting the request invisibly; the caller stays infallible.
+    let total_frames = job.driving_frames.len();
+    let covered = segments.last().map_or(0, |&(_, end)| end);
+    if covered < total_frames {
+        eprintln!(
+            "scail2: dropping the trailing {} of {total_frames} driving frame(s) — the segment \
+             plan covers {covered} (segment_len {} / overlap {} / VAE {TEMPORAL_STRIDE}-frame \
+             alignment)",
+            total_frames - covered,
+            job.segment_len,
+            job.segment_overlap
+        );
+    }
+    let num_segments = segments.len() as u32;
     let mut out_pieces: Vec<Array> = Vec::new();
     let mut prev_history_pixel: Option<Array> = None;
 
@@ -509,7 +545,12 @@ pub fn generate(
         let mut sched = make_scheduler(job.sampler, NUM_TRAIN_TIMESTEPS);
         sched.set_timesteps(job.steps, job.shift);
         let timesteps: Vec<f32> = sched.timesteps().to_vec();
-        let total = timesteps.len() as u32;
+        // F-096: report progress over the WHOLE job (steps × segments), not per segment — the old
+        // per-segment `Step{i, steps}` restarted at 1/N on every segment boundary, so a multi-segment
+        // render appeared to loop. The schedule is rebuilt identically per segment, so the per-segment
+        // step count is constant.
+        let seg_steps = timesteps.len() as u32;
+        let total = seg_steps * num_segments;
 
         let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
         for (i, &t) in timesteps.iter().enumerate() {
@@ -547,9 +588,21 @@ pub fn generate(
             latent = apply_clean_history(&latent, history_latent.as_ref())?;
             mlx_rs::transforms::eval([&latent])?;
             on_progress(Progress::Step {
-                current: (i + 1) as u32,
+                current: seg_idx as u32 * seg_steps + (i + 1) as u32,
                 total,
             });
+        }
+        // F-096: the bf16 opt-in re-enables the sc-5681 long-sequence overflow path with no gate —
+        // a NaN latent survives the decode and the `pixels_to_u8` clamp (min/max propagate NaN) and
+        // ships garbage pixels as success. Fail loudly at the segment boundary instead. f32 (the
+        // validated default) skips the check.
+        if compute_bf16 && latent.is_nan()?.any(None)?.item::<bool>() {
+            return Err(Error::Msg(format!(
+                "scail2: NaN in the denoised latent for segment {}/{num_segments} — the \
+                 SCAIL2_COMPUTE_BF16=1 experimental bf16 compute path overflows at long sequences \
+                 (sc-5681); unset it to run the validated f32 path",
+                seg_idx + 1
+            )));
         }
         // sc-5681: release the MLX buffer cache before the VAE decode. The decode is the heaviest
         // phase (Metal conv scratch ~2× its MLX-active), so the cache retained from preprocessing +
@@ -646,24 +699,51 @@ mod tests {
     }
 
     #[test]
+    fn build_segments_single_window_drops_trailing_unaligned_frames() {
+        // F-096: 15 frames, len=20 → single window VAE-aligned to 1 + 4k = 13, dropping the
+        // trailing 2 (generate() surfaces the drop; this pins the plan's coverage).
+        let segs = build_segments(15, 20, 0);
+        assert_eq!(segs, vec![(0, 13)]);
+    }
+
+    #[test]
+    fn build_segments_multi_window_drops_trailing_partial_window() {
+        // F-096: 23 frames, len=9, overlap=4 → stride 5: (0,9),(5,14),(10,19); the next window
+        // (15,24) overruns 23 frames, so frames 19..23 are dropped from the plan.
+        let segs = build_segments(23, 9, 4);
+        assert_eq!(segs, vec![(0, 9), (5, 14), (10, 19)]);
+        assert_eq!(segs.last().unwrap().1, 19);
+    }
+
+    #[test]
     fn validate_segment_params_rejects_overlap_ge_len() {
-        // F-039: overlap >= len would underflow the usize stride in build_segments.
-        let err = validate_segment_params(5, 5).unwrap_err().to_string();
+        // F-039: overlap >= len would underflow the usize stride in build_segments (the guards
+        // apply because total > segment_len ⇒ the multi-window path strides).
+        let err = validate_segment_params(20, 5, 5).unwrap_err().to_string();
         assert!(err.contains("must be < segment_len"), "{err}");
-        let err = validate_segment_params(5, 9).unwrap_err().to_string();
+        let err = validate_segment_params(20, 5, 9).unwrap_err().to_string();
         assert!(err.contains("must be < segment_len"), "{err}");
     }
 
     #[test]
     fn validate_segment_params_rejects_non_vae_aligned_len() {
         // segment_len must be 1 + 4k so the clean-history VAE encode aligns across segments.
-        let err = validate_segment_params(10, 2).unwrap_err().to_string();
+        let err = validate_segment_params(20, 10, 2).unwrap_err().to_string();
         assert!(err.contains("1 + 4"), "{err}");
     }
 
     #[test]
     fn validate_segment_params_accepts_aligned_window() {
         // 9 = 1 + 4·2, overlap 4 < 9 — the realistic SCAIL-2 window.
-        validate_segment_params(9, 4).expect("aligned window is valid");
+        validate_segment_params(25, 9, 4).expect("aligned window is valid");
+    }
+
+    #[test]
+    fn validate_segment_params_skips_guards_for_short_clips() {
+        // F-096 regression: a clip that fits one window (`total <= segment_len`) takes the
+        // single-window path, which never uses segment_len/overlap — a previously-working
+        // short-clip job must not be newly rejected over fields it doesn't use.
+        validate_segment_params(13, 81, 81).expect("single-window job ignores window params");
+        validate_segment_params(10, 10, 3).expect("total == segment_len is single-window");
     }
 }

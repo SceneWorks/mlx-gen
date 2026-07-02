@@ -18,8 +18,6 @@ use mlx_gen::{
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
-use std::path::Path;
-
 use crate::loader;
 use crate::pipeline::{
     add_noise_by_interpolation, create_noise, decode_and_collect, denoise_with_progress,
@@ -96,16 +94,6 @@ pub struct QwenImage {
 /// (group_size 64) — the fork's full `quantize=N` scope (sc-2565; see the inline note below). An
 /// fp32 precision override is not wired (the validated dense path is bf16) and is rejected rather
 /// than silently ignored.
-/// Read the on-disk packed-quantization bits from `transformer/config.json`, if the snapshot is a
-/// pre-quantized (Group-B packed) turnkey. The converter writes
-/// `"quantization": {"bits", "group_size"}` (see `convert.rs`); a dense snapshot has no such marker.
-/// Returns `None` for a dense snapshot or a missing/unreadable config.
-fn packed_quant_bits(root: &Path) -> Option<i32> {
-    let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
-    v.get("quantization")?.get("bits")?.as_i64().map(|b| b as i32)
-}
-
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -131,22 +119,10 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // quantize the TE+VAE, hence sc-2532; do not generalize that here.)
     let mut transformer = loader::load_transformer(root)?;
     if let Some(q) = spec.quantize {
-        // F-076: if the snapshot is already a pre-quantized packed turnkey, `quantize()` is a no-op
-        // (the loader detects packed weights and returns early), so e.g. Q4 requested over a Q8
-        // turnkey would silently serve Q8. Compare the requested bits against the config.json
-        // `quantization.bits` marker the Group-B converter writes; error on mismatch instead of
-        // silently serving the wrong tier. (A dense snapshot has no marker → the request stands.)
-        if let Some(packed) = packed_quant_bits(root) {
-            if packed != q.bits() {
-                return Err(Error::Msg(format!(
-                    "qwen_image: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
-                     requested; quantize() is a no-op on packed weights so the request would \
-                     silently serve Q{packed}. Point at a Q{} snapshot (or a dense one).",
-                    q.bits(),
-                    q.bits()
-                )));
-            }
-        } else {
+        // F-076: reject a requested-vs-packed quant-tier mismatch instead of silently serving the
+        // snapshot's tier; skip the no-op quantize when the turnkey is already packed at the
+        // requested bits (see `loader::needs_load_time_quant`).
+        if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
             transformer.quantize(q.bits())?;
         }
     }

@@ -304,7 +304,7 @@ impl VisionTower {
 
     /// Host-side plan from `grid_thw` (rows `[t, h, w]` in patches), merge-grouped order — mirrors
     /// `get_vision_position_ids` (rope) + `get_vision_bilinear_indices_and_weights` (pos-embed).
-    fn build_plan(&self, grid: &[[i32; 3]]) -> Plan {
+    fn build_plan(&self, grid: &[[i32; 3]]) -> Result<Plan> {
         let c = &self.cfg;
         let m = c.spatial_merge_size;
         let hd = c.head_dim();
@@ -376,21 +376,23 @@ impl VisionTower {
             }
         }
 
-        // rope table → cos/sin over the full head_dim (emb = cat(rope, rope)).
+        // rope table → cos/sin over the full head_dim (emb = cat(rope, rope)). F-085: these MLX ops
+        // run on request-derived shapes in the edit generate path — propagate a device failure as
+        // the typed error (sc-5009) instead of panicking.
         let rope = Array::from_slice(&rope_rows, &[seq, rd as i32]);
-        let emb = concatenate_axis(&[&rope, &rope], 1).unwrap(); // [seq, head_dim]
-        let cos = emb.cos().unwrap();
-        let sin = emb.sin().unwrap();
+        let emb = concatenate_axis(&[&rope, &rope], 1)?; // [seq, head_dim]
+        let cos = emb.cos()?;
+        let sin = emb.sin()?;
 
         let mk_i = |v: &[i32]| Array::from_slice(v, &[seq]);
         let mk_w = |v: &[f32]| Array::from_slice(v, &[seq, 1]);
-        Plan {
+        Ok(Plan {
             merged,
             cos,
             sin,
             bilinear_idx: [mk_i(&idx[0]), mk_i(&idx[1]), mk_i(&idx[2]), mk_i(&idx[3])],
             bilinear_w: [mk_w(&wts[0]), mk_w(&wts[1]), mk_w(&wts[2]), mk_w(&wts[3])],
-        }
+        })
     }
 
     /// Bilinearly-interpolated learned pos-embed `[seq, hidden]` (f32) for the plan.
@@ -438,7 +440,7 @@ impl VisionTower {
     ) -> Result<(Array, Vec<Array>, Array)> {
         let c = &self.cfg;
         let nh = c.num_heads;
-        let plan = self.build_plan(grid_thw);
+        let plan = self.build_plan(grid_thw)?;
         let merged = plan.merged;
 
         // Patch embed + learned (interpolated) position embedding.

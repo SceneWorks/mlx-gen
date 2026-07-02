@@ -74,7 +74,9 @@ fn descriptor_capabilities() {
     assert!(large.capabilities.supports_lora);
     assert!(large.capabilities.supports_lokr);
     assert!(large.capabilities.mac_only);
-    assert!(large.capabilities.requires_sigma_shift);
+    // F-034: the pipeline schedule is `for_static_shift(steps, 3.0)` — resolution-independent, so
+    // the loader hint is false (the z-image precedent).
+    assert!(!large.capabilities.requires_sigma_shift);
 
     let turbo = Sd3Variant::LargeTurbo.descriptor();
     assert_eq!(turbo.id, SD3_5_LARGE_TURBO_ID);

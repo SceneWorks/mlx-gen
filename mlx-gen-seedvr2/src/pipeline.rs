@@ -11,7 +11,7 @@
 
 use mlx_gen::image::{decoded_to_image, resize_bicubic_u8};
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, Error, Image, Result};
+use mlx_gen::{CancelFlag, Error, Image, Progress, Result};
 use mlx_rs::ops::{add, concatenate_axis, divide, multiply, pad, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
@@ -442,6 +442,7 @@ impl Seedvr2Pipeline {
         softness: f32,
         chunk_override: Option<i32>,
         cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let n = frames.len() as i32;
         if n == 0 {
@@ -451,7 +452,15 @@ impl Seedvr2Pipeline {
         // at the full `width×height` per frame, which corrupts above ~1536² regardless of memory. Above
         // the cap, force the per-frame spatial tiler (tiles capped at `VAE_SAFE_DECODE_EDGE_PX`).
         if width.max(height) > video::VAE_SAFE_DECODE_EDGE_PX {
-            return self.generate_video_tiled(frames, width, height, seed, softness, cancel);
+            return self.generate_video_tiled(
+                frames,
+                width,
+                height,
+                seed,
+                softness,
+                cancel,
+                on_progress,
+            );
         }
         let chunk = match (
             chunk_override,
@@ -463,12 +472,28 @@ impl Seedvr2Pipeline {
             (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
             (_, ChunkPlan::Chunked(c)) => c,
             (_, ChunkPlan::PerFrame) => {
-                return self.generate_video_per_frame(frames, width, height, seed, softness, cancel)
+                return self.generate_video_per_frame(
+                    frames,
+                    width,
+                    height,
+                    seed,
+                    softness,
+                    cancel,
+                    on_progress,
+                )
             }
             // Even one full-resolution frame exceeds the budget → spatially tile each frame
             // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
             (_, ChunkPlan::OverBudget { .. }) => {
-                return self.generate_video_tiled(frames, width, height, seed, softness, cancel)
+                return self.generate_video_tiled(
+                    frames,
+                    width,
+                    height,
+                    seed,
+                    softness,
+                    cancel,
+                    on_progress,
+                )
             }
         };
 
@@ -479,8 +504,16 @@ impl Seedvr2Pipeline {
             .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
             .clone();
         let ts = Array::from_f32(TIMESTEP);
+        let total_chunks = plan.len() as u32;
         let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(plan.len());
-        for Chunk { start, len } in &plan {
+        for (chunk_idx, Chunk { start, len }) in plan.iter().enumerate() {
+            // F-099: per-chunk progress — a minutes-long N-chunk run used to report a single
+            // Step{1,1}. Emitted before the chunk's compute, mirroring the image path's
+            // emit-then-work ordering in `registry.rs`.
+            on_progress(Progress::Step {
+                current: chunk_idx as u32 + 1,
+                total: total_chunks,
+            });
             // sc-5551 video-cancel: each chunk materializes via decoded_to_image→as_slice, so
             // this check observes the prior chunk's completed compute and bails before the next.
             if cancel.is_cancelled() {
@@ -510,6 +543,7 @@ impl Seedvr2Pipeline {
     /// Per-frame (`T=1`) video fallback: each frame through the still path with a fixed (anchored)
     /// seed — intrinsically temporally stable (spike sc-4812). Used when even an 8-frame chunk
     /// exceeds the memory budget.
+    #[allow(clippy::too_many_arguments)]
     fn generate_video_per_frame(
         &self,
         frames: &[Image],
@@ -518,9 +552,16 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
+        let total = frames.len() as u32;
         let mut out = Vec::with_capacity(frames.len());
-        for f in frames {
+        for (i, f) in frames.iter().enumerate() {
+            // F-099: per-frame progress on the fallback path (its "chunk" is one frame).
+            on_progress(Progress::Step {
+                current: i as u32 + 1,
+                total,
+            });
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -533,6 +574,7 @@ impl Seedvr2Pipeline {
     /// tiled** — the budget sizer picks the largest square tile that fits, and the decoded tiles are
     /// feather-blended. Used when even one full-resolution frame exceeds the memory budget; bounds peak
     /// at any resolution. The numeric tiling fidelity is gated in `tests/tiling_parity.rs`.
+    #[allow(clippy::too_many_arguments)]
     fn generate_video_tiled(
         &self,
         frames: &[Image],
@@ -541,6 +583,7 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
@@ -549,8 +592,14 @@ impl Seedvr2Pipeline {
             .as_ref()
             .ok_or_else(|| Error::Msg("seedvr2: negative embedding not loaded — construct via Seedvr2Pipeline::load, not from_weights".into()))?
             .clone();
+        let total = frames.len() as u32;
         let mut out = Vec::with_capacity(frames.len());
-        for f in frames {
+        for (i, f) in frames.iter().enumerate() {
+            // F-099: per-frame progress on the HD tiling path (its "chunk" is one frame).
+            on_progress(Progress::Step {
+                current: i as u32 + 1,
+                total,
+            });
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }

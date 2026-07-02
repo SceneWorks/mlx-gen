@@ -707,7 +707,12 @@ fn preflight_memory_guard(edge: u32, bf16: bool, variant: Sd3Variant) -> Result<
 /// The pure guard logic (no MLX global state, so it is unit-testable): refuse if the projected dense
 /// first-step peak exceeds `budget_gb × 0.85`. `edge` is the bucketed training edge; the SD3 unified
 /// token count is `(edge/16)²` (latent /8, patch 2) plus the fixed 333-token context.
-fn check_preflight_budget(edge: u32, bf16: bool, budget_gb: f64, variant: Sd3Variant) -> Result<()> {
+fn check_preflight_budget(
+    edge: u32,
+    bf16: bool,
+    budget_gb: f64,
+    variant: Sd3Variant,
+) -> Result<()> {
     let tokens_per_side = (edge as f64 / 16.0).ceil();
     let s = tokens_per_side * tokens_per_side + PREFLIGHT_TXT_TOKENS;
     let projected = projected_dense_peak_gb(s, bf16, variant);
@@ -1227,13 +1232,19 @@ mod tests {
     fn projection_is_monotonic_and_conservative() {
         for bf16 in [false, true] {
             let (s512, s768, s1024) = (1024.0 + 333.0, 2304.0 + 333.0, 4096.0 + 333.0);
-            assert!(projected_dense_peak_gb(s512, bf16, Sd3Variant::Large)
-                < projected_dense_peak_gb(s768, bf16, Sd3Variant::Large));
-            assert!(projected_dense_peak_gb(s768, bf16, Sd3Variant::Large)
-                < projected_dense_peak_gb(s1024, bf16, Sd3Variant::Large));
+            assert!(
+                projected_dense_peak_gb(s512, bf16, Sd3Variant::Large)
+                    < projected_dense_peak_gb(s768, bf16, Sd3Variant::Large)
+            );
+            assert!(
+                projected_dense_peak_gb(s768, bf16, Sd3Variant::Large)
+                    < projected_dense_peak_gb(s1024, bf16, Sd3Variant::Large)
+            );
         }
-        assert!(projected_dense_peak_gb(4429.0, true, Sd3Variant::Large)
-            < projected_dense_peak_gb(4429.0, false, Sd3Variant::Large));
+        assert!(
+            projected_dense_peak_gb(4429.0, true, Sd3Variant::Large)
+                < projected_dense_peak_gb(4429.0, false, Sd3Variant::Large)
+        );
         // The Large bf16 base (no tokens) is ~the resident 8.1B MMDiT weights (≥ 14 GB). Medium's
         // base is lower (~5 GB) — F-035 parameterized this by variant.
         assert!(projected_dense_peak_gb(0.0, true, Sd3Variant::Large) >= 14.0);

@@ -7,7 +7,7 @@
 //! The RNG is seeded once per image, then the sampler draws the prior + per-step ancestral noise from
 //! the global stream — reproducing the reference's exact noise sequence for a seed.
 
-use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, round, subtract};
+use mlx_rs::ops::{add, concatenate_axis, maximum, minimum, multiply, round};
 use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
@@ -305,6 +305,69 @@ pub fn denoise_ip_multi_control(
     )
 }
 
+/// One denoise-step ε-prediction: run each ControlNet branch and sum its residuals (the diffusers
+/// `MultiControlNetModel` rule, sc-3378), then dispatch the U-Net forward on the `(ip, control)`
+/// combination — IP+control (InstantID, sc-3113/3114/3117), IP-Adapter (sc-3059), ControlNet
+/// (sc-3058), or the plain forward. This per-step body was triplicated verbatim across the
+/// ancestral [`denoise_core`], the curated [`denoise_curated`], and the CFG++ [`denoise_cfgpp`]
+/// loops; it lives here once (F-082). `cn_enc` is the ControlNet cross-attention conditioning
+/// (the text `conditioning`, or the caller's override — InstantID's face tokens).
+#[allow(clippy::too_many_arguments)]
+fn forward_eps(
+    unet: &UNet2DConditionModel,
+    x_unet: &Array,
+    timestep: f32,
+    conditioning: &Array,
+    pooled: &Array,
+    time_ids: &Array,
+    controls: &[ControlContext],
+    cn_enc: &Array,
+    ip: Option<(&Array, f32)>,
+) -> Result<Array> {
+    let combined: Option<ControlResiduals> = {
+        let mut acc: Option<ControlResiduals> = None;
+        for cc in controls {
+            let res = cc.controlnet.forward(
+                x_unet,
+                &cc.cond_embed,
+                timestep,
+                cn_enc,
+                pooled,
+                time_ids,
+                cc.scale,
+            )?;
+            acc = Some(match acc {
+                None => res,
+                Some(prev) => prev.add(&res)?,
+            });
+        }
+        acc
+    };
+    match (ip, combined.as_ref()) {
+        (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
+            x_unet,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            (tokens, scale),
+            res,
+        ),
+        (Some((tokens, scale)), None) => unet.forward_with_ip(
+            x_unet,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            (tokens, scale),
+        ),
+        (None, Some(res)) => {
+            unet.forward_with_control(x_unet, timestep, conditioning, pooled, time_ids, res)
+        }
+        (None, None) => unet.forward(x_unet, timestep, conditioning, pooled, time_ids),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn denoise_core(
     d: &Denoiser,
@@ -334,6 +397,11 @@ fn denoise_core(
     let _compile_glue = crate::CompileGlueGuard::enable();
     let cfg_on = cfg > 1.0;
     let total = steps as u32;
+    // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
+    // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
+    // The override is shared across branches — matching the InstantID MultiControlNet path,
+    // where the vendored pipeline passes the same `prompt_image_emb` to every sub-ControlNet.
+    let cn_enc = control_encoder.unwrap_or(conditioning);
     for i in 0..steps {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -348,73 +416,17 @@ fn denoise_core(
             x_in
         };
         let timestep = d.sampler.timestep(i);
-        // ControlNet cross-attn conditioning: `conditioning` (text) for tile-CN; the caller may
-        // override it (InstantID feeds the face tokens as the IdentityNet's encoder_hidden_states).
-        // The override is shared across branches — matching the InstantID MultiControlNet path,
-        // where the vendored pipeline passes the same `prompt_image_emb` to every sub-ControlNet.
-        let cn_enc = control_encoder.unwrap_or(conditioning);
-        // MultiControlNet (sc-3378): run each branch and sum its (already conditioning_scale'd)
-        // residuals — the diffusers `MultiControlNetModel` rule. One branch ⇒ the single
-        // residual unchanged (bit-exact regression vs the pre-slice path); zero ⇒ `None`.
-        let combined: Option<ControlResiduals> = {
-            let mut acc: Option<ControlResiduals> = None;
-            for cc in controls {
-                let res = cc.controlnet.forward(
-                    &x_unet,
-                    &cc.cond_embed,
-                    timestep,
-                    cn_enc,
-                    pooled,
-                    time_ids,
-                    cc.scale,
-                )?;
-                acc = Some(match acc {
-                    None => res,
-                    Some(prev) => prev.add(&res)?,
-                });
-            }
-            acc
-        };
-        let eps = match (ip, combined.as_ref()) {
-            (Some((tokens, scale)), Some(res)) => {
-                // InstantID (sc-3113/3114/3117): the (possibly multi-branch summed) ControlNet
-                // residuals AND the face IP tokens injected into the UNet cross-attention.
-                d.unet.forward_with_ip_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                    res,
-                )?
-            }
-            (Some((tokens, scale)), None) => {
-                // IP-Adapter (sc-3059): inject the image tokens into every cross-attention.
-                d.unet.forward_with_ip(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                )?
-            }
-            (None, Some(res)) => {
-                // ControlNet (sc-3058 / MultiControlNet sc-3378): inject the (summed) residuals.
-                d.unet.forward_with_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    res,
-                )?
-            }
-            (None, None) => d
-                .unet
-                .forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
-        };
+        let eps = forward_eps(
+            d.unet,
+            &x_unet,
+            timestep,
+            conditioning,
+            pooled,
+            time_ids,
+            controls,
+            cn_enc,
+            ip,
+        )?;
         let eps = if cfg_on {
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;
@@ -503,65 +515,30 @@ pub fn denoise_curated(
             } else {
                 x16
             };
-            // ControlNet residuals (summed across branches — the MultiControlNet rule), mirroring
-            // `denoise_core`.
-            let combined: Option<ControlResiduals> = {
-                let mut acc: Option<ControlResiduals> = None;
-                for cc in controls {
-                    let res = cc.controlnet.forward(
-                        &x_unet,
-                        &cc.cond_embed,
-                        timestep,
-                        cn_enc,
-                        pooled,
-                        time_ids,
-                        cc.scale,
-                    )?;
-                    acc = Some(match acc {
-                        None => res,
-                        Some(prev) => prev.add(&res)?,
-                    });
-                }
-                acc
-            };
-            let eps = match (ip, combined.as_ref()) {
-                (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                    res,
-                )?,
-                (Some((tokens, scale)), None) => unet.forward_with_ip(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                )?,
-                (None, Some(res)) => unet.forward_with_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    res,
-                )?,
-                (None, None) => unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
-            };
-            // CFG combine (identical to `denoise_core`): `eps_neg + cfg·(eps_text − eps_neg)`, the
-            // scalar cast to the eps dtype so the blend runs in the compute dtype.
+            let eps = forward_eps(
+                unet,
+                &x_unet,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+            )?;
+            // CFG combine via the shared `gen_core::guidance::cfg` over `MlxLatentOps` (the sc-7443
+            // migration `denoise_core` already carries, F-082): byte-identical to the retired hand
+            // `eps_neg + cfg·(eps_text − eps_neg)` form — the dtype-preserving `axpy` casts the
+            // scale to the eps dtype so the blend runs in the compute dtype (fp16).
             if cfg_on {
                 let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
                 let eps_text = row(0)?;
                 let eps_neg = row(1)?;
-                let cfg_s = scalar(cfg).as_dtype(eps_text.dtype())?;
-                Ok(add(
+                Ok(gen_core::guidance::cfg(
+                    &MlxLatentOps,
+                    &eps_text,
                     &eps_neg,
-                    &multiply(&subtract(&eps_text, &eps_neg)?, &cfg_s)?,
+                    cfg,
                 )?)
             } else {
                 Ok(eps)
@@ -608,53 +585,17 @@ pub fn denoise_cfgpp(
             // Identical forward to `denoise_curated`; CFG++ always CFG-batches (cfg_on guaranteed).
             let x16 = x_in.as_dtype(mlx_rs::Dtype::Float16)?;
             let x_unet = concatenate_axis(&[&x16, &x16], 0)?;
-            let combined: Option<ControlResiduals> = {
-                let mut acc: Option<ControlResiduals> = None;
-                for cc in controls {
-                    let res = cc.controlnet.forward(
-                        &x_unet,
-                        &cc.cond_embed,
-                        timestep,
-                        cn_enc,
-                        pooled,
-                        time_ids,
-                        cc.scale,
-                    )?;
-                    acc = Some(match acc {
-                        None => res,
-                        Some(prev) => prev.add(&res)?,
-                    });
-                }
-                acc
-            };
-            let eps = match (ip, combined.as_ref()) {
-                (Some((tokens, scale)), Some(res)) => unet.forward_with_ip_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                    res,
-                )?,
-                (Some((tokens, scale)), None) => unet.forward_with_ip(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    (tokens, scale),
-                )?,
-                (None, Some(res)) => unet.forward_with_control(
-                    &x_unet,
-                    timestep,
-                    conditioning,
-                    pooled,
-                    time_ids,
-                    res,
-                )?,
-                (None, None) => unet.forward(&x_unet, timestep, conditioning, pooled, time_ids)?,
-            };
+            let eps = forward_eps(
+                unet,
+                &x_unet,
+                timestep,
+                conditioning,
+                pooled,
+                time_ids,
+                controls,
+                cn_enc,
+                ip,
+            )?;
             // guided = plain CFG combine (the trajectory anchor); uncond = eps_neg (the renoise branch).
             let row = |k: i32| eps.take_axis(Array::from_slice(&[k], &[1]), 0);
             let eps_text = row(0)?;

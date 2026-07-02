@@ -120,6 +120,41 @@ pub fn load_transformer_edit(root: &Path) -> Result<QwenTransformer> {
     QwenTransformer::from_weights(&w, "", &QwenTransformerConfig::qwen_image_edit())
 }
 
+/// Read the on-disk packed-quantization bits from `transformer/config.json`, if the snapshot is a
+/// pre-quantized (Group-B packed) turnkey. The converter writes
+/// `"quantization": {"bits", "group_size"}` (see `convert.rs`); a dense snapshot has no such marker.
+/// Returns `None` for a dense snapshot or a missing/unreadable config.
+fn packed_quant_bits(root: &Path) -> Option<i32> {
+    let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    v.get("quantization")?
+        .get("bits")?
+        .as_i64()
+        .map(|b| b as i32)
+}
+
+/// F-076 tier guard shared by the T2I / Edit / Control loaders: if the snapshot is already a
+/// pre-quantized packed turnkey, `quantize()` is a no-op (the loader detects packed weights and
+/// returns early), so e.g. Q4 requested over a Q8 turnkey would silently serve Q8. Compares the
+/// requested bits against the [`packed_quant_bits`] marker: errors on a tier mismatch; returns
+/// `false` (skip the no-op quantize) when the turnkey is already packed at the requested bits; and
+/// returns `true` (load-time quantize needed) for a dense snapshot, where the request stands.
+pub(crate) fn needs_load_time_quant(
+    root: &Path,
+    requested_bits: i32,
+    model_id: &str,
+) -> Result<bool> {
+    match packed_quant_bits(root) {
+        Some(packed) if packed != requested_bits => Err(Error::Msg(format!(
+            "{model_id}: snapshot is a pre-quantized Q{packed} turnkey but Q{requested_bits} was \
+             requested; quantize() is a no-op on packed weights so the request would silently \
+             serve Q{packed}. Point at a Q{requested_bits} snapshot (or a dense one)."
+        ))),
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
 /// Load the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` VACE control branch (sc-8267 — this
 /// **replaces** the retired InstantX `Qwen-Image-ControlNet-Union`). The checkpoint is a single
 /// `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors` (`File`) or a dir of shards (`Dir`). Its

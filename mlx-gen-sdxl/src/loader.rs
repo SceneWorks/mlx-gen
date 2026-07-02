@@ -149,7 +149,11 @@ pub fn load_controlnet(
         mlx_gen::WeightsSource::File(p) => Weights::from_file(p)?,
         mlx_gen::WeightsSource::Dir(p) => Weights::from_dir(p)?,
     };
-    w.cast_all(dtype)?;
+    // F-082: same packed guard as the U-Net load — casting a pre-quantized checkpoint's packed u32
+    // payloads to a float dtype would corrupt them; only a dense checkpoint downcasts.
+    if !is_packed(&w) {
+        w.cast_all(dtype)?;
+    }
     crate::unet::ControlNet::from_weights(&w, &UNetConfig::sdxl_base())
 }
 
@@ -169,7 +173,10 @@ pub fn load_ip_adapter(
     use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 
     let mut enc_w = Weights::from_file(dir.join("models/image_encoder/model.safetensors"))?;
-    enc_w.cast_all(dtype)?;
+    // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
+    if !is_packed(&enc_w) {
+        enc_w.cast_all(dtype)?;
+    }
     let encoder = ClipVisionEncoder::from_weights(&enc_w, &VisionConfig::vit_h_14())?;
 
     let ip_file = [
@@ -186,7 +193,10 @@ pub fn load_ip_adapter(
         ))
     })?;
     let mut ip_w = Weights::from_file(&ip_file)?;
-    ip_w.cast_all(dtype)?;
+    // F-082: packed guard, as in `load_unet_with_config` — never cast pre-quantized payloads.
+    if !is_packed(&ip_w) {
+        ip_w.cast_all(dtype)?;
+    }
     let resampler =
         Resampler::from_weights(&ip_w, "image_proj", &ResamplerConfig::plus_sdxl_vit_h())?;
     let pairs = load_ip_kv_pairs(&ip_w)?;
