@@ -243,6 +243,18 @@ impl Wan {
                 )));
             }
         }
+        // F-074(a): the curated-sampler × image-conditioned-TI2V mask-blend rejection previously
+        // fired in Stage 2 (denoise), AFTER the ~11 GB UMT5 load + VAE encode. Both inputs are known
+        // at validate time, so reject here — the keyframe mask-blend path (the `ti2v = Some(_)`
+        // branch) has no single-eval curated-sampler hook. The 14B sibling's `validate_impl` already
+        // rejects this combination.
+        if is_wan_curated(req.sampler.as_deref()) && !req.keyframes().is_empty() {
+            return Err(Error::Msg(
+                "wan2_2_ti2v_5b: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
+                 supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
+                    .into(),
+            ));
+        }
         Ok(())
     }
 

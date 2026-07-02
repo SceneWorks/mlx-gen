@@ -903,8 +903,13 @@ pub fn decode_to_frames_22(
 pub fn frames_to_images(frames_u8: &Array) -> Result<Vec<Image>> {
     let sh = frames_u8.shape(); // [F, H, W, 3]
     let (f, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
-    let total: i32 = f * h * w * c;
-    let flat = frames_u8.reshape(&[total])?; // materialize logical NHWC order
+    // F-070: previously `let total: i32 = f * h * w * c;` then `reshape(&[total])`. frames is
+    // unbounded and T2V-14B has max_area == 0, so f·h·w·3 > i32::MAX is reachable (1920×1088@349f
+    // ≈ 2.19e9; 4K@89f): the i32 product overflowed in release (wrapping) → a baffling reshape
+    // error; debug panicked. The reshape target is the full flattened buffer, so use the dynamic
+    // `-1` (the four sibling implementations — ltx/svd/seedvr2/scail2 — already do this; this copy
+    // was missed).
+    let flat = frames_u8.reshape(&[-1])?; // materialize logical NHWC order
     let bytes = flat.as_slice::<u8>();
     let per = (h * w * c) as usize;
     let mut out = Vec::with_capacity(f as usize);

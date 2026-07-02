@@ -639,7 +639,13 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
             .by_name(&pkl_name)
             .map_err(|e| Error::Msg(format!("read {pkl_name}: {e}")))?;
         require_stored(pkl_entry.compression(), &pkl_name)?;
-        pkl_bytes.reserve(pkl_entry.compressed_size() as usize);
+        // F-071: don't trust the zip header's compressed_size for the reservation — a crafted
+        // archive can claim a multi-hundred-GB entry and abort the process on allocation before a
+        // byte is read (bypassing the bomb guards). `try_reserve_exact` surfaces that as a typed
+        // error instead; `read_to_end` still grows the Vec to the real size as bytes arrive.
+        pkl_bytes
+            .try_reserve_exact(pkl_entry.compressed_size() as usize)
+            .map_err(|_| Error::Msg(format!("read {pkl_name}: entry too large to reserve")))?;
         pkl_entry.read_to_end(&mut pkl_bytes)?;
     }
 
@@ -691,7 +697,10 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
                 .by_name(&blob_name)
                 .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?;
             require_stored(blob_entry.compression(), &blob_name)?;
-            blob.reserve(blob_entry.compressed_size() as usize);
+            // F-071: try_reserve_exact (see the pkl entry above) — a crafted header must not abort.
+            blob
+                .try_reserve_exact(blob_entry.compressed_size() as usize)
+                .map_err(|_| Error::Msg(format!("read storage {blob_name}: entry too large")))?;
             blob_entry.read_to_end(&mut blob)?;
             blob_cache.insert(key.clone(), blob);
         }
