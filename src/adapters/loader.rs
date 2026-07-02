@@ -162,25 +162,68 @@ pub struct ApplyReport {
     pub unmatched_paths: Vec<String>,
 }
 
+/// How a LyCORIS applier resolves a file's raw module key to the host's dotted module path
+/// (the one axis the non-BFL LyCORIS installers differ on — see [`install_lycoris_groups`]).
+enum LycorisKeyResolution<'t> {
+    /// Keys are already bare dotted module paths (the peft LoKr convention, [`apply_lokr`]).
+    Dotted,
+    /// Trainer raw keys: a kohya/lycoris `<PREFIX>_<flattened>` stem resolves through the
+    /// host-derived flattened→dotted table ([`kohya_table`]); anything else is treated as
+    /// already-dotted after stripping a common `transformer.`/`diffusion_model.` namespace
+    /// ([`strip_common_lora_prefix`], sc-8395).
+    Thirdparty(&'t BTreeMap<String, String>),
+}
+
+/// Shared install skeleton for the non-BFL LyCORIS appliers ([`apply_lokr`],
+/// [`apply_lokr_thirdparty`], [`apply_loha_thirdparty`] — F-067): resolve each module's raw key to
+/// a host dotted path per `resolution`, reconstruct its `ΔW` at the target's base shape via the
+/// per-module `delta` closure (which bakes in the format's `alpha/rank` scale and dtype), and stack
+/// it as an [`Adapter::Lokr`] residual at the user `scale`. A key that resolves to no module is
+/// surfaced in `unmatched_paths` under its raw spelling, never silently dropped. The BFL
+/// fused→split twin is [`install_bfl_lycoris`].
+fn install_lycoris_groups<K, F>(
+    host: &mut impl AdaptableHost,
+    groups: impl IntoIterator<Item = (K, F)>,
+    scale: f32,
+    resolution: LycorisKeyResolution<'_>,
+) -> Result<ApplyReport>
+where
+    K: AsRef<str> + Into<String>,
+    F: FnOnce(&[i32]) -> Result<Array>,
+{
+    let mut report = ApplyReport::default();
+    for (raw, delta) in groups {
+        let dotted = match &resolution {
+            LycorisKeyResolution::Dotted => raw.as_ref(),
+            LycorisKeyResolution::Thirdparty(table) => resolve_lokr_path(raw.as_ref(), table)
+                .unwrap_or_else(|| strip_common_lora_prefix(raw.as_ref())),
+        };
+        let parts: Vec<&str> = dotted.split('.').collect();
+        match host.adaptable_mut(&parts) {
+            Some(lin) => {
+                let base_shape = lin.base_shape();
+                let delta = delta(&base_shape)?;
+                lin.push(Adapter::Lokr { delta, scale });
+                report.applied += 1;
+            }
+            None => report.unmatched_paths.push(raw.into()),
+        }
+    }
+    Ok(report)
+}
+
 /// Install a LoKr adapter file onto `host`. `scale` is the user-facing strength (the
 /// `alpha/rank` factor is baked into the reconstructed delta, mirroring the fork).
 pub fn apply_lokr(host: &mut impl AdaptableHost, w: &Weights, scale: f32) -> Result<ApplyReport> {
     let file = parse_lokr(w)?;
-    let mut report = ApplyReport::default();
-    for (path, factors) in &file.groups {
-        let parts: Vec<&str> = path.split('.').collect();
-        match host.adaptable_mut(&parts) {
-            Some(lin) => {
-                let base_shape = lin.base_shape();
-                // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
-                let delta = file.delta(factors, &base_shape, Dtype::Bfloat16)?;
-                lin.push(Adapter::Lokr { delta, scale });
-                report.applied += 1;
-            }
-            None => report.unmatched_paths.push(path.clone()),
-        }
-    }
-    Ok(report)
+    let file = &file;
+    let groups = file.groups.iter().map(|(path, factors)| {
+        // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609).
+        (path.as_str(), move |base: &[i32]| {
+            file.delta(factors, base, Dtype::Bfloat16)
+        })
+    });
+    install_lycoris_groups(host, groups, scale, LycorisKeyResolution::Dotted)
 }
 
 // ---- Third-party LyCORIS LoKr (sc-3642) ----------------------------------------------------------
@@ -349,26 +392,19 @@ pub fn apply_lokr_thirdparty(
 ) -> Result<ApplyReport> {
     let table = kohya_table(&host.adaptable_paths());
     let groups = parse_lokr_thirdparty(w)?;
-    let mut report = ApplyReport::default();
-    for (raw, g) in &groups {
-        // Flattened stem via the table (prefix-agnostic), else the raw key treated as already-dotted
-        // (after stripping a common `transformer.`/`diffusion_model.` namespace — sc-8395).
-        let dotted =
-            resolve_lokr_path(raw, &table).unwrap_or_else(|| strip_common_lora_prefix(raw));
-        let parts: Vec<&str> = dotted.split('.').collect();
-        match host.adaptable_mut(&parts) {
-            Some(lin) => {
-                let base_shape = lin.base_shape();
-                // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
-                // peft `apply_lokr`.
-                let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
-                lin.push(Adapter::Lokr { delta, scale });
-                report.applied += 1;
-            }
-            None => report.unmatched_paths.push(raw.clone()),
-        }
-    }
-    Ok(report)
+    let groups = groups.iter().map(|(raw, g)| {
+        // Fork-parity residual path keeps the delta at bf16 (PARITY-BF16, sc-2609) — same as
+        // peft `apply_lokr`.
+        (raw.as_str(), move |base: &[i32]| {
+            g.delta(base, Dtype::Bfloat16)
+        })
+    });
+    install_lycoris_groups(
+        host,
+        groups,
+        scale,
+        LycorisKeyResolution::Thirdparty(&table),
+    )
 }
 
 // ---- Third-party LyCORIS LoHa (sc-3643) ----------------------------------------------------------
@@ -397,7 +433,7 @@ pub struct ThirdPartyLoha {
 }
 
 impl ThirdPartyLoha {
-    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris store `hada_w1_b` as `[lora_dim, …]` in
+    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]` in
     /// both the tucker and non-tucker layouts).
     ///
     /// F-010: a 1-D/0-D factor panics on the shape index; a zero leading dim → `scale = alpha/0` =
@@ -498,23 +534,18 @@ pub fn apply_loha_thirdparty(
 ) -> Result<ApplyReport> {
     let table = kohya_table(&host.adaptable_paths());
     let groups = parse_loha_thirdparty(w)?;
-    let mut report = ApplyReport::default();
-    for (raw, g) in &groups {
-        // Same dotted-fallback prefix strip as the LoKr path (sc-8395).
-        let dotted =
-            resolve_lokr_path(raw, &table).unwrap_or_else(|| strip_common_lora_prefix(raw));
-        let parts: Vec<&str> = dotted.split('.').collect();
-        match host.adaptable_mut(&parts) {
-            Some(lin) => {
-                let base_shape = lin.base_shape();
-                let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
-                lin.push(Adapter::Lokr { delta, scale });
-                report.applied += 1;
-            }
-            None => report.unmatched_paths.push(raw.clone()),
-        }
-    }
-    Ok(report)
+    let groups = groups.iter().map(|(raw, g)| {
+        // Same bf16 residual as the LoKr paths (PARITY-BF16, sc-2609).
+        (raw.as_str(), move |base: &[i32]| {
+            g.delta(base, Dtype::Bfloat16)
+        })
+    });
+    install_lycoris_groups(
+        host,
+        groups,
+        scale,
+        LycorisKeyResolution::Thirdparty(&table),
+    )
 }
 
 /// Install a PEFT/diffusers-format LoRA file onto `host`. The down/up factors carry the file's
@@ -1177,7 +1208,19 @@ pub fn apply_adapter_specs(
     for spec in specs {
         let w = Weights::from_file(&spec.path)?;
         let report = match spec.kind {
-            AdapterKind::Lokr => apply_lokr(host, &w, spec.scale)?,
+            AdapterKind::Lokr => {
+                // A keys-only third-party LyCORIS LoKr (kohya / ai-toolkit / lycoris-lib) carries
+                // `lokr_*` keys but no `networkType` stamp, and its per-module `.alpha` scalars +
+                // optional tucker `lokr_t2` are invisible to the peft parser — routing it to
+                // `apply_lokr` would silently drop both and install a mis-scaled delta. Detect by
+                // keys and route to the third-party applier, mirroring the `Lora` arm below and
+                // the autoprefix dispatch (F-012).
+                if !is_lokr(&w) && is_lokr_keys(&w) {
+                    apply_lokr_thirdparty(host, &w, spec.scale)?
+                } else {
+                    apply_lokr(host, &w, spec.scale)?
+                }
+            }
             AdapterKind::Lora => {
                 // The file's metadata is authoritative; a kind/metadata mismatch is a caller error
                 // (the PEFT-LoRA loader would find no `lora_A/B` keys and apply nothing) — surface it.
@@ -1218,6 +1261,125 @@ pub fn detect_lora_prefix(w: &Weights) -> Option<&'static str> {
     wmeta::detect_lora_prefix(w.keys())
 }
 
+/// Host-derived lookup tables shared across one [`apply_adapter_specs_autoprefix`] call's specs.
+/// Each is a model-tree walk, so it is built lazily and at most once — the first time a spec's
+/// classification (or its apply arm) needs it.
+#[derive(Default)]
+struct HostTables {
+    kohya: Option<BTreeMap<String, String>>,
+    bfl: Option<Vec<BflTarget>>,
+    bfl_lyc: Option<BTreeMap<String, Vec<BflLycorisTarget>>>,
+}
+
+impl HostTables {
+    fn kohya(&mut self, host: &impl AdaptableHost) -> &BTreeMap<String, String> {
+        self.kohya
+            .get_or_insert_with(|| kohya_table(&host.adaptable_paths()))
+    }
+
+    fn bfl(&mut self, host: &impl AdaptableHost) -> &[BflTarget] {
+        self.bfl.get_or_insert_with(|| host.bfl_targets())
+    }
+
+    fn bfl_lyc(&mut self, host: &impl AdaptableHost) -> &BTreeMap<String, Vec<BflLycorisTarget>> {
+        if self.bfl_lyc.is_none() {
+            let map = bfl_lycoris_module_map(self.bfl(host));
+            self.bfl_lyc = Some(map);
+        }
+        self.bfl_lyc.as_ref().unwrap()
+    }
+}
+
+/// The on-disk format of one adapter file, as resolved by [`classify_adapter_format`] — the single
+/// routing truth for [`apply_adapter_specs_autoprefix`]'s dispatch (F-069). Variant order mirrors
+/// the detection precedence:
+///
+/// 1. **Third-party LyCORIS keys** (`lokr_*` without a `networkType` stamp, or `hada_*`) — before
+///    BFL-LoRA/kohya, because a kohya-flattened LyCORIS file also carries the `lora_unet_` prefix,
+///    which `is_kohya` would otherwise claim and then apply nothing (sc-3642/sc-3643).
+/// 2. **BFL/ComfyUI fused→split LoRA naming** — before kohya because it shares the `lora_unet_`
+///    prefix (sc-2743). Skipped (with kohya) for a metadata-stamped LoKr, whose keys stay dotted.
+/// 3. **kohya-flattened LoRA** (`lora_unet_…`).
+/// 4. The spec's declared [`AdapterKind`]: a peft/metadata LoKr (BFL-named or bare) or a
+///    PEFT/diffusers LoRA — where a `Lora` declaration against `networkType=lokr` metadata is a
+///    caller error, surfaced as [`Self::LoraKindMismatch`].
+///
+/// Each LyCORIS format carries a BFL twin because a LyCORIS file can ship in BFL/ComfyUI fused
+/// naming on a FLUX host (sc-8345); every other host has an empty BFL surface, so the `*Bfl`
+/// variants never classify there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdapterFormat {
+    /// Third-party LyCORIS LoKr (`lokr_*` keys, no `networkType` stamp) in BFL/ComfyUI fused naming.
+    ThirdpartyLokrBfl,
+    /// Third-party LyCORIS LoKr in bare / diffusers / kohya-flattened naming.
+    ThirdpartyLokr,
+    /// Third-party LyCORIS LoHa (`hada_*` keys) in BFL/ComfyUI fused naming.
+    ThirdpartyLohaBfl,
+    /// Third-party LyCORIS LoHa in bare / diffusers / kohya-flattened naming.
+    ThirdpartyLoha,
+    /// BFL/ComfyUI fused→split LoRA (sc-2743).
+    BflLora,
+    /// kohya / sd-scripts flattened LoRA (`lora_unet_…`).
+    KohyaLora,
+    /// Metadata-stamped (peft) LoKr in BFL/ComfyUI fused naming (sc-8345).
+    PeftLokrBfl,
+    /// Declared-`Lokr` fallback: a metadata-stamped or bare dotted-path LoKr.
+    PeftLokr,
+    /// PEFT/diffusers LoRA — the common fallback.
+    PeftLora,
+    /// Declared `Lora` but the file's metadata says `networkType=lokr` — a caller error (the
+    /// metadata is authoritative), surfaced as a hard error by the dispatch.
+    LoraKindMismatch,
+}
+
+/// Classify one adapter file for the autoprefix dispatch (F-069). A pure function of the file's
+/// keys/metadata, the declared `kind`, and the host's kohya/BFL surface; `tables` caches the
+/// host-tree walks across specs. See [`AdapterFormat`] for the precedence rationale.
+fn classify_adapter_format(
+    w: &Weights,
+    kind: AdapterKind,
+    host: &impl AdaptableHost,
+    tables: &mut HostTables,
+) -> AdapterFormat {
+    // The `networkType=lokr` stamp gates `lokr_*` keys: a stamped (peft) file routes by its stamp
+    // (global metadata alpha/rank), a keys-only file by the third-party per-module derivation.
+    let is_lokr_meta = is_lokr(w);
+    if !is_lokr_meta && is_lokr_keys(w) {
+        return if is_bfl_lycoris(w, tables.bfl_lyc(host)) {
+            AdapterFormat::ThirdpartyLokrBfl
+        } else {
+            AdapterFormat::ThirdpartyLokr
+        };
+    }
+    if is_loha_keys(w) {
+        return if is_bfl_lycoris(w, tables.bfl_lyc(host)) {
+            AdapterFormat::ThirdpartyLohaBfl
+        } else {
+            AdapterFormat::ThirdpartyLoha
+        };
+    }
+    if !is_lokr_meta {
+        if is_bfl(w, tables.bfl(host)) {
+            return AdapterFormat::BflLora;
+        }
+        if is_kohya(w) {
+            return AdapterFormat::KohyaLora;
+        }
+    }
+    // No format-discriminating keys left — fall back to the spec's declared kind.
+    match kind {
+        AdapterKind::Lokr => {
+            if is_lokr_meta && is_bfl_lycoris(w, tables.bfl_lyc(host)) {
+                AdapterFormat::PeftLokrBfl
+            } else {
+                AdapterFormat::PeftLokr
+            }
+        }
+        AdapterKind::Lora if is_lokr_meta => AdapterFormat::LoraKindMismatch,
+        AdapterKind::Lora => AdapterFormat::PeftLora,
+    }
+}
+
 /// [`apply_adapter_specs`] with per-file LoRA-prefix **auto-detection** ([`detect_lora_prefix`])
 /// instead of a fixed prefix — the common provider path, since LoRA files vary
 /// (`transformer.` / `diffusion_model.` / bare) while LoKr keys are bare. The host's key→module map
@@ -1226,98 +1388,46 @@ pub fn apply_adapter_specs_autoprefix(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
 ) -> Result<ApplyReport> {
-    // The kohya `flattened → dotted` table and the BFL target list both walk the model tree, so
-    // build each lazily and only once, the first time it is needed across `specs`.
-    let mut kohya: Option<BTreeMap<String, String>> = None;
-    let mut bfl: Option<Vec<BflTarget>> = None;
-    let mut bfl_lyc: Option<BTreeMap<String, Vec<BflLycorisTarget>>> = None;
+    let mut tables = HostTables::default();
     let mut combined = ApplyReport::default();
     for spec in specs {
-        // Load + classify the file once: the dispatch chain below (and the fallback that used to
-        // delegate to `apply_adapter_specs`, re-reading the file) all key off `is_lokr`, so hoist both
-        // the loaded `Weights` and `is_lokr(&w)` into locals rather than re-reading/re-evaluating
-        // them up to four times per spec (F-004).
+        // Load + classify the file once per spec (F-004); `classify_adapter_format` is the single
+        // source of routing truth (F-069) — the arms below only fetch the table the applier needs
+        // and apply.
         let w = Weights::from_file(&spec.path)?;
-        let is_lokr_w = is_lokr(&w);
-        // A LyCORIS file (peft/metadata LoKr, keyed third-party LoKr, or LoHa) can ship in BFL/ComfyUI
-        // fused naming on a FLUX host; detect that up front so the three LyCORIS arms below route to the
-        // fused→split appliers (sc-8345). Non-FLUX hosts have an empty BFL surface ⇒ never matches.
-        let is_lokr_keys_w = !is_lokr_w && is_lokr_keys(&w);
-        let is_loha_keys_w = is_loha_keys(&w);
-        let is_bfl_lycoris_file = if is_lokr_w || is_lokr_keys_w || is_loha_keys_w {
-            if bfl.is_none() {
-                bfl = Some(host.bfl_targets());
+        let report = match classify_adapter_format(&w, spec.kind, host, &mut tables) {
+            AdapterFormat::ThirdpartyLokrBfl => {
+                let map = tables.bfl_lyc(host);
+                apply_lokr_thirdparty_bfl(host, &w, spec.scale, map)?
             }
-            if bfl_lyc.is_none() {
-                bfl_lyc = Some(bfl_lycoris_module_map(bfl.as_ref().unwrap()));
+            AdapterFormat::ThirdpartyLokr => apply_lokr_thirdparty(host, &w, spec.scale)?,
+            AdapterFormat::ThirdpartyLohaBfl => {
+                let map = tables.bfl_lyc(host);
+                apply_loha_thirdparty_bfl(host, &w, spec.scale, map)?
             }
-            is_bfl_lycoris(&w, bfl_lyc.as_ref().unwrap())
-        } else {
-            false
-        };
-        // BFL / ComfyUI fused→split LoRA naming (sc-2743) is the orthogonal axis to kohya flattening and
-        // shares the `lora_unet_` prefix, so it must be detected BEFORE `is_kohya`. (LoKr first.)
-        let is_bfl_file = if is_lokr_w {
-            false
-        } else {
-            if bfl.is_none() {
-                bfl = Some(host.bfl_targets());
+            AdapterFormat::ThirdpartyLoha => apply_loha_thirdparty(host, &w, spec.scale)?,
+            AdapterFormat::BflLora => {
+                let targets = tables.bfl(host);
+                apply_lora_bfl(host, &w, spec.scale, targets)?
             }
-            is_bfl(&w, bfl.as_ref().unwrap())
-        };
-        let report = if is_lokr_keys_w {
-            // Third-party LyCORIS LoKr (sc-3642): `lokr_*` keys, no `networkType` stamp. Route to the
-            // fused→split applier when BFL/ComfyUI-named (sc-8345), else the bare/diffusers/kohya path.
-            // Detected BEFORE is_bfl/is_kohya — a kohya-flattened LoKr also carries the `lora_unet_`
-            // prefix, so is_kohya would otherwise claim it and apply nothing.
-            if is_bfl_lycoris_file {
-                apply_lokr_thirdparty_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
-            } else {
-                apply_lokr_thirdparty(host, &w, spec.scale)?
+            AdapterFormat::KohyaLora => {
+                let table = tables.kohya(host);
+                apply_lora_kohya(host, &w, spec.scale, table)?
             }
-        } else if is_loha_keys_w {
-            // Third-party LyCORIS LoHa (sc-3643): `hada_*` keys. Same reasoning — BFL fused→split when
-            // BFL-named (sc-8345), else the bare/diffusers/kohya path.
-            if is_bfl_lycoris_file {
-                apply_loha_thirdparty_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
-            } else {
-                apply_loha_thirdparty(host, &w, spec.scale)?
+            AdapterFormat::PeftLokrBfl => {
+                let map = tables.bfl_lyc(host);
+                apply_lokr_bfl(host, &w, spec.scale, map)?
             }
-        } else if is_bfl_file {
-            apply_lora_bfl(host, &w, spec.scale, bfl.as_ref().unwrap())?
-        } else if !is_lokr_w && is_kohya(&w) {
-            // kohya LoRA: dots are flattened to underscores, so keys resolve through the table
-            // rather than the prefix-strip path. (LoKr keeps dotted paths; checked first.)
-            if kohya.is_none() {
-                kohya = Some(kohya_table(&host.adaptable_paths()));
+            AdapterFormat::PeftLokr => apply_lokr(host, &w, spec.scale)?,
+            AdapterFormat::PeftLora => {
+                apply_lora_peft(host, &w, spec.scale, detect_lora_prefix(&w))?
             }
-            apply_lora_kohya(host, &w, spec.scale, kohya.as_ref().unwrap())?
-        } else {
-            // Plain PEFT/diffusers LoRA (the common case) or a metadata-LoKr. The earlier branches
-            // already excluded third-party LoKr/LoHa keys, so call the leaf appliers directly with the
-            // already-loaded `w` instead of re-reading the file via `apply_adapter_specs` (F-004).
-            match spec.kind {
-                AdapterKind::Lokr => {
-                    // metadata-stamped LoKr — BFL fused→split when BFL/ComfyUI-named (sc-8345), else
-                    // the bare dotted-path applier.
-                    if is_bfl_lycoris_file {
-                        apply_lokr_bfl(host, &w, spec.scale, bfl_lyc.as_ref().unwrap())?
-                    } else {
-                        apply_lokr(host, &w, spec.scale)?
-                    }
-                }
-                AdapterKind::Lora => {
-                    if is_lokr_w {
-                        // The file's metadata is authoritative; a kind/metadata mismatch is a caller
-                        // error (matches `apply_adapter_specs`).
-                        return Err(format!(
-                            "adapter {} declared Lora but its metadata says networkType=lokr",
-                            spec.path.display()
-                        )
-                        .into());
-                    }
-                    apply_lora_peft(host, &w, spec.scale, detect_lora_prefix(&w))?
-                }
+            AdapterFormat::LoraKindMismatch => {
+                return Err(format!(
+                    "adapter {} declared Lora but its metadata says networkType=lokr",
+                    spec.path.display()
+                )
+                .into());
             }
         };
         combined.applied += report.applied;
@@ -3204,6 +3314,271 @@ mod tests {
             report.unmatched_paths.is_empty(),
             "unexpected unmatched: {:?}",
             report.unmatched_paths
+        );
+    }
+
+    /// F-012: the fixed-prefix `apply_adapter_specs` must route a keys-only third-party LoKr
+    /// declared `AdapterKind::Lokr` to `apply_lokr_thirdparty` — the peft applier's global-metadata
+    /// parse ignores the per-module `.alpha` (and a tucker `lokr_t2`), so it would install the
+    /// delta at the wrong scale while reporting success.
+    #[test]
+    fn fixed_prefix_lokr_kind_routes_keys_only_file_to_thirdparty() {
+        // Keys-only LoKr (no `networkType` stamp): w1 full [2,2], w2 decomposed [2,r=2]·[2,2], and
+        // a per-module alpha=1 over rank 2 ⇒ lycoris scale 0.5 — discriminating, because the peft
+        // parse drops the `.alpha` tensor and defaults alpha=rank ⇒ scale 1.
+        let base = Array::from_slice(
+            &(0..16).map(|i| i as f32 * 0.1).collect::<Vec<_>>(),
+            &[4, 4],
+        );
+        let w1 = Array::from_slice(&[0.5f32, 0.6, 0.7, 0.8], &[2, 2]);
+        let w2_a = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[2, 2]);
+        let w2_b = Array::from_slice(&[0.4f32, 0.3, 0.2, 0.1], &[2, 2]);
+        let alpha = Array::from_slice(&[1.0f32], &[1]);
+        let path = tmp("f012_keysonly_lokr.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("lin.lokr_w1", &w1),
+                ("lin.lokr_w2_a", &w2_a),
+                ("lin.lokr_w2_b", &w2_b),
+                ("lin.alpha", &alpha),
+            ],
+            None as Option<&HashMap<String, String>>,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        assert!(
+            !is_lokr(&w) && is_lokr_keys(&w),
+            "premise: a keys-only third-party file"
+        );
+
+        // Reference: the third-party applier called directly (per-module alpha honored).
+        let mut want = OneLinear {
+            lin: AdaptableLinear::dense(base.clone(), None),
+        };
+        apply_lokr_thirdparty(&mut want, &w, 1.0).unwrap();
+
+        let mut got = OneLinear {
+            lin: AdaptableLinear::dense(base.clone(), None),
+        };
+        let report = apply_adapter_specs(
+            &mut got,
+            &[AdapterSpec::new(path, 1.0, AdapterKind::Lokr)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(report.applied, 1);
+        assert!(report.unmatched_paths.is_empty());
+
+        let x = Array::from_slice(&[1.0f32, -2.0, 0.5, 0.25], &[1, 4]);
+        let got_y = got.lin.forward(&x).unwrap();
+        let want_y = want.lin.forward(&x).unwrap();
+        assert!(
+            array_eq(&got_y, &want_y, false).unwrap().item::<bool>(),
+            "fixed-prefix Lokr dispatch must install the identical third-party delta"
+        );
+        // The pre-F-012 route: the peft applier drops the per-module alpha (scale 1, not 0.5).
+        let mut peft = OneLinear {
+            lin: AdaptableLinear::dense(base, None),
+        };
+        apply_lokr(&mut peft, &w, 1.0).unwrap();
+        let peft_y = peft.lin.forward(&x).unwrap();
+        assert!(
+            !all_close(&got_y, &peft_y, 1e-4, 1e-4, false)
+                .unwrap()
+                .item::<bool>(),
+            "the peft-path result must differ (it mis-scales) for this test to discriminate"
+        );
+    }
+
+    // ---- F-069 format classification --------------------------------------------------------------
+
+    /// Save a tiny safetensors of `keys` (dummy `[1,1]` tensors — classification reads only
+    /// keys/metadata) and load it back as `Weights`.
+    fn classify_weights(
+        name: &str,
+        keys: &[&str],
+        meta: Option<&HashMap<String, String>>,
+    ) -> Weights {
+        let dummy = Array::from_slice(&[1.0f32], &[1, 1]);
+        let entries: Vec<(&str, &Array)> = keys.iter().map(|k| (*k, &dummy)).collect();
+        let path = tmp(name);
+        Array::save_safetensors(entries, meta, &path).unwrap();
+        Weights::from_file(&path).unwrap()
+    }
+
+    /// F-069: `classify_adapter_format` is the single routing truth — one minimal key-set per
+    /// [`AdapterFormat`] variant, plus the precedence corners (LyCORIS keys beat kohya's shared
+    /// `lora_unet_` prefix; BFL naming beats kohya; the `networkType=lokr` stamp gates `lokr_*`
+    /// keys; a BFL-named LyCORIS file on a host without a BFL surface stays third-party).
+    #[test]
+    fn classify_adapter_format_per_format() {
+        let lokr_meta: HashMap<String, String> = [
+            ("networkType".to_string(), "lokr".to_string()),
+            ("alpha".to_string(), "1.0".to_string()),
+            ("rank".to_string(), "1".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        // A host without a BFL surface (the common case) and the FLUX-shaped `BflHost` whose
+        // `bfl_targets()` names `diffusion_model.double_blocks.…`. Tables are per-host.
+        let plain = MultiHost::new(&[(
+            "blocks.0.attn.to_q",
+            Array::from_slice(&[0.0f32; 4], &[2, 2]),
+        )]);
+        let flux = BflHost::new();
+        let mut tp = HostTables::default();
+        let mut tf = HostTables::default();
+        let bfl_qkv = "diffusion_model.double_blocks.0.img_attn.qkv";
+
+        // Third-party LoKr: `lokr_*` keys, no stamp — regardless of the declared kind.
+        let w = classify_weights(
+            "cls_tp_lokr.safetensors",
+            &["lin.lokr_w1", "lin.lokr_w2"],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::ThirdpartyLokr
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lokr, &plain, &mut tp),
+            AdapterFormat::ThirdpartyLokr
+        );
+
+        // Precedence: a kohya-flattened LoKr also carries `lora_unet_`, but LyCORIS keys win
+        // (is_kohya would claim it and apply nothing).
+        let w = classify_weights(
+            "cls_tp_lokr_kohya.safetensors",
+            &[
+                "lora_unet_blocks_0_attn_to_q.lokr_w1",
+                "lora_unet_blocks_0_attn_to_q.lokr_w2",
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::ThirdpartyLokr
+        );
+
+        // Third-party LoKr in BFL/ComfyUI fused naming — only on a host with a BFL surface.
+        let w = classify_weights(
+            "cls_tp_lokr_bfl.safetensors",
+            &[&format!("{bfl_qkv}.lokr_w1"), &format!("{bfl_qkv}.lokr_w2")],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lokr, &flux, &mut tf),
+            AdapterFormat::ThirdpartyLokrBfl
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lokr, &plain, &mut tp),
+            AdapterFormat::ThirdpartyLokr,
+            "no BFL surface ⇒ the same file stays on the plain third-party path"
+        );
+
+        // Third-party LoHa (`hada_*` keys) + its BFL twin.
+        let w = classify_weights(
+            "cls_tp_loha.safetensors",
+            &[
+                "lin.hada_w1_a",
+                "lin.hada_w1_b",
+                "lin.hada_w2_a",
+                "lin.hada_w2_b",
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::ThirdpartyLoha
+        );
+        let w = classify_weights(
+            "cls_tp_loha_bfl.safetensors",
+            &[
+                &format!("{bfl_qkv}.hada_w1_a"),
+                &format!("{bfl_qkv}.hada_w1_b"),
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &flux, &mut tf),
+            AdapterFormat::ThirdpartyLohaBfl
+        );
+
+        // BFL fused→split LoRA — detected before kohya despite sharing no `lora_unet_` here
+        // (the `diffusion_model.` spelling), and before the PEFT fallback.
+        let w = classify_weights(
+            "cls_bfl_lora.safetensors",
+            &[
+                &format!("{bfl_qkv}.lora_up.weight"),
+                &format!("{bfl_qkv}.lora_down.weight"),
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &flux, &mut tf),
+            AdapterFormat::BflLora
+        );
+
+        // kohya-flattened LoRA.
+        let w = classify_weights(
+            "cls_kohya.safetensors",
+            &[
+                "lora_unet_blocks_0_attn_to_q.lora_down.weight",
+                "lora_unet_blocks_0_attn_to_q.lora_up.weight",
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::KohyaLora
+        );
+
+        // peft LoKr: the `networkType=lokr` stamp gates the `lokr_*` keys off the third-party path.
+        let w = classify_weights(
+            "cls_peft_lokr.safetensors",
+            &["lin.lokr_w1", "lin.lokr_w2"],
+            Some(&lokr_meta),
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lokr, &plain, &mut tp),
+            AdapterFormat::PeftLokr
+        );
+
+        // peft LoKr in BFL/ComfyUI fused naming (sc-8345).
+        let w = classify_weights(
+            "cls_peft_lokr_bfl.safetensors",
+            &[&format!("{bfl_qkv}.lokr_w1"), &format!("{bfl_qkv}.lokr_w2")],
+            Some(&lokr_meta),
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lokr, &flux, &mut tf),
+            AdapterFormat::PeftLokrBfl
+        );
+
+        // PEFT/diffusers LoRA — the common fallback.
+        let w = classify_weights(
+            "cls_peft_lora.safetensors",
+            &[
+                "transformer.lin.lora_A.weight",
+                "transformer.lin.lora_B.weight",
+            ],
+            None,
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::PeftLora
+        );
+
+        // Declared `Lora` against `networkType=lokr` metadata — the caller error.
+        let w = classify_weights(
+            "cls_mismatch.safetensors",
+            &["lin.lokr_w1", "lin.lokr_w2"],
+            Some(&lokr_meta),
+        );
+        assert_eq!(
+            classify_adapter_format(&w, AdapterKind::Lora, &plain, &mut tp),
+            AdapterFormat::LoraKindMismatch
         );
     }
 }

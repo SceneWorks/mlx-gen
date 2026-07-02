@@ -38,15 +38,6 @@ pub(crate) fn lin(w: &Weights, base: &str, bias: bool) -> Result<AdaptableLinear
     mlx_gen::quant::lin(w, base, bias, GROUP_SIZE)
 }
 
-/// Bits inferred from the packed shapes at [`GROUP_SIZE`]: `scales` is `[out, in/gs]` ⇒
-/// `in = scales.cols·gs`; the u32-packed `weight` is `[out, in·bits/32]` ⇒ `bits = wq.cols·32/in`.
-/// (Duplicates the private `mlx_gen::quant::packed_bits` so [`lin_geglu_half`] can build the
-/// `from_quantized_parts` for a row-slice without threading bits through a manifest.)
-fn packed_bits(wq: &Array, scales: &Array) -> i32 {
-    let in_dim = scales.shape()[1] * GROUP_SIZE;
-    wq.shape()[1] * 32 / in_dim
-}
-
 /// Load the value/gate **half** of a GEGLU `ff.net.0.proj` — rows `[lo, hi)` of the stored
 /// `[2·hidden, D]` Linear (bias included). Packed when `{base}.scales` is present (row-slice the u32
 /// codes + scales + biases + dense bias along axis 0 — valid because group-wise affine quantization
@@ -60,7 +51,9 @@ pub(crate) fn lin_geglu_half(w: &Weights, base: &str, lo: i32, hi: i32) -> Resul
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
         let biases = w.require(&format!("{base}.biases"))?;
-        let bits = packed_bits(wq, scales);
+        // F-011: the shared derivation validates the untrusted packed shapes (2-D, non-zero in
+        // dim, bits ∈ {4, 8}) with a typed error instead of a panic/divide-by-zero.
+        let bits = mlx_gen::quant::packed_bits(wq, scales, GROUP_SIZE)?;
         return Ok(AdaptableLinear::from_quantized_parts(
             row_slice(wq)?,
             row_slice(scales)?,
