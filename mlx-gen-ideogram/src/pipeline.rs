@@ -109,6 +109,13 @@ fn add_noise_by_interpolation(clean: &Array, noise: &Array, sigma: f32) -> Resul
 fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (width as usize, height as usize);
+    // A 0×0 image with an empty buffer passes the length check but panics in the resampler —
+    // reject it with the same typed error (F-084 class).
+    if iw == 0 || ih == 0 {
+        return Err(Error::Msg(format!(
+            "ideogram edit: source image has a zero dimension ({iw}x{ih})"
+        )));
+    }
     if image.pixels.len() != iw * ih * 3 {
         return Err(Error::Msg(format!(
             "ideogram edit: source pixel buffer {} != {iw}x{ih}x3",
@@ -131,6 +138,20 @@ fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Arr
 /// downsample factor is 16 (vs 8 in sdxl `preprocess_mask`).
 fn preprocess_mask_packed(mask: &Image, width: u32, height: u32) -> Result<Array> {
     let (w, h) = (width as usize, height as usize);
+    // Request-supplied buffer: reject zero dims and a mismatched pixel buffer before the luma
+    // conversion/resize index into it (F-002; the guard `preprocess_source_image` already has).
+    let (mw, mh) = (mask.width as usize, mask.height as usize);
+    if mw == 0 || mh == 0 || w == 0 || h == 0 {
+        return Err(Error::Msg(format!(
+            "ideogram edit: mask image has a zero dimension ({mw}x{mh} -> {w}x{h})"
+        )));
+    }
+    if mask.pixels.len() != mw * mh * 3 {
+        return Err(Error::Msg(format!(
+            "ideogram edit: mask pixel buffer {} != {mw}x{mh}x3",
+            mask.pixels.len()
+        )));
+    }
     let patch = (PATCH * AE_SCALE) as usize; // 16
                                              // Nearest (not bicubic): a mask must not gain interpolated grays that flip the 0.5 binarize.
     let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
@@ -675,5 +696,91 @@ impl Packing {
             neg_segment_ids: vec![1; num_img as usize],
             neg_indicator: vec![OUTPUT_IMAGE_INDICATOR; num_img as usize],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-002: a request-supplied mask with a short pixel buffer must be a typed error, not an OOB
+    /// panic in the luma indexing (same-size path) or the resampler (resize path).
+    #[test]
+    fn preprocess_mask_packed_rejects_short_buffer() {
+        // Same-size path: claims 32×32 but carries 8 bytes.
+        let bad = Image {
+            width: 32,
+            height: 32,
+            pixels: vec![0u8; 8],
+        };
+        let e = preprocess_mask_packed(&bad, 32, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("mask pixel buffer"), "unexpected error: {e}");
+
+        // Resize path: 16×16 claimed, short buffer, target 32×32.
+        let e = preprocess_mask_packed(
+            &Image {
+                width: 16,
+                height: 16,
+                pixels: vec![0u8; 5],
+            },
+            32,
+            32,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("mask pixel buffer"), "unexpected error: {e}");
+    }
+
+    /// F-002: a 0×0 mask (empty buffer passes a bare length check) must also be a typed error.
+    #[test]
+    fn preprocess_mask_packed_rejects_zero_dims() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = preprocess_mask_packed(&zero, 32, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+    }
+
+    /// The valid path still binarizes + nearest-downsamples onto the 16× token grid.
+    #[test]
+    fn preprocess_mask_packed_binarizes_on_token_grid() {
+        // 32×32: left half white, right half black → 2×2 grid rows [1, 0] flattened.
+        let (w, h) = (32u32, 32u32);
+        let mut pixels = Vec::with_capacity((w * h * 3) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let v = if x < 16 { 255u8 } else { 0u8 };
+                pixels.extend_from_slice(&[v, v, v]);
+            }
+        }
+        let m = Image {
+            width: w,
+            height: h,
+            pixels,
+        };
+        let a = preprocess_mask_packed(&m, w, h).unwrap();
+        assert_eq!(a.shape(), &[1, 4, 1]);
+        assert_eq!(a.as_slice::<f32>(), &[1.0, 0.0, 1.0, 0.0]);
+    }
+
+    /// F-084 class: a 0×0 source image (empty buffer passes the length check) must be a typed
+    /// error instead of panicking in the resampler.
+    #[test]
+    fn preprocess_source_image_rejects_zero_dims() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = preprocess_source_image(&zero, 32, 32)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
     }
 }

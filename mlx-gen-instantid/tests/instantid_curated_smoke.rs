@@ -74,7 +74,7 @@ fn curated_samplers_preserve_identity() {
 
     // Reference identity (its ArcFace embedding drives the IP path).
     let ref_img = load_rgb(&env_path("INSTANTID_REF"));
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).unwrap();
     let ref_face = model
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");

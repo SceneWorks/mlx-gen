@@ -67,3 +67,25 @@ fn te_matches_reference() {
         "TE stacked context diverged beyond 1e-2 (cosine {c:.7})"
     );
 }
+
+/// F-081: dropping the template prefix needs strictly more tokens than `prefix_tokens`; a shorter
+/// prompt must be a typed error, not an opaque empty-index `take_axis` panic (the guard the qwen
+/// encoders already have).
+#[test]
+fn te_rejects_prompt_shorter_than_prefix() {
+    let w = Weights::from_file(FIXTURE)
+        .unwrap_or_else(|e| panic!("load te fixture (run tools/dump_krea_te_golden.py): {e}"));
+    let cfg = tiny_te_config(); // prefix_tokens = 3
+    let te = KreaTextEncoder::from_weights(&w, "language_model", &cfg).unwrap();
+
+    for s in [1i32, 3] {
+        // s <= prefix_tokens → typed error
+        let ids = Array::from_slice(&vec![0i32; s as usize], &[1, s]);
+        let mask = Array::from_slice(&vec![1i32; s as usize], &[1, s]);
+        let e = te.forward(&ids, &mask).unwrap_err().to_string();
+        assert!(
+            e.contains("template-prefix"),
+            "expected the prefix-drop guard for s={s}, got: {e}"
+        );
+    }
+}

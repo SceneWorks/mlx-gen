@@ -556,8 +556,22 @@ pub fn draw_kps(width: u32, height: u32, kps: &[(f32, f32)]) -> Result<Image> {
 /// Resize `image` keeping aspect (PIL LANCZOS) and center-pad onto a black `width × height` canvas —
 /// the sc-2009 kps-distortion rule (the control image must share the output aspect). Mirrors the
 /// vendored `_letterbox`.
-pub fn letterbox(image: &Image, width: u32, height: u32) -> Image {
+pub fn letterbox(image: &Image, width: u32, height: u32) -> Result<Image> {
     let (iw, ih) = (image.width, image.height);
+    // Request-supplied image: a zero dimension reaches the core resize `assert!` (or underflows the
+    // unsigned pad offsets below) and a short buffer indexes out of bounds in the resampler — give
+    // both the typed error `preprocess_clip_image_sized` produces for the same input class (F-084).
+    if iw == 0 || ih == 0 || width == 0 || height == 0 {
+        return Err(Error::Msg(format!(
+            "instantid letterbox: image has a zero dimension ({iw}x{ih} -> {width}x{height})"
+        )));
+    }
+    if image.pixels.len() != iw as usize * ih as usize * 3 {
+        return Err(Error::Msg(format!(
+            "instantid letterbox: image pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
     let ratio = (width as f64 / iw as f64).min(height as f64 / ih as f64);
     // Clamp to the canvas: fp round-up of `i*ratio` could exceed width/height, underflowing the
     // unsigned `width - new_w` / `height - new_h` offsets below (F-020 / L-A). `.min(..)` is inert
@@ -583,11 +597,11 @@ pub fn letterbox(image: &Image, width: u32, height: u32) -> Image {
             canvas[dst + 2] = resized[src + 2] as u8;
         }
     }
-    Image {
+    Ok(Image {
         width,
         height,
         pixels: canvas,
-    }
+    })
 }
 
 /// Canonical view-angle landmark sets (sc-2009), normalized `[0,1]` to a square canvas, order
@@ -766,5 +780,52 @@ mod tests {
         let before = img.clone();
         hline(&mut img, w, 2, 4, 1, [99, 99, 99]);
         assert_eq!(img, before);
+    }
+
+    /// F-084: a zero-dimension request image (or target) must be a typed error instead of an
+    /// underflowed pad offset / core resize `assert!`.
+    #[test]
+    fn letterbox_rejects_zero_dims() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = letterbox(&zero, 64, 64).unwrap_err().to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+
+        let ok = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 4 * 4 * 3],
+        };
+        assert!(letterbox(&ok, 0, 64).is_err(), "zero target width");
+        assert!(letterbox(&ok, 64, 0).is_err(), "zero target height");
+    }
+
+    /// F-084: a short pixel buffer must be a typed error, not an OOB index in the resampler.
+    #[test]
+    fn letterbox_rejects_short_buffer() {
+        let bad = Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 10], // not 8·8·3
+        };
+        let e = letterbox(&bad, 64, 64).unwrap_err().to_string();
+        assert!(e.contains("pixel buffer"), "unexpected error: {e}");
+    }
+
+    /// The valid path still resizes keep-aspect and center-pads onto the black canvas.
+    #[test]
+    fn letterbox_valid_path_centers_on_canvas() {
+        // 2×2 white → 4×4 target: ratio 2, fills the whole canvas.
+        let src = Image {
+            width: 2,
+            height: 2,
+            pixels: vec![255u8; 2 * 2 * 3],
+        };
+        let out = letterbox(&src, 4, 4).unwrap();
+        assert_eq!((out.width, out.height), (4, 4));
+        assert_eq!(out.pixels.len(), 4 * 4 * 3);
     }
 }

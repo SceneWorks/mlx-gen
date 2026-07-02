@@ -28,6 +28,20 @@ use crate::sampler::EulerSampler;
 /// (the top-left pixel of each 8×8 block — torch nearest's `floor(dst·scale)`).
 pub fn preprocess_mask(mask: &Image, width: u32, height: u32) -> Result<Array> {
     let (w, h) = (width as usize, height as usize);
+    // Request-supplied buffer: reject zero dims and a mismatched pixel buffer before the luma
+    // conversion/resize index into it (F-001; mirrors `preprocess_image`'s F-071 guard).
+    let (mw, mh) = (mask.width as usize, mask.height as usize);
+    if mw == 0 || mh == 0 || w == 0 || h == 0 {
+        return Err(Error::Msg(format!(
+            "sdxl mask image has a zero dimension ({mw}x{mh} -> {w}x{h})"
+        )));
+    }
+    if mask.pixels.len() != mw * mh * 3 {
+        return Err(Error::Msg(format!(
+            "sdxl mask pixel buffer {} != {mw}x{mh}x3",
+            mask.pixels.len()
+        )));
+    }
     // Align to W×H (the worker's `load_mask_image` already does; resize defensively otherwise).
     let luma: Vec<u8> = if (mask.width as usize, mask.height as usize) == (w, h) {
         rgb_to_luma(&mask.pixels)
@@ -160,5 +174,45 @@ mod tests {
         let hi = preprocess_mask(&gray(8, 8, |_, _| 128), 8, 8).unwrap();
         assert_eq!(lo.as_slice::<f32>(), &[0.0]);
         assert_eq!(hi.as_slice::<f32>(), &[1.0]);
+    }
+
+    /// F-001: a request-supplied mask with a short pixel buffer must be a typed error, not an OOB
+    /// panic in the luma indexing (same-size path) or the resampler (resize path).
+    #[test]
+    fn preprocess_mask_rejects_short_buffer() {
+        // Same-size path: claims 16×16 but carries 8 bytes.
+        let bad = Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 8],
+        };
+        let e = preprocess_mask(&bad, 16, 16).unwrap_err().to_string();
+        assert!(e.contains("mask pixel buffer"), "unexpected error: {e}");
+
+        // Resize path: 8×8 claimed, short buffer, target 16×16.
+        let e = preprocess_mask(
+            &Image {
+                width: 8,
+                height: 8,
+                pixels: vec![0u8; 5],
+            },
+            16,
+            16,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("mask pixel buffer"), "unexpected error: {e}");
+    }
+
+    /// F-001: a 0×0 mask (empty buffer passes the length check) must also be a typed error.
+    #[test]
+    fn preprocess_mask_rejects_zero_dims() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = preprocess_mask(&zero, 16, 16).unwrap_err().to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
     }
 }

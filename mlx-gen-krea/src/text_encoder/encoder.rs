@@ -114,8 +114,16 @@ impl KreaTextEncoder {
         let refs: Vec<&Array> = expanded.iter().collect();
         let stacked = concatenate_axis(&refs, 2)?; // [b, s, n, hidden]
 
-        // Drop the leading template-prefix tokens (the system instruction).
+        // Drop the leading template-prefix tokens (the system instruction). Dropping needs strictly
+        // more tokens than the prefix; a shorter sequence would build an empty index and hit an
+        // opaque `take_axis` panic (F-081; the guard qwen's encoders already have).
         let n = stacked.shape()[1];
+        if n <= self.prefix_tokens {
+            return Err(Error::Msg(format!(
+                "krea text encoder: prompt has {n} token(s), must exceed the {} dropped template-prefix tokens",
+                self.prefix_tokens
+            )));
+        }
         let idx: Vec<i32> = (self.prefix_tokens..n).collect();
         Ok(stacked.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?)
     }

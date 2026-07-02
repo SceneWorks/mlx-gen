@@ -690,6 +690,13 @@ fn preprocess_image(
 ) -> Result<Array> {
     let (iw, ih) = (image.width as usize, image.height as usize);
     let (tw, th) = (target_width as usize, target_height as usize);
+    // A 0×0 image with an empty buffer passes the length check but reaches the core resize
+    // `assert!` — give it the typed error `preprocess_clip_image_sized` already produces (F-084).
+    if iw == 0 || ih == 0 {
+        return Err(Error::Msg(format!(
+            "sdxl {kind} image has a zero dimension ({iw}x{ih})"
+        )));
+    }
     if image.pixels.len() != iw * ih * 3 {
         return Err(Error::Msg(format!(
             "sdxl {kind} image pixel buffer {} != {iw}x{ih}x3",
@@ -882,5 +889,22 @@ mod tests {
             e.contains("control"),
             "control error should name the kind: {e}"
         );
+    }
+
+    /// F-084: a 0×0 request image (empty buffer passes the length check) must be a typed error
+    /// instead of reaching the core resize `assert!`.
+    #[test]
+    fn preprocess_rejects_zero_dimension_image() {
+        let zero = Image {
+            width: 0,
+            height: 0,
+            pixels: vec![],
+        };
+        let e = preprocess_init_image(&zero, 8, 8).unwrap_err().to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+        let e = preprocess_control_image(&zero, 8, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
     }
 }

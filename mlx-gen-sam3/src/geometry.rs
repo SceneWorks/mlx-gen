@@ -23,7 +23,7 @@ use mlx_rs::{Array, Dtype, StreamOrDevice};
 
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::Sam3GeometryConfig;
 use crate::detr::{Attn, Ffn};
@@ -167,10 +167,13 @@ impl Sam3GeometryEncoder {
         vision: &Array,
         vision_pos: &Array,
     ) -> Result<Array> {
+        // Box prompts are request-supplied: validate shape/labels/coordinates before any host
+        // indexing (F-003/F-042). The [0,1] coordinate bound also caps the ROI-align grid loop.
+        let (n, boxes_host) = validate_box_prompts(boxes, box_labels)?;
+
         let sh = vision.shape();
         let (h, w) = (sh[1], sh[2]);
         let c = self.cfg.hidden_size;
-        let n = boxes.shape()[1];
 
         // (1) direct projection of the box coordinates
         let direct = self.boxes_direct.forward(boxes)?; // [1, N, C]
@@ -182,7 +185,6 @@ impl Sam3GeometryEncoder {
             &self.vision_ln_b,
             self.cfg.layer_norm_eps,
         )?; // [1, H, W, C]
-        let boxes_host = boxes.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec(); // N·4 cxcywh
         let pooled = self.roi_pool(&boxes_host, n, &norm_feat, h, w)?; // [1, N, C]
 
         // (3) sine position encoding of the box center (+ raw h/w), projected to C
@@ -249,6 +251,46 @@ impl Sam3GeometryEncoder {
         let pooled = matmul_device(&sampled, &wflat.transpose_axes(&[1, 0])?, &cpu)?; // [N, C]
         Ok(add(&pooled, &self.boxes_pool_b)?.reshape(&[1, n, c])?)
     }
+}
+
+/// Validate request-supplied box prompts before any host indexing (F-003/F-042): shape must be
+/// `[1, n, 4]` with `n ≥ 1`, `box_labels` must have exactly `n` entries each in `{0, 1}` (the
+/// `[2, C]` label-embed gather is otherwise out of bounds), and every cxcywh coordinate must be
+/// finite and within `[0, 1]` (which also bounds the host ROI-align grid loop — an unvalidated
+/// extent like `w = 1e6` would spin a ~10⁷-wide triple loop). Mirrors sam2's `preprocess` guard.
+/// Returns `(n, host cxcywh vec of length n·4)`.
+fn validate_box_prompts(boxes: &Array, box_labels: &[i32]) -> Result<(i32, Vec<f32>)> {
+    let sh = boxes.shape().to_vec();
+    if sh.len() != 3 || sh[0] != 1 || sh[2] != 4 || sh[1] < 1 {
+        return Err(Error::Msg(format!(
+            "sam3 box prompts must be [1, n, 4] normalized cxcywh with n >= 1, got shape {sh:?}"
+        )));
+    }
+    let n = sh[1];
+    if box_labels.len() != n as usize {
+        return Err(Error::Msg(format!(
+            "sam3 box prompts: {} label(s) for {n} box(es)",
+            box_labels.len()
+        )));
+    }
+    if let Some(&l) = box_labels.iter().find(|&&l| l != 0 && l != 1) {
+        return Err(Error::Msg(format!(
+            "sam3 box label {l} out of range (expected 0 = negative or 1 = positive)"
+        )));
+    }
+    let host = boxes.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+    if let Some((i, &v)) = host
+        .iter()
+        .enumerate()
+        .find(|(_, &v)| !v.is_finite() || !(0.0..=1.0).contains(&v))
+    {
+        return Err(Error::Msg(format!(
+            "sam3 box {} cxcywh component {} is {v} (must be finite and in [0, 1])",
+            i / 4,
+            i % 4
+        )));
+    }
+    Ok((n, host))
 }
 
 /// Sine position encoding of box centers (+ raw height/width), `[1, N, C+2]`. Mirrors
@@ -388,6 +430,62 @@ mod tests {
         assert!((row[2 * 4 + 1] - 1.0).abs() < 1e-6);
         let total: f32 = row.iter().sum();
         assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    /// F-003: request-supplied box prompts with a wrong shape, mismatched label count, or
+    /// out-of-range coordinates must be typed errors, not OOB host indexing / a hung ROI loop.
+    #[test]
+    fn validate_box_prompts_rejects_malformed_prompts() {
+        // Wrong last dim ([1, 2, 2] instead of [1, n, 4]) — would make boxes_host shorter than 4·n.
+        let bad_shape = Array::from_slice(&[0.5f32; 4], &[1, 2, 2]);
+        let e = validate_box_prompts(&bad_shape, &[1, 1])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("[1, n, 4]"), "unexpected error: {e}");
+
+        // Wrong ndim ([n, 4]).
+        let bad_ndim = Array::from_slice(&[0.5f32; 4], &[1, 4]);
+        assert!(validate_box_prompts(&bad_ndim, &[1]).is_err());
+
+        // Zero boxes.
+        let empty = Array::from_slice(&[] as &[f32], &[1, 0, 4]);
+        assert!(validate_box_prompts(&empty, &[]).is_err());
+
+        // Label count mismatch — would hard-panic `Array::from_slice(box_labels, &[n])`.
+        let ok_box = Array::from_slice(&[0.5f32, 0.5, 0.2, 0.2], &[1, 1, 4]);
+        let e = validate_box_prompts(&ok_box, &[1, 0])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("label"), "unexpected error: {e}");
+
+        // Label outside {0, 1} — OOB gather from the [2, C] label-embed table (F-042).
+        let e = validate_box_prompts(&ok_box, &[2]).unwrap_err().to_string();
+        assert!(e.contains("label 2"), "unexpected error: {e}");
+        assert!(validate_box_prompts(&ok_box, &[-1]).is_err());
+
+        // Oversized extent (w = 1e6) — would spin a ~10⁷-wide host ROI grid loop.
+        let huge = Array::from_slice(&[0.5f32, 0.5, 1e6, 0.2], &[1, 1, 4]);
+        let e = validate_box_prompts(&huge, &[1]).unwrap_err().to_string();
+        assert!(e.contains("[0, 1]"), "unexpected error: {e}");
+
+        // Non-finite coordinate.
+        let nan = Array::from_slice(&[0.5f32, f32::NAN, 0.2, 0.2], &[1, 1, 4]);
+        assert!(validate_box_prompts(&nan, &[1]).is_err());
+
+        // Negative coordinate.
+        let neg = Array::from_slice(&[-0.1f32, 0.5, 0.2, 0.2], &[1, 1, 4]);
+        assert!(validate_box_prompts(&neg, &[1]).is_err());
+    }
+
+    /// The valid path passes and returns `n` plus the host cxcywh copy.
+    #[test]
+    fn validate_box_prompts_accepts_valid_prompts() {
+        let boxes = Array::from_slice(&[0.5f32, 0.5, 0.2, 0.2, 0.0, 1.0, 1.0, 0.0], &[1, 2, 4]);
+        let (n, host) = validate_box_prompts(&boxes, &[1, 0]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(host.len(), 8);
+        assert_eq!(host[0], 0.5);
+        assert_eq!(host[5], 1.0);
     }
 
     #[test]

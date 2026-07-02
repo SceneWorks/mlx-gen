@@ -156,7 +156,7 @@ fn run_identity(quant_bits: Option<i32>, size_override: Option<u32>, out_png: &s
     };
 
     // Letterbox to the output size + detect the reference face (its embedding drives the IP path).
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).unwrap();
     let ref_face = model
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");
@@ -308,7 +308,7 @@ fn instantid_pose_mode_preserves_identity() {
 
     // Identity vs the reference embedding (the generated full-body face is small, so the cosine is
     // lower than the framed-portrait path; gate directionally for a clear positive signal).
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).unwrap();
     let ref_face = model
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");
@@ -357,7 +357,7 @@ fn instantid_face_restore_improves_identity() {
     };
 
     // The reference embedding (identity target) from the letterboxed reference.
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).unwrap();
     let ref_face = model
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");
@@ -455,7 +455,7 @@ fn instantid_view_angle_preserves_identity() {
     save_png("instantid_e2e_angle_out.png", &out);
 
     // Identity vs the reference's (frontal) embedding.
-    let canvas = letterbox(&ref_img, size, size);
+    let canvas = letterbox(&ref_img, size, size).unwrap();
     let ref_face = model
         .largest_face(&canvas.pixels, size as usize, size as usize)
         .expect("detect reference face");
@@ -516,7 +516,7 @@ fn instantid_user_lora_changes_output() {
                 &golden("arcface_iresnet100.safetensors"),
             )
             .expect("attach face stack");
-        let canvas = letterbox(&ref_img, size, size);
+        let canvas = letterbox(&ref_img, size, size).unwrap();
         let face = model
             .largest_face(&canvas.pixels, size as usize, size as usize)
             .expect("detect reference face");

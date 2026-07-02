@@ -336,7 +336,7 @@ impl InstantId {
         reference: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        let canvas = kps::letterbox(reference, req.width, req.height);
+        let canvas = kps::letterbox(reference, req.width, req.height)?;
         let face = self.largest_face(&canvas.pixels, req.height as usize, req.width as usize)?;
         let kps: Vec<(f32, f32)> = face.kps.iter().map(|p| (p[0], p[1])).collect();
         self.generate_with(req, &face.embedding, &kps, on_progress)
@@ -362,7 +362,7 @@ impl InstantId {
             ))
         })?;
         // Identity from the reference (letterboxed to the square canvas).
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
         let kps: Vec<(f32, f32)> = view.to_vec();
         let sq = InstantIdRequest {
@@ -396,7 +396,7 @@ impl InstantId {
             .map(|(x, y)| (x * side as f32, y * side as f32))
             .collect();
         // Identity from the reference (letterboxed to the square canvas).
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
         let sq = InstantIdRequest {
             width: side,
@@ -623,7 +623,7 @@ impl InstantId {
     ) -> Result<Image> {
         let side = req.width;
         // Identity from the reference (letterboxed to the square canvas).
-        let canvas = kps::letterbox(reference, side, side);
+        let canvas = kps::letterbox(reference, side, side)?;
         let face = self.largest_face(&canvas.pixels, side as usize, side as usize)?;
         // Place the reference's 5 face landmarks at the pose's head position (when the head is
         // visible). `None` ⇒ a back/occluded view: the no-face branch zeroes IdentityNet + IP.

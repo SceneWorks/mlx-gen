@@ -13,7 +13,7 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// The fixed model input side (`preprocessor_config.json` `size` = 518; multiple of `patch_size` 14).
 pub const INPUT_SIZE: i32 = 518;
@@ -63,6 +63,22 @@ pub fn rgb8_to_input(rgb: &[u8], width: u32, height: u32) -> Result<Array> {
 /// the token grid matches the loaded `position_embeddings`). The default model is square-518; this
 /// is the size-parametric form the estimator calls with `config().image_size`.
 pub fn rgb8_to_input_sized(rgb: &[u8], width: u32, height: u32, size: i32) -> Result<Array> {
+    // Request-supplied buffer funnel: a zero dimension underflows `.min(in_h - 1)` in the resampler
+    // (release: wraps → OOB) and a short buffer indexes out of bounds — reject both with a typed
+    // error (F-044; the guard convention face/gen-core already follow).
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 {
+        return Err(Error::Msg(format!(
+            "depth input image has a zero dimension ({width}x{height})"
+        )));
+    }
+    if rgb.len() != w * h * 3 {
+        return Err(Error::Msg(format!(
+            "depth input buffer is {} bytes, expected {} ({width}x{height}x3)",
+            rgb.len(),
+            w * h * 3
+        )));
+    }
     let out = size as usize;
     let mut unit = resize_rgb8_to_unit(rgb, height as usize, width as usize, out);
     // ImageNet normalize, in place.
@@ -117,6 +133,26 @@ mod tests {
             (got - expected_r).abs() < 1e-4,
             "channel-0 normalize: got {got}, want {expected_r}"
         );
+    }
+
+    /// F-044: a short/mismatched request buffer must be a typed error, not an OOB index in the
+    /// resampler.
+    #[test]
+    fn input_rejects_short_buffer() {
+        let rgb = vec![0u8; 5]; // not 4·4·3
+        let e = rgb8_to_input(&rgb, 4, 4).unwrap_err().to_string();
+        assert!(e.contains("48"), "should name the expected size: {e}");
+    }
+
+    /// F-044: a 0×0 image (empty buffer passes an exact-length check: 0 == 0) must be a typed
+    /// error — `in_h - 1` would underflow in the resampler.
+    #[test]
+    fn input_rejects_zero_dimension_image() {
+        let e = rgb8_to_input(&[], 0, 0).unwrap_err().to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+        // One zero side with a consistent (empty) buffer is equally degenerate.
+        assert!(rgb8_to_input(&[], 4, 0).is_err());
+        assert!(rgb8_to_input(&[], 0, 4).is_err());
     }
 
     #[test]

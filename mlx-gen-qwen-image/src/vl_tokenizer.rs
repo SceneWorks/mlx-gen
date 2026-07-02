@@ -159,6 +159,32 @@ pub fn encode_reference_latents(
     calc_w: u32,
     calc_h: u32,
 ) -> Result<(Array, (usize, usize))> {
+    let img = reference_image_nchw(&image, calc_w, calc_h)?;
+    let latent = vae.encode(&img)?.squeeze_axes(&[2])?; // [1,16,1,h/8,w/8] → [1,16,h/8,w/8]
+    let packed = pack_latents(&latent, calc_w, calc_h)?;
+    Ok((packed, ((calc_h / 16) as usize, (calc_w / 16) as usize)))
+}
+
+/// Validate + resize + normalize the reference image for [`encode_reference_latents`]: reject zero
+/// dims and a mismatched pixel buffer (F-081; the guard `QwenImageProcessor::preprocess` already
+/// has), then LANCZOS-resize to `(calc_w, calc_h)` and lay out `[0,255] → [-1,1]` NCHW
+/// `[1, 3, calc_h, calc_w]` f32 — the VAE encoder input.
+fn reference_image_nchw(image: &ImageInput, calc_w: u32, calc_h: u32) -> Result<Array> {
+    if image.width == 0 || image.height == 0 || calc_w == 0 || calc_h == 0 {
+        return Err(Error::Msg(format!(
+            "qwen reference image has a zero dimension ({}x{} -> {calc_w}x{calc_h})",
+            image.width, image.height
+        )));
+    }
+    let expected = image.height * image.width * 3;
+    if image.data.len() != expected {
+        return Err(Error::Msg(format!(
+            "qwen reference image buffer {} bytes != {}x{}x3 ({expected})",
+            image.data.len(),
+            image.width,
+            image.height
+        )));
+    }
     let (cw, ch) = (calc_w as usize, calc_h as usize);
     let resized = if (image.height, image.width) == (ch, cw) {
         image.data.iter().map(|&p| p as f32).collect::<Vec<f32>>()
@@ -176,10 +202,10 @@ pub fn encode_reference_latents(
             }
         }
     }
-    let img = Array::from_slice(&nchw, &[1, 3, calc_h as i32, calc_w as i32]);
-    let latent = vae.encode(&img)?.squeeze_axes(&[2])?; // [1,16,1,h/8,w/8] → [1,16,h/8,w/8]
-    let packed = pack_latents(&latent, calc_w, calc_h)?;
-    Ok((packed, ((calc_h / 16) as usize, (calc_w / 16) as usize)))
+    Ok(Array::from_slice(
+        &nchw,
+        &[1, 3, calc_h as i32, calc_w as i32],
+    ))
 }
 
 #[cfg(test)]
@@ -226,5 +252,71 @@ mod tests {
         .expect("expected an extreme-aspect-ratio error")
         .to_string();
         assert!(err.contains("zero dimension"), "got: {err}");
+    }
+
+    /// F-081: the reference-latent path indexes the request buffer — a short/mismatched buffer must
+    /// be a typed error, not an OOB panic (the guard `QwenImageProcessor::preprocess` already has).
+    #[test]
+    fn reference_image_nchw_rejects_short_buffer() {
+        let pixels = vec![0u8; 5]; // not 4·4·3
+        let e = reference_image_nchw(
+            &ImageInput {
+                data: &pixels,
+                width: 4,
+                height: 4,
+            },
+            16,
+            16,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("4x4x3"), "unexpected error: {e}");
+    }
+
+    /// F-081: zero image or condition dims must be typed errors.
+    #[test]
+    fn reference_image_nchw_rejects_zero_dims() {
+        let e = reference_image_nchw(
+            &ImageInput {
+                data: &[],
+                width: 0,
+                height: 0,
+            },
+            16,
+            16,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("zero dimension"), "unexpected error: {e}");
+        let pixels = vec![0u8; 4 * 4 * 3];
+        assert!(reference_image_nchw(
+            &ImageInput {
+                data: &pixels,
+                width: 4,
+                height: 4,
+            },
+            0,
+            16,
+        )
+        .is_err());
+    }
+
+    /// The valid path lays out [0,255] → [-1,1] NCHW at the condition dims.
+    #[test]
+    fn reference_image_nchw_normalizes_and_lays_out() {
+        let pixels = vec![255u8; 4 * 4 * 3];
+        let a = reference_image_nchw(
+            &ImageInput {
+                data: &pixels,
+                width: 4,
+                height: 4,
+            },
+            4,
+            4,
+        )
+        .unwrap();
+        assert_eq!(a.shape(), &[1, 3, 4, 4]);
+        let v = a.as_slice::<f32>();
+        assert!(v.iter().all(|&x| (x - 1.0).abs() < 1e-6), "255 → +1");
     }
 }

@@ -111,7 +111,7 @@ fn letterbox_matches_pil() {
         .unwrap();
     let golden = golden.as_slice::<u8>();
 
-    let out = letterbox(&src, ow, oh);
+    let out = letterbox(&src, ow, oh).unwrap();
     assert_eq!((out.width, out.height), (ow, oh), "letterbox output dims");
     let diff = out
         .pixels
