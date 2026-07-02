@@ -18,9 +18,9 @@ use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, resolve_flow_schedule, Capabilities, ConditioningKind, ControlBranch, Error,
-    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Result,
+    require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
+    ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Result,
 };
 use mlx_rs::Dtype;
 
@@ -128,13 +128,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 /// The Fun-Controlnet-Union is a *union* ControlNet (pose/canny/depth share one VAE-encoded control
-/// path), so the input-agnostic default [`AcceptedControlKinds::Any`] applies and all the control
-/// boilerplate (resolve/validate-present + the load helpers above) comes from the shared trait
-/// (sc-8241). The default message bodies already match this variant's hand-written wording, so no
-/// override is needed.
+/// path), so all the control boilerplate (resolve/validate-present + the load helpers above) comes
+/// from the shared trait (sc-8241). F-089: this is the SAME union checkpoint as the base variant, so
+/// it shares the base `accepted_kinds()` (`Only([Pose, Canny, Depth])`) — previously it fell back to
+/// the trait default `AcceptedControlKinds::Any`, accepting `Other("scribble")` the base rejects.
 impl ControlBranch for ZImageTurboControl {
     fn model_id(&self) -> &'static str {
         MODEL_ID
+    }
+
+    fn accepted_control_kinds(&self) -> AcceptedControlKinds {
+        crate::model_base_control::accepted_kinds()
     }
 }
 

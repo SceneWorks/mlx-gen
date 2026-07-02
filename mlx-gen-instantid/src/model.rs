@@ -412,6 +412,32 @@ impl InstantId {
         self.generate_with(&sq, &face.embedding, &kps, on_progress)
     }
 
+    /// F-024: validate the public `InstantIdRequest` fields the struct API exposes (it is not a
+    /// `Generator`, so `Capabilities::validate_request` never runs). `steps == 0` builds an empty
+    /// schedule and the pipeline VAE-decodes pure scaled noise as a "successful" image (the F-073
+    /// failure SDXL rejects); non-multiple-of-8 / zero dims fail deep in convs. Mirror the SDXL
+    /// `Capabilities` floor: steps ≥ 1, positive multiple-of-8 dims.
+    fn validate_request_params(req: &InstantIdRequest) -> Result<()> {
+        if req.steps == 0 {
+            return Err(Error::Msg(
+                "instantid: steps must be >= 1 (0 decodes pure noise as a success)".into(),
+            ));
+        }
+        if req.width == 0 || req.height == 0 {
+            return Err(Error::Msg(format!(
+                "instantid: width and height must be positive, got {}x{}",
+                req.width, req.height
+            )));
+        }
+        if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
+            return Err(Error::Msg(format!(
+                "instantid: width and height must be multiples of 8 (SDXL UNet/VAE), got {}x{}",
+                req.width, req.height
+            )));
+        }
+        Ok(())
+    }
+
     /// Core generate from a precomputed ArcFace `embedding` (512-d) and 5 `kps` (output-canvas pixel
     /// coords) — the face-stack-independent path (also the engine seam: `ip_adapter_scale = 0` +
     /// `controlnet_scale = 0` reduces to plain SDXL txt2img).
@@ -426,6 +452,7 @@ impl InstantId {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        Self::validate_request_params(req)?;
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
                 "instantid: ArcFace embedding must be 512-d, got {}",
@@ -699,6 +726,7 @@ impl InstantId {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        Self::validate_request_params(req)?;
         if embedding.len() != 512 {
             return Err(Error::Msg(format!(
                 "instantid: ArcFace embedding must be 512-d, got {}",

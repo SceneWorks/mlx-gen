@@ -63,6 +63,14 @@ const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
 /// than a bare `10 + 10*i`.
 const REFERENCE_TIME_STRIDE: i32 = 10;
 
+/// F-027: hard cap on the number of edit references a single request may supply. Each reference adds
+/// ~4096 joint-DiT tokens (sc-6124 measured ~104 GB peak with 2 UNBOUNDED refs at 1024² → quadratic
+/// SDPA + OOM from request input), and the time-stride band tops out at `REFERENCE_TIME_STRIDE * 8`.
+/// This matches the descriptor's `max_count` (8) and the REFERENCE_TIME_STRIDE doc invariant, but
+/// nothing previously ENFORCED it — `collect_edit_references` flattened every Reference/MultiReference
+/// with no bound. Request-input OOM is the repo's historical highest-severity class.
+const MAX_EDIT_REFERENCES: usize = 8;
+
 /// Sanitize model-generated text for a single-line, machine-parsed log record (the worker consumes
 /// the `ENHANCED_PROMPT:` / `ENHANCER_FALLBACK:` prefix): replace every control/whitespace char (incl.
 /// embedded newlines that would split the record or forge a second prefix line) with a space, collapse
@@ -381,6 +389,17 @@ impl Flux2 {
             return Err(Error::Msg(format!(
                 "{}: edit requires at least one reference image",
                 self.descriptor.id
+            )));
+        }
+        // F-027: cap the reference count — each ref adds ~4096 joint-DiT tokens (quadratic SDPA + a
+        // request-input OOM class). `MAX_EDIT_REFERENCES` matches the descriptor `max_count`/the
+        // REFERENCE_TIME_STRIDE invariant that nothing previously enforced.
+        if refs.len() > MAX_EDIT_REFERENCES {
+            return Err(Error::Msg(format!(
+                "{}: edit supports at most {MAX_EDIT_REFERENCES} reference images (got {}); \
+                 each adds ~4096 joint-DiT tokens",
+                self.descriptor.id,
+                refs.len()
             )));
         }
         Ok(refs)

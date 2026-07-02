@@ -96,13 +96,17 @@ impl TextEncoder {
         let (cos, sin) = self.rope.forward(s)?;
         let mask = build_mask(attention_mask, b, s)?;
 
-        // all_hidden_states = [embed, out(L0), out(L1), ...]; return the second-to-last.
-        let mut hidden = vec![embed];
+        // all_hidden_states = [embed, out(L0), out(L1), ...]; return the second-to-last. Track only
+        // the previous + current layer output instead of retaining all 37 (~180 MB f32 at the real
+        // hidden size) — F-089. `second_to_last` ends as all_hidden_states[len-2].
+        let mut prev = embed; // all_hidden_states[0] = embed
+        let mut second_to_last = prev.clone();
         for layer in &self.layers {
-            let h = layer.forward(hidden.last().unwrap(), &cos, &sin, &mask)?;
-            hidden.push(h);
+            let cur = layer.forward(&prev, &cos, &sin, &mask)?;
+            // After this push all_hidden_states would be [..., prev, cur]; second-to-last is `prev`.
+            second_to_last = std::mem::replace(&mut prev, cur);
         }
-        Ok(hidden[hidden.len() - 2].clone())
+        Ok(second_to_last)
     }
 }
 
