@@ -558,7 +558,7 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
 }
 
 mlx_gen::impl_generator!(Flux2 {
-    validate: |s, req| validate_request(&s.descriptor, req),
+    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), req),
     generate: generate_impl,
 });
 
@@ -824,7 +824,11 @@ impl Flux2 {
     }
 }
 
-pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
+pub(crate) fn validate_request(
+    desc: &ModelDescriptor,
+    is_edit: bool,
+    req: &GenerationRequest,
+) -> Result<()> {
     // Empty-prompt first so it wins over the shared floor for a bare default request.
     if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{}: prompt is required", desc.id)));
@@ -838,6 +842,17 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
         return Err(Error::Msg(format!(
             "{}: width and height must be multiples of 16, got {}x{}",
             desc.id, req.width, req.height
+        )));
+    }
+    // F-088: the edit variants consume at least one reference image (single `Reference`,
+    // `MultiReference`, or several `Reference`s). Previously this was enforced only inside
+    // `generate` (`collect_edit_references`); surface it at validate time — mirroring
+    // `Flux2DevControl`'s `require_control_present` — so an editor rejects a reference-less request up
+    // front instead of after loading and starting the run.
+    if is_edit && collect_reference_images(req).is_empty() {
+        return Err(Error::Msg(format!(
+            "{}: edit requires at least one reference image",
+            desc.id
         )));
     }
     Ok(())
@@ -1051,6 +1066,26 @@ mod tests {
         };
         let err = model.collect_edit_references(&req).unwrap_err().to_string();
         assert!(err.contains("at least one reference image"));
+    }
+
+    #[test]
+    fn edit_without_reference_rejected_at_validate() {
+        // F-088: the edit variants require a reference — enforce it at `validate` (not only inside
+        // `generate` via `collect_edit_references`), mirroring `Flux2DevControl::require_control_present`.
+        // A non-edit variant (Klein9b txt2img) must still validate a reference-less request.
+        let edit = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let req = GenerationRequest {
+            prompt: "make it night".into(),
+            ..Default::default()
+        };
+        let err = edit.validate(&req).unwrap_err().to_string();
+        assert!(
+            err.contains("at least one reference image"),
+            "edit validate should reject a reference-less request, got: {err}"
+        );
+        // The txt2img variant tolerates no reference.
+        let t2i = Flux2::new_for_tests(Flux2Variant::Klein9b);
+        assert!(t2i.validate(&req).is_ok());
     }
 
     // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------

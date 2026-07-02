@@ -567,12 +567,12 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     if req.prompt.is_empty() {
         return Err(Error::Msg("kolors: prompt must not be empty".into()));
     }
-    // `steps == 0` divides by zero in `KolorsEulerSampler::new` (`num_train_timesteps / num_steps`),
-    // and `steps > 1100` (the train-timestep count) makes `step_ratio == 0` so every timestep
-    // collapses to 1 — silent garbage. Reject both at the request boundary (F-124). `None` falls back
-    // to DEFAULT_STEPS.
+    // `steps == 0` divides by zero in `KolorsEulerSampler::new` (`num_train_timesteps / num_steps`) —
+    // now rejected by the shared floor above (F-007). `steps > 1100` (the train-timestep count) makes
+    // `step_ratio == 0` so every timestep collapses to 1 — a silent-garbage upper bound the floor
+    // doesn't know about, so keep it here (F-124). `None` falls back to DEFAULT_STEPS.
     if let Some(steps) = req.steps {
-        if steps == 0 || steps as usize > NUM_TRAIN_TIMESTEPS {
+        if steps as usize > NUM_TRAIN_TIMESTEPS {
             return Err(Error::Msg(format!(
                 "kolors: steps must be in 1..={NUM_TRAIN_TIMESTEPS} (got {steps})"
             )));
@@ -642,9 +642,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_steps() {
-        // F-124: `steps == 0` would divide by zero in the sampler; `steps > NUM_TRAIN_TIMESTEPS`
-        // collapses every timestep to 1. Both must be rejected at the request boundary; `None` and an
-        // in-range count pass.
+        // `steps == 0` would divide by zero in the sampler — now rejected by the shared floor (F-007,
+        // message "steps must be >= 1"). `steps > NUM_TRAIN_TIMESTEPS` collapses every timestep to 1 —
+        // still Kolors' own upper-bound check (F-124). Both must be rejected; `None` and an in-range
+        // count pass.
         let caps = descriptor().capabilities;
         let base = GenerationRequest {
             prompt: "a fox".into(),
@@ -652,14 +653,20 @@ mod tests {
             height: 1024,
             ..Default::default()
         };
-        for bad in [Some(0), Some(NUM_TRAIN_TIMESTEPS as u32 + 1)] {
-            let req = GenerationRequest {
-                steps: bad,
-                ..base.clone()
-            };
-            let err = validate_request(&caps, &req).unwrap_err().to_string();
-            assert!(err.contains("steps must be in"), "steps={bad:?} got: {err}");
-        }
+        // steps == 0 is rejected by the floor with its own message.
+        let zero = GenerationRequest {
+            steps: Some(0),
+            ..base.clone()
+        };
+        let err = validate_request(&caps, &zero).unwrap_err().to_string();
+        assert!(err.contains("steps must be >= 1"), "steps=0 got: {err}");
+        // steps > NUM_TRAIN_TIMESTEPS is rejected by Kolors' upper-bound check.
+        let over = GenerationRequest {
+            steps: Some(NUM_TRAIN_TIMESTEPS as u32 + 1),
+            ..base.clone()
+        };
+        let err = validate_request(&caps, &over).unwrap_err().to_string();
+        assert!(err.contains("steps must be in"), "over-max got: {err}");
         for ok in [None, Some(1), Some(50), Some(NUM_TRAIN_TIMESTEPS as u32)] {
             let req = GenerationRequest {
                 steps: ok,

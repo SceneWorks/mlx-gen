@@ -831,32 +831,17 @@ impl Sdxl {
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
 /// weights. Rejects unsupported guidance / negative prompt / conditioning / size / count.
 pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+    // Shared capability floor (F-022): count/steps range, size range, negative_prompt/guidance/
+    // true_cfg support gating + finiteness, sampler/scheduler/guidance_method membership, and accepted
+    // conditioning kinds. Delegating to core (like Kolors, F-132) restores the `true_cfg` and
+    // `guidance_method` checks this hand-rolled copy had dropped — a `cfg_pp` typo in `guidance_method`
+    // previously slipped through and silently rendered plain CFG. `steps == Some(0)` is now the floor's
+    // job too. The `?` keeps the typed `Error::Unsupported` for capability gaps.
+    caps.validate_request(MODEL_ID, req)?;
+
+    // SDXL-specific checks layered on top of the shared floor:
     if req.prompt.is_empty() {
         return Err(Error::Msg("sdxl: prompt must not be empty".into()));
-    }
-    if req.count == 0 || req.count > caps.max_count {
-        return Err(Error::Msg(format!(
-            "count {} out of range 1..={}",
-            req.count, caps.max_count
-        )));
-    }
-    // An explicit `steps: Some(0)` would run a 0-step denoise and VAE-decode pure scaled noise, so
-    // reject it (the crate's reject-loudly philosophy; F-073). A *derived* 0 from img2img
-    // `int(steps·strength)` is a legitimate no-op (returns the init) and is NOT this case.
-    if req.steps == Some(0) {
-        return Err(Error::Msg(
-            "sdxl: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
-        ));
-    }
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(Error::Msg(format!(
-            "{}x{} out of supported range {}..={}",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
     }
     // SDXL works in latent space at /8; both dims must be multiples of 8.
     if !req.width.is_multiple_of(8) || !req.height.is_multiple_of(8) {
@@ -864,42 +849,6 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             "sdxl: width/height must be multiples of 8 (got {}x{})",
             req.width, req.height
         )));
-    }
-    if req.guidance.is_some() && !caps.supports_guidance {
-        return Err(Error::Msg(
-            "sdxl: `guidance` is not supported by this build".into(),
-        ));
-    }
-    if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
-        return Err(Error::Msg(
-            "sdxl: negative prompt is not supported by this build".into(),
-        ));
-    }
-    // Reject an unsupported sampler instead of silently downgrading it to the ancestral default.
-    if let Some(s) = &req.sampler {
-        if !caps.samplers.contains(&s.as_str()) {
-            return Err(Error::Msg(format!(
-                "sdxl: unsupported sampler {s:?} (supported: {:?})",
-                caps.samplers
-            )));
-        }
-    }
-    // Likewise the scheduler (epic 7114 axis) — `discrete` (native) + the curated σ schedulers.
-    if let Some(s) = &req.scheduler {
-        if !caps.schedulers.contains(&s.as_str()) {
-            return Err(Error::Msg(format!(
-                "sdxl: unsupported scheduler {s:?} (supported: {:?})",
-                caps.schedulers
-            )));
-        }
-    }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "sdxl does not accept {kind:?} conditioning"
-            )));
-        }
     }
     Ok(())
 }
@@ -962,6 +911,38 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&caps, &one).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unadvertised_guidance_method_and_true_cfg() {
+        // F-022: the hand-rolled copy dropped the `guidance_method` membership + `true_cfg` gate. A
+        // `cfg_pp` typo (e.g. "cfgpp") previously slipped through and silently rendered plain CFG.
+        let caps = descriptor().capabilities;
+        // Advertised methods are ["cfg", "cfg_pp"]; a typo must be rejected (typed Unsupported).
+        let typo = GenerationRequest {
+            prompt: "a fox".into(),
+            guidance_method: Some("cfgpp".into()),
+            ..Default::default()
+        };
+        let err = validate_request(&caps, &typo).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "cfg_pp typo should be a typed Unsupported gap, got {err:?}"
+        );
+        // The correct spelling passes.
+        let ok = GenerationRequest {
+            prompt: "a fox".into(),
+            guidance_method: Some("cfg_pp".into()),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &ok).is_ok());
+        // SDXL doesn't support true_cfg — a request must be rejected, not ignored.
+        let tcfg = GenerationRequest {
+            prompt: "a fox".into(),
+            true_cfg: Some(4.0),
+            ..Default::default()
+        };
+        assert!(validate_request(&caps, &tcfg).is_err());
     }
 
     #[test]

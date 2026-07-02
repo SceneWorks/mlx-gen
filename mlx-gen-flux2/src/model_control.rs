@@ -335,7 +335,8 @@ impl Generator for Flux2DevControl {
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Shared capability floor (size/count/guidance/negative/accepted conditioning + multiple-of-16),
         // then the shared control-present check (sc-8241's `ControlBranch::require_control_present`).
-        validate_request(&self.descriptor, req)?;
+        // `is_edit = false`: the control variant requires a *Control* image, not an edit reference.
+        validate_request(&self.descriptor, false, req)?;
         self.require_control_present(req)?;
         Ok(())
     }

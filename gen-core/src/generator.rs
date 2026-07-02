@@ -522,10 +522,20 @@ impl Capabilities {
     /// `validate` then silently ignores at runtime:
     ///
     /// - `count` within `1..=max_count`,
+    /// - `steps` (when supplied) must be `>= 1` — an explicit `0` would run a 0-step denoise and
+    ///   VAE-decode pure noise (F-007); the schedule builders' `.max(1)` clamps document this as the
+    ///   real floor,
     /// - `width`/`height` within `min_size..=max_size`,
     /// - `negative_prompt` / `guidance` / `true_cfg` only when the matching `supports_*` flag is set,
-    /// - `sampler` / `scheduler` (when supplied) must name an advertised entry,
+    ///   and `guidance` / `true_cfg` must be finite (a NaN would poison the guidance math, F-053),
+    /// - `sampler` / `scheduler` / `guidance_method` (when supplied) must name an advertised entry,
     /// - every `conditioning` entry must be an [`accepts`](Self::accepts)ed kind.
+    ///
+    /// Capability-gap rejections (unsupported negative_prompt / guidance / true_cfg / sampler /
+    /// scheduler / guidance_method / conditioning) return the typed [`Error::Unsupported`] so a
+    /// consumer (SceneWorks worker / candle gating) can distinguish "this backend can't do that"
+    /// from a range violation or generic failure (F-008); malformed-value rejections (count/size/
+    /// steps out of range, non-finite guidance) return [`Error::Msg`].
     ///
     /// `id` is the model's descriptor id, used in error messages. Model-specific constraints — an
     /// empty-prompt rejection, size-alignment (multiple-of-N), frame-count divisibility,
@@ -547,6 +557,16 @@ impl Capabilities {
                 req.count, self.max_count
             )));
         }
+        // An explicit `steps: Some(0)` runs a 0-step denoise and VAE-decodes pure scaled noise; the
+        // schedule builders' `.max(1)` clamps (sampling.rs) cite this as the real floor, so enforce it
+        // here rather than letting it fall through to ad-hoc per-provider guards (F-007). `None` falls
+        // back to each model's default; a *derived* 0 from img2img `int(steps·strength)` is a separate,
+        // legitimate no-op handled downstream.
+        if req.steps == Some(0) {
+            return Err(Error::Msg(format!(
+                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+            )));
+        }
         if req.width < self.min_size
             || req.height < self.min_size
             || req.width > self.max_size
@@ -558,19 +578,39 @@ impl Capabilities {
             )));
         }
         if req.negative_prompt.is_some() && !self.supports_negative_prompt {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "{id}: negative prompts are not supported"
             )));
         }
         if req.guidance.is_some() && !self.supports_guidance {
-            return Err(Error::Msg(format!("{id}: guidance is not supported")));
+            return Err(Error::Unsupported(format!(
+                "{id}: guidance is not supported"
+            )));
         }
         if req.true_cfg.is_some() && !self.supports_true_cfg {
-            return Err(Error::Msg(format!("{id}: true_cfg is not supported")));
+            return Err(Error::Unsupported(format!(
+                "{id}: true_cfg is not supported"
+            )));
+        }
+        // A non-finite guidance / true_cfg would flow into the CFG combine and NaN-poison the run
+        // (a NaN passes `x > 1.0`-style checks silently); reject it at the boundary (F-053).
+        if let Some(g) = req.guidance {
+            if !g.is_finite() {
+                return Err(Error::Msg(format!(
+                    "{id}: guidance must be finite (got {g})"
+                )));
+            }
+        }
+        if let Some(c) = req.true_cfg {
+            if !c.is_finite() {
+                return Err(Error::Msg(format!(
+                    "{id}: true_cfg must be finite (got {c})"
+                )));
+            }
         }
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "{id}: unsupported sampler {s:?} (supported: {:?})",
                     self.samplers
                 )));
@@ -578,7 +618,7 @@ impl Capabilities {
         }
         if let Some(s) = &req.scheduler {
             if !self.schedulers.contains(&s.as_str()) {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "{id}: unsupported scheduler {s:?} (supported: {:?})",
                     self.schedulers
                 )));
@@ -586,7 +626,7 @@ impl Capabilities {
         }
         if let Some(m) = &req.guidance_method {
             if !self.supported_guidance_methods.contains(&m.as_str()) {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "{id}: unsupported guidance_method {m:?} (supported: {:?})",
                     self.supported_guidance_methods
                 )));
@@ -595,7 +635,7 @@ impl Capabilities {
         for c in &req.conditioning {
             let kind = c.kind();
             if !self.accepts(kind) {
-                return Err(Error::Msg(format!(
+                return Err(Error::Unsupported(format!(
                     "{id}: {kind:?} conditioning is not supported"
                 )));
             }
@@ -797,5 +837,115 @@ mod tests {
                 "case {i} should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn validate_request_rejects_explicit_zero_steps() {
+        // F-007: the floor now enforces the steps>=1 claim the schedule builders rely on.
+        let c = caps();
+        let bad = GenerationRequest {
+            steps: Some(0),
+            ..base_req()
+        };
+        let err = c.validate_request("m", &bad).unwrap_err();
+        assert!(matches!(err, Error::Msg(_)), "steps=0 is a range error");
+        assert!(err.to_string().contains("steps must be >= 1"));
+        // `None` and a positive count still pass.
+        assert!(c.validate_request("m", &base_req()).is_ok());
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    steps: Some(1),
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn capability_gaps_return_typed_unsupported() {
+        // F-008: capability-gap branches must be `Error::Unsupported`, not `Msg`, so candle gating /
+        // the worker can distinguish them. Malformed-value branches (range/finiteness) stay `Msg`.
+        let c = caps();
+        let gap_cases: Vec<GenerationRequest> = vec![
+            GenerationRequest {
+                negative_prompt: Some("n".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance: Some(3.5),
+                ..base_req()
+            },
+            GenerationRequest {
+                true_cfg: Some(4.0),
+                ..base_req()
+            },
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                scheduler: Some("linear".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                guidance_method: Some("apg".into()),
+                ..base_req()
+            },
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..base_req()
+            },
+        ];
+        for (i, req) in gap_cases.iter().enumerate() {
+            let err = c.validate_request("m", req).unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "gap case {i} should be typed Unsupported, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_finite_guidance_and_true_cfg_are_rejected() {
+        // F-053: a NaN passes `x > 1.0`-style checks; the floor rejects non-finite explicitly. Uses
+        // a caps that advertises guidance/true_cfg so the finiteness branch (not the support gate) runs.
+        let c = Capabilities {
+            supports_guidance: true,
+            supports_true_cfg: true,
+            ..caps()
+        };
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let g = GenerationRequest {
+                guidance: Some(bad),
+                ..base_req()
+            };
+            let err = c.validate_request("m", &g).unwrap_err();
+            assert!(
+                matches!(err, Error::Msg(_)),
+                "guidance {bad} → Msg range error"
+            );
+            assert!(err.to_string().contains("guidance must be finite"));
+            let t = GenerationRequest {
+                true_cfg: Some(bad),
+                ..base_req()
+            };
+            assert!(matches!(
+                c.validate_request("m", &t).unwrap_err(),
+                Error::Msg(_)
+            ));
+        }
+        // Finite guidance/true_cfg still pass.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    guidance: Some(3.5),
+                    true_cfg: Some(2.0),
+                    ..base_req()
+                }
+            )
+            .is_ok());
     }
 }

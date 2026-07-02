@@ -30,6 +30,13 @@ pub enum Error {
     #[error("cancelled")]
     Canceled,
 
+    /// The request asked for something this engine/backend cannot do (a capability gap the descriptor
+    /// doesn't advertise). Typed — like [`Error::Canceled`] — so it bridges to
+    /// [`gen_core::Error::Unsupported`] 1:1 in both directions; candle gating and the worker match on
+    /// the typed variant to tell "unsupported" apart from a generic failure (epic 3720, F-008).
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// A contextual message (config/validation/adapter-shape errors).
     #[error("{0}")]
     Msg(String),
@@ -60,6 +67,7 @@ impl From<Error> for gen_core::Error {
             Error::MissingTensor(s) => gen_core::Error::MissingTensor(s),
             Error::Io(io) => gen_core::Error::Io(io),
             Error::Canceled => gen_core::Error::Canceled,
+            Error::Unsupported(s) => gen_core::Error::Unsupported(s),
             Error::Msg(s) => gen_core::Error::Msg(s),
         }
     }
@@ -67,16 +75,18 @@ impl From<Error> for gen_core::Error {
 
 /// The reverse bridge: gen-core contract calls (tokenizer, registry, imageops, capability
 /// validation) return `gen_core::Error`; mlx-gen and family code invoke them with `?` inside
-/// `mlx_gen::Result` fns, so down-convert here. `Backend`/`Unsupported` have no rich mlx-gen
-/// analog and collapse to `Msg` (keeping the display text); `Canceled` maps across 1:1 so a
-/// round-trip preserves the typed cancellation (sc-4481).
+/// `mlx_gen::Result` fns, so down-convert here. `Backend` has no rich mlx-gen analog and collapses
+/// to `Msg` (keeping the display text); `Canceled` and `Unsupported` map across 1:1 so a round-trip
+/// preserves the typed cancellation (sc-4481) and the typed capability gap (F-008) — a provider that
+/// delegates to `Capabilities::validate_request` and then returns the error keeps it typed all the
+/// way to the worker / candle gating.
 impl From<gen_core::Error> for Error {
     fn from(e: gen_core::Error) -> Self {
         match e {
             gen_core::Error::Backend(b) => Error::Msg(b.to_string()),
             gen_core::Error::MissingTensor(s) => Error::MissingTensor(s),
             gen_core::Error::Io(io) => Error::Io(io),
-            gen_core::Error::Unsupported(s) => Error::Msg(format!("unsupported: {s}")),
+            gen_core::Error::Unsupported(s) => Error::Unsupported(s),
             gen_core::Error::Canceled => Error::Canceled,
             gen_core::Error::Msg(s) => Error::Msg(s),
         }
@@ -85,3 +95,36 @@ impl From<gen_core::Error> for Error {
 
 /// Crate-wide result type.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canceled_round_trips_1to1_both_directions() {
+        // The reference behavior the Unsupported bridge mirrors (sc-4481): Canceled stays typed.
+        let up: gen_core::Error = Error::Canceled.into();
+        assert!(matches!(up, gen_core::Error::Canceled));
+        let down: Error = gen_core::Error::Canceled.into();
+        assert!(matches!(down, Error::Canceled));
+    }
+
+    #[test]
+    fn unsupported_round_trips_1to1_both_directions() {
+        // F-008: a capability gap must stay a typed `Unsupported` across the seam so candle gating /
+        // the worker can distinguish it from a generic failure — not be stringified into `Msg`.
+        let up: gen_core::Error = Error::Unsupported("hyper sampler".into()).into();
+        match &up {
+            gen_core::Error::Unsupported(s) => assert_eq!(s, "hyper sampler"),
+            other => panic!("mlx-gen→gen-core Unsupported degraded to {other:?}"),
+        }
+        // Full round-trip gen-core → mlx-gen → gen-core stays typed.
+        let down: Error = up.into();
+        match &down {
+            Error::Unsupported(s) => assert_eq!(s, "hyper sampler"),
+            other => panic!("gen-core→mlx-gen Unsupported degraded to {other:?}"),
+        }
+        let back: gen_core::Error = down.into();
+        assert!(matches!(back, gen_core::Error::Unsupported(_)));
+    }
+}

@@ -284,21 +284,14 @@ impl Flux1DevControl {
                 "{FLUX1_DEV_CONTROL_ID}: prompt is required"
             )));
         }
-        let caps = &self.descriptor.capabilities;
-        if let Some(s) = &req.sampler {
-            if !caps.samplers.contains(&s.as_str()) {
-                return Err(Error::Msg(format!(
-                    "{FLUX1_DEV_CONTROL_ID}: unsupported sampler {s:?}"
-                )));
-            }
-        }
-        if let Some(s) = &req.scheduler {
-            if !caps.schedulers.contains(&s.as_str()) {
-                return Err(Error::Msg(format!(
-                    "{FLUX1_DEV_CONTROL_ID}: unsupported scheduler {s:?}"
-                )));
-            }
-        }
+        // Shared capability floor (F-025): the hand-rolled copy only checked sampler/scheduler and
+        // multiple-of-16, silently skipping min/max size, count bounds (`count: 0` succeeded on an
+        // empty batch), the steps>=1 floor, and negative_prompt/true_cfg/guidance rejection. Delegate
+        // to core (like Kolors, F-132) so those are enforced; the `?` preserves the typed
+        // `Error::Unsupported` for capability gaps.
+        self.descriptor
+            .capabilities
+            .validate_request(FLUX1_DEV_CONTROL_ID, req)?;
         if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
             return Err(Error::Msg(format!(
                 "{FLUX1_DEV_CONTROL_ID}: width and height must be multiples of 16, got {}x{}",
@@ -433,6 +426,57 @@ mod tests {
         assert!(policy.accepts(&ControlKind::Canny));
         assert!(policy.accepts(&ControlKind::Depth));
         assert!(!policy.accepts(&ControlKind::Other("scribble".into())));
+    }
+
+    #[test]
+    fn validate_floor_rejects_zero_count_and_capability_gaps() {
+        // F-025: the hand-rolled `validate_capability` skipped count/size bounds and negative/true_cfg
+        // rejection — `count: 0` silently succeeded on an empty batch. `validate_capability` now
+        // delegates to this shared floor; exercise it directly (no loaded weights needed).
+        let caps = descriptor_dev_control().capabilities;
+        let base = GenerationRequest {
+            prompt: "a fox".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![mlx_gen::Conditioning::Control {
+                image: Image {
+                    width: 64,
+                    height: 64,
+                    pixels: vec![0u8; 64 * 64 * 3],
+                },
+                kind: ControlKind::Pose,
+                scale: 1.0,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &base).is_ok(),
+            "a well-formed control request should pass the floor"
+        );
+        // count: 0 must be rejected (previously an empty-batch success).
+        let zero_count = GenerationRequest {
+            count: 0,
+            ..base.clone()
+        };
+        assert!(caps
+            .validate_request(FLUX1_DEV_CONTROL_ID, &zero_count)
+            .is_err());
+        // Below-min size must be rejected.
+        let tiny = GenerationRequest {
+            width: 16,
+            height: 16,
+            ..base.clone()
+        };
+        assert!(caps.validate_request(FLUX1_DEV_CONTROL_ID, &tiny).is_err());
+        // true_cfg / negative_prompt are unadvertised → typed Unsupported.
+        let tcfg = GenerationRequest {
+            true_cfg: Some(4.0),
+            ..base.clone()
+        };
+        assert!(matches!(
+            caps.validate_request(FLUX1_DEV_CONTROL_ID, &tcfg),
+            Err(gen_core::Error::Unsupported(_))
+        ));
     }
 
     #[test]

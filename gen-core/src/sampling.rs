@@ -165,7 +165,7 @@ pub fn lcm_style_timesteps(
 ) -> Vec<usize> {
     // Clamp caller-supplied counts so a 0 can't divide-by-zero (`num_train/original_steps`) or
     // underflow `reversed.len()-1` on an empty table. Mirrors `build_flow_sigmas`'s clamp; the real
-    // floor is `validate_request` enforcing steps>=1 upstream (F-037).
+    // floor is `Capabilities::validate_request` rejecting `steps == Some(0)` upstream (F-007/F-037).
     let original_steps = original_steps.max(1);
     let num_steps = num_steps.max(1);
     let k = num_train_timesteps / original_steps;
@@ -387,7 +387,8 @@ impl LightningPolicy {
     /// `round(arange(N, 0, −N/num_steps)) − 1`; sigmas are `√((1-ᾱ)/ᾱ)` linearly interpolated at
     /// those (float) timesteps, with a trailing `0` (`final_sigmas_type="zero"`).
     pub fn new(sched: &AlphaSchedule, num_train_timesteps: usize, num_steps: usize) -> Self {
-        // Guard /0 (F-037); the real floor is `validate_request` enforcing steps>=1 upstream.
+        // Guard /0 (F-037); the real floor is `Capabilities::validate_request` rejecting
+        // `steps == Some(0)` upstream (F-007).
         let num_steps = num_steps.max(1);
         let step_ratio = num_train_timesteps as f64 / num_steps as f64;
         // arange(N, 0, -step_ratio): N, N-step_ratio, … (num_steps entries), round, then −1.

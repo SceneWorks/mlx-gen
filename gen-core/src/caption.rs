@@ -263,12 +263,14 @@ impl CaptionCapabilities {
                 self.max_trigger_word_chars
             )));
         }
-        if req.sampling.temperature < 0.0 || req.sampling.temperature > 2.0 {
+        // NaN-rejecting range checks: `NAN < 0.0` and `NAN > 2.0` are both false, so a plain
+        // `x < lo || x > hi` would let a NaN temperature/top_p through to poison decode (F-053).
+        if !(req.sampling.temperature >= 0.0 && req.sampling.temperature <= 2.0) {
             return Err(Error::Msg(format!(
                 "{id}: temperature must be between 0 and 2"
             )));
         }
-        if req.sampling.top_p < 0.0 || req.sampling.top_p > 1.0 {
+        if !(req.sampling.top_p >= 0.0 && req.sampling.top_p <= 1.0) {
             return Err(Error::Msg(format!("{id}: top_p must be between 0 and 1")));
         }
         if req.sampling.max_new_tokens == 0 || req.sampling.max_new_tokens > self.max_new_tokens {
@@ -438,5 +440,28 @@ mod tests {
                 "case {i} should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn nan_sampling_params_are_rejected() {
+        // F-053: a NaN temperature/top_p passed the old `x < lo || x > hi` checks (both comparisons
+        // are false for NaN) and reached decode. The NaN-rejecting form must catch it.
+        let c = caps();
+        let bad_temp = CaptionRequest {
+            sampling: CaptionSampling {
+                temperature: f32::NAN,
+                ..Default::default()
+            },
+            ..base_req()
+        };
+        assert!(c.validate_request("captioner", &bad_temp).is_err());
+        let bad_top_p = CaptionRequest {
+            sampling: CaptionSampling {
+                top_p: f32::NAN,
+                ..Default::default()
+            },
+            ..base_req()
+        };
+        assert!(c.validate_request("captioner", &bad_top_p).is_err());
     }
 }

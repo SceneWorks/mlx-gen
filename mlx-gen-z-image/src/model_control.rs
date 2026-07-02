@@ -248,7 +248,7 @@ impl Generator for ZImageTurboControl {
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         // Shared capability checks (size/count/guidance/negative/accepted conditioning), then the
         // shared control-present check (sc-8241's `ControlBranch::require_control_present`).
-        validate_request(&self.descriptor.capabilities, req)?;
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req)?;
         self.require_control_present(req)?;
         Ok(())
     }

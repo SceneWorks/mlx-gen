@@ -159,7 +159,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 mlx_gen::impl_generator!(ZImage {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
     generate: generate_impl,
 });
 
@@ -318,7 +318,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            validate_request(&caps, &req).is_ok(),
+            validate_request(MODEL_ID, &caps, &req).is_ok(),
             "base must accept guidance + negative prompt"
         );
     }

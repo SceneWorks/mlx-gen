@@ -54,9 +54,13 @@ pub fn descriptor() -> ModelDescriptor {
         backend: "mlx",
         modality: Modality::Image,
         capabilities: Capabilities {
-            supports_negative_prompt: false, // real-CFG + negative prompt = sc-3075
-            supports_guidance: true,         // FLUX.1-dev guidance-distilled CFG (default ~4.0)
-            supports_true_cfg: false,        // sc-3075
+            // PuLID drives its OWN real-CFG (sc-3075): `generate` reads `req.true_cfg` (>1 enables the
+            // pos/neg identity branches) and `req.negative_prompt` (the negative branch text). The
+            // descriptor must advertise what `generate` actually honors, else the shared floor (which
+            // `validate` now delegates to, F-026) would reject the very request that drives the feature.
+            supports_negative_prompt: true, // honored in the real-CFG branch (sc-3075)
+            supports_guidance: true,        // FLUX.1-dev guidance-distilled CFG (default ~4.0)
+            supports_true_cfg: true, // >1 enables real-CFG pos/neg identity branches (sc-3075)
             conditioning: vec![ConditioningKind::Reference], // the reference face
             supports_lora: false,
             supports_lokr: false,
@@ -219,7 +223,17 @@ impl Generator for PulidFlux {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        // Require a reference face; the FLUX backbone validates the rest (size/steps/sampler).
+        // Validate against PuLID's OWN descriptor, not the FLUX-dev backbone's (F-026). `generate`
+        // delegates the denoise to `PulidFlux::flux` (the dev backbone), whose descriptor advertises
+        // the `hyper` sampler — but PuLID deliberately does NOT load the dev Hyper LoRA, so a `hyper`
+        // request would silently render WITHOUT it. PuLID's descriptor omits `hyper`, so delegating to
+        // its own capability floor rejects that (and every other un-advertised sampler/scheduler,
+        // negative_prompt, true_cfg, size/count/steps) instead of the backbone waving it through. The
+        // `?` keeps the typed `Error::Unsupported` for capability gaps.
+        self.descriptor
+            .capabilities
+            .validate_request(self.descriptor.id, req)?;
+        // PuLID-specific: a reference face image is required (consumed into the identity injector).
         self.reference_face(req)?;
         Ok(())
     }
@@ -429,6 +443,49 @@ mod tests {
         ];
         let err = select_reference_face(&cond).unwrap_err().to_string();
         assert!(err.contains("unsupported"), "got: {err}");
+    }
+
+    /// F-026: `validate` delegates to PuLID's OWN descriptor floor, which omits the `hyper` sampler
+    /// (PuLID doesn't load the dev Hyper LoRA). A `hyper` request must be rejected — not silently
+    /// rendered WITHOUT the LoRA the way the dev backbone descriptor would have allowed.
+    #[test]
+    fn own_descriptor_floor_rejects_hyper_sampler() {
+        let caps = descriptor().capabilities;
+        assert!(
+            !caps.samplers.contains(&"hyper"),
+            "PuLID's descriptor must omit the hyper sampler"
+        );
+        let base = GenerationRequest {
+            prompt: "a portrait".into(),
+            width: 1024,
+            height: 1024,
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        // hyper is not advertised → typed Unsupported.
+        let hyper = GenerationRequest {
+            sampler: Some("hyper".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            caps.validate_request(descriptor().id, &hyper),
+            Err(gen_core::Error::Unsupported(_))
+        ));
+        // A curated sampler + PuLID's real-CFG knobs (true_cfg / negative_prompt) now validate, since
+        // the descriptor advertises them (sc-3075).
+        let ok = GenerationRequest {
+            sampler: Some("euler".into()),
+            true_cfg: Some(2.0),
+            negative_prompt: Some("blurry".into()),
+            ..base
+        };
+        assert!(
+            caps.validate_request(descriptor().id, &ok).is_ok(),
+            "curated sampler + real-CFG should pass PuLID's floor"
+        );
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.

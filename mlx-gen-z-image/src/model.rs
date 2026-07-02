@@ -173,7 +173,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 mlx_gen::impl_generator!(ZImageTurbo {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
     generate: generate_impl,
 });
 
@@ -275,32 +275,24 @@ impl ZImageTurbo {
 /// Required divisor for requested image dims: VAE downsample (8) × transformer patch (2).
 const SIZE_MULTIPLE: u32 = 16;
 
-pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
+pub(crate) fn validate_request(
+    id: &str,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    // Shared capability floor (F-030): count/steps range, size range, negative_prompt/guidance/
+    // true_cfg support gating + finiteness, sampler/scheduler/guidance_method membership, and accepted
+    // conditioning kinds. The hand-rolled copy validated NONE of sampler/scheduler/true_cfg — a typo'd
+    // sampler silently fell back to Euler in `run_flow_sampler`. Delegating to core (like Kolors,
+    // F-132) rejects it. `id` is threaded from each of the four registered variants so the error
+    // strings name the actual model instead of a hardcoded `z_image_turbo:` (F-089a). The `?` keeps
+    // the typed `Error::Unsupported` for capability gaps.
+    caps.validate_request(id, req)?;
+
+    // Z-Image-specific checks layered on top of the shared floor:
     if req.prompt.is_empty() {
-        return Err(mlx_gen::Error::Msg(
-            "z_image_turbo: prompt must not be empty".into(),
-        ));
-    }
-    if req.count == 0 || req.count > caps.max_count {
         return Err(mlx_gen::Error::Msg(format!(
-            "count {} out of range 1..={}",
-            req.count, caps.max_count
-        )));
-    }
-    // `steps == 0` builds a 1-element sigmas schedule; img2img then indexes `sigmas[init_time_step]`
-    // (>= 1) out of bounds → process abort, and txt2img silently decodes pure noise (F-032). `None`
-    // falls back to DEFAULT_STEPS, so only an explicit zero is rejected.
-    if req.steps == Some(0) {
-        return Err(mlx_gen::Error::Msg("steps must be >= 1".into()));
-    }
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(mlx_gen::Error::Msg(format!(
-            "{}x{} out of supported range {}..={}",
-            req.width, req.height, caps.min_size, caps.max_size
+            "{id}: prompt must not be empty"
         )));
     }
     // The pipeline needs dims divisible by VAE downsample (8) × patch (2) = 16. A non-multiple either
@@ -308,27 +300,9 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     // and silently returns a smaller image than requested (F-033) — reject it clearly at the boundary.
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(mlx_gen::Error::Msg(format!(
-            "{}x{} must be a multiple of {SIZE_MULTIPLE} (VAE 8 × patch 2)",
+            "{id}: {}x{} must be a multiple of {SIZE_MULTIPLE} (VAE 8 × patch 2)",
             req.width, req.height
         )));
-    }
-    if req.guidance.is_some() && !caps.supports_guidance {
-        return Err(mlx_gen::Error::Msg(
-            "z_image_turbo is guidance-distilled; `guidance` is not supported".into(),
-        ));
-    }
-    if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
-        return Err(mlx_gen::Error::Msg(
-            "z_image_turbo does not support a negative prompt".into(),
-        ));
-    }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(mlx_gen::Error::Msg(format!(
-                "z_image_turbo does not accept {kind:?} conditioning"
-            )));
-        }
     }
     Ok(())
 }
@@ -357,7 +331,9 @@ mod tests {
         // `as_slice` on the size-0 token array — F-001).
         let caps = descriptor().capabilities;
         let req = GenerationRequest::default(); // default prompt is empty
-        let err = validate_request(&caps, &req).unwrap_err().to_string();
+        let err = validate_request(MODEL_ID, &caps, &req)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty"), "got: {err}");
     }
 
@@ -370,7 +346,7 @@ mod tests {
             guidance: Some(4.0),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
         // out-of-range size.
         req = GenerationRequest {
             prompt: "a fox".into(),
@@ -378,13 +354,13 @@ mod tests {
             height: 64,
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
         // a plain valid request passes.
         req = GenerationRequest {
             prompt: "a fox".into(),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
     }
 
     #[test]
@@ -398,7 +374,9 @@ mod tests {
             steps: Some(0),
             ..Default::default()
         };
-        let err = validate_request(&caps, &req).unwrap_err().to_string();
+        let err = validate_request(MODEL_ID, &caps, &req)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("steps must be >= 1"), "got: {err}");
 
         // `None` falls back to DEFAULT_STEPS and a positive count both pass.
@@ -408,7 +386,10 @@ mod tests {
                 steps,
                 ..Default::default()
             };
-            assert!(validate_request(&caps, &ok).is_ok(), "steps={steps:?}");
+            assert!(
+                validate_request(MODEL_ID, &caps, &ok).is_ok(),
+                "steps={steps:?}"
+            );
         }
     }
 
@@ -424,7 +405,9 @@ mod tests {
                 height: h,
                 ..Default::default()
             };
-            let err = validate_request(&caps, &req).unwrap_err().to_string();
+            let err = validate_request(MODEL_ID, &caps, &req)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("multiple of 16"), "{w}x{h} got: {err}");
         }
         // A multiple-of-16 in-range request still passes.
@@ -434,7 +417,45 @@ mod tests {
             height: 768,
             ..Default::default()
         };
-        assert!(validate_request(&caps, &ok).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &ok).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_typoed_sampler_and_scheduler() {
+        // F-030: the hand-rolled copy never validated sampler/scheduler, so a typo'd sampler silently
+        // fell back to Euler in `run_flow_sampler`. Delegating to the floor now rejects an
+        // un-advertised name as a typed Unsupported gap. The error string threads the actual model id.
+        let caps = descriptor().capabilities;
+        let bad_sampler = GenerationRequest {
+            prompt: "a fox".into(),
+            sampler: Some("eular".into()), // typo of "euler"
+            ..Default::default()
+        };
+        let err = validate_request(MODEL_ID, &caps, &bad_sampler).unwrap_err();
+        assert!(
+            matches!(err, mlx_gen::Error::Unsupported(_)),
+            "typo'd sampler must be a typed Unsupported gap, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(MODEL_ID),
+            "error must name the model id, got: {err}"
+        );
+        let bad_scheduler = GenerationRequest {
+            prompt: "a fox".into(),
+            scheduler: Some("not_a_scheduler".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_request(MODEL_ID, &caps, &bad_scheduler).unwrap_err(),
+            mlx_gen::Error::Unsupported(_)
+        ));
+        // An advertised curated sampler passes.
+        let ok = GenerationRequest {
+            prompt: "a fox".into(),
+            sampler: Some("euler".into()),
+            ..Default::default()
+        };
+        assert!(validate_request(MODEL_ID, &caps, &ok).is_ok());
     }
 
     #[test]
@@ -447,7 +468,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
     }
 
     #[test]
