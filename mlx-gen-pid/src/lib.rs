@@ -24,6 +24,7 @@
 //! it must be surfaced/labeled as research/evaluation-only at the worker/web layer (Phase 3).
 
 pub mod backbone;
+pub mod budget;
 pub mod caption;
 pub mod config;
 pub mod decoder;

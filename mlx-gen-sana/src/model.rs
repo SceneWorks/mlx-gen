@@ -52,10 +52,19 @@ pub const MODEL_ID: &str = "sana_1600m";
 /// Registry id for **SANA-Sprint** 1.6B 1024px (the CFG-free, SCM/TrigFlow few-step variant, sc-8490).
 pub const SPRINT_MODEL_ID: &str = "sana_sprint_1600m";
 
-/// SANA-1.6B's native generation resolution (the model is bucket-trained at 1024²; the catalog
-/// gates the exposed buckets tighter, this is the engine validation range).
+/// SANA-1.6B's native generation resolution. The model is bucket-trained at 1024² and the only
+/// real-weight e2e that exists validates 1024² ([`real_weight_1024_e2e`]), so 1024 is the validated
+/// engine envelope — and the advertised [`Capabilities::max_size`] is bounded to it.
+///
+/// **Why not 2048 (F-032, sc-9095):** the DC-AE decoder ([`crate::dc_ae::DcAeDecoder::decode`]) runs
+/// the full f32 decode monolithically — no tiling — so at 2048² the shallow 128-channel stage
+/// materializes ~2.1 GB tensors with several live at once (GLUMBConv expands 8×), an uncatchable
+/// OOM/SIGKILL class the workspace already budgeted for wan (sc-4998) and seedvr2 (sc-8135/8261). DC-AE
+/// is a deep conv stack that *could* be spatially tiled, but no larger-than-1024 output is validated,
+/// so we advertise only what we can honor rather than tiling toward an unvalidated envelope. Raising
+/// this ceiling later means porting wan's budgeted spatial tiling, not just bumping the constant.
 const RES_MIN: u32 = 256;
-const RES_MAX: u32 = 2048;
+const RES_MAX: u32 = 1024;
 /// DC-AE 32× spatial compression — requested dims must be a multiple of this so the latent edge
 /// (`image / 32`) is integral.
 const RES_MULTIPLE: u32 = crate::pipeline::SPATIAL_SCALE;
@@ -384,6 +393,29 @@ mod tests {
     fn validate_accepts_1024_square() {
         let d = descriptor();
         assert!(validate_request(&d, &req(1024, 1024)).is_ok());
+    }
+
+    #[test]
+    fn max_size_is_the_validated_1024_envelope() {
+        // F-032 (sc-9095): the DC-AE decode is monolithic f32 (no tiling), so we advertise only the
+        // validated 1024² envelope — not the old, un-decodable 2048² — on both the base and Sprint
+        // descriptors. Advertising must match what we refuse.
+        assert_eq!(descriptor().capabilities.max_size, 1024);
+        assert_eq!(sprint_descriptor().capabilities.max_size, 1024);
+    }
+
+    #[test]
+    fn validate_rejects_2048_over_the_dc_ae_envelope() {
+        // A 2048² request (a legal multiple of 32) now falls outside the advertised max_size and is
+        // refused up front with the shared size error — rather than proceeding into a monolithic f32
+        // DC-AE decode that OOMs on a smaller Mac (F-032).
+        let d = descriptor();
+        let err = validate_request(&d, &req(2048, 2048))
+            .expect_err("2048² is above the validated DC-AE envelope");
+        assert!(
+            err.to_string().contains("size"),
+            "size-range refusal, got: {err}"
+        );
     }
 
     #[test]

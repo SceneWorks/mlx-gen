@@ -102,6 +102,12 @@ impl PidEngine {
         self.cfg.latent_spatial_down_factor
     }
 
+    /// The backbone config (`patch_size`/`hidden_size`/…) — used by the F-013 decode memory-budget
+    /// guard ([`crate::budget::guard`]) at the resolve seam.
+    pub fn config(&self) -> &PidConfig {
+        &self.cfg
+    }
+
     /// Mint a per-generation [`PidDecoder`] bound to one caption. `sigma` is the LQ degrade level
     /// (0 for a clean-latent decode of a fully-denoised latent); `seed` drives the sampler's noise +
     /// per-step ε. Rebuilds the [`PidNet`] from the retained weights (cheap relative to decode) and
@@ -179,6 +185,22 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
+    // Memory budget guard (F-013, sc-9095). PiD super-resolves in pixel space by `engine.scale()`, so a
+    // `max_size`-legal `req.width × req.height` decodes at `(width·scale) × (height·scale)` — a 2048²
+    // request → 8192², tens of GB of concurrent pixel-space + patch-stream tensors. Estimate that peak
+    // against this machine's `safe_budget_gib()` (min(MLX_limit × 0.85, maxBufferLength) — the same
+    // shared budget wan/seedvr2 use) and refuse *here*, before the caption encode + `PidNet` build,
+    // rather than letting the OS SIGKILL the worker mid-decode. There is no clean spatial-tiling seam
+    // for a single global-attention PixDiT super-res forward, so the typed refusal is the minimum.
+    crate::budget::guard(
+        model_id,
+        req.count,
+        req.width,
+        req.height,
+        engine.scale(),
+        engine.config(),
+        mlx_gen::memory::safe_budget_gib(),
+    )?;
     // Thread the request's cancel flag into the minted decoder so the ~100 s 4-step decode honors a
     // cancel per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag,
     // so we bind it here where the request is in scope.
