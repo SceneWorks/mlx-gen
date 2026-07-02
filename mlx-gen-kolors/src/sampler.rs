@@ -25,6 +25,14 @@ use mlx_gen::{DiffusionSampler, Error, Result};
 /// it makes `step_ratio == 0` so every timestep collapses to a single value.
 pub const NUM_TRAIN_TIMESTEPS: usize = 1100;
 
+/// Kolors' `scaled_linear` β schedule endpoints (diffusers `EulerDiscreteScheduler` config: β₀ =
+/// 0.00085, β₁ = 0.014). Single source of truth (F-083) — the native sampler
+/// ([`KolorsEulerSampler::kolors`]), the curated-path `DiscreteModelSampling` (`model.rs`), and the
+/// trainer's DDPM schedule (`training.rs`) all build the *same* `scaled_linear` betas over
+/// [`NUM_TRAIN_TIMESTEPS`], so hoist the literals here rather than re-spelling them at each site.
+pub const BETA_START: f32 = 0.00085;
+pub const BETA_END: f32 = 0.014;
+
 /// Kolors' EulerDiscrete (leading) sampler over the 1100-step `scaled_linear` schedule.
 pub struct KolorsEulerSampler {
     /// Interpolated sigmas at the (effective) timesteps, length `num_steps + 1` (trailing `0.0`).
@@ -45,8 +53,8 @@ impl KolorsEulerSampler {
     pub fn kolors(num_steps: usize, model_dtype: Dtype) -> Result<Self> {
         Self::new(
             NUM_TRAIN_TIMESTEPS,
-            0.00085,
-            0.014,
+            BETA_START,
+            BETA_END,
             1,
             num_steps,
             model_dtype,

@@ -25,7 +25,7 @@ use mlx_gen_sdxl::{
 };
 
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
-use crate::sampler::{KolorsEulerSampler, NUM_TRAIN_TIMESTEPS};
+use crate::sampler::{KolorsEulerSampler, BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
 use crate::tokenizer::KolorsTokenizer;
 
 /// VAE spatial downscale (latent is image/8 per side).
@@ -110,6 +110,44 @@ fn cfg_conditioning(
             pos.1.clone(),
             kolors_time_ids(1, height, width),
         ))
+    }
+}
+
+/// CFG-batch a preprocessed ControlNet control image to match the U-Net latents' batch dim (sc-9343,
+/// follow-up to F-005). The Kolors ControlNet sees the SAME CFG-batched input as the U-Net:
+///
+/// - `cfg > 1.0` → duplicate the control image to `[cond, uncond]` (B=2), matching the CFG-batched
+///   latents `denoise_core` builds;
+/// - `cfg <= 1.0` → the single control image (B=1), matching the unbatched latents.
+///
+/// `cimg` is the already-preprocessed control image (`preprocess_control_image` → `[1, H, W, 3]`);
+/// this is only the shape-preserving CFG duplication so it is a pure, synthetic-array-testable gate
+/// shared by every control mode (`denoise_controlnet_latents`, `denoise_controlnet_ip_latents`, and
+/// the curated path) — the per-mode branch that could silently regress the B=1/B=2 contract.
+fn cfg_batch_control_image(cimg: &Array, cfg: f32) -> Result<Array> {
+    use mlx_rs::ops::concatenate_axis;
+    if cfg > 1.0 {
+        Ok(concatenate_axis(&[cimg, cimg], 0)?)
+    } else {
+        Ok(cimg.clone())
+    }
+}
+
+/// CFG-batch IP-Adapter image tokens to match the U-Net latents' batch dim (sc-9343, follow-up to
+/// F-005). Mirrors [`cfg_batch_control_image`] but the uncond row gets **no** image conditioning:
+///
+/// - `cfg > 1.0` → `[image tokens, zeros]` (B=2) — the uncond half sees a zeroed token stream;
+/// - `cfg <= 1.0` → the image tokens alone (B=1).
+///
+/// `ip_tokens` is `[1, N, 2048]` (from `IpImageEncoder::tokens`). Pure + synthetic-array-testable,
+/// shared by every IP mode (`denoise_ip_latents`, `denoise_controlnet_ip_latents`, curated path).
+fn cfg_batch_ip_tokens(ip_tokens: &Array, cfg: f32) -> Result<Array> {
+    use mlx_rs::ops::{concatenate_axis, zeros};
+    if cfg > 1.0 {
+        let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
+        Ok(concatenate_axis(&[ip_tokens, &zero], 0)?)
+    } else {
+        Ok(ip_tokens.clone())
     }
 }
 
@@ -390,11 +428,11 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::{add, concatenate_axis, multiply, zeros};
+        use mlx_rs::ops::{add, multiply};
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
         // — the same `EulerDiscreteScheduler` config the native sampler interpolates, here as the
         // discrete `ModelSampling` the curated solvers integrate over (ε-prediction, σ_data = 1).
-        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, 0.00085, 0.014)?;
+        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)?;
         let ms = DiscreteModelSampling::sdxl(&sched);
         let scheduler = scheduler_name
             .and_then(Scheduler::from_name)
@@ -424,11 +462,7 @@ impl Kolors {
         let controls: Vec<ControlContext> = match control {
             Some((controlnet, control_image, scale)) => {
                 let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-                let cimg = if cfg > 1.0 {
-                    concatenate_axis(&[&cimg, &cimg], 0)?
-                } else {
-                    cimg
-                };
+                let cimg = cfg_batch_control_image(&cimg, cfg)?;
                 vec![ControlContext {
                     cond_embed: controlnet.embed_cond(&cimg)?,
                     controlnet,
@@ -442,15 +476,7 @@ impl Kolors {
         // (the uncond gets no image conditioning) when guidance is on; the image tokens alone when off
         // — exactly as `denoise_ip_latents`.
         let ip_batched = match ip_tokens {
-            Some((tokens, scale)) => {
-                let batched = if cfg > 1.0 {
-                    let zero = zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
-                    concatenate_axis(&[tokens, &zero], 0)?
-                } else {
-                    tokens.clone()
-                };
-                Some((batched, scale))
-            }
+            Some((tokens, scale)) => Some((cfg_batch_ip_tokens(tokens, cfg)?, scale)),
             None => None,
         };
 
@@ -545,18 +571,13 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         // The ControlNet sees the same CFG-batched input as the U-Net (cfg>1 ⇒ [cond, uncond]).
         let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-        let cimg = if cfg > 1.0 {
-            concatenate_axis(&[&cimg, &cimg], 0)?
-        } else {
-            cimg
-        };
+        let cimg = cfg_batch_control_image(&cimg, cfg)?;
         let cc = ControlContext {
             // The conditioning embedding is step-invariant, computed once per denoise here (F-069).
             // Under the registry's count loop this runs once per image rather than once per run; the
@@ -656,19 +677,13 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::{concatenate_axis, zeros};
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         // IP-Adapter image tokens, batched to match the U-Net latents: [image tokens, zeros] under CFG
         // (the uncond row gets no image conditioning); the image tokens alone when guidance is off.
-        let tokens = if cfg > 1.0 {
-            let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
-            concatenate_axis(&[ip_tokens, &zero], 0)?
-        } else {
-            ip_tokens.clone()
-        };
+        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
         let d = Denoiser {
             unet: &self.unet,
@@ -727,7 +742,6 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::{concatenate_axis, zeros};
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         // Seed the img2img init (raw `x₀ + noise·σ_start`), as in `denoise_img2img_latents`.
@@ -735,11 +749,7 @@ impl Kolors {
 
         // The ControlNet sees the same CFG-batched control image as the U-Net (cfg>1 ⇒ [cond, uncond]).
         let cimg = preprocess_control_image(control_image, width as u32, height as u32)?;
-        let cimg = if cfg > 1.0 {
-            concatenate_axis(&[&cimg, &cimg], 0)?
-        } else {
-            cimg
-        };
+        let cimg = cfg_batch_control_image(&cimg, cfg)?;
         let cc = ControlContext {
             cond_embed: controlnet.embed_cond(&cimg)?,
             controlnet,
@@ -749,12 +759,7 @@ impl Kolors {
         // Batch the IP tokens to match the latents: a zeros uncond row (the uncond gets no image
         // conditioning) under CFG; the image tokens alone when guidance is off — as in
         // `denoise_ip_latents`.
-        let tokens = if cfg > 1.0 {
-            let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
-            concatenate_axis(&[ip_tokens, &zero], 0)?
-        } else {
-            ip_tokens.clone()
-        };
+        let tokens = cfg_batch_ip_tokens(ip_tokens, cfg)?;
 
         let d = Denoiser {
             unet: &self.unet,
@@ -965,5 +970,193 @@ mod tests {
         assert_eq!(ctx.shape(), &[1, 4, 8]);
         assert_eq!(pooled.shape(), &[1, 8]);
         assert_eq!(time_ids.shape(), &[1, 6]);
+    }
+
+    // --- sc-9343: per-mode control-image + IP-token batch-shape contract ------------------------
+    //
+    // Follow-up to sc-9091 (F-005). `cfg_conditioning` already has default-run tests, but the per-mode
+    // control-image / IP-token gates (`cfg_batch_control_image`, `cfg_batch_ip_tokens`) that the six
+    // denoise assemblies use to keep the ControlNet / IP token batch dim aligned with the latents were
+    // only exercised end-to-end by the `#[ignore]`d real-weight smoke. These default-run tests assert
+    // the B=1 (CFG-off, guidance ≤ 1.0) / B=2 (CFG-on, guidance > 1.0) contract for each of the six
+    // modes using synthetic arrays (no ChatGLM3-6B / U-Net / VAE), so a future edit can't silently
+    // regress it. The extraction is a pure refactor — these assemble exactly what the methods build.
+
+    /// A tiny synthetic preprocessed control image (`preprocess_control_image` shape `[1, H, W, 3]`,
+    /// here `[1, 2, 2, 3]`), tagged so the CFG-duplication order is checkable.
+    fn synthetic_control_image(tag: f32) -> Array {
+        mlx_rs::ops::full::<f32>(&[1, 2, 2, 3], mlx_gen::array::scalar(tag)).unwrap()
+    }
+
+    /// Tiny synthetic IP-Adapter image tokens (`IpImageEncoder::tokens` shape `[1, N, 2048]`, here
+    /// `[1, 4, 8]`), tagged so the zeros-uncond row is checkable.
+    fn synthetic_ip_tokens(tag: f32) -> Array {
+        mlx_rs::ops::full::<f32>(&[1, 4, 8], mlx_gen::array::scalar(tag)).unwrap()
+    }
+
+    /// The expected batch dim per guidance setting: B=2 under CFG (guidance > 1.0), B=1 with it off.
+    fn expected_batch(cfg: f32) -> i32 {
+        if cfg > 1.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The two CFG regimes to sweep: one CFG-on value and the CFG-off values (guidance ≤ 1.0, all of
+    /// which disable the uncond stream and must produce B=1).
+    const CFG_CASES: [f32; 4] = [5.0, 1.0, 0.5, 0.0];
+
+    /// Mode: **base** (plain T2I) — conditioning only, no control / IP. `denoise_latents`.
+    #[test]
+    fn mode_base_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(ctx.shape(), &[b, 4, 8], "base context B at cfg={cfg}");
+            assert_eq!(pooled.shape(), &[b, 8], "base pooled B at cfg={cfg}");
+            assert_eq!(time_ids.shape(), &[b, 6], "base time_ids B at cfg={cfg}");
+        }
+    }
+
+    /// Mode: **img2img** — same conditioning-only assembly as base (the init latents don't affect the
+    /// conditioning batch). `denoise_img2img_latents`.
+    #[test]
+    fn mode_img2img_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(ctx.shape(), &[b, 4, 8], "img2img context B at cfg={cfg}");
+            assert_eq!(pooled.shape(), &[b, 8], "img2img pooled B at cfg={cfg}");
+            assert_eq!(time_ids.shape(), &[b, 6], "img2img time_ids B at cfg={cfg}");
+        }
+    }
+
+    /// Mode: **controlnet** — conditioning + a CFG-batched control image. `denoise_controlnet_latents`.
+    #[test]
+    fn mode_controlnet_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(ctx.shape(), &[b, 4, 8], "controlnet context B at cfg={cfg}");
+            assert_eq!(pooled.shape(), &[b, 8], "controlnet pooled B at cfg={cfg}");
+            assert_eq!(
+                time_ids.shape(),
+                &[b, 6],
+                "controlnet time_ids B at cfg={cfg}"
+            );
+
+            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            assert_eq!(
+                cimg.shape(),
+                &[b, 2, 2, 3],
+                "controlnet control image B at cfg={cfg}"
+            );
+        }
+    }
+
+    /// Mode: **ip** — conditioning + CFG-batched IP tokens (a zeros uncond row under CFG).
+    /// `denoise_ip_latents`.
+    #[test]
+    fn mode_ip_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(ctx.shape(), &[b, 4, 8], "ip context B at cfg={cfg}");
+            assert_eq!(pooled.shape(), &[b, 8], "ip pooled B at cfg={cfg}");
+            assert_eq!(time_ids.shape(), &[b, 6], "ip time_ids B at cfg={cfg}");
+
+            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            assert_eq!(tokens.shape(), &[b, 4, 8], "ip tokens B at cfg={cfg}");
+            if cfg > 1.0 {
+                // Row 0 is the image tokens (tag 1.0 → 4*8), row 1 the zeros uncond (0.0).
+                assert_eq!(tokens.index(0).sum(None).unwrap().item::<f32>(), 32.0);
+                assert_eq!(
+                    tokens.index(1).sum(None).unwrap().item::<f32>(),
+                    0.0,
+                    "the uncond IP row is zeroed"
+                );
+            }
+        }
+    }
+
+    /// Mode: **controlnet_ip** (the combined strict-pose tier, sc-5012) — conditioning + a CFG-batched
+    /// control image + CFG-batched IP tokens. `denoise_controlnet_ip_latents`.
+    #[test]
+    fn mode_controlnet_ip_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(
+                ctx.shape(),
+                &[b, 4, 8],
+                "controlnet_ip context B at cfg={cfg}"
+            );
+            assert_eq!(
+                pooled.shape(),
+                &[b, 8],
+                "controlnet_ip pooled B at cfg={cfg}"
+            );
+            assert_eq!(
+                time_ids.shape(),
+                &[b, 6],
+                "controlnet_ip time_ids B at cfg={cfg}"
+            );
+
+            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            assert_eq!(
+                cimg.shape(),
+                &[b, 2, 2, 3],
+                "controlnet_ip control image B at cfg={cfg}"
+            );
+            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            assert_eq!(
+                tokens.shape(),
+                &[b, 4, 8],
+                "controlnet_ip tokens B at cfg={cfg}"
+            );
+        }
+    }
+
+    /// Mode: **curated** (the additive unified-sampler path, sc-7121) — the same per-mode gates as the
+    /// bespoke dispatch, threaded through `denoise_curated_latents`: conditioning always, plus the
+    /// optional CFG-batched control image and IP tokens when the conditioned sub-providers are wired.
+    #[test]
+    fn mode_curated_batch_shape() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in CFG_CASES {
+            let b = expected_batch(cfg);
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).unwrap();
+            assert_eq!(ctx.shape(), &[b, 4, 8], "curated context B at cfg={cfg}");
+            assert_eq!(pooled.shape(), &[b, 8], "curated pooled B at cfg={cfg}");
+            assert_eq!(time_ids.shape(), &[b, 6], "curated time_ids B at cfg={cfg}");
+
+            // The curated path threads control + IP through the SAME gates (sc-7297).
+            let cimg = cfg_batch_control_image(&synthetic_control_image(1.0), cfg).unwrap();
+            assert_eq!(
+                cimg.shape(),
+                &[b, 2, 2, 3],
+                "curated control image B at cfg={cfg}"
+            );
+            let tokens = cfg_batch_ip_tokens(&synthetic_ip_tokens(1.0), cfg).unwrap();
+            assert_eq!(tokens.shape(), &[b, 4, 8], "curated tokens B at cfg={cfg}");
+        }
     }
 }

@@ -66,12 +66,8 @@ use mlx_gen_sdxl::{
 use crate::chatglm3::{ChatGlmConfig, ChatGlmModel};
 use crate::model::{kolors_time_ids, render_sample};
 use crate::registry::MODEL_ID;
-use crate::sampler::NUM_TRAIN_TIMESTEPS;
+use crate::sampler::{BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
 use crate::tokenizer::KolorsTokenizer;
-
-/// Kolors `scaled_linear` betas — `β₀ = 0.00085`, `β₁ = 0.014` (the [`KolorsEulerSampler`] config).
-const BETA_START: f32 = 0.00085;
-const BETA_END: f32 = 0.014;
 
 /// The Kolors family deltas behind the shared [`train_family`] backbone (sc-7781): the ChatGLM3-6B
 /// encoder + its tokenizer, and the DDPM `alphas_cumprod` schedule that drives the noising. Held in

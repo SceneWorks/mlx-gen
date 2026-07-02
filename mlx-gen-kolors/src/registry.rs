@@ -13,7 +13,7 @@
 //! worker, or this crate's own test binary) links `mlx-gen-kolors`. The core `mlx-gen` crate does
 //! **not** depend on the model crates (by design); there is no root-crate dependency to add.
 
-use mlx_rs::{random, Dtype};
+use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::{
     curated_scheduler_names, default_seed, Capabilities, Conditioning, ConditioningKind,
@@ -334,6 +334,68 @@ impl KolorsGenerator {
 
         let (lh, lw) = (h / SPATIAL_SCALE, w / SPATIAL_SCALE);
 
+        // F-083: the curated-path init latent (`encode_init_latents`) is seed-INDEPENDENT (the VAE
+        // encode draws no RNG — confirmed by the per-image RNG-order note below), so it is identical
+        // across the count loop (only the noise varies per seed). Hoist it above the loop instead of
+        // re-encoding the same reference image every iteration (sdxl F-068 precedent).
+        let curated_init: Option<(Option<Array>, f32)> = if use_curated {
+            let (init_opt, strength) = if control.is_some() && ip_mode {
+                let (reference_image, _) = reference.expect("ip mode requires a reference");
+                (
+                    Some(encode_init_latents(
+                        self.kolors.vae(),
+                        reference_image,
+                        w as u32,
+                        h as u32,
+                    )?),
+                    req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
+                )
+            } else if let Some((image, strength)) = img2img {
+                (
+                    Some(encode_init_latents(
+                        self.kolors.vae(),
+                        image,
+                        w as u32,
+                        h as u32,
+                    )?),
+                    strength,
+                )
+            } else {
+                (None, 0.0)
+            };
+            Some((init_opt, strength))
+        } else {
+            None
+        };
+
+        // F-083: the legacy (native `euler_discrete`) dispatch's init latents are seed-INDEPENDENT for
+        // the same reason (`encode_init_latents` → `vae.encode_mean` draws no RNG), so hoist them above
+        // the loop too instead of re-encoding the same reference every iteration. Two sites mirror the
+        // two per-mode branch arms below: the combined strict-pose tier (Control + IP-Adapter, seeded
+        // from the reference == IP image) and plain img2img (seeded from its reference). Both are `None`
+        // on the curated path (which uses `curated_init`) and on the non-img2img modes.
+        let legacy_pose_init: Option<Array> = if !use_curated && control.is_some() && ip.is_some() {
+            let (reference_image, _) = reference.expect("ip mode requires a reference");
+            Some(encode_init_latents(
+                self.kolors.vae(),
+                reference_image,
+                w as u32,
+                h as u32,
+            )?)
+        } else {
+            None
+        };
+        let legacy_img2img_init: Option<Array> =
+            match (use_curated, control.is_none(), &ip, img2img) {
+                (false, true, None, Some((image, _))) => Some(encode_init_latents(
+                    self.kolors.vae(),
+                    image,
+                    w as u32,
+                    h as u32,
+                )?),
+                _ => None,
+            };
+
         // PiD decode overlay (epic 7840, sc-7848): mint a per-generation decoder (clean σ=0, seeded
         // from `base_seed`) when `req.use_pid` is set and the model was loaded with `LoadSpec::pid`;
         // it super-resolves the final latent 4× in place of the SDXL VAE. `None` ⇒ byte-exact VAE.
@@ -371,31 +433,10 @@ impl KolorsGenerator {
                 // Init mirrors the bespoke dispatch's per-mode choice: the combined pose tier seeds
                 // img2img from the reference (== the IP image) at the strict-pose strength; plain
                 // img2img seeds from its reference; ControlNet-only / IP-only / txt2img seed raw
-                // `ε·σ_max` (no init).
-                let (init_opt, strength) = if control.is_some() && ip_mode {
-                    let (reference_image, _) = reference.expect("ip mode requires a reference");
-                    (
-                        Some(encode_init_latents(
-                            self.kolors.vae(),
-                            reference_image,
-                            w as u32,
-                            h as u32,
-                        )?),
-                        req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
-                    )
-                } else if let Some((image, strength)) = img2img {
-                    (
-                        Some(encode_init_latents(
-                            self.kolors.vae(),
-                            image,
-                            w as u32,
-                            h as u32,
-                        )?),
-                        strength,
-                    )
-                } else {
-                    (None, 0.0)
-                };
+                // `ε·σ_max` (no init). Hoisted above the loop (F-083: seed-independent VAE encode).
+                let (init_opt, strength) = curated_init
+                    .clone()
+                    .expect("curated_init is Some iff use_curated (computed above)");
 
                 let latents = self.kolors.denoise_curated_latents(
                     req.sampler.as_deref(),
@@ -426,14 +467,15 @@ impl KolorsGenerator {
                 // Combined strict-pose tier (sc-5012): the pose ControlNet (skeleton) + the
                 // IP-Adapter identity, on an img2img init from the SAME reference. `ip_mode` ⇒ a
                 // Reference is present (validated), and it is both the IP image prompt and the init.
-                let (reference_image, _) = reference.expect("ip mode requires a reference");
-                let init_latents =
-                    encode_init_latents(self.kolors.vae(), reference_image, w as u32, h as u32)?;
+                // The init latents were hoisted above the loop (F-083: seed-independent VAE encode).
+                let init_latents = legacy_pose_init
+                    .as_ref()
+                    .expect("legacy_pose_init is Some in the non-curated combined-pose mode");
                 let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
                 self.kolors.denoise_controlnet_ip_latents(
                     self.control.as_ref().expect("validated above"),
                     tokens,
-                    &init_latents,
+                    init_latents,
                     &noise,
                     skeleton,
                     &pos,
@@ -477,10 +519,13 @@ impl KolorsGenerator {
                     &req.cancel,
                     on_progress,
                 )?
-            } else if let Some((image, strength)) = img2img {
-                let x0 = encode_init_latents(self.kolors.vae(), image, w as u32, h as u32)?;
+            } else if let Some((_image, strength)) = img2img {
+                // Init latents hoisted above the loop (F-083: seed-independent VAE encode).
+                let x0 = legacy_img2img_init
+                    .as_ref()
+                    .expect("legacy_img2img_init is Some in the non-curated img2img mode");
                 self.kolors.denoise_img2img_latents(
-                    &x0,
+                    x0,
                     &noise,
                     &pos,
                     neg.as_ref(),
