@@ -107,7 +107,14 @@ else
   echo "cache  : missing ($CACHE)"
 fi
 mkdir -p "$CACHE_DIR"
-cp -f "$SRC" "$CACHE"               # replace atomically-enough; never leaves the cache absent
+# Atomic install (F-117): cp -f truncates-then-writes, so an MLX process launching concurrently can
+# read a partially-written metallib and panic on a missing symbol. Stage to a temp file in the same
+# directory (so the rename is an atomic mv on APFS) and rename over the cache — the cache is never
+# observed in a partial state.
+stage="$(mktemp "$CACHE.tmp.XXXXXX")"
+trap 'rm -f "$stage"' EXIT
+cp -f "$SRC" "$stage"
+mv -f "$stage" "$CACHE"
 
 if verify "$CACHE"; then
   echo "OK: installed complete metallib -> $CACHE"

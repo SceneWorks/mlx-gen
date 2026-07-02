@@ -52,9 +52,23 @@ sceneworks-gen-core-testkit = { path = "gen-core-testkit" }
 # core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
 # so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of
 # the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/inventory/tokenizers/serde_json/
-# minijinja) so this preserves gen-core's zero-tensor invariant. Branch-pinned to match the mlx-llm
-# convention; cargo unifies on one core-llm across the graph. See sc-7189.
-core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# minijinja) so this preserves gen-core's zero-tensor invariant. Rev-pinned (F-048): mlx-llm (pinned
+# just below) declares core-llm at `branch = "main"`, so cargo would otherwise resolve core-llm to
+# whatever main's tip is on each generate-lockfile — a moving mutable ref, the last branch pin in the
+# workspace. Pinning here to main's current tip keeps the lock's core-llm unified with the one mlx-llm
+# pulls in (one core-llm build, one type), and the rev + `cargo ... --locked` in CI means a changed
+# core-llm is now a deliberate, reviewed re-pin rather than a silent drift. Bump this rev (and the
+# lock) in lockstep with the SceneWorks worker + mlx-llm pins. See sc-7189 / sc-9109.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "54cbac806304e823470ce3ded08f78589acdbb62" }
+# The shared on-device LLM engine (KV cache + sampler + RoPE): the only MLX-backed LLM decode runtime.
+# Pinned to the SAME rev the SceneWorks worker pins so cargo unifies ONE mlx-llm — one `Array`, one
+# `core-llm` — across the worker dependency graph (the worker also depends on mlx-llm directly for
+# prompt-refine). Both mlx-gen and mlx-llm build the identical pmetal `mlx-rs`, so there is a single
+# MLX build and one `Array` type. Hoisted here (F-049) from the 3 crates that copy-pasted it
+# (joycaption + flux2 + sensenova, sensenova once more as a dev-dep): a single source of truth so a
+# divergent pin — the failure mode workspace.dependencies exists to prevent — cannot reintroduce the
+# two-Array-builds class. Bump in lockstep with core-llm + the worker.
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
 thiserror = "2"
 # Link-time model registration (the DI-container stand-in; see docs/MODEL_ARCHITECTURE.md §4).
 inventory = "0.3"
@@ -69,6 +83,12 @@ safetensors = "0.4"
 # per-module `alpha_pattern`/`rank_pattern`) in gen-core's weights-metadata layer (sc-5513). Already
 # in the lock transitively via safetensors; surfaced as a direct dep for the blob parser.
 serde_json = "1"
+# PNG/JPEG decode for the e2e parity tests' visual-dump fixtures (every family test crate dev-depends
+# on it). Hoisted here (F-115): the per-crate pins had drifted to two feature sets (`["png"]` vs
+# `["png","jpeg"]`), so a crate that loads a JPEG fixture would silently need the wider set. The
+# superset `["png","jpeg"]` is the safe default for a dev-only dep (additive; crates that only render
+# PNG pay nothing extra at runtime).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [package]
 name = "mlx-gen"

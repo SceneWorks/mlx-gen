@@ -18,9 +18,9 @@ mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry.
 inventory = { workspace = true }
 # bernini_renderer.json knob sidecar reading.
-serde_json = "1"
+serde_json = { workspace = true }
 # Source-media decode (i2i/v2v/r2v/rv2v conditioning). PNG + JPEG cover the still inputs.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 # Qwen2.5-VL ChatML tokenizer (planner templating, sc-5136).
 tokenizers = { workspace = true }
 

@@ -13,17 +13,16 @@ mlx-gen = { path = ".." }
 # Must match the core crate's MLX binding exactly (shared `Array` type). See root Cargo.toml.
 mlx-rs = { workspace = true }
 # config.json parsing (matches the sdxl/wan/ltx/flux2 provider convention: serde_json::Value, no derive).
-serde_json = "1"
+serde_json = { workspace = true }
 # Link-time self-registration of the `Generator` into the core registry (sc-3194).
 inventory = { workspace = true }
 # The shared on-device decode primitives (KV cache + sampler + RoPE). The dual-path AR runtime
 # (sc-3187) + denoise loop consume mlx-llm's `ContiguousKvCache` / `sample` / `Rope` instead of
 # hand-rolled copies (sc-7159); the bespoke dual-path / multimodal-MRoPE / think-interleave runtime
-# stays here. Pin must equal every other mlx-llm pin in the worker graph (mlx-gen-joycaption +
-# mlx-gen-flux2 + the worker) so cargo unifies ONE mlx-llm — one `Array`, one `core-llm`.
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
+# stays here. The pin lives in the root workspace so cargo unifies ONE mlx-llm across the worker graph.
+mlx-llm = { workspace = true }
 
 [dev-dependencies]
 # The cache-equivalence parity test reads `KvCache::offset()` on the shared cache directly, so the
 # integration-test crate needs the trait in scope (same pin as the library dependency above).
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", rev = "7041411f395e43c542770d1cfb3c3945c8c9a875" }
+mlx-llm = { workspace = true }

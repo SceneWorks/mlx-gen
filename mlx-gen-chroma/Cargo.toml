@@ -24,8 +24,8 @@ mlx-rs = { workspace = true }
 inventory = { workspace = true }
 # Offline pre-quantization converter (sc-8777): annotate the packed transformer `config.json` with a
 # `quantization` block (HF/diffusers-compat; the Rust loader auto-detects via `.scales` and ignores it).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # PNG dump of the Rust render for visual inspection in the e2e parity test.
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }

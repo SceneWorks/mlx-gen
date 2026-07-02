@@ -20,4 +20,4 @@ mlx-rs = { workspace = true }
 
 [dev-dependencies]
 # PNG inspection output for the e2e test (matches the workspace `image` version).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }

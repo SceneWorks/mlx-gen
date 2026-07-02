@@ -19,7 +19,7 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 # Save the e2e render frames for inspection (matches the workspace `image` version).
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 # Real-weight typed-cancellation conformance gate (story 6883): drives the registered svd_xt
 # Generator through the testkit cancellation check. Weight-gated (#[ignore]).
 sceneworks-gen-core-testkit = { workspace = true }

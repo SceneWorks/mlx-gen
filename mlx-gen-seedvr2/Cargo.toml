@@ -15,7 +15,7 @@ mlx-rs = { workspace = true }
 # Link-time generator registration (`inventory::submit!` collected by mlx_gen's `inventory::collect!`).
 inventory = { workspace = true }
 # config parsing (matches the sdxl/wan/ltx/flux2/lens provider convention).
-serde_json = "1"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # Real-weight typed-cancellation conformance gate (story 6883): drives the registered seedvr2

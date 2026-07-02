@@ -25,10 +25,10 @@ mlx-rs = { workspace = true }
 # force-links this crate.
 inventory = { workspace = true }
 # Parse the diffusers `transformer/config.json` + `model_index.json` (architecture + quant manifest).
-serde_json = "1"
+serde_json = { workspace = true }
 # Decode training-dataset images (sc-7577 Raw LoRA trainer) + encode the e2e real-weight smoke output to
 # PNG (sc-7571); mirrors mlx-gen-lens / mlx-gen-z-image.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
 
 [dev-dependencies]
 # Backend-neutral gen-core contract conformance (capability honesty / progress monotonicity / typed

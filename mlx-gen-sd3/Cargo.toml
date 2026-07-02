@@ -28,6 +28,6 @@ mlx-rs = { workspace = true }
 # Link-time self-registration into mlx-gen's model registry (wired by the later E5 model story).
 inventory = { workspace = true }
 # Parse the diffusers `transformer/config.json` arch manifest in the converter / validator.
-serde_json = "1"
+serde_json = { workspace = true }
 # Decode the LoRA-training dataset images (T2 sc-7883). Also serves the e2e smoke PNG save in tests.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }

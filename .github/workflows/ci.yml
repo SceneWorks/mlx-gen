@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege GITHUB_TOKEN (F-047): the default job token is write-capable, which CI does not
+# need. Scoping to read-only contents matches the fetch-only operations the steps perform.
+permissions:
+  contents: read
+
 # Supersede in-flight runs on the same ref (the macOS + MLX build is expensive).
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,20 +25,20 @@ jobs:
     name: gen-core + testkit (Linux, no tensor backend)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Install Rust (pinned by rust-toolchain.toml)
         run: |
           rustup show
           rustup component add rustfmt clippy
           rustc --version
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Format (contract crates)
         run: cargo fmt -p sceneworks-gen-core -p sceneworks-gen-core-testkit --check
       - name: Clippy (contract crates)
-        run: cargo clippy -p sceneworks-gen-core -p sceneworks-gen-core-testkit --all-targets -- -D warnings
+        run: cargo clippy --locked -p sceneworks-gen-core -p sceneworks-gen-core-testkit --all-targets -- -D warnings
       - name: Test (contract crates + testkit stub conformance)
-        run: cargo test -p sceneworks-gen-core -p sceneworks-gen-core-testkit
+        run: cargo test --locked -p sceneworks-gen-core -p sceneworks-gen-core-testkit
 
   test:
     name: fmt + clippy + test (macOS / Metal GPU)
@@ -56,7 +61,7 @@ jobs:
       # garbage below 26.2).
       MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Toolchain versions
         run: |
@@ -87,13 +92,13 @@ jobs:
           rustc --version
 
       - name: Cache cargo + mlx-sys build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace

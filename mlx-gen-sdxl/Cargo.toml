@@ -23,8 +23,8 @@ inventory = { workspace = true }
 # that tokenizer to match the reference IDs exactly; `regex` provides the unicode-property pattern.
 regex = "1"
 # Parse vocab.json (a flat {token: id} object) without pulling a heavy dep.
-serde_json = "1"
+serde_json = { workspace = true }
 # Decode training-dataset images (LoRA/LoKr training, sc-3045) and save the e2e render for
 # inspection. PNG + JPEG cover the SceneWorks dataset formats; the trainer center-crops + hands the
 # Image to the VAE preprocess.
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { workspace = true }
