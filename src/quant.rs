@@ -35,9 +35,37 @@ pub const DEFAULT_GROUP_SIZE: i32 = 64;
 /// `[out, in/gs]` ⇒ `in = scales.cols·gs`; the u32-packed `weight` is `[out, in·bits/32]` ⇒
 /// `bits = wq.cols·32/in`. Exact for any group-aligned Q4/Q8 pack, so the bit-width need not be
 /// carried in a side manifest.
-fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> i32 {
-    let in_dim = scales.shape()[1] * group_size;
-    wq.shape()[1] * 32 / in_dim
+///
+/// F-011: returns `Result` and validates the shapes a corrupt/mis-converted pre-quantized snapshot
+/// would otherwise mishandle: a 1-D `scales` (or `wq`) panics on the shape index; a `[out, 0]` scales
+/// tensor makes `in_dim == 0` → integer divide-by-zero; a mis-packed `wq` yields bits ∉ {4,8}. The
+/// shared load seam for every Group-B packed snapshot feeds straight off external `.safetensors`, so
+/// these shapes are untrusted.
+pub fn packed_bits(wq: &Array, scales: &Array, group_size: i32) -> Result<i32> {
+    let sshape = scales.shape();
+    let wshape = wq.shape();
+    if sshape.len() != 2 || wshape.len() != 2 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: scales and weight must be 2-D, got scales {:?} / weight {:?}",
+            sshape, wshape
+        )));
+    }
+    let in_dim = sshape[1] * group_size;
+    if in_dim == 0 {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: zero input dim (scales cols {} × group_size {})",
+            sshape[1], group_size
+        )));
+    }
+    let bits = wshape[1] * 32 / in_dim;
+    if !matches!(bits, 4 | 8) {
+        return Err(crate::Error::Msg(format!(
+            "packed quant: inferred bit-width {bits} ∉ {{4, 8}} \
+             (weight cols {}, in_dim {in_dim}); snapshot is corrupt or mis-converted",
+            wshape[1]
+        )));
+    }
+    Ok(bits)
 }
 
 /// Load `{base}` as an [`AdaptableLinear`] — **packed** (Q4/Q8) when `{base}.scales` is present (a
@@ -54,7 +82,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<Adapt
     };
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
-        let bits = packed_bits(wq, scales, group_size);
+        let bits = packed_bits(wq, scales, group_size)?;
         return Ok(AdaptableLinear::from_quantized_parts(
             wq.clone(),
             scales.clone(),
@@ -75,7 +103,7 @@ pub fn lin(w: &Weights, base: &str, bias: bool, group_size: i32) -> Result<Adapt
 pub fn embedding(w: &Weights, base: &str, group_size: i32) -> Result<TokenEmbedding> {
     if let Some(scales) = w.get(&format!("{base}.scales")) {
         let wq = w.require(&format!("{base}.weight"))?;
-        let bits = packed_bits(wq, scales, group_size);
+        let bits = packed_bits(wq, scales, group_size)?;
         return Ok(TokenEmbedding::from_quantized_parts(
             wq.clone(),
             scales.clone(),
@@ -146,4 +174,52 @@ pub fn quantize_map(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-011: a Q4 pack at group_size 64 derives bits == 4 from the standard shapes.
+    #[test]
+    fn packed_bits_derives_q4() {
+        // scales [out, in/gs] = [128, 4] ⇒ in_dim 256; wq [out, in·4/32] = [128, 32] ⇒ bits 4.
+        let scales = Array::zeros::<f32>(&[128, 4]).unwrap();
+        let wq = Array::zeros::<u32>(&[128, 32]).unwrap();
+        assert_eq!(packed_bits(&wq, &scales, 64).unwrap(), 4);
+    }
+
+    #[test]
+    fn packed_bits_derives_q8() {
+        // scales [out, in/gs] = [64, 2] ⇒ in_dim 128; wq [out, in·8/32] = [64, 32] ⇒ bits 8.
+        let scales = Array::zeros::<f32>(&[64, 2]).unwrap();
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        assert_eq!(packed_bits(&wq, &scales, 64).unwrap(), 8);
+    }
+
+    #[test]
+    fn packed_bits_rejects_1d_shapes() {
+        let scales = Array::zeros::<f32>(&[64]).unwrap(); // 1-D
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("must be 2-D"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_zero_in_dim() {
+        // [out, 0] scales ⇒ in_dim 0 ⇒ integer divide-by-zero today; now a typed error.
+        let scales = Array::zeros::<f32>(&[64, 0]).unwrap();
+        let wq = Array::zeros::<u32>(&[64, 32]).unwrap();
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("zero input dim"), "{err}");
+    }
+
+    #[test]
+    fn packed_bits_rejects_non_q4_q8_width() {
+        // in_dim 256, wq cols 24 ⇒ bits 24·32/256 = 3 ∉ {4,8}.
+        let scales = Array::zeros::<f32>(&[64, 4]).unwrap(); // in_dim 256
+        let wq = Array::zeros::<u32>(&[64, 24]).unwrap(); // bits 3
+        let err = packed_bits(&wq, &scales, 64).unwrap_err().to_string();
+        assert!(err.contains("∉ {4, 8}"), "{err}");
+    }
 }

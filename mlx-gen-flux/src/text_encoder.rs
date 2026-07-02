@@ -48,9 +48,9 @@ impl TokenEmbedding {
     fn from_weights(w: &Weights, base: &str, group_size: i32) -> Result<Self> {
         if let Some(scales) = w.get(&format!("{base}.scales")) {
             let wq = w.require(&format!("{base}.weight"))?.clone();
-            // scales `[vocab, in/gs]` ⇒ `in = scales.cols·gs`; u32 `wq [vocab, in·bits/32]` ⇒ bits.
-            let in_dim = scales.shape()[1] * group_size;
-            let bits = wq.shape()[1] * 32 / in_dim;
+            // F-011: reuse the shared, validated bit-width derivation (mlx_gen::quant::packed_bits)
+            // instead of a local copy that panic'd on 1-D shapes / divided by zero on [vocab,0].
+            let bits = mlx_gen::quant::packed_bits(&wq, scales, group_size)?;
             return Ok(Self::Quantized {
                 wq,
                 scales: scales.clone(),

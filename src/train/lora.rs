@@ -103,6 +103,14 @@ pub fn build_lora_targets<H: AdaptableHost>(
     rank: i32,
     seed: u64,
 ) -> Result<(Vec<LoraTarget>, LoraParams)> {
+    // F-065: training-side twin of the F-002/F-010 load guard. rank <= 0 yields a 0·inf = NaN
+    // no-op delta (and a degenerate `[0,in]`/`[out,0]` factor shape); reject it up front rather
+    // than training a silently-corrupt adapter.
+    if rank <= 0 {
+        return Err(crate::Error::Msg(format!(
+            "LoRA training: rank must be > 0, got {rank}"
+        )));
+    }
     let mut targets = Vec::with_capacity(target_paths.len());
     let mut params: LoraParams = HashMap::new();
     for (i, path) in target_paths.iter().enumerate() {
@@ -269,6 +277,13 @@ pub fn build_lokr_targets<H: AdaptableHost>(
     factor: i32,
     seed: u64,
 ) -> Result<(Vec<LokrTarget>, LoraParams)> {
+    // F-065: training-side twin of the F-010 load guard. rank <= 0 (or a degenerate factorization)
+    // yields a NaN-scale reconstructed delta; reject it rather than training a corrupt adapter.
+    if rank <= 0 {
+        return Err(crate::Error::Msg(format!(
+            "LoKr training: rank must be > 0, got {rank}"
+        )));
+    }
     let mut targets = Vec::with_capacity(target_paths.len());
     let mut params = LoraParams::new();
     // `torch.nn.init.kaiming_uniform_(a=√5)` on a 2-D `[d0, d1]` factor ⇒ `U(±1/√fan_in)` with

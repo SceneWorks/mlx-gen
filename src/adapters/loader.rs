@@ -218,22 +218,47 @@ impl ThirdPartyLokr {
     /// (dim = `shape[1]`); the tucker `lokr_t2` is `[dim, dim, kH, kW]` (dim = `shape[0]`); the
     /// non-tucker `lokr_w2_a` is `[shape0, dim]` (dim = `shape[1]`). `None` when **both** factors are
     /// full — lycoris then forces `alpha = lora_dim` ⇒ scale 1, so rank is unused.
-    fn rank(&self) -> Option<f32> {
+    ///
+    /// F-010: a corrupt/adversarial third-party file can carry a 1-D/0-D factor (the shape index used
+    /// to panic) or a zero dim (→ `scale = alpha/0` = inf/NaN baked into the reconstructed delta and
+    /// silently installed). `Result` so both are rejected with a typed error instead; mirrors the
+    /// F-002 LoRA rank-0 guard.
+    fn rank(&self) -> Result<Option<f32>> {
+        fn leading_dim(a: &Array, axis: usize, what: &str) -> Result<f32> {
+            let shp = a.shape();
+            if shp.len() < 2 {
+                return Err(Error::Msg(format!(
+                    "lokr adapter: {what} factor must be 2-D, got {}-D shape {:?}",
+                    shp.len(),
+                    shp
+                )));
+            }
+            let r = shp[axis] as f32;
+            if r <= 0.0 {
+                return Err(Error::Msg(format!(
+                    "lokr adapter: {what} factor has zero rank (zero leading dim)"
+                )));
+            }
+            Ok(r)
+        }
         if let Some(a) = &self.w1_a {
-            return Some(a.shape()[1] as f32);
+            return Ok(Some(leading_dim(a, 1, "lokr_w1_a")?));
         }
         if let Some(t) = &self.t2 {
-            return Some(t.shape()[0] as f32);
+            return Ok(Some(leading_dim(t, 0, "lokr_t2")?));
         }
-        self.w2_a.as_ref().map(|a| a.shape()[1] as f32)
+        self.w2_a
+            .as_ref()
+            .map(|a| leading_dim(a, 1, "lokr_w2_a"))
+            .transpose()
     }
 
     /// LyCORIS `scale`: `alpha / lora_dim` (alpha defaulting to `lora_dim`), EXCEPT both-full forces
     /// scale 1 (mirrors `LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
-    fn scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
+    fn scale(&self) -> Result<f32> {
+        match self.rank()? {
+            None => Ok(1.0),
+            Some(r) => Ok(self.alpha.unwrap_or(r) / r),
         }
     }
 
@@ -242,7 +267,7 @@ impl ThirdPartyLokr {
     /// differ only in how they install it (in-place merge vs forward residual).
     pub fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
         reconstruct_lokr_delta_scaled(
-            self.scale(),
+            self.scale()?,
             base_shape,
             self.w1.as_ref(),
             self.w1_a.as_ref(),
@@ -372,18 +397,40 @@ pub struct ThirdPartyLoha {
 }
 
 impl ThirdPartyLoha {
-    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]` in
+    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris store `hada_w1_b` as `[lora_dim, …]` in
     /// both the tucker and non-tucker layouts).
-    fn rank(&self) -> Option<f32> {
-        self.w1_b.as_ref().map(|b| b.shape()[0] as f32)
+    ///
+    /// F-010: a 1-D/0-D factor panics on the shape index; a zero leading dim → `scale = alpha/0` =
+    /// inf/NaN baked into the reconstructed delta. `Result` so both are rejected (F-002 LoRA twin).
+    fn rank(&self) -> Result<Option<f32>> {
+        Ok(match &self.w1_b {
+            None => None,
+            Some(b) => {
+                let shp = b.shape();
+                if shp.len() < 2 {
+                    return Err(Error::Msg(format!(
+                        "loha adapter: hada_w1_b must be 2-D, got {}-D shape {:?}",
+                        shp.len(),
+                        shp
+                    )));
+                }
+                let r = shp[0] as f32;
+                if r <= 0.0 {
+                    return Err(Error::Msg(
+                        "loha adapter: hada_w1_b has zero rank (zero leading dim)".into(),
+                    ));
+                }
+                Some(r)
+            }
+        })
     }
 
     /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`). LoHa is always decomposed
     /// (no both-full case), so — unlike LoKr — there is no forced-1 branch.
-    fn scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
+    fn scale(&self) -> Result<f32> {
+        match self.rank()? {
+            None => Ok(1.0),
+            Some(r) => Ok(self.alpha.unwrap_or(r) / r),
         }
     }
 
@@ -395,7 +442,7 @@ impl ThirdPartyLoha {
             _ => return Err("LoHa: a hada_w1/w2 a/b factor is missing".into()),
         };
         reconstruct_loha_delta(
-            self.scale(),
+            self.scale()?,
             base_shape,
             w1_a,
             w1_b,
@@ -730,6 +777,16 @@ impl LoraRowSlice {
                 if *n <= 0 || *index < 0 || *index >= *n {
                     return Err(Error::Msg(format!(
                         "LoraRowSlice::Chunk: invalid chunk spec (n={n}, index={index})"
+                    )));
+                }
+                // F-060: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
+                // `rows` silently mis-slices the fused qkv delta (truncating division drops the tail).
+                // The fork's `_split_qkv_up` is only ever emitted for an exactly-divisible fused linear,
+                // so a non-divisible shape means a mis-converted/mismatched adapter — reject it.
+                if rows % n != 0 {
+                    return Err(Error::Msg(format!(
+                        "LoraRowSlice::Chunk: rows ({rows}) not divisible by n ({n}); \
+                         the fused factor is mis-shaped for this split"
                     )));
                 }
                 let chunk = rows / n;
@@ -2772,6 +2829,14 @@ mod tests {
             &[0.0, 1.0, 2.0, 3.0],
             "rank 6 ÷3 → sliced"
         );
+
+        // F-060: `Chunk` ALWAYS slices (vs `ChunkIfDivisible`'s fall-through), so a non-divisible
+        // rows count must be rejected instead of silently truncating the fused qkv delta.
+        let err = LoraRowSlice::Chunk { n: 3, index: 0 }
+            .apply(&d4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not divisible"), "{err}");
 
         // qkv-mlp up `dims` (FLUX.1 `linear1`): q = rows[0:3072], mlp = rows[9216:21504].
         let dims = vec![3072, 3072, 3072, 12288];
