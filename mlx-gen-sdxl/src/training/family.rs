@@ -496,11 +496,21 @@ pub fn train_family<H: SdxlFamilyHooks>(
         if step % accum == 0 || step == cfg.steps {
             let mult = lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
             opt.set_lr_scaled(mult);
+            // F-017: average by the ACTUAL in-window count, not the full `accum`. The final-step
+            // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
+            // down-scaled that update (halved effective LR on the tail) for BOTH the SDXL and
+            // Kolors trainers. Mirrors z-image/lens F-069. (When step%accum==0 the window is the
+            // full `accum`.)
+            let window = if step % accum == 0 {
+                accum
+            } else {
+                step % accum
+            };
             let avg = average_grads(
                 accumulated
                     .take()
                     .expect("an update fires only after accumulation"),
-                accum,
+                window,
             )?;
             let (clipped, _norm) = clip_grad_norm(&avg, 1.0)?;
             let clipped: LoraParams = clipped

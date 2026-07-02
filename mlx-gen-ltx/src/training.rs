@@ -456,7 +456,11 @@ impl LtxTrainer {
                 // flush is usually a partial window (cfg.steps % accum != 0); dividing by `accum`
                 // down-scaled that update (halved effective LR on the tail). Mirrors z-image/lens
                 // F-069. (When step%accum==0 the window is the full `accum`.)
-                let window = if step % accum == 0 { accum } else { step % accum };
+                let window = if step % accum == 0 {
+                    accum
+                } else {
+                    step % accum
+                };
                 let avg = average_grads(
                     accumulated
                         .take()
