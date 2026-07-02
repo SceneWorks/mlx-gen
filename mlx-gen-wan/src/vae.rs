@@ -24,7 +24,7 @@ use mlx_rs::Array;
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::vae_common::{
     contiguous, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
@@ -568,7 +568,12 @@ impl WanVae {
     /// the full (small) latent, then tile the denormalized latent and run only conv2+decoder+clip per
     /// tile. The full-size `output`/`weights` accumulators are filled tile-by-tile (pad-and-add) so
     /// peak memory stays bounded by one tile's decode. Shared tiling geometry: [`mlx_gen::tiling`].
-    pub fn decode_tiled(&self, z: &Array, cfg: &TilingConfig) -> Result<Array> {
+    pub fn decode_tiled(
+        &self,
+        z: &Array,
+        cfg: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
         let sh = z.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
         if !cfg.needs_tiling(VaeTiling::WAN, f, h, w) {
@@ -579,7 +584,7 @@ impl WanVae {
         let plan = cfg.plan(VaeTiling::WAN, f, h, w);
 
         // NCTHW: channel axis at 1, tiled axes [2, 3, 4]. Per-tile decode = conv2 → decoder → clamp.
-        tile_decode_accumulate(&denorm, &plan, [2, 3, 4], |tile| {
+        tile_decode_accumulate(&denorm, &plan, [2, 3, 4], cancel, |tile| {
             let x = self.conv2.forward(tile, None)?;
             let dec = self.decoder.forward(&x)?;
             Ok(minimum(&maximum(&dec, scalar(-1.0))?, scalar(1.0))?)

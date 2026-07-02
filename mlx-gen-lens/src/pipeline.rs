@@ -162,11 +162,16 @@ impl LensPipeline {
     /// mask. Returns `(features, mask)` where `features` is `num_text_layers × [1, S, 2880]` and
     /// `mask` is `[1, S]` (all-`1`; a single prompt is unpadded). When the rendered prompt is ≤ the
     /// offset (never, for real prompts) the features collapse to length 0 (`_get_text_embeddings`).
-    fn encode_one(&self, prompt: &str, date: &str) -> Result<(Vec<Array>, Array)> {
+    fn encode_one(
+        &self,
+        prompt: &str,
+        date: &str,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<(Vec<Array>, Array)> {
         let out = self.tokenizer.encode(prompt, date)?;
         let l = out.ids.len();
         let input_ids = Array::from_slice(&out.ids, &[1, l as i32]);
-        let layers = self.encoder.encode(&input_ids)?; // num_text_layers × [1, L, 2880]
+        let layers = self.encoder.encode(&input_ids, cancel)?; // num_text_layers × [1, L, 2880]
 
         let offset = TXT_OFFSET as i32;
         if l as i32 > offset {
@@ -198,9 +203,16 @@ impl LensPipeline {
         prompt: &str,
         negative_prompt: &str,
         date: &str,
+        cancel: Option<&CancelFlag>,
     ) -> Result<(Vec<Array>, Array)> {
-        let (pos_feats, pos_mask) = self.encode_one(prompt, date)?;
+        let (pos_feats, pos_mask) = self.encode_one(prompt, date, cancel)?;
         let s_pos = pos_feats[0].shape()[1];
+
+        // Honor a cancel between the positive and negative MoE encodes (F-019) — each is a full
+        // ~24-layer 20B forward, so the gap between them is a meaningful cancellation point.
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
 
         // Empty negative ⇒ the unconditional branch: zero text features matching the positive shape +
         // an all-`false` (all-zero) mask. A non-empty negative is encoded normally.
@@ -211,7 +223,7 @@ impl LensPipeline {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             (zeros, mlx_rs::ops::zeros_like(&pos_mask)?)
         } else {
-            self.encode_one(negative_prompt, date)?
+            self.encode_one(negative_prompt, date, cancel)?
         };
         let s_neg = neg_feats[0].shape()[1];
 
@@ -411,7 +423,7 @@ impl LensPipeline {
         };
 
         let (encoder_features, encoder_mask) =
-            self.encode_prompt(prompt, opts.negative_prompt, opts.date)?;
+            self.encode_prompt(prompt, opts.negative_prompt, opts.date, Some(cancel))?;
 
         mlx_rs::random::seed(opts.seed)?;
         let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
@@ -463,7 +475,8 @@ impl LensPipeline {
 /// [`Image`]. A stripped [`LensPipeline::denoise`] + decode for the trainer (which holds the raw DiT +
 /// VAE, not a `LensPipeline` — the gpt-oss encoder is freed after caching). `encoder_features`/
 /// `encoder_mask` are the pre-encoded joint CFG batch (`[2, …]` = positive then empty-negative);
-/// `dtype` is the trainer compute dtype. No progress/cancel plumbing — the caller drives the cadence.
+/// `dtype` is the trainer compute dtype. `cancel` is the training request's flag (F-077): a cancel
+/// during a preview burst interrupts this render's own denoise mid-loop, not just between prompts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     transformer: &LensTransformer,
@@ -475,6 +488,7 @@ pub(crate) fn render_sample(
     num_steps: usize,
     guidance_scale: f32,
     dtype: Dtype,
+    cancel: &CancelFlag,
 ) -> Result<Image> {
     let latent = (edge / VAE_SCALE_FACTOR) as usize;
     let seq_len = (latent * latent) as i32;
@@ -484,6 +498,9 @@ pub(crate) fn render_sample(
     let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
     let mut latents = init.as_dtype(dtype)?;
     for (i, &sigma) in timesteps.iter().enumerate() {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call (mirrors
         // `LensPipeline::denoise`).
         let hidden = concatenate_axis(&[&latents, &latents], 0)?;

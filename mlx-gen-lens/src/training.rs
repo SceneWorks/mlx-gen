@@ -631,6 +631,7 @@ impl LensTrainer {
                         cfg.sample_steps.max(1) as usize,
                         cfg.sample_guidance_scale,
                         compute_dtype,
+                        &req.cancel,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
                             step,
@@ -822,8 +823,9 @@ fn encode_caption(
         .into());
     }
     let input_ids = Array::from_slice(&out.ids, &[1, l]);
-    let layers = encoder.encode(&input_ids)?; // num_text_layers × [1, L, 2880]
-                                              // `[:, offset:, :]` — split at the offset along the sequence axis, keep the tail.
+    // Training-loss encode: the outer train loop checks cancel between steps, so no per-layer hook here.
+    let layers = encoder.encode(&input_ids, None)?; // num_text_layers × [1, L, 2880]
+                                                    // `[:, offset:, :]` — split at the offset along the sequence axis, keep the tail.
     let features = layers
         .iter()
         .map(|f| Ok(split_sections(f, &[offset], 1)?[1].as_dtype(dtype)?))

@@ -838,6 +838,7 @@ impl Ltx {
                 &req.prompt,
                 &cfg,
                 &SampleParams::uncensored(temperature),
+                Some(&req.cancel),
             )
         } else {
             enhance::enhance(
@@ -847,6 +848,7 @@ impl Ltx {
                 &req.prompt,
                 &cfg,
                 &SampleParams::censored(temperature),
+                Some(&req.cancel),
             )
         }
     }

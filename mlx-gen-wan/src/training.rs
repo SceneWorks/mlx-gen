@@ -93,7 +93,9 @@ const DEFAULT_TARGET_SUFFIXES: [&str; 4] = ["q", "k", "v", "o"];
 /// preview is a still thumbnail). `ctxs` are this prompt's per-expert [`WanTransformer::embed_text`]
 /// outputs; `latent_shape` is a cached clean latent's `[z, 1, h, w]` (so the init noise matches the
 /// VAE's exact latent geometry without re-deriving the per-family stride). CFG is off (guidance 1.0).
-/// No progress/cancel plumbing — the caller drives the cadence.
+/// `cancel` is the training request's flag: a cancel during a preview burst interrupts the render's
+/// own denoise + decode mid-flight (F-077 sibling), not just between preview prompts.
+#[allow(clippy::too_many_arguments)]
 fn render_wan_sample(
     experts: &[WanTransformer],
     vae: &WanTrainVae,
@@ -102,6 +104,7 @@ fn render_wan_sample(
     latent_shape: &[i32],
     seed: u64,
     steps: usize,
+    cancel: &CancelFlag,
 ) -> Result<Image> {
     let init = random::normal::<f32>(latent_shape, None, None, Some(&random::key(seed)?))?;
     let kind = SolverKind::from_name("uni_pc");
@@ -131,7 +134,7 @@ fn render_wan_sample(
             shift,
             &init,
             None,
-            &CancelFlag::default(),
+            cancel,
             &mut |_| {},
         )?
     } else {
@@ -145,13 +148,13 @@ fn render_wan_sample(
             &ctxs[0],
             None,
             &init,
-            &CancelFlag::default(),
+            cancel,
             &mut |_| {},
         )?
     };
     let frames = match vae {
-        WanTrainVae::Z16(v) => decode_to_frames(v, &latents, None)?,
-        WanTrainVae::Z48(v) => decode_to_frames_22(v, &latents, None)?,
+        WanTrainVae::Z16(v) => decode_to_frames(v, &latents, None, Some(cancel))?,
+        WanTrainVae::Z48(v) => decode_to_frames_22(v, &latents, None, Some(cancel))?,
     };
     frames_to_images(&frames)?
         .into_iter()
@@ -707,6 +710,7 @@ impl WanMoeTrainer {
                         &sample_latent_shape,
                         sample_seed,
                         cfg.sample_steps.max(1) as usize,
+                        &req.cancel,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
                             step,

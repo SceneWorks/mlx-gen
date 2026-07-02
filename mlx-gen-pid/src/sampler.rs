@@ -15,10 +15,11 @@
 //! decode, per the repo's full-trajectory chaos note).
 
 use mlx_rs::ops::{add, clip, multiply, subtract};
+use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
 use mlx_gen::array::scalar;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{SampleType, SamplerConfig};
 use crate::lq::PidNet;
@@ -61,6 +62,12 @@ impl Sampler {
 
     /// Deterministic loop with the initial `noise` and the per-step `eps` injected (one ε per SDE
     /// interior step, in order). `caption`/`lq_latent`/`sigma` condition the net every step.
+    ///
+    /// `cancel` is the cooperative cancellation handle (F-006): checked at each of the ~4 step
+    /// boundaries and forced-eval'd there so a cancel actually interrupts this multi-second decode
+    /// (MLX is lazy — without the per-step `eval` the whole graph would schedule at once and a
+    /// mid-loop check could never observe the trip). Returns [`Error::Canceled`] on trip.
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         net: &PidNet,
@@ -69,11 +76,15 @@ impl Sampler {
         caption: &Array,
         lq_latent: &Array,
         sigma: &Array,
+        cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let b = noise.shape()[0];
         let mut x = noise.clone();
         let mut ei = 0usize;
         for i in 0..self.steps() {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
             let t_cur = self.t_list[i];
             let t_next = self.t_list[i + 1];
             let t_scaled = Array::from_slice(&vec![t_cur * self.timescale; b as usize], &[b]);
@@ -94,12 +105,15 @@ impl Sampler {
             } else {
                 x = Self::velocity_to_x0(&x, &v, t_cur)?;
             }
+            // Materialize this step so a cancel between steps is actually observed (MLX is lazy),
+            // and to bound transient peak memory (F-013): the 4-step graph no longer schedules at once.
+            eval([&x])?;
         }
         Ok(clip(&x, (-1.0, 1.0))?)
     }
 
     /// Production entry: draw the initial noise + per-step ε from MLX's PRNG (seeded), then run the
-    /// loop. Returns clamped pixels `[B, 3, H, W]`.
+    /// loop. Returns clamped pixels `[B, 3, H, W]`. `cancel` is threaded into [`Self::run`] (F-006).
     #[allow(clippy::too_many_arguments)]
     pub fn sample(
         &self,
@@ -111,6 +125,7 @@ impl Sampler {
         h: i32,
         w: i32,
         seed: u64,
+        cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         let (k_noise, mut k_rest) = random::split(&random::key(seed)?, 2)?;
         let noise = random::normal::<f32>(&[b, 3, h, w], None, None, Some(&k_noise))?;
@@ -125,6 +140,6 @@ impl Sampler {
             )?);
             k_rest = k_n;
         }
-        self.run(net, &noise, &eps, caption, lq_latent, sigma)
+        self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)
     }
 }

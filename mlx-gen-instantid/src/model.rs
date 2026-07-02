@@ -291,7 +291,13 @@ impl InstantId {
                     .into(),
             )
         })?;
-        Ok(Some(engine.decoder(&req.prompt, 0.0, req.seed)?))
+        // Thread the request cancel into the PiD decoder so the ~100 s 4-step decode is cancellable
+        // per sampler step (F-006), matching the denoise loop's per-step contract.
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Quantize the stack to `bits` (8 or 4) — Q8/Q4 (sc-3116), the same scope as the SDXL provider

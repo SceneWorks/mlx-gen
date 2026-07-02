@@ -468,7 +468,7 @@ impl Wan {
             let mut w = Weights::from_file(self.root.join("vae.safetensors"))?;
             w.cast_all(mlx_rs::Dtype::Bfloat16)?;
             let vae = Wan22Vae::from_weights(&w)?;
-            decode_to_frames_22(&vae, &latents, decode_tiling.as_ref())?
+            decode_to_frames_22(&vae, &latents, decode_tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
         // Discard the extra leading frames generated for `trim_first_frames`.
@@ -892,7 +892,7 @@ impl Wan14b {
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents, tiling.as_ref())?
+            decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let mut images = frames_to_images(&frames_u8)?;
         // Discard the extra leading frames generated for `trim_first_frames`.

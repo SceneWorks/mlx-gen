@@ -151,7 +151,7 @@ fn wan_ti2v_5b_wedge_sweep() {
         reset_peak_memory();
         let t = Instant::now();
         let video = match (notile, tiling.as_ref()) {
-            (false, Some(cfg)) => vae.decode_tiled(&latents, cfg).unwrap(),
+            (false, Some(cfg)) => vae.decode_tiled(&latents, cfg, None).unwrap(),
             _ => vae.decode(&latents).unwrap(),
         };
         mlx_rs::transforms::eval([&video]).unwrap();
@@ -175,7 +175,7 @@ fn wan_ti2v_5b_wedge_sweep() {
             reset_peak_memory();
             let t = Instant::now();
             let video_bf16 = match (notile, tiling.as_ref()) {
-                (false, Some(cfg)) => vae_bf16.decode_tiled(&latents, cfg).unwrap(),
+                (false, Some(cfg)) => vae_bf16.decode_tiled(&latents, cfg, None).unwrap(),
                 _ => vae_bf16.decode(&latents).unwrap(),
             };
             mlx_rs::transforms::eval([&video_bf16]).unwrap();

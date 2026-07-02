@@ -85,7 +85,7 @@ fn worst_cosine_for(quant: Quant) -> f32 {
     let mut worst = 1f32;
     for i in 0..n {
         let ids = g.require(&format!("ids_{i}")).unwrap().clone(); // [1, L] i32
-        let captured = encoder.encode(&ids).expect("encode");
+        let captured = encoder.encode(&ids, None).expect("encode");
         for (j, layer_idx) in selected.iter().enumerate() {
             let want = g.require(&format!("cap_{i}_{j}")).unwrap();
             let got = captured[j].as_dtype(Dtype::Float32).unwrap();

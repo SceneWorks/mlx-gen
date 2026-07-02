@@ -66,7 +66,9 @@ fn wan_tiled_decode_matches_reference() {
         cfg.needs_tiling(VaeTiling::WAN, sh[2], sh[3], sh[4]),
         "golden latent must actually tile"
     );
-    let got = vae.decode_tiled(tiled_in, &cfg).expect("tiled decode");
+    let got = vae
+        .decode_tiled(tiled_in, &cfg, None)
+        .expect("tiled decode");
     assert_eq!(got.shape(), exp.shape(), "tiled decode shape");
 
     let (max_abs, mean_rel) = diff(got.as_slice::<f32>(), exp.as_slice::<f32>());
@@ -95,7 +97,7 @@ fn wan_tiled_fallback_is_single_pass() {
     let untiled = vae.decode(dec_in).expect("single-pass");
     // Huge tiles → needs_tiling is false → fallback to the single pass.
     let big = TilingConfig::spatial_only(4096, 64);
-    let got = vae.decode_tiled(dec_in, &big).expect("fallback");
+    let got = vae.decode_tiled(dec_in, &big, None).expect("fallback");
     let (max_abs, mean_rel) = diff(got.as_slice::<f32>(), untiled.as_slice::<f32>());
     println!("[fallback] max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");
     assert!(
@@ -164,7 +166,9 @@ fn wan_combined_plan_decode_is_sane() {
         );
         let single = vae.decode(&z).expect("single-pass");
         single.eval().unwrap();
-        let got = vae.decode_tiled(&z, &cfg).expect("combined tiled decode");
+        let got = vae
+            .decode_tiled(&z, &cfg, None)
+            .expect("combined tiled decode");
         got.eval().unwrap();
         assert_eq!(
             got.shape(),
@@ -236,7 +240,9 @@ fn wan_combined_auto_decode_not_flat_real() {
     );
     let key = random::key(7).unwrap();
     let z = random::normal::<f32>(&[1, 16, f, h, ww], None, None, Some(&key)).unwrap();
-    let got = vae.decode_tiled(&z, &cfg).expect("combined auto decode");
+    let got = vae
+        .decode_tiled(&z, &cfg, None)
+        .expect("combined auto decode");
     got.eval().unwrap();
     let s = got.shape();
     assert_eq!(s, &[1, 3, 84, 480, 832], "combined auto decode shape");
@@ -283,7 +289,7 @@ fn wan_tiled_close_to_single_pass_real() {
     let key = random::key(3).unwrap();
     let z = random::normal::<f32>(&[1, 16, 3, 24, 24], None, None, Some(&key)).unwrap();
     let untiled = vae.decode(&z).expect("single-pass");
-    let got = vae.decode_tiled(&z, &golden_cfg()).expect("tiled");
+    let got = vae.decode_tiled(&z, &golden_cfg(), None).expect("tiled");
     assert_eq!(got.shape(), untiled.shape());
     let (max_abs, mean_rel) = diff(got.as_slice::<f32>(), untiled.as_slice::<f32>());
     println!("[real tiled vs single-pass] max|Δ|={max_abs:.3e} mean_rel={mean_rel:.3e}");

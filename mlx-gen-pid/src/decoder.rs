@@ -7,7 +7,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::decoder::LatentDecoder;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Result};
 
 use crate::lq::PidNet;
 use crate::sampler::Sampler;
@@ -26,6 +26,10 @@ pub struct PidDecoder {
     vae_compression: i32,
     /// Per-decode RNG seed for the sampler's noise + per-step ε.
     seed: u64,
+    /// Cooperative cancellation for the ~100 s 4-step decode (F-006). Bound at decoder-mint time
+    /// from `req.cancel` so [`LatentDecoder::decode`] — whose trait signature carries no flag — can
+    /// still honor a cancel per sampler step. `None` ⇒ uncancellable (direct struct-API construction).
+    cancel: Option<CancelFlag>,
 }
 
 impl PidDecoder {
@@ -47,7 +51,16 @@ impl PidDecoder {
             scale,
             vae_compression,
             seed,
+            cancel: None,
         }
+    }
+
+    /// Bind a cooperative cancellation handle (F-006). Callers that go through
+    /// [`crate::resolve_pid_decoder`] get this wired from `req.cancel` automatically; direct
+    /// struct-API callers (e.g. InstantID) can opt in with their request's flag.
+    pub fn with_cancel(mut self, cancel: CancelFlag) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     /// The output pixel resolution for a latent grid `[.., .., zH, zW]`.
@@ -79,6 +92,7 @@ impl LatentDecoder for PidDecoder {
             th,
             tw,
             self.seed,
+            self.cancel.as_ref(),
         )
     }
 }

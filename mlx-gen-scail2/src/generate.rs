@@ -554,7 +554,7 @@ pub fn generate(
             let tile_frames = (budget_frames / 4 * 4).clamp(8, out_frames.max(8));
             let overlap = (tile_frames / 4).max(1);
             let cfg = TilingConfig::temporal_only(tile_frames, overlap);
-            vae.decode_tiled(&z, &cfg)? // [1,3,T_out,H,W]; single-pass fallback if it doesn't tile
+            vae.decode_tiled(&z, &cfg, Some(cancel))? // [1,3,T_out,H,W]; single-pass fallback if it doesn't tile
         };
         let vs = video.shape();
         let seg_video = video.reshape(&[vs[1], vs[2], vs[3], vs[4]])?; // [3,T_out,H,W]

@@ -141,7 +141,7 @@ fn wan_z16_vae_decode_sweep() {
     reset_peak_memory();
     let t = Instant::now();
     let video = match &cfg {
-        Some(c) => vae.decode_tiled(&latent, c).unwrap(),
+        Some(c) => vae.decode_tiled(&latent, c, None).unwrap(),
         None => vae.decode(&latent).unwrap(),
     };
     mlx_rs::transforms::eval([&video]).unwrap();

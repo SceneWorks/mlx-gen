@@ -914,7 +914,7 @@ impl Bernini {
         let frames_u8 = {
             let w = Weights::from_file(self.root.join("vae.safetensors"))?;
             let vae = WanVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents, tiling.as_ref())?
+            decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
         };
         let images_out = frames_to_images(&frames_u8)?;
 

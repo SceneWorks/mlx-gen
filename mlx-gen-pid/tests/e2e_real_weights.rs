@@ -59,7 +59,7 @@ fn qwenimage_loads_and_runs() {
     // 2) full 4-step sampler — clamped pixels
     let sampler = Sampler::new(&SamplerConfig::distill_4step());
     let out = sampler
-        .sample(&net, &caption, &lq_latent, &sigma, b, h, wd, 0)
+        .sample(&net, &caption, &lq_latent, &sigma, b, h, wd, 0, None)
         .unwrap();
     assert_eq!(out.shape(), &[b, 3, h, wd], "sampler output shape");
     let om = max_abs(&out);

@@ -89,6 +89,7 @@ fn vqa_greedy_matches_reference() {
             &[],
             want.len(),
             Sampler::Greedy,
+            None,
         )
         .expect("decode");
 

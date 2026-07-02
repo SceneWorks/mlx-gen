@@ -88,11 +88,23 @@ fn lens_encoder_matches_reference() {
     // Collect every (prompt, layer) result first, then gate — the bf16 worst-element peak_rel grows
     // with capture depth (reference bf16-on-CPU vs ours bf16-on-Metal accumulate differently over up
     // to 24 MoE layers), so the robust metric is **cosine**; peak_rel is reported and bounded loosely.
+    // F-019: a pre-tripped cancel aborts the per-layer MoE encode with Error::Canceled.
+    {
+        let ids = g.require("ids_0").unwrap().clone();
+        let tripped = mlx_gen::CancelFlag::new();
+        tripped.cancel();
+        let res = encoder.encode(&ids, Some(&tripped));
+        assert!(
+            matches!(res, Err(mlx_gen::Error::Canceled)),
+            "pre-tripped cancel must abort the MoE encode with Error::Canceled"
+        );
+    }
+
     let mut worst_peak = 0f32;
     let mut worst_cos = 1f32;
     for i in 0..n {
         let ids = g.require(&format!("ids_{i}")).unwrap().clone(); // [1, L] i32
-        let captured = encoder.encode(&ids).expect("encode");
+        let captured = encoder.encode(&ids, None).expect("encode");
         assert_eq!(captured.len(), n_sel);
         for (j, layer_idx) in selected.iter().enumerate() {
             let want = g.require(&format!("cap_{i}_{j}")).unwrap(); // f32

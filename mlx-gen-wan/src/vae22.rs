@@ -35,7 +35,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::nn::{conv2d, conv3d, silu, upsample_nearest};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::vae_common::{
     contiguous, eval, last_t_axis, scalar, slice_axis, tile_decode_accumulate, FeatCache,
@@ -953,7 +953,12 @@ impl Wan22Vae {
     /// `[1,T,H,W,z]` into overlapping tiles, decodes each (denorm + conv2 + decoder + unpatchify +
     /// clamp), and trapezoidally blends. Falls back to single-pass [`decode`] when `cfg` doesn't fire.
     /// vae22 upsamples 16× spatially, 4× temporally, **causally** ([`VaeTiling::WAN22`]).
-    pub fn decode_tiled(&self, latent_czthw: &Array, cfg: &TilingConfig) -> Result<Array> {
+    pub fn decode_tiled(
+        &self,
+        latent_czthw: &Array,
+        cfg: &TilingConfig,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
         let z = self.to_channels_last(latent_czthw)?; // [1,T,H,W,z]
         let sh = z.shape();
         let (f, h, w) = (sh[1], sh[2], sh[3]);
@@ -967,7 +972,7 @@ impl Wan22Vae {
         // unpatchify (vae22 upsamples 16× via decoder×8 + patch×2) before the clamp. The per-tile
         // body runs in `compute_dtype` (bf16 halves its activation peak, sc-5039); the f32 blend
         // accumulators are unchanged (the clamp scalars promote each tile back to f32).
-        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], |tile| {
+        tile_decode_accumulate(&denorm, &plan, [1, 2, 3], cancel, |tile| {
             let tile = tile.as_dtype(self.compute_dtype)?;
             let x = self.conv2.forward(&tile, None)?;
             let dec = self.decoder.forward(&x)?;

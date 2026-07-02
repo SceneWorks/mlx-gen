@@ -22,7 +22,7 @@
 
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::gemma::GemmaModel;
 use crate::tokenizer::LtxTokenizer;
@@ -41,9 +41,10 @@ pub const DEFAULT_SEED: u64 = 42;
 
 /// Hard ceiling on enhance decode length (F-012 twin of the flux2 cap). Each decode step is a full
 /// Gemma forward over a growing KV cache, so a request-supplied `enhance_max_tokens` must be capped
-/// or a single `enhance_prompt=true` request becomes an effectively unbounded job (only cooperative
-/// `cancel` breaks it). 4× the 512 reference default leaves room for legitimately long rewrites while
-/// bounding the worst case to ~2048 forwards instead of billions.
+/// or a single `enhance_prompt=true` request becomes an effectively unbounded job. 4× the 512
+/// reference default leaves room for legitimately long rewrites while bounding the worst case to
+/// ~2048 forwards instead of billions. Cooperative cancellation ([`enhance`]'s `cancel`) also
+/// interrupts the loop per decoded token (F-018).
 pub const MAX_TOKENS_CAP: usize = 2048;
 
 /// Resolve the decode budget from the request's `enhance_max_tokens`: the reference default
@@ -138,6 +139,11 @@ pub fn clean_response(response: &str) -> String {
 /// Run the autoregressive enhancement loop over `gemma` + `tokenizer`, returning the cleaned rewrite.
 /// May return an empty string (e.g. the model immediately emits a stop token) — the caller decides
 /// whether to fall back to the original prompt (the reference treats empty output as a failure).
+/// `cancel` is the request's cooperative cancellation handle (F-018): checked before each of the up
+/// to [`MAX_TOKENS_CAP`] Gemma decode steps and after the prefill, returning [`Error::Canceled`] so a
+/// cancel during a multi-minute enhancement is honored (matching the denoise loops' per-step
+/// contract). Each `decode_logits` step already forces a host sync, so the check observes the trip.
+#[allow(clippy::too_many_arguments)]
 pub fn enhance(
     gemma: &GemmaModel,
     tokenizer: &LtxTokenizer,
@@ -145,7 +151,12 @@ pub fn enhance(
     user_prompt: &str,
     cfg: &EnhanceConfig,
     sampler: &SampleParams,
+    cancel: Option<&CancelFlag>,
 ) -> Result<String> {
+    // Honor a cancel tripped before enhancement even begins (before the ~12B prefill forward, F-018).
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
     let formatted = chat_template(system_prompt, user_prompt);
     let prompt_ids = tokenizer.encode_chat(&formatted)?;
     if prompt_ids.is_empty() {
@@ -165,6 +176,9 @@ pub fn enhance(
 
     let mut generated: Vec<i32> = Vec::new();
     for step in 0..cfg.max_tokens {
+        if cancel.is_some_and(CancelFlag::is_cancelled) {
+            return Err(Error::Canceled);
+        }
         let next = sample_token(&logits, &history, sampler, &mut rng)?;
         generated.push(next);
         history.push(next);

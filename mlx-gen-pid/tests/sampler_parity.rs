@@ -5,6 +5,7 @@
 //! the SDE renoise `(1−t_next)·x0 + t_next·ε`, and the final clamp) — not the production RNG path.
 
 use mlx_gen::weights::Weights;
+use mlx_gen::CancelFlag;
 use mlx_gen_pid::{PidConfig, PidNet, RopeMode, Sampler, SamplerConfig};
 use mlx_rs::ops::{abs, max, subtract};
 use mlx_rs::Array;
@@ -64,7 +65,7 @@ fn sampler_loop_matches() {
     let golden = w.require("__io__.output").unwrap().clone();
 
     let got = sampler
-        .run(&net, &noise, &eps, &caption, &lq_latent, &sigma)
+        .run(&net, &noise, &eps, &caption, &lq_latent, &sigma, None)
         .unwrap();
     assert_eq!(got.shape(), golden.shape(), "output shape");
 
@@ -76,4 +77,48 @@ fn sampler_loop_matches() {
         rel < 2e-2,
         "sampler output peak-rel={rel} (max|Δ|={d}) — divergence in velocity→x0 / SDE renoise / clamp"
     );
+}
+
+/// F-006: a pre-tripped [`CancelFlag`] makes the 4-step decode loop return [`Error::Canceled`] at the
+/// first step boundary instead of running the full ~100 s decode. Uses the committed tiny fixture, so
+/// it runs by default (no real weights / Metal weight snapshot needed).
+#[test]
+fn sampler_run_honors_pretripped_cancel() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+    let w = Weights::from_file(format!("{dir}/sampler_tiny.safetensors")).unwrap();
+
+    let net = PidNet::from_weights(&w, "", &tiny_cfg()).unwrap();
+    let sampler = Sampler::new(&SamplerConfig::distill_4step());
+
+    let noise = w.require("__io__.noise").unwrap().clone();
+    let caption = w.require("__io__.caption").unwrap().clone();
+    let lq_latent = w.require("__io__.lq_latent").unwrap().clone();
+    let sigma = w.require("__io__.sigma").unwrap().clone();
+    let eps: Vec<Array> = (0..3)
+        .map(|i| w.require(&format!("__io__.eps_{i}")).unwrap().clone())
+        .collect();
+
+    let cancel = CancelFlag::new();
+    cancel.cancel(); // trip before the loop starts
+
+    let res = sampler.run(
+        &net,
+        &noise,
+        &eps,
+        &caption,
+        &lq_latent,
+        &sigma,
+        Some(&cancel),
+    );
+    assert!(
+        matches!(res, Err(mlx_gen::Error::Canceled)),
+        "a pre-tripped cancel must abort the PiD decode with Error::Canceled, got {:?}",
+        res.map(|a| a.shape().to_vec())
+    );
+
+    // With no cancel handle, the same call still completes (regression guard for the default path).
+    let ok = sampler
+        .run(&net, &noise, &eps, &caption, &lq_latent, &sigma, None)
+        .expect("uncancelled run completes");
+    assert_eq!(ok.shape()[0], noise.shape()[0]);
 }

@@ -88,6 +88,7 @@ fn vqa_realweight_matches_reference() {
             &[eos_id],
             max_new,
             Sampler::Greedy,
+            None,
         )
         .expect("decode");
 
@@ -132,6 +133,7 @@ fn vqa_realweight_matches_reference() {
             std::slice::from_ref(&src),
             max_new,
             Sampler::Greedy,
+            None,
         )
         .expect("vqa");
     println!("  vqa(): {answer:?}");
@@ -163,6 +165,7 @@ fn vqa_primes_no_think_on_small_budget() {
             &[],
             32,
             Sampler::Greedy,
+            None,
         )
         .expect("vqa");
     println!("small-budget vqa answer: {answer:?}");

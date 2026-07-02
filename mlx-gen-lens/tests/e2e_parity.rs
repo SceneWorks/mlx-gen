@@ -111,7 +111,7 @@ fn lens_e2e_matches_reference() {
     let pipe = LensPipeline::load(&snap, Dtype::Bfloat16).expect("load pipeline");
 
     let (features, mask) = pipe
-        .encode_prompt(prompt, negative, date)
+        .encode_prompt(prompt, negative, date, None)
         .expect("encode_prompt");
     let init = g.require("init_latents").unwrap().clone(); // [1, seq, 128] f32
 
@@ -216,7 +216,7 @@ fn lens_curated_samplers_drive_the_real_dit() {
     let seq = (lat_h * lat_w) as i32;
     let (num_steps, guidance) = (4usize, 5.0f32);
     let (features, mask) = pipe
-        .encode_prompt("a red fox in snow", "", "2025-01-01")
+        .encode_prompt("a red fox in snow", "", "2025-01-01", None)
         .expect("encode_prompt");
 
     let run = |sampler: Option<&str>, scheduler: Option<&str>| -> Array {

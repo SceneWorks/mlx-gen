@@ -4,7 +4,7 @@
 //! channel axis at different positions) stay with their respective modules.
 
 use mlx_gen::tiling::TilePlan;
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 use mlx_rs::ops::{add, divide, maximum, multiply, pad};
 use mlx_rs::Array;
 
@@ -77,10 +77,15 @@ fn axis_shape(axis: i32, len: i32) -> [i32; 5] {
 /// `denorm` is the already-denormalized latent; `plan` comes from
 /// [`TilingConfig::plan`](mlx_gen::tiling::TilingConfig::plan). The reference's per-tile `mx.eval`
 /// (bounding the lazy graph + peak memory) is preserved.
+///
+/// `cancel` is the cooperative cancellation handle (F-014): the z48 decode is ~95% of a Lightning
+/// render's wall-clock (sc-4998), so a cancel is checked between tiles and returns [`Error::Canceled`].
+/// The per-tile `eval` already forces materialization, so the check observes the trip promptly.
 pub(crate) fn tile_decode_accumulate(
     denorm: &Array,
     plan: &TilePlan,
     axes: [i32; 3],
+    cancel: Option<&CancelFlag>,
     decode_tile: impl Fn(&Array) -> Result<Array>,
 ) -> Result<Array> {
     let [t_ax, h_ax, w_ax] = axes;
@@ -89,6 +94,9 @@ pub(crate) fn tile_decode_accumulate(
     for t in &plan.t {
         for hh in &plan.h {
             for ww in &plan.w {
+                if cancel.is_some_and(CancelFlag::is_cancelled) {
+                    return Err(Error::Canceled);
+                }
                 let tile = slice_axis(denorm, t_ax, t.start, t.end)?;
                 let tile = slice_axis(&tile, h_ax, hh.start, hh.end)?;
                 let tile = slice_axis(&tile, w_ax, ww.start, ww.end)?;
@@ -174,7 +182,8 @@ mod tests {
             out_h: 2,
             out_w: 2,
         };
-        let out = tile_decode_accumulate(denorm, &plan, axes, |tile| Ok(tile.clone())).unwrap();
+        let out =
+            tile_decode_accumulate(denorm, &plan, axes, None, |tile| Ok(tile.clone())).unwrap();
         out.eval().unwrap();
         out.as_slice::<f32>().to_vec()
     }
@@ -193,6 +202,45 @@ mod tests {
         let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
         let denorm = Array::from_slice(&vals, &[1, 4, 2, 2, 1]);
         assert_eq!(roundtrip(&denorm, [1, 2, 3], 4), vals);
+    }
+
+    /// F-014: a pre-tripped [`CancelFlag`] makes the tiled decode return [`Error::Canceled`] at the
+    /// first tile boundary instead of decoding every tile of a dominant-cost VAE pass.
+    #[test]
+    fn tile_decode_honors_pretripped_cancel() {
+        let vals: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let denorm = Array::from_slice(&vals, &[1, 1, 4, 2, 2]);
+        let half = 2;
+        let tile = |start, out_start| AxisTile {
+            start,
+            end: start + half,
+            out_start,
+            out_stop: out_start + half,
+            mask: vec![1.0; half as usize],
+        };
+        let unit = AxisTile {
+            start: 0,
+            end: 2,
+            out_start: 0,
+            out_stop: 2,
+            mask: vec![1.0; 2],
+        };
+        let plan = TilePlan {
+            t: vec![tile(0, 0), tile(half, half)],
+            h: vec![unit.clone()],
+            w: vec![unit],
+            out_f: 4,
+            out_h: 2,
+            out_w: 2,
+        };
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let res =
+            tile_decode_accumulate(&denorm, &plan, [2, 3, 4], Some(&cancel), |t| Ok(t.clone()));
+        assert!(
+            matches!(res, Err(Error::Canceled)),
+            "a pre-tripped cancel must abort the tiled decode with Error::Canceled"
+        );
     }
 
     /// Block (nearest-neighbour) upsample by `scales` along `axes` — `repeat_axis` along each. This is
@@ -244,8 +292,10 @@ mod tests {
         let denorm = Array::from_slice(&vals, &shape);
 
         let expected = upsample(&denorm, axes, scales);
-        let got = tile_decode_accumulate(&denorm, &plan, axes, |t| Ok(upsample(t, axes, scales)))
-            .unwrap();
+        let got = tile_decode_accumulate(&denorm, &plan, axes, None, |t| {
+            Ok(upsample(t, axes, scales))
+        })
+        .unwrap();
         got.eval().unwrap();
         assert_eq!(
             got.shape(),

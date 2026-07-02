@@ -24,7 +24,7 @@
 
 use mlx_rs::Array;
 
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 // Shared decode sampler (sc-7159): on-device greedy argmax + the unified temperature/top-k/top-p
 // sampler + the deterministic SplitMix64. The bespoke think/no-think + dual-path rollout stays here.
@@ -151,6 +151,11 @@ impl Qwen3Backbone {
     /// distribution over the first generated token); `t_idx` is the prefix's max temporal index.
     /// Decoding stops at any id in `eos` (not emitted) or after `max_new_tokens`. Returns the
     /// generated token ids. This is the runtime under `chat`/`answer_question` (sc-3191).
+    ///
+    /// `cancel` is the cooperative cancellation handle (F-037): checked before each decoded token so a
+    /// worker-consumed VQA / Document Studio rollout is cancellable (each token forces a host sync, so
+    /// the check observes the trip). Returns [`Error::Canceled`] on trip.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         first_logits: &[f32],
@@ -159,6 +164,7 @@ impl Qwen3Backbone {
         eos: &[i32],
         max_new_tokens: usize,
         sampler: Sampler,
+        cancel: Option<&CancelFlag>,
     ) -> Result<Vec<i32>> {
         // Greedy decodes argmax on device (single-index host transfer per token); sampling needs the
         // full logits row on host. Split so the common greedy path avoids the ~600 KB copy (F-140).
@@ -167,6 +173,9 @@ impl Qwen3Backbone {
             let mut out = Vec::new();
             let mut t = t_idx;
             for _ in 0..max_new_tokens {
+                if cancel.is_some_and(CancelFlag::is_cancelled) {
+                    return Err(Error::Canceled);
+                }
                 if eos.contains(&next) {
                     break;
                 }
@@ -182,6 +191,9 @@ impl Qwen3Backbone {
         let mut out = Vec::new();
         let mut t = t_idx;
         for _ in 0..max_new_tokens {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
             let next = sampler.pick(&logits, &mut rng)?;
             if eos.contains(&next) {
                 break;
@@ -209,12 +221,16 @@ impl Qwen3Backbone {
         eos: i32,
         append_ids: &[i32],
         max_think_tokens: usize,
+        cancel: Option<&CancelFlag>,
     ) -> Result<ThinkRollout> {
         let mut t = t_idx;
         let mut next = argmax(first_logits);
         let mut think_token_ids = Vec::new();
         let mut closed = false;
         for _ in 0..max_think_tokens {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
             if next == eos {
                 break;
             }

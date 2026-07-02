@@ -96,6 +96,8 @@ fn interleave_realweight_matches_reference() {
             512,
             10,
             None,
+            &mlx_gen::CancelFlag::new(),
+            &mut |_| {},
         )
         .expect("interleave_gen");
 

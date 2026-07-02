@@ -20,7 +20,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Quant, Result};
+use mlx_gen::{CancelFlag, Error, Quant, Result};
 
 use crate::config::GptOssConfig;
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer};
@@ -122,7 +122,12 @@ impl LensTextEncoder {
     /// Encode `input_ids` `[B, L]` (int32) → the captured hidden states, one `[B, L, hidden]` per
     /// selected layer in selection order (== `LensGptOssEncoder.forward`'s returned list). Runs
     /// `position_ids = arange(L)` and stops after the max selected layer.
-    pub fn encode(&self, input_ids: &Array) -> Result<Vec<Array>> {
+    ///
+    /// `cancel` is the cooperative cancellation handle (F-019): checked before each of the ~24 gpt-oss
+    /// MoE decoder layers (the dominant cost on a 4-step turbo run) so a cancel during the encode is
+    /// honored. `routing_weights` already forces a host sync per layer, so the check observes the trip
+    /// promptly. Returns [`Error::Canceled`] on trip.
+    pub fn encode(&self, input_ids: &Array, cancel: Option<&CancelFlag>) -> Result<Vec<Array>> {
         let l = input_ids.shape()[1];
 
         // Both per-layer masks, built once for the sequence (full causal + sliding-window causal).
@@ -134,6 +139,9 @@ impl LensTextEncoder {
         // Capture slots, filled in selection order (matches the reference's `index_lookup`).
         let mut captured: Vec<Option<Array>> = vec![None; self.selected_layers.len()];
         for (i, layer) in self.layers.iter().enumerate() {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(Error::Canceled);
+            }
             let mask = if self.cfg.is_sliding(i) {
                 &sliding_mask
             } else {

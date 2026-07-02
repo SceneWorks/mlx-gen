@@ -66,6 +66,12 @@ impl<'a> StepReporter<'a> {
         Ok(())
     }
 
+    /// The bound cancellation flag, so AR text loops that run alongside the denoise (F-037) can share
+    /// the same request cancel without a separate parameter.
+    pub fn cancel_flag(&self) -> &CancelFlag {
+        self.cancel
+    }
+
     /// Report one completed denoise step (`current` is 1-based).
     fn step(&mut self, current: usize, total: usize) {
         (self.on_progress)(Progress::Step {
@@ -439,6 +445,7 @@ impl T2iModel {
                 tokens::IM_END,
                 &append_ids,
                 opts.max_think_tokens,
+                reporter.as_ref().map(StepReporter::cancel_flag),
             )?;
             let ids_u32: Vec<u32> = roll.think_token_ids.iter().map(|&i| i as u32).collect();
             think_text = Some(tokenizer.decode(&ids_u32, false)?);
@@ -827,6 +834,7 @@ impl T2iModel {
     /// Greedy/sampled understanding-path text decode from a prefilled cache (wraps
     /// [`Qwen3Backbone::generate`]). `first_logits` are the prefix's last-position logits; `t_idx`
     /// the prefix's max temporal index. Returns the generated token ids (stop ids excluded).
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_text(
         &self,
         first_logits: &[f32],
@@ -835,6 +843,7 @@ impl T2iModel {
         eos: &[i32],
         max_new_tokens: usize,
         sampler: Sampler,
+        cancel: Option<&CancelFlag>,
     ) -> Result<Vec<i32>> {
         self.backbone.generate(
             first_logits,
@@ -843,6 +852,7 @@ impl T2iModel {
             eos,
             max_new_tokens,
             sampler,
+            cancel,
         )
     }
 
@@ -953,6 +963,7 @@ impl T2iModel {
                 tokens::IM_END,
                 &append_ids,
                 opts.max_think_tokens,
+                reporter.as_ref().map(StepReporter::cancel_flag),
             )?;
             let u32s: Vec<u32> = roll.think_token_ids.iter().map(|&i| i as u32).collect();
             think_text = Some(tokenizer.decode(&u32s, false)?);
@@ -1009,6 +1020,9 @@ impl T2iModel {
     /// stop. `images` are decoded RGB `[3,H,W]` in `[0,1]` (sized to multiples of `patch·merge`);
     /// pass an empty slice for a text-only question. Returns the decoded answer (special tokens
     /// stripped, trimmed).
+    /// `cancel` is the request's cooperative cancellation handle (F-037): threaded into the AR decode
+    /// so a long VQA / understanding rollout consumed directly by the worker is cancellable per token.
+    #[allow(clippy::too_many_arguments)]
     pub fn vqa(
         &self,
         tokenizer: &TextTokenizer,
@@ -1016,6 +1030,7 @@ impl T2iModel {
         images: &[Array],
         max_new_tokens: usize,
         sampler: Sampler,
+        cancel: Option<&CancelFlag>,
     ) -> Result<String> {
         // Preprocess any source images.
         let mut pv_parts = Vec::with_capacity(images.len());
@@ -1060,6 +1075,7 @@ impl T2iModel {
             &[tokens::IM_END],
             max_new_tokens,
             sampler,
+            cancel,
         )?;
         let u32s: Vec<u32> = tokens.iter().map(|&i| i as u32).collect();
         Ok(tokenizer.decode(&u32s, true)?.trim().to_string())
@@ -1127,6 +1143,11 @@ impl T2iModel {
     /// `system_message` is normally [`INTERLEAVE_SYSTEM_MESSAGE`]; `init_noises`, when supplied, are
     /// per-image standard-normal `[1,3,H,W]` tensors for cross-build parity. Returns the composed text
     /// (with `<image>` placeholders) and the generated images in order.
+    /// `cancel` is the request's cooperative cancellation handle (F-037): the AR text rollout checks it
+    /// per decoded token and each per-image denoise runs under a [`StepReporter`] built from `cancel` +
+    /// `on_progress`, so a worker-consumed Document Studio interleave is cancellable and reports denoise
+    /// progress (the prior F-128 fix covered only the registry T2I path). Returns [`Error::Canceled`] on
+    /// trip.
     #[allow(clippy::too_many_arguments)]
     pub fn interleave_gen(
         &self,
@@ -1140,6 +1161,8 @@ impl T2iModel {
         max_new_tokens: usize,
         max_images: usize,
         init_noises: Option<&[Array]>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> Result<InterleaveOutput> {
         let cell = self.patch_size * self.merge_size;
         if width % cell != 0 || height % cell != 0 {
@@ -1201,6 +1224,9 @@ impl T2iModel {
             let mut gen_tokens = Vec::new();
             let mut hit_max = false;
             loop {
+                if cancel.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
                 if next == tokens::IM_END || next == self.img_start_id {
                     break;
                 }
@@ -1252,7 +1278,7 @@ impl T2iModel {
                 height,
                 &base_noise,
                 opts,
-                None,
+                Some(StepReporter::new(cancel, on_progress)),
             )?;
             let image = traj.into_iter().last().expect("at least one step");
 

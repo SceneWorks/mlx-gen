@@ -230,7 +230,7 @@ fn wan_ti2v_5b_real_weight_e2e_matches_reference() {
     println!("[ti2v video] max|Δ|={ti2v_max:.3e} mean_rel={ti2v_mr:.3e}");
 
     // Exercise the product frame-assembly (uint8 [F,H,W,3] → Vec<Image>).
-    let frames_u8 = decode_to_frames_22(&vae, &ti2v_latents, None).unwrap();
+    let frames_u8 = decode_to_frames_22(&vae, &ti2v_latents, None, None).unwrap();
     let images = mlx_gen_wan::frames_to_images(&frames_u8).unwrap();
     assert_eq!(
         images.len(),

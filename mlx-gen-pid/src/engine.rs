@@ -179,11 +179,14 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    Ok(Some(engine.decoder(
-        &req.prompt,
-        capture_sigma,
-        base_seed,
-    )?))
+    // Thread the request's cancel flag into the minted decoder so the ~100 s 4-step decode honors a
+    // cancel per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag,
+    // so we bind it here where the request is in scope.
+    Ok(Some(
+        engine
+            .decoder(&req.prompt, capture_sigma, base_seed)?
+            .with_cancel(req.cancel.clone()),
+    ))
 }
 
 /// Resolve the `from_ldm` early-stop for one **flow-match** generation (sc-7993): fold `req.use_pid` +

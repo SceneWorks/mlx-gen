@@ -610,6 +610,7 @@ impl KreaRawTrainer {
                         edge,
                         cfg.sample_steps.max(1) as usize,
                         cfg.sample_guidance_scale,
+                        &req.cancel,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
                             step,
@@ -880,19 +881,21 @@ fn render_sample(
     edge: u32,
     steps: usize,
     guidance: f32,
+    cancel: &CancelFlag,
 ) -> Result<Image> {
     let (hl, wl) = ((edge / 8) as i32, (edge / 8) as i32);
     let noise = random::normal::<f32>(&[1, 16, hl, wl], None, None, Some(&random::key(seed)?))?;
     let img_seq = (edge as f64 / 16.0).powi(2);
     let sigmas = krea_sigmas(steps, dynamic_mu(img_seq));
-    let cancel = CancelFlag::new();
+    // F-077: honor the training request's cancel per denoise step. Previously a fresh
+    // `CancelFlag::new()` here meant the preview render could never be cancelled mid-denoise.
     let lat = run_flow_sampler(
         None,
         TimestepConvention::Sigma,
         &sigmas,
         noise,
         seed,
-        &cancel,
+        cancel,
         &mut |_: Progress| {},
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);

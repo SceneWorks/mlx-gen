@@ -844,11 +844,16 @@ pub fn decode_to_frames(
     vae: &WanVae,
     latents: &Array,
     tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    // Honor cancellation before the (dominant-cost, sc-4998) decode stage (F-014).
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
     // WanVae::decode[_tiled] expect/return a leading batch dim: [1, 3, F, H, W] in [-1, 1].
     let z = latents.reshape(&prepend1(latents.shape()))?;
     let video = match tiling {
-        Some(cfg) => vae.decode_tiled(&z, cfg)?,
+        Some(cfg) => vae.decode_tiled(&z, cfg, cancel)?,
         None => vae.decode(&z)?,
     };
     // [1,3,F,H,W] → [F,H,W,3]
@@ -872,9 +877,14 @@ pub fn decode_to_frames_22(
     vae: &Wan22Vae,
     latents: &Array,
     tiling: Option<&TilingConfig>,
+    cancel: Option<&CancelFlag>,
 ) -> Result<Array> {
+    // Honor cancellation before the (dominant-cost, sc-4998) decode stage (F-014).
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(Error::Canceled);
+    }
     let video = match tiling {
-        Some(cfg) => vae.decode_tiled(latents, cfg)?,
+        Some(cfg) => vae.decode_tiled(latents, cfg, cancel)?,
         None => vae.decode(latents)?,
     };
     // [1, F', H', W', 3] → [F', H', W', 3]; [-1,1] → [0,255] uint8.

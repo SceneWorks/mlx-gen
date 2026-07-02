@@ -172,6 +172,7 @@ fn ar_runtime_matches_reference() {
             &[],
             n,
             Sampler::Greedy,
+            None,
         )
         .unwrap();
     assert_eq!(
@@ -232,6 +233,7 @@ fn generate_think_stops_and_appends() {
             -1,
             &append_ids,
             64,
+            None,
         )
         .unwrap();
     // Emitted ids are the greedy stream up to and including the `</think>` token.
@@ -255,6 +257,7 @@ fn generate_think_stops_and_appends() {
             eos,
             &append_ids,
             64,
+            None,
         )
         .unwrap();
     assert!(

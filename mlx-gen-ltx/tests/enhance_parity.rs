@@ -58,6 +58,23 @@ fn run_smoke(dir: &PathBuf, sampler: SampleParams) -> String {
         max_tokens: 96, // keep the smoke quick; full default is 512
         seed: 42,
     };
+    // F-018: a pre-tripped cancel aborts before the ~12B prefill, returning Error::Canceled.
+    let tripped = mlx_gen::CancelFlag::new();
+    tripped.cancel();
+    let canceled = enhance::enhance(
+        &gemma,
+        &tok,
+        enhance::T2V_SYSTEM_PROMPT,
+        "a red fox running through a snowy forest at dawn",
+        &cfg,
+        &sampler,
+        Some(&tripped),
+    );
+    assert!(
+        matches!(canceled, Err(mlx_gen::Error::Canceled)),
+        "pre-tripped cancel must abort enhance with Error::Canceled"
+    );
+
     let out = enhance::enhance(
         &gemma,
         &tok,
@@ -65,6 +82,7 @@ fn run_smoke(dir: &PathBuf, sampler: SampleParams) -> String {
         "a red fox running through a snowy forest at dawn",
         &cfg,
         &sampler,
+        None,
     )
     .expect("enhance");
     eprintln!("enhanced ({:?}): {out}", sampler);

@@ -206,7 +206,7 @@ fn wan_a14b_lora_real_weight_e2e_matches_reference() {
         video.shape()
     );
 
-    let frames_u8 = decode_to_frames(&vae, &latents, None).unwrap();
+    let frames_u8 = decode_to_frames(&vae, &latents, None, None).unwrap();
     let images = mlx_gen_wan::frames_to_images(&frames_u8).unwrap();
     assert_eq!(images.len(), exp_vid.shape()[2] as usize, "frame count");
 
