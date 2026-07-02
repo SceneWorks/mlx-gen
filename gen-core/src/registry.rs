@@ -183,13 +183,15 @@ pub fn load_text_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextEmbed
 // Descriptor-level conformance sweep (sc-9098, F-009)
 // ---------------------------------------------------------------------------------------------
 
-/// An identifier-shaped registry string: non-empty lowercase `a-z0-9` with `_`/`-`/`.` separators —
-/// the shape every shipped id/family/backend uses (`z_image_turbo`, `image-embed`, `mlx`). Rejects
-/// whitespace/uppercase/unicode, which would break worker payload routing and log grepping.
+/// An identifier-shaped registry string: non-empty lowercase `a-z0-9` with `_`/`-`/`.`/`/`
+/// separators — the shape every shipped id/family/backend uses (`z_image_turbo`, `image-embed`,
+/// `mlx`, and HF-repo-style captioner ids like `fancyfeast/llama-joycaption-beta-one-hf-llava`).
+/// Rejects whitespace/uppercase/unicode, which would break worker payload routing and log grepping.
 fn is_registry_ident(s: &str) -> bool {
     !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+        && s.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
+        })
 }
 
 /// Push an error for every malformed identity field (shared by all descriptor kinds).
