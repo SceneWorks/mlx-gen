@@ -156,7 +156,7 @@ fn kolors_t2i_matches_diffusers() {
         .denoise_latents(
             init_noise,
             &r_pos,
-            &r_neg,
+            Some(&r_neg),
             steps,
             cfg,
             h,

@@ -70,6 +70,49 @@ pub(crate) fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     Array::from_slice(&v, &[batch, 6])
 }
 
+/// Assemble the U-Net conditioning batch (`context`, `pooled`, `time_ids`) so its batch dim matches
+/// what `mlx_gen_sdxl::denoise*` feeds the U-Net latents (sc-9091, F-005). The shared engine only
+/// CFG-batches the latents to B=2 when `cfg > 1.0` (`denoise_core`, sdxl pipeline.rs); with
+/// `cfg <= 1.0` (guidance disabled, valid per capabilities) the latents stay B=1. Every Kolors mode
+/// runs through this ONE helper so a single gate keeps all six denoise assemblies' batch dims correct:
+///
+/// - `cfg > 1.0` → `[positive, negative]` context/pooled (row 0 = cond, row 1 = uncond) + `time_ids(2)`;
+///   `neg` **must** be `Some` (the caller encodes it).
+/// - `cfg <= 1.0` → the positive row only + `time_ids(1)`; `neg` is ignored (the caller skips the whole
+///   ChatGLM3-6B negative encode).
+///
+/// Before this gate the assemblies unconditionally built B=2 conditioning, so a CFG-off request handed
+/// the U-Net B=1 latents with B=2 conditioning and the attention reshape failed mid-denoise.
+fn cfg_conditioning(
+    pos: &(Array, Array),
+    neg: Option<&(Array, Array)>,
+    cfg: f32,
+    height: i32,
+    width: i32,
+) -> Result<(Array, Array, Array)> {
+    use mlx_rs::ops::concatenate_axis;
+    if cfg > 1.0 {
+        // CFG batch order is [positive, negative] — `mlx_gen_sdxl::denoise*` reads row 0 as the text
+        // (cond) and row 1 as the uncond.
+        let neg = neg.ok_or_else(|| {
+            Error::Msg(
+                "kolors: CFG is on (guidance > 1.0) but no negative conditioning was supplied"
+                    .into(),
+            )
+        })?;
+        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
+        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
+        Ok((conditioning, pooled, kolors_time_ids(2, height, width)))
+    } else {
+        // CFG off: B=1 conditioning to match the B=1 latents `denoise_core` keeps unbatched.
+        Ok((
+            pos.0.clone(),
+            pos.1.clone(),
+            kolors_time_ids(1, height, width),
+        ))
+    }
+}
+
 /// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed
 /// on `unet`: seeded prior → leading-Euler CFG denoise → VAE decode → [`Image`]. A stripped
 /// [`Kolors::denoise_latents`] + [`Kolors::decode`] for the trainer (which holds the raw components,
@@ -93,7 +136,9 @@ pub(crate) fn render_sample(
     let lw = (edge as i32) / SPATIAL_SCALE;
     let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
     let sampler = KolorsEulerSampler::kolors(steps.max(1), dtype)?;
-    let time_ids = kolors_time_ids(2, edge as i32, edge as i32);
+    // Match the time_ids batch to the conditioning batch the caller supplied (mirrors SDXL's
+    // `render_sample`), so this stays correct if the preview ever runs a B=1 (CFG-off) batch.
+    let time_ids = kolors_time_ids(pooled.shape()[0], edge as i32, edge as i32);
     let latents = sampler.scale_initial_noise(&init_noise)?;
     let d = Denoiser {
         unet,
@@ -198,7 +243,7 @@ impl Kolors {
         &self,
         init_noise: &Array,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         cfg: f32,
         height: i32,
@@ -206,13 +251,8 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
-        // CFG batch order is [positive, negative] — `mlx_gen_sdxl::denoise` reads row 0 as the text
-        // (cond) and row 1 as the uncond.
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         let d = Denoiser {
@@ -249,11 +289,17 @@ impl Kolors {
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
-        let neg = self.encode(negative)?;
+        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005) — the uncond row
+        // is never used, so encoding it would be a large wasted forward.
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
         let latents = self.denoise_latents(
             &init_noise,
             &pos,
-            &neg,
+            neg.as_ref(),
             num_steps,
             cfg,
             height,
@@ -276,7 +322,7 @@ impl Kolors {
         init_latents: &Array,
         noise: &Array,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         strength: f32,
         cfg: f32,
@@ -285,11 +331,8 @@ impl Kolors {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
         let latents = sampler.add_noise(init_latents, noise)?;
 
@@ -335,7 +378,7 @@ impl Kolors {
         init_latents: Option<&Array>,
         noise: &Array,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         strength: f32,
         cfg: f32,
@@ -374,9 +417,7 @@ impl Kolors {
                 multiply(&noise, scalar(full_sigmas[0]))?,
             )
         };
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
 
         // ControlNet branch: preprocess + CFG-batch the control image, then embed it once (the
         // conditioning embedding is step-invariant, F-069) — exactly as `denoise_controlnet_latents`.
@@ -397,12 +438,18 @@ impl Kolors {
             None => Vec::new(),
         };
 
-        // IP-Adapter image tokens: CFG-batch with a zeros uncond row (the uncond gets no image
-        // conditioning) — exactly as `denoise_ip_latents`.
+        // IP-Adapter image tokens, batched to match the latents: CFG-batch with a zeros uncond row
+        // (the uncond gets no image conditioning) when guidance is on; the image tokens alone when off
+        // — exactly as `denoise_ip_latents`.
         let ip_batched = match ip_tokens {
             Some((tokens, scale)) => {
-                let zero = zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
-                Some((concatenate_axis(&[tokens, &zero], 0)?, scale))
+                let batched = if cfg > 1.0 {
+                    let zero = zeros::<f32>(tokens.shape())?.as_dtype(tokens.dtype())?;
+                    concatenate_axis(&[tokens, &zero], 0)?
+                } else {
+                    tokens.clone()
+                };
+                Some((batched, scale))
             }
             None => None,
         };
@@ -454,12 +501,16 @@ impl Kolors {
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
-        let neg = self.encode(negative)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
         let latents = self.denoise_img2img_latents(
             &init_latents,
             &noise,
             &pos,
-            &neg,
+            neg.as_ref(),
             num_steps,
             strength,
             cfg,
@@ -485,7 +536,7 @@ impl Kolors {
         init_noise: &Array,
         control_image: &Image,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         cfg: f32,
         control_scale: f32,
@@ -496,9 +547,7 @@ impl Kolors {
     ) -> Result<Array> {
         use mlx_rs::ops::concatenate_axis;
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
         // The ControlNet sees the same CFG-batched input as the U-Net (cfg>1 ⇒ [cond, uncond]).
@@ -557,13 +606,17 @@ impl Kolors {
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
-        let neg = self.encode(negative)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
         let latents = self.denoise_controlnet_latents(
             controlnet,
             &init_noise,
             control_image,
             &pos,
-            &neg,
+            neg.as_ref(),
             num_steps,
             cfg,
             control_scale,
@@ -594,7 +647,7 @@ impl Kolors {
         ip_tokens: &Array,
         init_noise: &Array,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         cfg: f32,
         ip_scale: f32,
@@ -605,15 +658,17 @@ impl Kolors {
     ) -> Result<Array> {
         use mlx_rs::ops::{concatenate_axis, zeros};
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
-        // CFG batch: [image tokens, zeros] — the uncond row gets no image conditioning.
-        let sh = ip_tokens.shape();
-        let zero = zeros::<f32>(sh)?.as_dtype(ip_tokens.dtype())?;
-        let tokens = concatenate_axis(&[ip_tokens, &zero], 0)?;
+        // IP-Adapter image tokens, batched to match the U-Net latents: [image tokens, zeros] under CFG
+        // (the uncond row gets no image conditioning); the image tokens alone when guidance is off.
+        let tokens = if cfg > 1.0 {
+            let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
+            concatenate_axis(&[ip_tokens, &zero], 0)?
+        } else {
+            ip_tokens.clone()
+        };
 
         let d = Denoiser {
             unet: &self.unet,
@@ -661,7 +716,7 @@ impl Kolors {
         noise: &Array,
         control_image: &Image,
         pos: &(Array, Array),
-        neg: &(Array, Array),
+        neg: Option<&(Array, Array)>,
         num_steps: usize,
         strength: f32,
         cfg: f32,
@@ -674,9 +729,7 @@ impl Kolors {
     ) -> Result<Array> {
         use mlx_rs::ops::{concatenate_axis, zeros};
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
-        let conditioning = concatenate_axis(&[&pos.0, &neg.0], 0)?;
-        let pooled = concatenate_axis(&[&pos.1, &neg.1], 0)?;
-        let time_ids = kolors_time_ids(2, height, width);
+        let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         // Seed the img2img init (raw `x₀ + noise·σ_start`), as in `denoise_img2img_latents`.
         let latents = sampler.add_noise(init_latents, noise)?;
 
@@ -693,11 +746,15 @@ impl Kolors {
             scale: control_scale,
         };
 
-        // CFG batch the IP tokens with a zeros uncond row (the uncond gets no image conditioning), as
-        // in `denoise_ip_latents`.
-        let sh = ip_tokens.shape();
-        let zero = zeros::<f32>(sh)?.as_dtype(ip_tokens.dtype())?;
-        let tokens = concatenate_axis(&[ip_tokens, &zero], 0)?;
+        // Batch the IP tokens to match the latents: a zeros uncond row (the uncond gets no image
+        // conditioning) under CFG; the image tokens alone when guidance is off — as in
+        // `denoise_ip_latents`.
+        let tokens = if cfg > 1.0 {
+            let zero = zeros::<f32>(ip_tokens.shape())?.as_dtype(ip_tokens.dtype())?;
+            concatenate_axis(&[ip_tokens, &zero], 0)?
+        } else {
+            ip_tokens.clone()
+        };
 
         let d = Denoiser {
             unet: &self.unet,
@@ -755,7 +812,11 @@ impl Kolors {
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
-        let neg = self.encode(negative)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
         let latents = self.denoise_controlnet_ip_latents(
             controlnet,
             &ip_tokens,
@@ -763,7 +824,7 @@ impl Kolors {
             &noise,
             control_image,
             &pos,
-            &neg,
+            neg.as_ref(),
             num_steps,
             strength,
             cfg,
@@ -800,12 +861,16 @@ impl Kolors {
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
         let pos = self.encode(prompt)?;
-        let neg = self.encode(negative)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
         let latents = self.denoise_ip_latents(
             &ip_tokens,
             &init_noise,
             &pos,
-            &neg,
+            neg.as_ref(),
             num_steps,
             cfg,
             ip_scale,
@@ -821,6 +886,7 @@ impl Kolors {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::indexing::IndexOp;
 
     /// F-020: the struct-API dim guard rejects non-positive / non-multiple-of-8 dimensions (which the
     /// registry validates but the `pub fn generate*` methods previously did not).
@@ -838,5 +904,66 @@ mod tests {
         );
         assert!(validate_dims(0, 512).is_err(), "0 is non-positive");
         assert!(validate_dims(512, -8).is_err(), "negative width");
+    }
+
+    /// Tiny synthetic `(context, pooled)` in the Kolors conditioning shapes (`[1, T, D]` / `[1, D]`).
+    fn synthetic_cond(tag: f32) -> (Array, Array) {
+        // T=4 tokens, D=8 channels — dimension-parametric, not the real 256×4096.
+        let ctx = mlx_rs::ops::full::<f32>(&[1, 4, 8], mlx_gen::array::scalar(tag)).unwrap();
+        let pooled = mlx_rs::ops::full::<f32>(&[1, 8], mlx_gen::array::scalar(tag)).unwrap();
+        (ctx, pooled)
+    }
+
+    /// sc-9091 (F-005): with CFG on (`cfg > 1.0`) the conditioning is the B=2 `[positive, negative]`
+    /// batch and `time_ids` is B=2 — matching the B=2 latents `denoise_core` builds.
+    #[test]
+    fn cfg_conditioning_batches_two_when_guidance_on() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        let (ctx, pooled, time_ids) =
+            cfg_conditioning(&pos, Some(&neg), 5.0, 1024, 768).expect("cfg-on assembly");
+        assert_eq!(ctx.shape(), &[2, 4, 8], "context is the [pos, neg] batch");
+        assert_eq!(pooled.shape(), &[2, 8], "pooled is the [pos, neg] batch");
+        assert_eq!(time_ids.shape(), &[2, 6], "time_ids batches to 2 under CFG");
+        // Row 0 must be the positive stream, row 1 the negative (the order denoise reads).
+        assert_eq!(ctx.index(0).sum(None).unwrap().item::<f32>(), 32.0); // 4*8*1.0
+        assert_eq!(ctx.index(1).sum(None).unwrap().item::<f32>(), -32.0); // 4*8*-1.0
+    }
+
+    /// sc-9091 (F-005): with CFG off (`cfg <= 1.0`) the conditioning is B=1 (positive only) and
+    /// `time_ids` is B=1 — matching the B=1 latents `denoise_core` keeps unbatched. This is the batch
+    /// the pre-fix code got wrong (it always built B=2), which is why the attention reshape failed.
+    #[test]
+    fn cfg_conditioning_batches_one_when_guidance_off() {
+        let pos = synthetic_cond(1.0);
+        let neg = synthetic_cond(-1.0);
+        for cfg in [1.0f32, 0.0, 0.5] {
+            let (ctx, pooled, time_ids) =
+                cfg_conditioning(&pos, Some(&neg), cfg, 1024, 768).expect("cfg-off assembly");
+            assert_eq!(
+                ctx.shape(),
+                &[1, 4, 8],
+                "context is B=1 (positive only) at cfg={cfg}"
+            );
+            assert_eq!(pooled.shape(), &[1, 8], "pooled is B=1 at cfg={cfg}");
+            assert_eq!(time_ids.shape(), &[1, 6], "time_ids is B=1 at cfg={cfg}");
+            assert_eq!(
+                ctx.index(0).sum(None).unwrap().item::<f32>(),
+                32.0,
+                "the positive stream"
+            );
+        }
+    }
+
+    /// sc-9091 (F-005): CFG-off must NOT require a negative conditioning — the caller skips the full
+    /// ChatGLM3-6B negative encode and passes `None`, and the assembly still yields a valid B=1 batch.
+    #[test]
+    fn cfg_conditioning_off_needs_no_negative() {
+        let pos = synthetic_cond(1.0);
+        let (ctx, pooled, time_ids) =
+            cfg_conditioning(&pos, None, 1.0, 512, 512).expect("cfg-off needs no negative");
+        assert_eq!(ctx.shape(), &[1, 4, 8]);
+        assert_eq!(pooled.shape(), &[1, 8]);
+        assert_eq!(time_ids.shape(), &[1, 6]);
     }
 }

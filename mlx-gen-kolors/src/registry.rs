@@ -303,7 +303,14 @@ impl KolorsGenerator {
         // time_ids. Routing every mode through those methods keeps a single denoise assembly shared
         // with the struct API + parity gates — only the real cancel/progress differ here (F-146).
         let pos = self.kolors.encode(&req.prompt)?;
-        let neg = self.kolors.encode(negative)?;
+        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005, sc-9091): the
+        // per-mode denoise assemblies build B=1 conditioning for `cfg <= 1.0` and never read the
+        // uncond stream, so encoding it would be a large wasted 6B forward.
+        let neg = if cfg > 1.0 {
+            Some(self.kolors.encode(negative)?)
+        } else {
+            None
+        };
 
         // IP-Adapter image tokens are seed-independent — encode the reference once (the
         // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
@@ -396,7 +403,7 @@ impl KolorsGenerator {
                     init_opt.as_ref(),
                     &noise,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     strength,
                     cfg,
@@ -430,7 +437,7 @@ impl KolorsGenerator {
                     &noise,
                     skeleton,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     strength,
                     cfg,
@@ -447,7 +454,7 @@ impl KolorsGenerator {
                     &noise,
                     image,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     cfg,
                     scale,
@@ -461,7 +468,7 @@ impl KolorsGenerator {
                     tokens,
                     &noise,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     cfg,
                     *scale,
@@ -476,7 +483,7 @@ impl KolorsGenerator {
                     &x0,
                     &noise,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     strength,
                     cfg,
@@ -489,7 +496,7 @@ impl KolorsGenerator {
                 self.kolors.denoise_latents(
                     &noise,
                     &pos,
-                    &neg,
+                    neg.as_ref(),
                     steps,
                     cfg,
                     h,
