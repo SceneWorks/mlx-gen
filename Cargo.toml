@@ -52,14 +52,17 @@ sceneworks-gen-core-testkit = { path = "gen-core-testkit" }
 # core-llm (gen-core re-exports it as `gen_core::core_llm`, mirroring how mlx-gen re-exports gen-core),
 # so the gen-ai side runs its LLM providers through the unified `core_llm::TextLlm` engine instead of
 # the duplicate `gen_core::TextLlm`. core-llm is tensor-free (thiserror/inventory/tokenizers/serde_json/
-# minijinja) so this preserves gen-core's zero-tensor invariant. Rev-pinned (F-048): mlx-llm (pinned
-# just below) declares core-llm at `branch = "main"`, so cargo would otherwise resolve core-llm to
-# whatever main's tip is on each generate-lockfile — a moving mutable ref, the last branch pin in the
-# workspace. Pinning here to main's current tip keeps the lock's core-llm unified with the one mlx-llm
-# pulls in (one core-llm build, one type), and the rev + `cargo ... --locked` in CI means a changed
-# core-llm is now a deliberate, reviewed re-pin rather than a silent drift. Bump this rev (and the
-# lock) in lockstep with the SceneWorks worker + mlx-llm pins. See sc-7189 / sc-9109.
-core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "54cbac806304e823470ce3ded08f78589acdbb62" }
+# minijinja) so this preserves gen-core's zero-tensor invariant. Deliberately `branch = "main"`, NOT
+# a rev pin (F-048): mlx-llm (pinned just below) declares core-llm at `branch = "main"`, and cargo
+# treats `?branch=main` and `?rev=…` as DISTINCT source ids even at the identical commit — a rev pin
+# here would put TWO core-llm packages in the lock, splitting the `inventory` registry statics so
+# mlx-llm's providers register into one core-llm instance while gen-core resolves through the other
+# (JoyCaption provider lookup breaks at runtime; the exact two-builds failure mode the mlx-llm pin
+# below exists to prevent). The commit is frozen by Cargo.lock + `--locked` in CI instead, so a
+# changed core-llm is still a deliberate, reviewed re-lock rather than silent drift. True rev-pinning
+# requires mlx-llm's own core-llm dep to move off `branch = "main"` upstream first; until then both
+# must stay on the branch source id. See sc-7189 / sc-9109.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 # The shared on-device LLM engine (KV cache + sampler + RoPE): the only MLX-backed LLM decode runtime.
 # Pinned to the SAME rev the SceneWorks worker pins so cargo unifies ONE mlx-llm — one `Array`, one
 # `core-llm` — across the worker dependency graph (the worker also depends on mlx-llm directly for
