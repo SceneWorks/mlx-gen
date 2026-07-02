@@ -243,15 +243,44 @@ impl Wan {
                 )));
             }
         }
+        // The TI2V mask-blend path (the `ti2v = Some(_)` branch of `generate_impl`) is entered by
+        // Keyframe conditioning OR a Reference image — the contract checks below must cover both.
+        let image_conditioned = !req.keyframes().is_empty() || i2v_reference(req).is_some();
+        // F-074(b): a `Reference` image AND `Keyframe`s together previously fell into the keyframe
+        // branch, silently dropping the Reference (undocumented precedence). The combination is
+        // redundant — a Reference *is* a first-frame pin — so reject it; the first frame is
+        // expressed as a Keyframe with frame_idx 0 alongside the others.
+        if i2v_reference(req).is_some() && !req.keyframes().is_empty() {
+            return Err(Error::Msg(
+                "wan2_2_ti2v_5b: Reference and Keyframe conditioning cannot be combined (the \
+                 keyframe path would silently drop the Reference) — express the first frame as a \
+                 Keyframe with frame_idx 0"
+                    .into(),
+            ));
+        }
         // F-074(a): the curated-sampler × image-conditioned-TI2V mask-blend rejection previously
         // fired in Stage 2 (denoise), AFTER the ~11 GB UMT5 load + VAE encode. Both inputs are known
-        // at validate time, so reject here — the keyframe mask-blend path (the `ti2v = Some(_)`
-        // branch) has no single-eval curated-sampler hook. The 14B sibling's `validate_impl` already
-        // rejects this combination.
-        if is_wan_curated(req.sampler.as_deref()) && !req.keyframes().is_empty() {
+        // at validate time, so reject here — the mask-blend path has no single-eval curated-sampler
+        // hook. (The 14B sibling has no mask-blend path: its I2V is channel-concat, which the
+        // curated solvers DO serve via `denoise_moe_curated`.)
+        if is_wan_curated(req.sampler.as_deref()) && image_conditioned {
             return Err(Error::Msg(
                 "wan2_2_ti2v_5b: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                  supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"
+                    .into(),
+            ));
+        }
+        // F-015: `trim_first_frames` generates extra leading latent frames and drops them after
+        // decode — but the mask-blend pins the Reference at latent frame 0 (into the discarded
+        // prefix) and Keyframe indices resolve against the trim-EXTENDED grid (shifted vs the
+        // delivered video). The reference (mlx_video generate_wan.py) documents trim as a 14B
+        // first-frame-artifact fix and, run this way, trims its own pinned frame off — a degenerate
+        // outcome, not a supported mode. Reject, mirroring the 14B's trim×I2V rejection.
+        if req.trim_first_frames.unwrap_or(0) > 0 && image_conditioned {
+            return Err(Error::Msg(
+                "wan2_2_ti2v_5b: trim_first_frames is not supported with Reference/Keyframe \
+                 conditioning (the pinned frame would be trimmed off, and keyframe positions \
+                 would shift vs the delivered video)"
                     .into(),
             ));
         }
@@ -401,6 +430,8 @@ impl Wan {
             // single-eval curated-sampler hook, so it stays native-only.
             match (&ti2v, is_wan_curated(req.sampler.as_deref())) {
                 (Some(_), true) => {
+                    // Unreachable via requests — `validate_impl` rejects curated × mask-blend up
+                    // front (F-074a); kept as a defensive backstop for direct callers.
                     return Err(Error::Msg(
                         "wan: curated samplers (euler_ancestral/heun/dpmpp_sde/ddim) are not \
                          supported with image-conditioned TI2V mask-blend — use unipc/euler/dpmpp2m"

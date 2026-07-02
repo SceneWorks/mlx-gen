@@ -698,8 +698,7 @@ pub fn load_pth_f32(path: impl AsRef<Path>) -> Result<HashMap<String, Array>> {
                 .map_err(|e| Error::Msg(format!("read storage {blob_name} for {name}: {e}")))?;
             require_stored(blob_entry.compression(), &blob_name)?;
             // F-071: try_reserve_exact (see the pkl entry above) — a crafted header must not abort.
-            blob
-                .try_reserve_exact(blob_entry.compressed_size() as usize)
+            blob.try_reserve_exact(blob_entry.compressed_size() as usize)
                 .map_err(|_| Error::Msg(format!("read storage {blob_name}: entry too large")))?;
             blob_entry.read_to_end(&mut blob)?;
             blob_cache.insert(key.clone(), blob);
