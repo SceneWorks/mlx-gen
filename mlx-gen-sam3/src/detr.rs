@@ -24,7 +24,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
 use crate::config::Sam3DetrConfig;
-use crate::util::join;
+use crate::util::{join, text_key_mask};
 
 const SCALE_2PI: f32 = 2.0 * PI;
 const NUM_POS: i32 = 128; // sine position features per axis (hidden_size / 2)
@@ -723,15 +723,6 @@ fn log_scale(d: &Array) -> Result<Array> {
     let mag = log(&add(&abs(&d8)?, Array::from_f32(1.0))?)?; // ln(|d8|+1)
     let log2 = multiply(&mag, Array::from_f32(std::f32::consts::LOG2_E * inv_log2_8))?; // ln·log2(e)/3 = log2/3
     multiply(&sign(&d8)?, &log2).map_err(Into::into)
-}
-
-/// Build a key-padding additive mask `[1, 1, 1, L]` (0 valid, −1e9 padded), broadcast over heads/queries.
-fn text_key_mask(text_mask: &[i32]) -> Array {
-    let row: Vec<f32> = text_mask
-        .iter()
-        .map(|&m| if m == 1 { 0.0 } else { -1e9 })
-        .collect();
-    Array::from_slice(&row, &[1, 1, 1, row.len() as i32])
 }
 
 /// Sine position embedding (normalize=True), flattened to `[1, H·W, D]` (host-computed constant for

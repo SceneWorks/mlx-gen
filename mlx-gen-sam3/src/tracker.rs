@@ -14,6 +14,8 @@
 //! mask decoder), the SAM2-`Sam2Segmenter`-equivalent that the memory/video layer (F2) builds on.
 //! Layout is NHWC end-to-end (matching [`crate::vision`] / [`crate::mask`]).
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::f32::consts::PI;
 
 use mlx_rs::fast::{layer_norm, scaled_dot_product_attention};
@@ -725,10 +727,33 @@ fn conv2d_g(
     Ok(add(&y, b)?)
 }
 
+thread_local! {
+    /// [`bilinear_resize_matrix`] results keyed by `(in_size, out_size)`. Every video frame hits the
+    /// same handful of fixed sizes (1008→1152 mask-mem prep, 288→1008 upsamples, 252→288 prompt
+    /// prep) **per object per frame**, and each build is a 1.2–4.6 MB host loop + upload — so build
+    /// each matrix once and hand out cheap ref-counted `Array` clones (F-108, following the
+    /// sc-6954 / F-167 memoization precedent in `detr::VisPosCache` and sam2's RoPE-table caches).
+    /// Thread-local so the cache needs no `Send`/`Sync` guarantees on `Array`.
+    static RESIZE_MATRIX_CACHE: RefCell<HashMap<(i32, i32), Array>> = RefCell::new(HashMap::new());
+}
+
+/// Memoized [`build_bilinear_resize_matrix`]: the matrix is a pure function of the key, so the first
+/// call for a given `(in, out)` pair builds it and every later call returns the same handle
+/// (bit-identical by construction).
+fn bilinear_resize_matrix(in_size: i32, out_size: i32) -> Array {
+    let key = (in_size, out_size);
+    if let Some(hit) = RESIZE_MATRIX_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return hit;
+    }
+    let m = build_bilinear_resize_matrix(in_size, out_size);
+    RESIZE_MATRIX_CACHE.with(|c| c.borrow_mut().insert(key, m.clone()));
+    m
+}
+
 /// Separable bilinear-resize weight matrix `W` `[out, in]` for `align_corners=False`
 /// (`out = W @ in @ Wᵀ`). Matches `torch.nn.functional.interpolate(mode="bilinear")`; the SAM3 mask
 /// prep is 1008²→1152² (**upsampling**, so the reference `antialias=True` is a documented no-op).
-fn bilinear_resize_matrix(in_size: i32, out_size: i32) -> Array {
+fn build_bilinear_resize_matrix(in_size: i32, out_size: i32) -> Array {
     let mut data = vec![0f32; (out_size * in_size) as usize];
     let scale = in_size as f32 / out_size as f32;
     for o in 0..out_size {
@@ -1852,10 +1877,15 @@ impl Sam3Tracker {
     }
 }
 
+/// Index of the maximum value under [`f32::total_cmp`]'s total order, so a NaN in the IoU-head
+/// output resolves deterministically instead of poisoning every `>` comparison (a leading NaN made
+/// the old `x > v[best]` loop stick at index 0 no matter the finite values behind it) — mirrors
+/// sam2's F-169 `argmax_f32`. Ties keep the **first** maximum (this loop's historical semantics, vs
+/// sam2's last-max `max_by`), so finite inputs are bit-for-bit unchanged.
 fn argmax(v: &[f32]) -> usize {
     let mut best = 0usize;
-    for (i, &x) in v.iter().enumerate() {
-        if x > v[best] {
+    for (i, x) in v.iter().enumerate() {
+        if x.total_cmp(&v[best]).is_gt() {
             best = i;
         }
     }

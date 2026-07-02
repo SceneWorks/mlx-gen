@@ -18,15 +18,11 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::config::Sam3DetrConfig;
-use crate::util::join;
+// The OIHW→OHWI conv-weight permute is the shared `util` helper, not a local copy (F-108).
+use crate::util::{conv_w_ohwi as conv_w, join};
 
 const LN_EPS: f32 = 1e-5; // nn.LayerNorm / GroupNorm default eps in the mask decoder
 const NUM_GROUPS: i32 = 8;
-
-/// Torch conv weight `[out, in, kH, kW]` (OIHW) → MLX `[out, kH, kW, in]` (OHWI).
-fn conv_w(w: &Array) -> Result<Array> {
-    Ok(w.transpose_axes(&[0, 2, 3, 1])?)
-}
 
 /// Prompt cross-attention (text-conditioned), `[B, Nq, D]` query over `[B, Nk, D]` key/value.
 struct PromptAttn {

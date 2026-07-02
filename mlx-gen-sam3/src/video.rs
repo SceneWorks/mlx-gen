@@ -160,7 +160,7 @@ impl Sam3VideoModel {
         cancel: Option<&CancelFlag>,
         mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<Vec<VideoFrameOutput>> {
-        self.num_frames = frames.len() as i32;
+        self.reset_session(frames.len() as i32);
         let total = frames.len();
         let mut outputs = Vec::new();
         for (f, px) in frames.iter().enumerate() {
@@ -172,10 +172,31 @@ impl Sam3VideoModel {
             }
             outputs.push(self.process_frame(f as i32, px, input_ids, text_mask)?);
             if let Some(cb) = progress.as_deref_mut() {
-                cb(f, total);
+                // f+1 completed frames of `total`, so `done == total` is actually observable (F-108).
+                cb(f + 1, total);
             }
         }
         Ok(outputs)
+    }
+
+    /// Clear all per-session tracking state at the start of a new propagation session (F-040).
+    /// `propagate` is the session boundary — without this reset, a second clip on a resident model
+    /// would gather memory keyed by the *previous* clip's frame indices (stale banks / keep-alive /
+    /// first-frame bookkeeping) and `removed` would permanently suppress object ids across clips
+    /// (silent cross-clip contamination). A fresh model's first clip is unaffected (all fields start
+    /// empty).
+    fn reset_session(&mut self, num_frames: i32) {
+        self.obj_ids.clear();
+        self.banks.clear();
+        self.obj_prompt.clear();
+        self.max_obj_id = -1;
+        self.num_frames = num_frames;
+        self.first_frame.clear();
+        self.unmatched_frames.clear();
+        self.keep_alive.clear();
+        self.overlap_pairs.clear();
+        self.removed.clear();
+        self.last_occluded.clear();
     }
 
     fn process_frame(
@@ -225,10 +246,6 @@ impl Sam3VideoModel {
         let new_obj_ids: Vec<i32> = (0..assoc.new_det_inds.len() as i32)
             .map(|i| self.max_obj_id + 1 + i)
             .collect();
-        for (&oid, &di) in new_obj_ids.iter().zip(&assoc.new_det_inds) {
-            // prompt id assigned at creation (recorded when the object is added below)
-            let _ = (oid, di);
-        }
         let removed_now = self.process_hotstart(frame_idx, &assoc, &new_obj_ids);
 
         // recondition every Nth frame: confidently re-detected tracks become conditioning frames
@@ -333,21 +350,30 @@ impl Sam3VideoModel {
             .map(|&s| s * presence)
             .collect();
         let q = probs.len();
-        let masks = seg.pred_masks.reshape(&[q as i32, LOW_RES * LOW_RES])?;
-        let masks_v = masks.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
-        let mut dets = Vec::new();
-        for (qi, &p) in probs.iter().enumerate() {
-            if p <= SCORE_THRESH_DET {
-                continue;
+        // Pick the survivors on the (small, already read back) probs first, then gather ONLY the
+        // kept mask rows on-device and read those back — instead of reading back all Q≈200 query
+        // masks (~66 MB/frame) to keep a handful (F-043). Same threshold (`> SCORE_THRESH_DET`, the
+        // complement of the old `<=` skip), same survivors, same ascending query order; the gather
+        // is exact and the f32 cast is elementwise, so the kept logits are bit-identical.
+        let keep: Vec<i32> = (0..q)
+            .filter(|&qi| probs[qi] > SCORE_THRESH_DET)
+            .map(|qi| qi as i32)
+            .collect();
+        let mut dets = Vec::with_capacity(keep.len());
+        if !keep.is_empty() {
+            let px = (LOW_RES * LOW_RES) as usize;
+            let rows = seg
+                .pred_masks
+                .reshape(&[q as i32, LOW_RES * LOW_RES])?
+                .take_axis(Array::from_slice(&keep, &[keep.len() as i32]), 0)?;
+            let rows_v = rows.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+            for (row, &qi) in keep.iter().enumerate() {
+                dets.push(Detection {
+                    mask: rows_v[row * px..(row + 1) * px].to_vec(),
+                    score: probs[qi as usize],
+                    prompt_id: 0,
+                });
             }
-            let m = masks_v
-                [qi * (LOW_RES * LOW_RES) as usize..(qi + 1) * (LOW_RES * LOW_RES) as usize]
-                .to_vec();
-            dets.push(Detection {
-                mask: m,
-                score: p,
-                prompt_id: 0,
-            });
         }
         let dets = nms_dedup(dets, DET_NMS_THRESH);
         Ok(DetFrame { dets })

@@ -629,6 +629,14 @@ impl Sam2VideoPredictor {
         pts: Array,
         labels: Array,
     ) -> Result<Array> {
+        // `frame_idx` is request-derived: reject it before any state mutation or the `take_axis`
+        // gather in `frame_pixels`, which would otherwise index out of the clip (F-108).
+        if frame_idx < 0 || frame_idx >= state.num_frames {
+            return Err(Error::Msg(format!(
+                "sam2 video: frame_idx {frame_idx} out of range for a {}-frame clip",
+                state.num_frames
+            )));
+        }
         let is_init_cond = !state.frames_tracked.contains_key(&frame_idx);
         let reverse = state
             .frames_tracked
@@ -802,6 +810,9 @@ impl Sam2VideoPredictor {
             if let Some(out) = state.cond.get(&frame_idx) {
                 results.push((frame_idx, out.pred_masks.clone()));
             } else {
+                // Re-encode any evicted memory this frame's read window still needs (only reachable
+                // when a previous pass over stale state — e.g. the opposite direction — nulled it).
+                self.restore_windowed_maskmem(state, frame_idx, false)?;
                 // Non-cond propagate frames are encoded once and never revisited, so their `Encoded`
                 // is dropped rather than cached (keeps the cache bounded to cond frames — F-168).
                 let (out, _enc) =
@@ -810,8 +821,12 @@ impl Sam2VideoPredictor {
                 state.non_cond.insert(frame_idx, out);
             }
             state.frames_tracked.insert(frame_idx, false);
+            // Bound the memory bank: null the heavy `maskmem_*` pair of non-cond frames the rest of
+            // this forward pass can no longer read (F-041, the sam3 F-024 eviction policy).
+            evict_stale_maskmem(&mut state.non_cond, frame_idx, false);
             if let Some(cb) = progress.as_deref_mut() {
-                cb(i, total);
+                // i+1 completed frames of `total`, so `done == total` is actually observable (F-108).
+                cb(i + 1, total);
             }
         }
         Ok(results)
@@ -859,6 +874,9 @@ impl Sam2VideoPredictor {
             if let Some(out) = state.cond.get(&frame_idx) {
                 results.push((frame_idx, out.pred_masks.clone()));
             } else {
+                // Reverse propagation reads *ahead* of the current frame — restore any evicted
+                // memory in that window first (e.g. frames a prior forward pass evicted, F-041).
+                self.restore_windowed_maskmem(state, frame_idx, true)?;
                 // As in `propagate`, non-cond reverse frames are encoded once and never revisited, so
                 // their `Encoded` is dropped rather than cached (F-168). The `reverse = true` flag
                 // routes `condition_with_memories` through the ahead-of-current memory arithmetic.
@@ -868,11 +886,59 @@ impl Sam2VideoPredictor {
                 state.non_cond.insert(frame_idx, out);
             }
             state.frames_tracked.insert(frame_idx, true);
+            // Reverse twin of the forward eviction: null the heavy pair of frames *above* the
+            // remaining (descending) read window (F-041).
+            evict_stale_maskmem(&mut state.non_cond, frame_idx, true);
             if let Some(cb) = progress.as_deref_mut() {
-                cb(i, total);
+                // i+1 completed frames of `total`, so `done == total` is actually observable (F-108).
+                cb(i + 1, total);
             }
         }
         Ok(results)
+    }
+
+    /// Re-encode the memory of any non-cond frame inside `frame_idx`'s spatial read window whose
+    /// heavy `maskmem_*` pair was nulled by [`evict_stale_maskmem`] (F-041). Only reachable when a
+    /// *previous* pass evicted frames a new pass re-reads (e.g. forward-then-reverse: the first
+    /// reverse frames read ahead into forward-tracked territory) — within one pass the eviction
+    /// floor/ceiling never overtakes the pass's own window. The re-encode is bit-identical to the
+    /// original: `encode_memory` is deterministic in `(vision_features, pred_masks,
+    /// object_score_logits)`, the frame pixels re-encode to the same `vision_features`, and the
+    /// latter two are retained in the bank (`add_points` re-reads `pred_masks` too, which is why
+    /// eviction nulls **only** the maskmem pair). `is_mask_from_points = false` matches the original
+    /// encode: non-cond entries are only ever created by the point-less propagation loops.
+    fn restore_windowed_maskmem(
+        &self,
+        state: &mut VideoState,
+        frame_idx: i32,
+        reverse: bool,
+    ) -> Result<()> {
+        for t_pos in 1..NUM_MASKMEM {
+            let prev = maskmem_prev_frame(frame_idx, t_pos, reverse);
+            let evicted = state
+                .non_cond
+                .get(&prev)
+                .is_some_and(|o| o.maskmem_features.is_none());
+            if !evicted {
+                continue;
+            }
+            let enc = self.encode_frame(state, prev)?;
+            let Some(out) = state.non_cond.get(&prev) else {
+                continue;
+            };
+            let (mf, mp) = self.model.encode_memory(
+                &enc.vision_features,
+                &out.pred_masks,
+                &out.object_score_logits,
+                false,
+            )?;
+            let Some(out) = state.non_cond.get_mut(&prev) else {
+                continue;
+            };
+            out.maskmem_features = Some(mf);
+            out.maskmem_pos_enc = Some(mp);
+        }
+        Ok(())
     }
 
     /// Threshold a frame's low-res logits to a binary `L` mask at the original video resolution
@@ -883,6 +949,31 @@ impl Sam2VideoPredictor {
         let up = resize_bilinear_2d(&logits, 256, 256, h, w);
         let bin: Vec<u8> = up.iter().map(|&v| if v > 0.0 { 255 } else { 0 }).collect();
         Ok(Array::from_slice(&bin, &[h as i32, w as i32]))
+    }
+}
+
+/// Null the heavy `maskmem_features`/`maskmem_pos_enc` pair of non-cond frames the current
+/// propagation pass can no longer read, so a long clip's bank stops growing ~2 MB per frame without
+/// a ceiling (F-041, porting the sam3 F-024 eviction policy to sam2's structures). Direction-aware,
+/// derived from the same [`maskmem_prev_frame`] window `condition_with_memories` reads (single
+/// source of truth): after processing `frame_idx`, a forward pass's next reads reach back to
+/// `(frame_idx + 1) − (NUM_MASKMEM − 1)` and a reverse pass's reach ahead to `(frame_idx − 1) +
+/// (NUM_MASKMEM − 1)`, and each window only slides onward — so everything beyond it is dead for the
+/// rest of the pass. Entries are **kept** (never dropped) and only the maskmem pair is nulled:
+/// `add_points` re-reads `pred_masks`, the object-pointer window re-reads `obj_ptr`, and a later
+/// opposite-direction pass may re-enter the window (handled by
+/// [`Sam2VideoPredictor::restore_windowed_maskmem`]).
+fn evict_stale_maskmem(non_cond: &mut BTreeMap<i32, FrameOut>, frame_idx: i32, reverse: bool) {
+    for (&k, o) in non_cond.iter_mut() {
+        let stale = if reverse {
+            k > frame_idx - 1 + (NUM_MASKMEM - 1)
+        } else {
+            k < frame_idx + 1 - (NUM_MASKMEM - 1)
+        };
+        if stale {
+            o.maskmem_features = None;
+            o.maskmem_pos_enc = None;
+        }
     }
 }
 
@@ -940,6 +1031,87 @@ mod tests {
         assert_eq!(reverse_propagation_order(1), vec![1, 0]);
         // Prompt on frame 0 ⇒ nothing behind it ⇒ empty order.
         assert!(reverse_propagation_order(0).is_empty());
+    }
+
+    fn dummy_frame_out() -> FrameOut {
+        FrameOut {
+            pred_masks: Array::from_slice(&[0.0f32], &[1, 1, 1, 1]),
+            obj_ptr: Array::from_slice(&[0.0f32], &[1, 1]),
+            object_score_logits: Array::from_slice(&[10.0f32], &[1, 1]),
+            maskmem_features: Some(Array::from_slice(&[0.0f32], &[1, 1])),
+            maskmem_pos_enc: Some(Array::from_slice(&[0.0f32], &[1, 1])),
+        }
+    }
+
+    /// F-041 (forward): eviction nulls exactly the heavy pairs behind the remaining forward read
+    /// window and never drops an entry (`pred_masks`/`obj_ptr` stay re-readable).
+    #[test]
+    fn evict_stale_maskmem_forward_nulls_only_behind_window() {
+        let mut non_cond = BTreeMap::new();
+        for k in 0..=20 {
+            non_cond.insert(k, dummy_frame_out());
+        }
+        evict_stale_maskmem(&mut non_cond, 20, false);
+        let keep_min = 20 + 1 - (NUM_MASKMEM - 1); // 15
+        for k in 0..=20 {
+            let o = non_cond.get(&k).expect("entries are never dropped");
+            let kept = o.maskmem_features.is_some() && o.maskmem_pos_enc.is_some();
+            assert_eq!(kept, k >= keep_min, "key {k}");
+        }
+    }
+
+    /// F-041 (reverse): the mirrored eviction nulls exactly the heavy pairs *above* the remaining
+    /// (descending) read window.
+    #[test]
+    fn evict_stale_maskmem_reverse_nulls_only_ahead_of_window() {
+        let mut non_cond = BTreeMap::new();
+        for k in 0..=20 {
+            non_cond.insert(k, dummy_frame_out());
+        }
+        evict_stale_maskmem(&mut non_cond, 5, true);
+        let keep_max = 5 - 1 + (NUM_MASKMEM - 1); // 10
+        for k in 0..=20 {
+            let o = non_cond.get(&k).expect("entries are never dropped");
+            assert_eq!(o.maskmem_features.is_some(), k <= keep_max, "key {k}");
+        }
+    }
+
+    /// Within one pass the eviction never touches what the next frame's spatial window reads (the
+    /// restore path is only for cross-pass re-reads), in both directions.
+    #[test]
+    fn evict_stale_maskmem_never_nulls_the_next_frames_window() {
+        // Forward sweep: insert + evict per frame, then check frame f+1's window is intact.
+        let mut non_cond = BTreeMap::new();
+        for f in 0..60 {
+            non_cond.insert(f, dummy_frame_out());
+            evict_stale_maskmem(&mut non_cond, f, false);
+            for t_pos in 1..NUM_MASKMEM {
+                let prev = maskmem_prev_frame(f + 1, t_pos, false);
+                if let Some(o) = non_cond.get(&prev) {
+                    assert!(
+                        o.maskmem_features.is_some(),
+                        "forward frame {}: window key {prev} was nulled",
+                        f + 1
+                    );
+                }
+            }
+        }
+        // Reverse sweep (descending), same invariant against frame f−1's window.
+        let mut non_cond = BTreeMap::new();
+        for f in (0..60).rev() {
+            non_cond.insert(f, dummy_frame_out());
+            evict_stale_maskmem(&mut non_cond, f, true);
+            for t_pos in 1..NUM_MASKMEM {
+                let prev = maskmem_prev_frame(f - 1, t_pos, true);
+                if let Some(o) = non_cond.get(&prev) {
+                    assert!(
+                        o.maskmem_features.is_some(),
+                        "reverse frame {}: window key {prev} was nulled",
+                        f - 1
+                    );
+                }
+            }
+        }
     }
 
     /// The object-pointer temporal table is `[P, 256]`, and each `(sin, cos)` column pair for the

@@ -17,6 +17,7 @@ use mlx_gen::Result;
 use crate::config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
 use crate::detr::sine_position_embedding_flat;
 use crate::mask::{post_process_instances, Instance, Sam3MaskHead};
+use crate::util::text_key_mask;
 use crate::vision::Backbone;
 use crate::{Sam3Detector, Sam3GeometryEncoder, Sam3TextEncoder, Sam3VisionEncoder};
 
@@ -197,7 +198,7 @@ impl Sam3ImageSegmenter {
             &backbone,
             &det.encoder_hidden_states,
             prompt,
-            &prompt_key_mask(prompt_mask),
+            &text_key_mask(prompt_mask),
         )?;
         Ok(SegmentationOutput {
             pred_logits: det.pred_logits,
@@ -256,13 +257,4 @@ impl Sam3ImageSegmenter {
             mask_threshold,
         )
     }
-}
-
-/// Additive key-padding mask `[1, 1, 1, L]` (0 valid, −1e9 padded) for the mask head's prompt attn.
-fn prompt_key_mask(text_mask: &[i32]) -> Array {
-    let row: Vec<f32> = text_mask
-        .iter()
-        .map(|&m| if m == 1 { 0.0 } else { -1e9 })
-        .collect();
-    Array::from_slice(&row, &[1, 1, 1, row.len() as i32])
 }
