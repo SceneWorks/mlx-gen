@@ -109,6 +109,7 @@ fn mar_loop_matches_reference_f32() {
         &order,
         &step_noise,
         &CancelFlag::default(),
+        &mut |_step| {},
         &mask_token,
     )
     .expect("sample_vit_embed");

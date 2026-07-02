@@ -258,6 +258,11 @@ fn stream_for_vit(
 /// reference — tiled ×3 internally). Both are injected so the trajectory matches torch bit-for-bit;
 /// a step whose revealed set is empty (or `{token 0}` only — the reference's `nonzero().sum()==0`
 /// skip) consumes no noise. `mask_token` is `[1, 1, H]`.
+///
+/// `on_step` receives the **1-based** planning step (`1..=cfg.planning_step`, every iteration —
+/// skipped-reveal steps still run the 3 backbone forwards, so they still count). The multi-minute
+/// MAR stage (3 × Qwen2.5-VL-7B forwards per step) was previously progress-silent (F-038); the full
+/// pipeline folds these into its `Progress::Step` total ahead of the renderer denoise.
 #[allow(clippy::too_many_arguments)]
 pub fn sample_vit_embed(
     backbone: &Qwen25VlText,
@@ -270,6 +275,7 @@ pub fn sample_vit_embed(
     order: &[i32],
     step_noise: &[Array],
     cancel: &CancelFlag,
+    on_step: &mut dyn FnMut(usize),
     mask_token: &Array,
 ) -> Result<SampledStreams> {
     let n_query = order.len() as i32;
@@ -285,6 +291,9 @@ pub fn sample_vit_embed(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
+        // 1-based planner-stage progress (F-038) — emitted for every iteration (skipped-reveal
+        // steps still run the 3 backbone forwards below).
+        on_step(step + 1);
         // Every step runs all 3 backbones over the current (partially-filled) embeds.
         let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
         let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;

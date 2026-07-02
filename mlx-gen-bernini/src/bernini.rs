@@ -653,10 +653,6 @@ impl Bernini {
         let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
 
         // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
-        on_progress(Progress::Step {
-            current: 0,
-            total: steps as u32,
-        });
         let planner = BerniniPlanner::load(&self.root, self.quant)?;
 
         // Preprocess the conditioning: videos first, then images (the conversation / source_id order).
@@ -742,6 +738,12 @@ impl Bernini {
             vit_txt_cfg: FullDefaults::VIT_TXT_CFG,
             vit_img_cfg: FullDefaults::VIT_IMG_CFG,
         };
+        // One folded Progress::Step bar across both compute stages (F-038): the multi-minute MAR
+        // planning loop (`planning_step` steps × 3 Qwen2.5-VL-7B forwards) occupies
+        // `1..=planning_step`, the renderer denoise `planning_step+1..=total` — monotone, complete,
+        // 1-based (the testkit progress contract).
+        let planner_steps = vit_cfg.planning_step as u32;
+        let total = planner_steps + steps as u32;
         if n_query > planner.knobs.num_mask_token {
             return Err(Error::Msg(format!(
                 "bernini: gen-target needs {n_query} ViT tokens but the planner has only {} mask \
@@ -770,6 +772,12 @@ impl Bernini {
             &order,
             &step_noise,
             &req.cancel,
+            &mut |p| {
+                on_progress(Progress::Step {
+                    current: p as u32,
+                    total,
+                })
+            },
             &planner.mask_token,
         )?;
         eval([
@@ -881,10 +889,11 @@ impl Bernini {
                 self.knobs.interpolate_src_id,
             );
             let boundary = self.knobs.switch_dit_boundary * cfg.num_train_timesteps as f32;
-            let total = steps as u32;
+            // Renderer denoise steps continue the folded bar after the planner stage (1-based `i`
+            // from `denoise_bernini_wvitcfg`): `planning_step+1 ..= total`.
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
-                    current: i as u32,
+                    current: planner_steps + i as u32,
                     total,
                 })
             };

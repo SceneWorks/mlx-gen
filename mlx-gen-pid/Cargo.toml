@@ -17,6 +17,5 @@ serde_json = { workspace = true }
 # Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-krea / mlx-gen-z-image).
 image = { workspace = true }
 
-[dev-dependencies]
-# Backend-neutral gen-core contract conformance (sc-4481). Weight-gated (#[ignore]).
-sceneworks-gen-core-testkit = { workspace = true }
+# No dev-dependency on the gen-core testkit (sc-9098, F-102): PiD is a struct-API decoder overlay
+# (no registered `Generator`), so the registered-id conformance suite cannot apply to it.

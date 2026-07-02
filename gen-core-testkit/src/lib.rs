@@ -252,10 +252,24 @@ pub fn check_validate_honesty(g: &dyn Generator, profile: &Profile) -> Result<()
 /// **Progress.** `Progress::Step{current,total}` is monotone and complete: `current` runs exactly
 /// `1..=total`, `total` is constant, and `total` equals the profile's resolved step count.
 pub fn check_progress(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    check_progress_with(g, &base_request(profile), Some(profile.steps))
+}
+
+/// **Progress (request-supplied).** The general form of [`check_progress`] for providers whose
+/// `generate` needs a request the text-only [`base_request`] cannot express — image→video (SVD),
+/// super-resolution (SeedVR2), and the renderer families (Bernini, scail2), the same shape as
+/// [`check_cancellation_with`]. Asserts `Progress::Step{current,total}` is monotone and complete
+/// (`current` runs exactly `1..=total`, `total` constant); when `expected_total` is `Some`, `total`
+/// must equal it (pass the value the model resolves the request's step count to — for a multi-stage
+/// pipeline that folds its stages into one bar, the folded grand total).
+pub fn check_progress_with(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+    expected_total: Option<u32>,
+) -> Result<(), String> {
     let id = g.descriptor().id;
-    let req = base_request(profile);
     let mut steps: Vec<(u32, u32)> = Vec::new();
-    g.generate(&req, &mut |p| {
+    g.generate(req, &mut |p| {
         if let Progress::Step { current, total } = p {
             steps.push((current, total));
         }
@@ -280,12 +294,13 @@ pub fn check_progress(g: &dyn Generator, profile: &Profile) -> Result<(), String
             "progress[{id}]: Step.current must be exactly 1..={total} (monotone, complete, no repeats); got {observed:?}"
         ));
     }
-    if total != profile.steps {
-        return Err(format!(
-            "progress[{id}]: Step.total ({total}) != the profile's resolved step count ({}). \
-             Set Profile.steps to the value the model resolves req.steps to.",
-            profile.steps
-        ));
+    if let Some(want) = expected_total {
+        if total != want {
+            return Err(format!(
+                "progress[{id}]: Step.total ({total}) != the expected resolved step count ({want}). \
+                 Pass the value the model resolves the request's steps to.",
+            ));
+        }
     }
     Ok(())
 }
@@ -405,6 +420,25 @@ pub fn check_registry_roundtrip(g: &dyn Generator) -> Result<(), String> {
              crate is not linked/registered (missing inventory::submit! or dead-stripped; gen-core {})",
             gen_core::VERSION
         ))
+    }
+}
+
+/// **Descriptor sweep (weights-free).** Run the registry-wide descriptor-level conformance sweep
+/// ([`gen_core::registry::descriptor_conformance_errors`], sc-9098 / F-009) over every registration
+/// linked into the calling binary and panic with the aggregated violations — the test-helper idiom
+/// of [`conformance`], minus any model load. Because no weights are touched, providers wire this as
+/// a **default** (non-`#[ignore]`d) test, so every registered id gets at least descriptor-level
+/// coverage on a fresh clone; the behavioral checks stay weights-gated. Remember the linkage
+/// gotcha: the sweep sees only what the calling binary links (`use mlx_gen_<x> as _;`).
+pub fn registry_conformance() {
+    let errs = gen_core::registry::descriptor_conformance_errors();
+    if !errs.is_empty() {
+        panic!(
+            "gen-core descriptor conformance FAILED ({} violations, gen-core {}):\n  - {}",
+            errs.len(),
+            gen_core::VERSION,
+            errs.join("\n  - ")
+        );
     }
 }
 

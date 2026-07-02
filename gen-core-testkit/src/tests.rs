@@ -235,6 +235,33 @@ fn unregistered_id_fails_registry_check() {
     assert!(check_registry_roundtrip(&g).is_err());
 }
 
+/// The weights-free descriptor sweep (sc-9098, F-009) is clean over this binary's registry (the
+/// good stub is its only registration). The per-violation firing is unit-tested next to the checks
+/// in `gen_core::registry`.
+#[test]
+fn registry_sweep_passes_for_the_registered_stub() {
+    registry_conformance();
+}
+
+/// `check_progress_with` accepts a request-supplied run (the SVD/SeedVR2/renderer shape) and flags
+/// a resolved-total mismatch when `expected_total` is pinned.
+#[test]
+fn progress_with_checks_request_supplied_runs() {
+    let g = Stub::new(STUB_ID, Behavior::good());
+    let req = GenerationRequest {
+        prompt: "a fox".into(),
+        width: 128,
+        height: 128,
+        steps: Some(3),
+        seed: Some(7),
+        ..Default::default()
+    };
+    check_progress_with(&g, &req, Some(3)).unwrap();
+    check_progress_with(&g, &req, None).unwrap();
+    let err = check_progress_with(&g, &req, Some(5)).unwrap_err();
+    assert!(err.contains("expected resolved step count"), "got: {err}");
+}
+
 #[test]
 #[should_panic(expected = "conformance FAILED")]
 fn conformance_panics_on_a_broken_stub() {

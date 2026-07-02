@@ -177,7 +177,8 @@ fn denoise_bernini(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        on_step(i);
+        // 1-based, so the final step reaches `total` (the Progress::Step 1..=total contract, F-038).
+        on_step(i + 1);
         let expert = if t >= boundary {
             high
         } else {
@@ -286,7 +287,8 @@ pub fn denoise_bernini_wvitcfg(
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        on_step(i);
+        // 1-based, so the final step reaches `total` (the Progress::Step 1..=total contract, F-038).
+        on_step(i + 1);
         let expert = if t >= boundary {
             high
         } else {
@@ -455,6 +457,7 @@ impl BerniniRenderer {
             );
             let boundary = k.switch_dit_boundary * cfg.num_train_timesteps as f32;
             let total = steps as u32;
+            // `denoise_bernini` reports 1-based steps, so `current` runs exactly 1..=total (F-038).
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
                     current: i as u32,

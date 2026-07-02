@@ -7,7 +7,7 @@
 //! `MODEL_TARGETS` → load.
 
 use crate::caption::{Captioner, CaptionerDescriptor};
-use crate::generator::{Generator, ModelDescriptor};
+use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 use crate::runtime::LoadSpec;
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
@@ -179,6 +179,249 @@ pub fn load_text_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextEmbed
     (reg.load)(spec)
 }
 
+// ---------------------------------------------------------------------------------------------
+// Descriptor-level conformance sweep (sc-9098, F-009)
+// ---------------------------------------------------------------------------------------------
+
+/// An identifier-shaped registry string: non-empty lowercase `a-z0-9` with `_`/`-`/`.` separators —
+/// the shape every shipped id/family/backend uses (`z_image_turbo`, `image-embed`, `mlx`). Rejects
+/// whitespace/uppercase/unicode, which would break worker payload routing and log grepping.
+fn is_registry_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Push an error for every malformed identity field (shared by all descriptor kinds).
+fn check_identity(errs: &mut Vec<String>, ctx: &str, fields: &[(&str, &str)]) {
+    for (name, value) in fields {
+        if !is_registry_ident(value) {
+            errs.push(format!(
+                "{ctx}: {name} {value:?} is not a valid registry identifier \
+                 (non-empty lowercase [a-z0-9_.-])"
+            ));
+        }
+    }
+}
+
+/// Push an error for empty/whitespace/duplicate entries in a descriptor's curated name list
+/// (samplers / schedulers / guidance methods).
+fn check_name_list(errs: &mut Vec<String>, ctx: &str, list_name: &str, names: &[&str]) {
+    for (i, n) in names.iter().enumerate() {
+        if n.is_empty() || n.chars().any(char::is_whitespace) {
+            errs.push(format!(
+                "{ctx}: {list_name}[{i}] {n:?} is empty or contains whitespace"
+            ));
+        }
+        if names[..i].contains(n) {
+            errs.push(format!("{ctx}: duplicate {list_name} entry {n:?}"));
+        }
+    }
+}
+
+/// The weights-free invariants a generator [`ModelDescriptor`] must satisfy — everything checkable
+/// from `(registration.descriptor)()` alone, with no model load (sc-9098, F-009):
+///
+/// - `id` / `family` / `backend` are non-empty registry identifiers,
+/// - `max_count ≥ 1` and `1 ≤ min_size ≤ max_size` (a `Default` 0 bound rejects every request with
+///   a confusing "out of range 0..=0" — the F-084 footgun, enforced here for *every* linked
+///   descriptor rather than only when a request happens to reach `validate_request`),
+/// - `samplers` / `schedulers` / `supported_guidance_methods` entries are non-empty, whitespace-free
+///   and duplicate-free (name *shape* only — resolvability is per-engine: several families advertise
+///   native sampler names alongside the gen-core curated set),
+/// - `conditioning` is duplicate-free, and the video-clip kinds
+///   ([`Keyframe`](ConditioningKind::Keyframe) / [`VideoClip`](ConditioningKind::VideoClip) /
+///   [`ControlClip`](ConditioningKind::ControlClip)) are only advertised by `Video`/`Both`-modality
+///   models — an `Image` model cannot consume a clip.
+///
+/// Returns one message per violation (empty = conformant). Public so a provider's own tests can
+/// target a single descriptor; [`descriptor_conformance_errors`] sweeps every linked registration.
+pub fn model_descriptor_errors(d: &ModelDescriptor) -> Vec<String> {
+    let mut errs = Vec::new();
+    let ctx = format!("generator '{}'", d.id);
+    check_identity(
+        &mut errs,
+        &ctx,
+        &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+    );
+    let caps = &d.capabilities;
+    if caps.max_count == 0 {
+        errs.push(format!(
+            "{ctx}: max_count is 0 — every request would be rejected"
+        ));
+    }
+    if caps.min_size == 0 || caps.max_size == 0 {
+        errs.push(format!(
+            "{ctx}: min_size={} max_size={} — size bounds left at the Default 0",
+            caps.min_size, caps.max_size
+        ));
+    } else if caps.min_size > caps.max_size {
+        errs.push(format!(
+            "{ctx}: min_size {} > max_size {}",
+            caps.min_size, caps.max_size
+        ));
+    }
+    check_name_list(&mut errs, &ctx, "sampler", &caps.samplers);
+    check_name_list(&mut errs, &ctx, "scheduler", &caps.schedulers);
+    check_name_list(
+        &mut errs,
+        &ctx,
+        "guidance_method",
+        &caps.supported_guidance_methods,
+    );
+    for (i, k) in caps.conditioning.iter().enumerate() {
+        if caps.conditioning[..i].contains(k) {
+            errs.push(format!("{ctx}: duplicate conditioning kind {k:?}"));
+        }
+        let is_video_kind = matches!(
+            k,
+            ConditioningKind::Keyframe
+                | ConditioningKind::VideoClip
+                | ConditioningKind::ControlClip
+        );
+        if is_video_kind && d.modality == Modality::Image {
+            errs.push(format!(
+                "{ctx}: advertises video conditioning {k:?} but modality is Image"
+            ));
+        }
+    }
+    errs
+}
+
+/// Push duplicate-id errors for one registry kind (the link-time registry is first-wins, so a
+/// duplicate silently shadows a registration — sc-6983's debug assertion, surfaced for every kind).
+fn check_unique_ids(errs: &mut Vec<String>, kind: &str, ids: &[&str]) {
+    for (i, id) in ids.iter().enumerate() {
+        if ids[..i].contains(id) {
+            errs.push(format!(
+                "{kind} id '{id}' is registered more than once (first-wins shadows the rest)"
+            ));
+        }
+    }
+}
+
+/// Weights-free descriptor-level conformance sweep over **every registration linked into the
+/// current binary** (sc-9098, F-009): generators through [`model_descriptor_errors`], plus identity
+/// and capability-bound checks and per-kind id uniqueness for trainers, captioners, transforms and
+/// image/text embedders. No `load` is ever called, so it runs by default (no weights, no Metal) —
+/// each provider crate invokes it from a default test, giving every registered id at least
+/// descriptor-level coverage; behavioral conformance (progress/cancel/seed) stays weights-gated in
+/// the `gen-core-testkit` suite.
+///
+/// Returns one message per violation (empty = conformant). The sweep sees exactly the registrations
+/// the calling binary links — the same visibility rule as [`load`] (the sc-4482 dead-strip trap),
+/// so a caller must force-link its providers (`use mlx_gen_<x> as _;`).
+pub fn descriptor_conformance_errors() -> Vec<String> {
+    let mut errs = Vec::new();
+
+    let gen_descs: Vec<ModelDescriptor> = generators().map(|r| (r.descriptor)()).collect();
+    for d in &gen_descs {
+        errs.extend(model_descriptor_errors(d));
+    }
+    let gen_ids: Vec<&str> = gen_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "generator", &gen_ids);
+
+    let trainer_descs: Vec<TrainerDescriptor> = trainers().map(|r| (r.descriptor)()).collect();
+    for d in &trainer_descs {
+        let ctx = format!("trainer '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+        if !d.supports_lora && !d.supports_lokr {
+            errs.push(format!(
+                "{ctx}: supports neither LoRA nor LoKr — a trainer must offer at least one adapter kind"
+            ));
+        }
+    }
+    let trainer_ids: Vec<&str> = trainer_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "trainer", &trainer_ids);
+
+    let cap_descs: Vec<CaptionerDescriptor> = captioners().map(|r| (r.descriptor)()).collect();
+    for d in &cap_descs {
+        let ctx = format!("captioner '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+        let c = &d.capabilities;
+        if c.min_image_size == 0 || c.max_image_size < c.min_image_size {
+            errs.push(format!(
+                "{ctx}: image-size bounds incoherent (min {} max {})",
+                c.min_image_size, c.max_image_size
+            ));
+        }
+        if c.max_new_tokens == 0 {
+            errs.push(format!(
+                "{ctx}: max_new_tokens is 0 — no caption could be produced"
+            ));
+        }
+    }
+    let cap_ids: Vec<&str> = cap_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "captioner", &cap_ids);
+
+    let tf_descs: Vec<TransformDescriptor> = transforms().map(|r| (r.descriptor)()).collect();
+    for d in &tf_descs {
+        let ctx = format!("transform '{}'", d.id);
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", d.id), ("family", d.family), ("backend", d.backend)],
+        );
+    }
+    let tf_ids: Vec<&str> = tf_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "transform", &tf_ids);
+
+    let ie_descs: Vec<ImageEmbedderDescriptor> =
+        image_embedders().map(|r| (r.descriptor)()).collect();
+    let te_descs: Vec<TextEmbedderDescriptor> =
+        text_embedders().map(|r| (r.descriptor)()).collect();
+    for (ctx_kind, id, family, backend, dim, space) in ie_descs
+        .iter()
+        .map(|d| {
+            (
+                "image embedder",
+                d.id,
+                d.family,
+                d.backend,
+                d.embedding_dim,
+                d.space,
+            )
+        })
+        .chain(te_descs.iter().map(|d| {
+            (
+                "text embedder",
+                d.id,
+                d.family,
+                d.backend,
+                d.embedding_dim,
+                d.space,
+            )
+        }))
+    {
+        let ctx = format!("{ctx_kind} '{id}'");
+        check_identity(
+            &mut errs,
+            &ctx,
+            &[("id", id), ("family", family), ("backend", backend)],
+        );
+        if dim == 0 {
+            errs.push(format!("{ctx}: embedding_dim is 0"));
+        }
+        if space.is_empty() {
+            errs.push(format!("{ctx}: embedding space is empty"));
+        }
+    }
+    let ie_ids: Vec<&str> = ie_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "image embedder", &ie_ids);
+    let te_ids: Vec<&str> = te_descs.iter().map(|d| d.id).collect();
+    check_unique_ids(&mut errs, "text embedder", &te_ids);
+
+    errs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,13 +460,26 @@ mod tests {
         }
     }
 
+    /// Small-but-coherent capabilities for the dummy registrations: the descriptor sweep
+    /// ([`descriptor_conformance_errors`]) runs over everything this test binary registers, so the
+    /// dummies must carry real bounds (a `Capabilities::default()` has the F-084 all-zero bounds
+    /// the sweep exists to reject).
+    fn dummy_caps() -> Capabilities {
+        Capabilities {
+            min_size: 64,
+            max_size: 512,
+            max_count: 1,
+            ..Default::default()
+        }
+    }
+
     fn dummy_descriptor() -> ModelDescriptor {
         ModelDescriptor {
             id: "dummy_test_model",
             family: "test",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities::default(),
+            capabilities: dummy_caps(),
         }
     }
 
@@ -260,7 +516,7 @@ mod tests {
             family: "test",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities::default(),
+            capabilities: dummy_caps(),
         }
     }
 
@@ -326,7 +582,7 @@ mod tests {
             family: "test",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities::default(),
+            capabilities: dummy_caps(),
         }
     }
 
@@ -336,7 +592,7 @@ mod tests {
             family: "test",
             backend: "mlx",
             modality: Modality::Image,
-            capabilities: Capabilities::default(),
+            capabilities: dummy_caps(),
         }
     }
 
@@ -633,5 +889,66 @@ mod tests {
     #[test]
     fn dummy_image_embedder_appears_in_iteration() {
         assert!(image_embedders().any(|r| (r.descriptor)().id == "dummy_test_image_embedder"));
+    }
+
+    /// The sweep (sc-9098, F-009) is clean over everything this test binary registers — the dummy
+    /// generators/trainers/captioner/embedders all carry coherent descriptors.
+    #[test]
+    fn descriptor_sweep_is_clean_over_registered_dummies() {
+        let errs = descriptor_conformance_errors();
+        assert!(
+            errs.is_empty(),
+            "descriptor conformance FAILED:\n  - {}",
+            errs.join("\n  - ")
+        );
+    }
+
+    /// Each per-descriptor invariant fires: identity shape, zero/inverted bounds, duplicate or
+    /// malformed curated names, duplicate conditioning, video conditioning on an Image model.
+    #[test]
+    fn model_descriptor_errors_flags_each_violation() {
+        // A fully-coherent descriptor produces no errors.
+        assert!(model_descriptor_errors(&dummy_descriptor()).is_empty());
+
+        let broken = ModelDescriptor {
+            id: "Bad Id", // uppercase + whitespace
+            family: "",   // empty
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities {
+                min_size: 512,
+                max_size: 256,                                // inverted
+                max_count: 0,                                 // zero
+                samplers: vec!["euler", "euler", "bad name"], // duplicate + whitespace
+                conditioning: vec![
+                    ConditioningKind::Reference,
+                    ConditioningKind::Reference, // duplicate
+                    ConditioningKind::VideoClip, // video kind on an Image model
+                ],
+                ..Default::default()
+            },
+        };
+        let errs = model_descriptor_errors(&broken);
+        let has = |needle: &str| errs.iter().any(|e| e.contains(needle));
+        assert!(has("id \"Bad Id\""), "{errs:?}");
+        assert!(has("family \"\""), "{errs:?}");
+        assert!(has("max_count is 0"), "{errs:?}");
+        assert!(has("min_size 512 > max_size 256"), "{errs:?}");
+        assert!(has("duplicate sampler entry \"euler\""), "{errs:?}");
+        assert!(has("sampler[2] \"bad name\""), "{errs:?}");
+        assert!(has("duplicate conditioning kind Reference"), "{errs:?}");
+        assert!(has("video conditioning VideoClip"), "{errs:?}");
+
+        // All-zero bounds report the Default-0 message (F-084), not the inverted-bounds one.
+        let zeroed = ModelDescriptor {
+            id: "zeroed",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: Capabilities::default(),
+        };
+        assert!(model_descriptor_errors(&zeroed)
+            .iter()
+            .any(|e| e.contains("left at the Default 0")));
     }
 }
