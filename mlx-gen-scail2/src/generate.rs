@@ -209,6 +209,31 @@ fn apply_clean_history(latent: &Array, history: Option<&Array>) -> Result<Array>
     Ok(concatenate_axis(&[&head, &tail], 1)?)
 }
 
+/// F-039: validate the public `Scail2Job.segment_len` / `segment_overlap` fields. `build_segments`
+/// computes `stride = segment_len - segment_overlap` (so `overlap >= len` underflows `usize`), and
+/// the clean-history VAE encode in segment 2+ shape-errors when `segment_len` isn't `1 + 4k` (the 4×
+/// temporal compression factor). Extracted so the guards have a unit test (generate() needs weights).
+fn validate_segment_params(segment_len: usize, segment_overlap: usize) -> Result<()> {
+    if segment_len == 0 {
+        return Err(Error::Msg("scail2: segment_len must be >= 1".into()));
+    }
+    if segment_overlap >= segment_len {
+        return Err(Error::Msg(format!(
+            "scail2: segment_overlap ({}) must be < segment_len ({}) \
+             (the window stride is segment_len − segment_overlap)",
+            segment_overlap, segment_len
+        )));
+    }
+    if !(segment_len - 1).is_multiple_of(TEMPORAL_STRIDE) {
+        return Err(Error::Msg(format!(
+            "scail2: segment_len ({}) must be 1 + {TEMPORAL_STRIDE}·k \
+             (VAE temporal alignment across overlapping segments)",
+            segment_len
+        )));
+    }
+    Ok(())
+}
+
 /// Segment plan over `total` driving frames (upstream `build_segments`): a single VAE-aligned segment
 /// when the clip fits, else overlapping `segment_len` windows striding by `len − overlap`.
 fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize)> {
@@ -258,6 +283,13 @@ pub fn generate(
             job.driving_frames.len()
         )));
     }
+    // F-039: Scail2Job has public fields and nothing else validates them. `build_segments` computes
+    // `stride = segment_len - segment_overlap`, so `overlap >= len` underflows `usize` (debug panic;
+    // release wraps to a huge stride and silently renders one window). And the clean-history VAE
+    // encode in segment 2+ shape-errors when `segment_len` isn't VAE-temporal-aligned (the 4×
+    // temporal compression factor: segment_len must be `1 + 4k` so the decoded frame count matches
+    // across overlapping windows). Reject both up front with a typed error.
+    validate_segment_params(job.segment_len, job.segment_overlap)?;
     // Partition the inference LoRAs (before the 31 GB DiT load, so the gate below fails fast):
     //   * diff-patch ("lightning") files — full-rank `.diff`/`.diff_b` (+ low-rank factors) that the
     //     residual loader can't consume — are merged *in place* into the dense weights below (sc-5684).
@@ -593,4 +625,45 @@ pub fn generate(
         fps: job.fps,
         audio: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_segments_single_window_when_clip_fits() {
+        // 13 frames (1 + 4·3, VAE-aligned), len=13 → one window keeping all 13 aligned frames.
+        let segs = build_segments(13, 13, 0);
+        assert_eq!(segs, vec![(0, 13)]);
+    }
+
+    #[test]
+    fn build_segments_overlapping_windows() {
+        // 25 frames, len=9, overlap=4 → stride 5: (0,9),(5,14),(10,19),(15,24).
+        let segs = build_segments(25, 9, 4);
+        assert_eq!(segs, vec![(0, 9), (5, 14), (10, 19), (15, 24)]);
+    }
+
+    #[test]
+    fn validate_segment_params_rejects_overlap_ge_len() {
+        // F-039: overlap >= len would underflow the usize stride in build_segments.
+        let err = validate_segment_params(5, 5).unwrap_err().to_string();
+        assert!(err.contains("must be < segment_len"), "{err}");
+        let err = validate_segment_params(5, 9).unwrap_err().to_string();
+        assert!(err.contains("must be < segment_len"), "{err}");
+    }
+
+    #[test]
+    fn validate_segment_params_rejects_non_vae_aligned_len() {
+        // segment_len must be 1 + 4k so the clean-history VAE encode aligns across segments.
+        let err = validate_segment_params(10, 2).unwrap_err().to_string();
+        assert!(err.contains("1 + 4"), "{err}");
+    }
+
+    #[test]
+    fn validate_segment_params_accepts_aligned_window() {
+        // 9 = 1 + 4·2, overlap 4 < 9 — the realistic SCAIL-2 window.
+        validate_segment_params(9, 4).expect("aligned window is valid");
+    }
 }

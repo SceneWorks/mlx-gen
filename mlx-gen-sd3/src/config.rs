@@ -37,8 +37,9 @@ pub const DEFAULT_GUIDANCE_MEDIUM: f32 = 5.0;
 pub const DEFAULT_STEPS_MEDIUM: u32 = 40;
 
 /// The base flow-match sampler name in the capability surface. An unset `req.sampler` resolves to
-/// this — SD3.5's flow-match Euler over a shift-resolved logit-normal sigma schedule (the unified
-/// sampler framework, epic 7114; logit-normal weighting reused from mlx-gen-ideogram per the spike).
+/// this — SD3.5's flow-match Euler over a STATIC shift-3.0 sigma schedule
+/// (`FlowMatchEulerDiscreteScheduler { shift: 3.0 }`, no dynamic shifting; the unified sampler
+/// framework, epic 7114; logit-normal weighting reused from mlx-gen-ideogram per the spike).
 pub const DEFAULT_SAMPLER: &str = "flow_match";
 
 // ----------------------------------------------------------------------------------------------
@@ -218,8 +219,12 @@ impl Sd3Variant {
                 max_count: 8,
                 mac_only: true,
                 supports_kv_cache: false,
-                // SD3.5 uses a resolution-aware flow-match shift (handled by the unified sampler).
-                requires_sigma_shift: true,
+                // SD3.5 uses a STATIC flow-match shift of 3.0 (FlowMatchEulerDiscreteScheduler
+                // { shift: 3.0 }, no dynamic shifting) baked into the schedule — resolution-
+                // independent, identical to the Z-Image path. So this loader hint is false: a
+                // consumer must NOT additionally apply the resolution-aware dynamic shift this flag
+                // requests (doing so would double-shift). See model.rs `for_static_shift(steps, 3.0)`.
+                requires_sigma_shift: false,
             },
         }
     }

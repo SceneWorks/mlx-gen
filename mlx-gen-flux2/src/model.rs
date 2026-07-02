@@ -558,7 +558,7 @@ pub(crate) fn match_latent_spatial_size(x: &Array, target_h: i32, target_w: i32)
 }
 
 mlx_gen::impl_generator!(Flux2 {
-    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), req),
+    validate: |s, req| validate_request(&s.descriptor, s.variant.is_edit(), s.variant.is_kv(), req),
     generate: generate_impl,
 });
 
@@ -718,12 +718,16 @@ impl Flux2 {
         // (sc-8234: ArcFace 0.60 → 0.38 under a strong scene prompt). With `s > 1` the denoise
         // extrapolates the with-reference velocity against the reference-dropped (image-unconditional)
         // velocity: `v = v_img0 + s·(v_ref − v_img0)`, reusing the existing `include_ref=false` forward
-        // (the kv-cache code path). The `FLUX2_IMG_GUIDANCE` env var overrides `req.image_guidance`
-        // (debug). Scoped to the non-kv edit path (a reference present, no KV cache — checked per step).
-        let img_guidance: Option<f32> = std::env::var("FLUX2_IMG_GUIDANCE")
+        // (the non-kv-cache code path). `req.image_guidance` wins; `FLUX2_IMG_GUIDANCE` is a debug
+        // fallback only (F-087: the env previously *overrode* the request, leaking pixel changes
+        // untraceably). Scoped to the non-kv edit path — a reference present with no KV cache; the kv
+        // variant rejects `image_guidance` in `validate_impl` (it would silently no-op here otherwise).
+        let img_guidance_debug = std::env::var("FLUX2_IMG_GUIDANCE")
             .ok()
-            .and_then(|s| s.trim().parse::<f32>().ok())
-            .or(req.image_guidance)
+            .and_then(|s| s.trim().parse::<f32>().ok());
+        let img_guidance: Option<f32> = req
+            .image_guidance
+            .or(img_guidance_debug)
             .filter(|s| *s > 1.0 && reference.is_some());
 
         let sampler_name = req.sampler.as_deref();
@@ -827,6 +831,7 @@ impl Flux2 {
 pub(crate) fn validate_request(
     desc: &ModelDescriptor,
     is_edit: bool,
+    is_kv: bool,
     req: &GenerationRequest,
 ) -> Result<()> {
     // Empty-prompt first so it wins over the shared floor for a bare default request.
@@ -852,6 +857,17 @@ pub(crate) fn validate_request(
     if is_edit && collect_reference_images(req).is_empty() {
         return Err(Error::Msg(format!(
             "{}: edit requires at least one reference image",
+            desc.id
+        )));
+    }
+    // F-087: image-guidance CFG runs only on the non-kv edit path (it needs the uncached
+    // `include_ref=false` forward). On the kv variant a set `image_guidance` would silently no-op
+    // (the cached step's `cache_ref` is `Some`, so the extrapolation arm never fires) — reject it
+    // up front instead of letting the request appear to succeed while doing nothing.
+    if is_kv && req.image_guidance.is_some() {
+        return Err(Error::Msg(format!(
+            "{}: image_guidance is not supported on the kv-edit variant \
+             (it would be silently ignored — the cached reference path can't run the dropped-ref CFG)",
             desc.id
         )));
     }

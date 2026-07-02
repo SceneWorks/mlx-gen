@@ -11,14 +11,24 @@
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, Error, GenerationOutput,
-    GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
+    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
+    ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 
+use std::path::Path;
+
 use crate::pipeline::{turbo_schedule, KreaPipeline, TurboOptions};
+
+/// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
+/// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
+fn packed_quant_bits(root: &Path) -> Option<i32> {
+    let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    v.get("quantization")?.get("bits")?.as_i64().map(|b| b as i32)
+}
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
 /// `payload.model` and the manifest `engine_id` (sc-7572).
@@ -122,7 +132,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         pipeline.apply_adapters(&spec.adapters)?;
     }
     if let Some(q) = spec.quantize {
-        pipeline.quantize(q.bits())?;
+        // F-076: on an already-packed turnkey, `pipeline.quantize()` is a no-op, so e.g. Q4 over a
+        // Q8 turnkey would silently serve Q8. Compare the requested bits against the config.json
+        // `quantization.bits` marker the Group-B converter writes; error on mismatch. A dense
+        // snapshot (no marker) takes the ordinary in-place quantize.
+        if let Some(packed) = packed_quant_bits(root) {
+            if packed != q.bits() {
+                return Err(Error::Msg(format!(
+                    "krea_2_turbo: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
+                     requested; quantize() is a no-op on packed weights so the request would \
+                     silently serve Q{packed}. Point at a Q{} snapshot (or a dense one).",
+                    q.bits(),
+                    q.bits()
+                )));
+            }
+        } else {
+            pipeline.quantize(q.bits())?;
+        }
     }
     // Optional PiD decoder overlay (sc-7845): Krea reuses the Qwen-Image latent space, so it loads the
     // same `qwenimage` student + Gemma-2 caption encoder when `spec.pid` is set.
@@ -154,7 +180,7 @@ impl Krea {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-        let base_seed = req.seed.unwrap_or(0);
+        let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): when `req.use_pid`, build one PiD
         // decoder from the prompt and reuse it across the batch — same prompt → same caption; per-image
