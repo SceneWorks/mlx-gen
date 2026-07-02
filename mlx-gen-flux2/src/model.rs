@@ -58,17 +58,20 @@ const LONG_SEQ_TOKEN_THRESHOLD: usize = 10_000;
 /// reference `i` is tagged at `t = REFERENCE_TIME_STRIDE * (i + 1)` (10, 20, 30, …) so each edit
 /// reference occupies its own time band, distinct from the target's `t = 0`. The stride must exceed a
 /// single reference's t-extent (1, since each ref is one packed grid at a fixed t) to avoid two refs
-/// colliding on the same time index; at the `MultiReference` capability cap (`max_count = 8`) the band
-/// tops out at `t = 80`, well inside the RoPE t-axis range. Named so the invariant is explicit rather
-/// than a bare `10 + 10*i`.
+/// colliding on the same time index; at the [`MAX_EDIT_REFERENCES`] cap (8) the band tops out at
+/// `t = 80`, well inside the RoPE t-axis range. Named so the invariant is explicit rather than a bare
+/// `10 + 10*i`.
 const REFERENCE_TIME_STRIDE: i32 = 10;
 
 /// F-027: hard cap on the number of edit references a single request may supply. Each reference adds
 /// ~4096 joint-DiT tokens (sc-6124 measured ~104 GB peak with 2 UNBOUNDED refs at 1024² → quadratic
-/// SDPA + OOM from request input), and the time-stride band tops out at `REFERENCE_TIME_STRIDE * 8`.
-/// This matches the descriptor's `max_count` (8) and the REFERENCE_TIME_STRIDE doc invariant, but
-/// nothing previously ENFORCED it — `collect_edit_references` flattened every Reference/MultiReference
-/// with no bound. Request-input OOM is the repo's historical highest-severity class.
+/// SDPA + OOM from request input), and the RoPE time band tops out at `REFERENCE_TIME_STRIDE * 8 = 80`
+/// (the [`REFERENCE_TIME_STRIDE`] invariant). This constant is the ONLY enforcement of that invariant:
+/// `Capabilities::max_count` bounds `req.count` (the output batch size), NOT the reference count, so
+/// the shared capability floor never caps references — previously `collect_edit_references` flattened
+/// every Reference/MultiReference with no bound. Checked both in `validate_request` (up-front worker
+/// rejection) and `collect_edit_references` (the generate path). Request-input OOM is the repo's
+/// historical highest-severity class.
 const MAX_EDIT_REFERENCES: usize = 8;
 
 /// Sanitize model-generated text for a single-line, machine-parsed log record (the worker consumes
@@ -392,8 +395,8 @@ impl Flux2 {
             )));
         }
         // F-027: cap the reference count — each ref adds ~4096 joint-DiT tokens (quadratic SDPA + a
-        // request-input OOM class). `MAX_EDIT_REFERENCES` matches the descriptor `max_count`/the
-        // REFERENCE_TIME_STRIDE invariant that nothing previously enforced.
+        // request-input OOM class); see [`MAX_EDIT_REFERENCES`]. Also enforced in `validate_request`
+        // so `validate()` rejects up front; this generate-path check covers direct callers.
         if refs.len() > MAX_EDIT_REFERENCES {
             return Err(Error::Msg(format!(
                 "{}: edit supports at most {MAX_EDIT_REFERENCES} reference images (got {}); \
@@ -873,11 +876,24 @@ pub(crate) fn validate_request(
     // `generate` (`collect_edit_references`); surface it at validate time — mirroring
     // `Flux2DevControl`'s `require_control_present` — so an editor rejects a reference-less request up
     // front instead of after loading and starting the run.
-    if is_edit && collect_reference_images(req).is_empty() {
-        return Err(Error::Msg(format!(
-            "{}: edit requires at least one reference image",
-            desc.id
-        )));
+    if is_edit {
+        let n_refs = collect_reference_images(req).len();
+        if n_refs == 0 {
+            return Err(Error::Msg(format!(
+                "{}: edit requires at least one reference image",
+                desc.id
+            )));
+        }
+        // F-027: mirror `collect_edit_references`' reference cap at validate time (same F-088
+        // rationale) so a worker's `validate()` rejects an over-cap request — e.g. 50 refs, a
+        // quadratic-SDPA OOM — up front instead of after loading and starting the run.
+        if n_refs > MAX_EDIT_REFERENCES {
+            return Err(Error::Msg(format!(
+                "{}: edit supports at most {MAX_EDIT_REFERENCES} reference images (got {n_refs}); \
+                 each adds ~4096 joint-DiT tokens",
+                desc.id
+            )));
+        }
     }
     // F-087: image-guidance CFG runs only on the non-kv edit path (it needs the uncached
     // `include_ref=false` forward). On the kv variant a set `image_guidance` would silently no-op
@@ -1121,6 +1137,46 @@ mod tests {
         // The txt2img variant tolerates no reference.
         let t2i = Flux2::new_for_tests(Flux2Variant::Klein9b);
         assert!(t2i.validate(&req).is_ok());
+    }
+
+    #[test]
+    fn edit_over_cap_references_rejected() {
+        // F-027: more than `MAX_EDIT_REFERENCES` refs is rejected at BOTH `validate` (up-front worker
+        // rejection) and the generate-path collector; exactly the cap is accepted.
+        let model = Flux2::new_for_tests(Flux2Variant::Klein9bEdit);
+        let over = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(); MAX_EDIT_REFERENCES + 1],
+            }],
+            ..Default::default()
+        };
+        let err = model.validate(&over).unwrap_err().to_string();
+        assert!(
+            err.contains("at most 8 reference images (got 9)"),
+            "validate should reject an over-cap request, got: {err}"
+        );
+        let err = model
+            .collect_edit_references(&over)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at most 8 reference images (got 9)"),
+            "generate-path collector should reject an over-cap request, got: {err}"
+        );
+        // At the cap: both paths accept.
+        let at_cap = GenerationRequest {
+            prompt: "combine these".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![Image::default(); MAX_EDIT_REFERENCES],
+            }],
+            ..Default::default()
+        };
+        model.validate(&at_cap).unwrap();
+        assert_eq!(
+            model.collect_edit_references(&at_cap).unwrap().len(),
+            MAX_EDIT_REFERENCES
+        );
     }
 
     // ---- sc-5919 FLUX.2-dev edit (DiT-concat reference conditioning) ---------------------------

@@ -871,6 +871,13 @@ pub fn denoise_vace(
         &ctx_cond_emb,
     ])?;
 
+    // F-073 (documented divergence from the base loop): CFG here runs cond/uncond as two
+    // sequential B=1 forwards, while `crate::pipeline::denoise` batches them into one B=2 forward
+    // (sc-2853). Adopting that pattern needs `build_vace_cache`/`forward_vace_cached` extended to
+    // the stacked-context + broadcast-latent form AND a real-weight VACE parity re-validation:
+    // sc-2853's bit-exactness was proven for the base transformer only, never the VACE branch, and
+    // Wan's bf16-native path is a known batch-size numerics hazard (the sc-2680 B2≠2×B1 gotcha).
+    // Until a VACE golden validates the batched form, sequential B=1 is the parity-safe choice.
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
@@ -952,6 +959,8 @@ pub fn denoise_vace_moe(
         &high_cond,
     ])?;
 
+    // F-073: cond/uncond run as two sequential B=1 forwards, not a B=2 batch — the same documented
+    // divergence (and parity rationale) as [`denoise_vace`]'s loop.
     let mut latents = init_noise.clone();
     for (i, &t) in timesteps.iter().enumerate() {
         // Honor the engine cancellation contract — check before each (minutes-long) step (sc-5551).
