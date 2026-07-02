@@ -571,6 +571,10 @@ impl T2iModel {
             // sc-5399): MLX is lazy, so without it the whole denoise is one un-cancellable graph run
             // at decode. `image` is the carried latent each step. Output-neutral.
             image.eval()?;
+            // F-036: every consumer takes `.into_iter().last()`, so retaining the full evaluated
+            // trajectory (~2.5 GB at 50 steps/2048²) is pure dead retention. Keep only the current
+            // frame (the last), returning a 1-element Vec to preserve the signature.
+            traj.clear();
             traj.push(image.clone());
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);
@@ -1232,11 +1236,14 @@ impl T2iModel {
                 }
                 gen_tokens.push(next);
                 total_tokens += 1;
-                let logits =
-                    self.backbone
-                        .decode_logits(next, (t_cond + 1) as i32, &mut cache_cond)?;
+                // Greedy interleave decode: reduce to the argmax index on device (single-index host
+                // transfer) instead of copying the whole `[vocab]` f32 row (~600 KB/token) to host and
+                // arg-maxing there. MLX `argmax` breaks ties to the lowest index, matching the host
+                // `argmax`, so the greedy stream is bit-identical (F-095, F-140 precedent).
+                next = self
+                    .backbone
+                    .decode_argmax(next, (t_cond + 1) as i32, &mut cache_cond)?;
                 t_cond += 1;
-                next = argmax(&logits);
                 if total_tokens >= max_new_tokens {
                     hit_max = true;
                     break;
@@ -1255,13 +1262,19 @@ impl T2iModel {
 
             // ---- Image generation ----
             text.push_str("<image>");
-            // Append `<img>` to the condition + text-uncondition caches.
-            self.backbone
-                .decode_logits(self.img_start_id, (t_cond + 1) as i32, &mut cache_cond)?;
-            t_cond += 1;
-            self.backbone
-                .decode_logits(self.img_start_id, (t_tu + 1) as i32, &mut cache_tu)?;
-            t_tu += 1;
+            // Append `<img>` to the condition + text-uncondition caches. Only the cache advance is
+            // needed here — the logits row is discarded — so splice the known token in without the
+            // `lm_head` projection or the host copy (`append_tokens`; F-095, F-140 precedent).
+            // `append_tokens(&[id], t, cache)` forwards it at temporal `t+1` (h=w=0, Path::Und),
+            // identical to the prior `decode_logits(id, t+1, cache)`.
+            t_cond =
+                self.backbone
+                    .append_tokens(&[self.img_start_id], t_cond as i32, &mut cache_cond)?
+                    as usize;
+            t_tu = self
+                .backbone
+                .append_tokens(&[self.img_start_id], t_tu as i32, &mut cache_tu)?
+                as usize;
 
             let base_noise = match init_noises {
                 Some(ns) if images.len() < ns.len() => ns[images.len()].as_dtype(Dtype::Float32)?,
@@ -1426,6 +1439,10 @@ impl T2iModel {
             // sc-5399): MLX is lazy, so without it the whole denoise is one un-cancellable graph run
             // at decode. `image` is the carried latent each step. Output-neutral.
             image.eval()?;
+            // F-036: every consumer takes `.into_iter().last()`, so retaining the full evaluated
+            // trajectory (~2.5 GB at 50 steps/2048²) is pure dead retention. Keep only the current
+            // frame (the last), returning a 1-element Vec to preserve the signature.
+            traj.clear();
             traj.push(image.clone());
             if let Some(r) = reporter.as_mut() {
                 r.step(i + 1, steps);

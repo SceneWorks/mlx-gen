@@ -78,9 +78,16 @@ pub fn load_vision_encoder(root: &Path) -> Result<VisionTransformer> {
 /// Load the Qwen-Image-**Edit** vision-language conditioning encoder: the Qwen2.5-VL LM (`model.*`,
 /// same layout as T2I) + the vision transformer (`visual.*`), composed into a
 /// [`QwenVisionLanguageEncoder`]. Edit-only.
+///
+/// The LM (`model.*`) and the vision transformer (`visual.*`) both live in the same `text_encoder/`
+/// shard set, so the ~16 GB is parsed ONCE and reused for both trees (F-080) — previously
+/// `load_text_encoder` + `load_vision_encoder` each ran their own `Weights::from_dir`, reading every
+/// shard twice. `remap_vision_keys` only touches `visual.*`, so it is safe to apply before the LM read.
 pub fn load_vision_language_encoder(root: &Path) -> Result<QwenVisionLanguageEncoder> {
-    let lm = load_text_encoder(root)?;
-    let visual = load_vision_encoder(root)?;
+    let mut w = Weights::from_dir(root.join("text_encoder"))?;
+    remap_vision_keys(&mut w)?;
+    let lm = QwenTextEncoder::from_weights(&w, "model", &QwenTextEncoderConfig::qwen_image())?;
+    let visual = VisionTransformer::from_weights(&w, "visual", &VisionConfig::qwen_image_edit())?;
     Ok(QwenVisionLanguageEncoder::new(lm, visual))
 }
 

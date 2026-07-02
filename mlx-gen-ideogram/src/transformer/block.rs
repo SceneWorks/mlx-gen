@@ -45,8 +45,17 @@ impl Ideogram4Attention {
         })
     }
 
-    /// `x`: `[B, L, hidden]`; `cos`/`sin`: `[B, L, head_dim]`; `mask`: additive `[B, 1, L, L]`.
-    pub fn forward(&self, x: &Array, cos: &Array, sin: &Array, mask: &Array) -> Result<Array> {
+    /// `x`: `[B, L, hidden]`; `cos`/`sin`: `[B, L, head_dim]`; `mask`: optional additive `[B, 1, L, L]`.
+    /// `None` = no attention mask (the packed Ideogram sequence is a single segment, so the additive
+    /// segment mask is identically zero — `logit + 0 == logit` — and is skipped rather than built and
+    /// added; F-029).
+    pub fn forward(
+        &self,
+        x: &Array,
+        cos: &Array,
+        sin: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
         let sh = x.shape();
         let (b, s) = (sh[0], sh[1]);
 
@@ -72,8 +81,11 @@ impl Ideogram4Attention {
         let q = apply_rope(&q, cos, sin)?;
         let k = apply_rope(&k, cos, sin)?;
 
-        let mask = mask.as_dtype(q.dtype())?;
-        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, &mask, None)?;
+        let mask = mask.map(|m| m.as_dtype(q.dtype())).transpose()?;
+        let sdpa_mask = mask
+            .as_ref()
+            .map(mlx_rs::fast::ScaledDotProductAttentionMask::from);
+        let o = scaled_dot_product_attention(&q, &k, &v, self.scale, sdpa_mask, None)?;
         let o =
             o.transpose_axes(&[0, 2, 1, 3])?
                 .reshape(&[b, s, self.num_heads * self.head_dim])?;
@@ -192,13 +204,13 @@ impl Ideogram4Block {
     }
 
     /// `x`: `[B, L, hidden]`; `adaln_input`: `[B, 1, adaln_dim]`; `cos`/`sin`: `[B, L, head_dim]`;
-    /// `mask`: additive `[B, 1, L, L]`.
+    /// `mask`: optional additive `[B, 1, L, L]` (`None` = unmasked; see [`Ideogram4Attention::forward`]).
     pub fn forward(
         &self,
         x: &Array,
         cos: &Array,
         sin: &Array,
-        mask: &Array,
+        mask: Option<&Array>,
         adaln_input: &Array,
     ) -> Result<Array> {
         let mod_ = self.adaln_modulation.forward(adaln_input)?; // [B,1,4*hidden]

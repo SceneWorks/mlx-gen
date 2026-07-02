@@ -41,10 +41,11 @@ fn c(v: f32) -> Array {
     Array::from_slice(&[v], &[1])
 }
 
-/// Sum every element of `x` to a host f32 (full reduction).
-fn sum_all(x: &Array) -> Result<f32> {
+/// Full reduction to a lazy scalar `[1]` array, WITHOUT a blocking `.item()` host sync — many of
+/// these accumulate into one graph and sync once per step (F-066).
+fn sum_all_lazy(x: &Array) -> Result<Array> {
     let axes: Vec<i32> = (0..x.ndim() as i32).collect();
-    Ok(sum_axes(x, &axes[..], false)?.item::<f32>())
+    Ok(sum_axes(x, &axes[..], false)?.reshape(&[1])?)
 }
 
 /// Replace exact zeros with `1.0` (the reference `masked_fill_(x == 0, 1.0)` SGD/identity fallback).
@@ -299,8 +300,12 @@ impl Prodigy {
         let d_numerator = self.d_numerator * beta3;
 
         // --- Pass 1: EMAs + s; accumulate the global numerator/denominator ---
-        let mut delta_numerator = 0.0f32;
-        let mut d_denom = 0.0f32;
+        // The two per-factor reductions (⟨g, p0−p⟩ and Σ|s|) accumulate LAZILY into scalar `[1]`
+        // arrays and are synced to host ONCE after the loop (F-066), rather than a blocking `.item()`
+        // per factor per step (hundreds of round-trips). f32 add is IEEE-deterministic and the loop
+        // order is unchanged, so the folded sums are bit-identical to the prior per-term host `+=`.
+        let mut delta_numerator = c(0.0);
+        let mut d_denom = c(0.0);
         for (k, g) in grads.iter() {
             let Some(p) = params.get(k) else { continue };
             // `Array::zeros` is fallible, so build the initial state with `?` rather than `.unwrap()`
@@ -315,9 +320,10 @@ impl Prodigy {
                     p0: p.clone(),
                 }),
             };
-            // delta_numerator += (d/d0)·dlr·⟨g, p0 − p⟩
-            let dot = sum_all(&multiply(g, &subtract(&st.p0, p)?)?)?;
-            delta_numerator += (d / d0) * dlr * dot;
+            // delta_numerator += (d/d0)·dlr·⟨g, p0 − p⟩  (coefficient folded exactly as the prior
+            // `(d / d0) * dlr * dot`, i.e. `((d/d0)*dlr) · dot`).
+            let dot = sum_all_lazy(&multiply(g, &subtract(&st.p0, p)?)?)?;
+            delta_numerator = add(&delta_numerator, &multiply(&dot, c((d / d0) * dlr))?)?;
             // Adam EMAs scaled by d (Prodigy folds d into the gradient magnitude).
             st.exp_avg = add(
                 &multiply(&st.exp_avg, c(beta1))?,
@@ -332,8 +338,11 @@ impl Prodigy {
                 &multiply(&st.s, c(beta3))?,
                 &multiply(g, c((d / d0) * dlr))?,
             )?;
-            d_denom += sum_all(&st.s.abs()?)?;
+            d_denom = add(&d_denom, &sum_all_lazy(&st.s.abs()?)?)?;
         }
+        // The two syncs for the whole step (F-066): fold the lazy accumulators to host scalars here.
+        let delta_numerator = delta_numerator.item::<f32>();
+        let d_denom = d_denom.item::<f32>();
 
         // No usable gradient signal this step (e.g. all-zero grads) — leave d/params unchanged.
         if d_denom == 0.0 {

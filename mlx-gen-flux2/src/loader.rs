@@ -106,8 +106,18 @@ pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
     let dir = root.join("text_encoder");
     let quant = read_component_quant(&dir)?;
     let w = Weights::from_dir(dir)?;
+    load_text_encoder_dev_from(&w, quant)
+}
+
+/// [`load_text_encoder_dev`] from an already-parsed `text_encoder/` [`Weights`] (+ its component
+/// quant manifest). Lets the dev edit load parse the ~45 GB shard set ONCE and share it across the
+/// Mistral language tower, the Pixtral vision tower, and the multimodal projector (F-112).
+pub fn load_text_encoder_dev_from(
+    w: &Weights,
+    quant: Option<Flux2Quant>,
+) -> Result<Qwen3TextEncoder> {
     let mut encoder = Qwen3TextEncoder::from_weights_quant(
-        &w,
+        w,
         "language_model.model",
         &Qwen3TextEncoderConfig::mistral_dev(),
         quant,
@@ -116,8 +126,24 @@ pub fn load_text_encoder_dev(root: &Path) -> Result<Qwen3TextEncoder> {
     // `generate()` loop (sc-6030) — the dev `Mistral3ForConditionalGeneration` snapshot carries
     // `language_model.lm_head.weight` (dense bf16) + `language_model.model.norm.weight`, both
     // retained by the pre-quant convert. The T2I/edit prompt-embeds path never touches them.
-    encoder.load_generation_head(&w, "language_model", quant)?;
+    encoder.load_generation_head(w, "language_model", quant)?;
     Ok(encoder)
+}
+
+/// Load the whole dev `text_encoder/` group — the Mistral language tower, the Pixtral vision tower,
+/// and the multimodal projector — parsing the ~45 GB shard set ONCE and sharing it across all three
+/// (F-112), instead of three independent `Weights::from_dir` reads. The vision tower + projector are
+/// full precision; only the language tower honours the component quant manifest.
+pub fn load_dev_text_encoder_group(
+    root: &Path,
+) -> Result<(Qwen3TextEncoder, PixtralVisionTower, Mistral3Projector)> {
+    let dir = root.join("text_encoder");
+    let quant = read_component_quant(&dir)?;
+    let w = Weights::from_dir(dir)?;
+    let encoder = load_text_encoder_dev_from(&w, quant)?;
+    let vision_tower = load_vision_tower_dev_from(&w)?;
+    let projector = load_multimodal_projector_dev_from(&w)?;
+    Ok((encoder, vision_tower, projector))
 }
 
 /// Load the FLUX.2 VAE. The on-disk diffusers keys (`encoder.*`/`decoder.*`/`quant_conv.*`/
@@ -215,7 +241,12 @@ pub fn load_control_transformer_dev(
 /// pre-quantized-snapshot manifest.
 pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
-    PixtralVisionTower::from_weights(&w, "vision_tower", PixtralVisionConfig::dev())
+    load_vision_tower_dev_from(&w)
+}
+
+/// [`load_vision_tower_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).
+pub fn load_vision_tower_dev_from(w: &Weights) -> Result<PixtralVisionTower> {
+    PixtralVisionTower::from_weights(w, "vision_tower", PixtralVisionConfig::dev())
 }
 
 /// Load the FLUX.2-dev **Mistral3 multimodal projector** (sc-5918) from the `text_encoder/`
@@ -224,5 +255,10 @@ pub fn load_vision_tower_dev(root: &Path) -> Result<PixtralVisionTower> {
 /// vision tower.
 pub fn load_multimodal_projector_dev(root: &Path) -> Result<Mistral3Projector> {
     let w = Weights::from_dir(root.join("text_encoder"))?;
-    Mistral3Projector::from_weights(&w, "multi_modal_projector", 2, 1e-5)
+    load_multimodal_projector_dev_from(&w)
+}
+
+/// [`load_multimodal_projector_dev`] from an already-parsed `text_encoder/` [`Weights`] (F-112).
+pub fn load_multimodal_projector_dev_from(w: &Weights) -> Result<Mistral3Projector> {
+    Mistral3Projector::from_weights(w, "multi_modal_projector", 2, 1e-5)
 }

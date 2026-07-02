@@ -563,8 +563,31 @@ pub(crate) fn prequantize_expert_proj(
 /// `GptOssTopKRouter` + `GptOssExperts`: router → top-`k` softmax over the selected logits; each
 /// expert computes `(up+1)·(gate·σ(α·gate))` with `gate` clamped to `≤limit` and `up` clamped to
 /// `±limit`, weighted by its router score. Correctness-first: the experts are evaluated densely (all
-/// 32) and combined by a masked routing-weight matrix (the encoder runs short prompts; a gather/
-/// grouped-GEMM path can follow).
+/// 32) and combined by a masked routing-weight matrix.
+///
+/// F-021 (DEFERRED — needs a dedicated real-weight-validated story). The dense path wastes ~8× the
+/// routed FLOPs (evaluates all `E=32` experts when only `top_k=4` are selected per token) plus one
+/// host sync per layer for the top-k. A token-gather / grouped-GEMM path is the crate's biggest perf
+/// lever, but it is NOT a bit-safe drop-in and cannot be landed here without real-weight validation,
+/// for two concrete reasons:
+///   1. **Quant layout.** Each expert's `gate_up`/`down` is an independent `AdaptableLinear` that may
+///      be Q4/Q8-packed (sc-3172, the memory win). You cannot gather rows out of a group-wise packed
+///      quantized weight; a grouped kernel would have to either dequantize the selected experts
+///      per-step (forfeiting the quant footprint win) or use a quant-aware grouped GEMM that MLX does
+///      not expose here. The current per-expert-module design is what keeps the experts quantizable.
+///   2. **Accumulation order / numerics.** The dense sum is `Σ_{e=0..E} out_e · w_e` in fixed index
+///      order with `w_e == 0` (exactly) off the top-k. Token gather changes both which experts run
+///      and the summation order, so the result is only ~1e-5-equivalent, not bit-exact — and the
+///      encoder feeds a pixel-parity-tested DiT conditioning, so this must be gated on the real
+///      encoder golden, not just a synthetic-weight unit test. (`0 · out_e` is also only exactly 0 for
+///      *finite* `out_e`; a bf16 overflow in an unselected expert would poison the dense sum too, so
+///      the two paths can even disagree in the pathological case.)
+///
+/// Concrete plan for the follow-up story: top-k indices on device (`argpartition`/`topk`) to drop the
+/// per-layer host sync, then a per-token gather of the `top_k` expert weights (dequantizing the
+/// selected experts if quantized, or a quant-aware grouped GEMM), a grouped SwiGLU + `down`, and a
+/// scatter-add of the weighted outputs — gated on the real gpt-oss encoder golden (`encoder_parity`
+/// and `encoder_quant_parity`) at both dense and Q4/Q8, asserting ≤1e-5 vs this dense reference.
 pub struct GptOssMoe {
     router_w: Array, // [E, hidden]
     router_b: Array, // [E]

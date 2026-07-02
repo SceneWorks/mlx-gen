@@ -133,7 +133,76 @@ impl Krea2Transformer {
         context: &Array,
         mask: Option<&Array>,
     ) -> Result<Array> {
-        let j = self.joint_inputs(latent, timestep, context, mask)?;
+        let prep = self.prepare(context, mask, latent)?;
+        self.forward_prepared(latent, timestep, &prep)
+    }
+
+    /// Build the **step-invariant** conditioning ([`JointPrep`]): the fused + projected text stream
+    /// and the joint RoPE tables. Neither depends on the noise latent's *values* or the timestep —
+    /// only on `context`/`mask` and the latent *shape* — so a denoise loop builds this ONCE and reuses
+    /// it across every step (F-079, the qwen F-115 precedent), instead of re-running the 12-layer text
+    /// fusion + text-in projection + `RopeTables::build_t2i` (~1M host trig ops) on every forward.
+    pub fn prepare(
+        &self,
+        context: &Array,
+        mask: Option<&Array>,
+        latent: &Array,
+    ) -> Result<JointPrep> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size as i32;
+        let dt = self.dtype;
+        let sh = latent.shape();
+        let (h, w) = (sh[2], sh[3]);
+        let (ht, wt) = (h / p, w / p);
+        let latent_ch = cfg.in_channels as i32 / (p * p);
+
+        // Trim the text stream to its valid length (B = 1).
+        let n_tok = context.shape()[1];
+        let cap_len = match mask {
+            Some(m) => sum(&m.as_dtype(Dtype::Float32)?, false)?.item::<f32>() as i32,
+            None => n_tok,
+        };
+        // Contiguous head slice `[0, cap_len)` via a split boundary, not an arange-gather (F-114).
+        let context = split_axis1(context, cap_len)?.swap_remove(0).as_dtype(dt)?;
+
+        // Text fusion (12 layers → 1) then the text input projection.
+        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
+        let ctx = self.txt_in_norm.forward(&ctx)?;
+        let ctx = self
+            .txt_in_l2
+            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
+
+        // Joint RoPE tables (also step-invariant: depend only on cap_len + image grid).
+        let rope = RopeTables::build_t2i(
+            cap_len as usize,
+            ht as usize,
+            wt as usize,
+            cfg.axes_dims_rope,
+            cfg.rope_theta as f64,
+        );
+        let (rcos, rsin) = rope.joint();
+        Ok(JointPrep {
+            ctx,
+            rcos,
+            rsin,
+            cap_len,
+            ht,
+            wt,
+            latent_ch,
+            p,
+        })
+    }
+
+    /// Velocity prediction from a precomputed [`JointPrep`] — runs the per-step compute only: image
+    /// patch embed, timestep embed + shared modulation, joint-sequence assembly, the block stack, and
+    /// the final layer. Numerically identical to [`forward`](Self::forward) given the same prep.
+    pub fn forward_prepared(
+        &self,
+        latent: &Array,
+        timestep: &Array,
+        prep: &JointPrep,
+    ) -> Result<Array> {
+        let j = self.joint_inputs(latent, timestep, prep)?;
         let mut combined = j.combined.clone();
         for blk in &self.blocks {
             combined = blk.forward(&combined, &j.tvec, &j.rcos, &j.rsin)?;
@@ -163,7 +232,8 @@ impl Krea2Transformer {
         block_local_targets: &[Vec<String>],
         alpha: f32,
     ) -> Result<Array> {
-        let j = self.joint_inputs(latent, timestep, context, mask)?;
+        let prep = self.prepare(context, mask, latent)?;
+        let j = self.joint_inputs(latent, timestep, &prep)?;
         let mut combined = j.combined.clone();
         for (i, blk) in self.blocks.iter().enumerate() {
             // Cheap clone (Arrays are refcounted): the closure must OWN its state because the backward
@@ -238,32 +308,22 @@ impl Krea2Transformer {
     /// and [`forward_with_blocks_checkpointed`](Self::forward_with_blocks_checkpointed): image patch
     /// embed, timestep + shared modulation, text-fusion + text-in projection, the joint `[ctx; img]`
     /// sequence, and the joint RoPE tables. Returns everything the block stack + final layer consume.
+    /// The per-step embed/assemble stage: image patch embed + timestep embed/modulation, fused with
+    /// the step-invariant text stream + RoPE from [`prep`](JointPrep) into the joint inputs the block
+    /// stack + final layer consume.
     fn joint_inputs(
         &self,
         latent: &Array,
         timestep: &Array,
-        context: &Array,
-        mask: Option<&Array>,
+        prep: &JointPrep,
     ) -> Result<JointInputs> {
         let cfg = &self.cfg;
-        let p = cfg.patch_size as i32;
         let dt = self.dtype;
-        let sh = latent.shape();
-        let (h, w) = (sh[2], sh[3]);
-        let (ht, wt) = (h / p, w / p);
-        let img_len = ht * wt;
-        let latent_ch = cfg.in_channels as i32 / (p * p);
-
-        // Trim the text stream to its valid length (B = 1).
-        let n_tok = context.shape()[1];
-        let cap_len = match mask {
-            Some(m) => sum(&m.as_dtype(Dtype::Float32)?, false)?.item::<f32>() as i32,
-            None => n_tok,
-        };
-        let context = slice_axis1(context, 0, cap_len)?.as_dtype(dt)?;
 
         // Image patch embed.
-        let img = self.img_in.forward(&patchify(&latent.as_dtype(dt)?, p)?)?; // [b, img_len, hidden]
+        let img = self
+            .img_in
+            .forward(&patchify(&latent.as_dtype(dt)?, prep.p)?)?; // [b, img_len, hidden]
 
         // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
         let t_sin = temb(timestep, cfg.timestep_embed_dim as i32)?.as_dtype(dt)?; // [b, 1, tdim]
@@ -272,42 +332,28 @@ impl Krea2Transformer {
             .forward(&gelu_tanh(&self.time_embed_l1.forward(&t_sin)?)?)?; // [b, 1, hidden]
         let tvec = self.time_mod_proj.forward(&gelu_tanh(&t)?)?; // [b, 1, 6·hidden]
 
-        // Text fusion (12 layers → 1) then the text input projection.
-        let ctx = self.text_fusion.forward(&context)?; // [b, cap, text_hidden]
-        let ctx = self.txt_in_norm.forward(&ctx)?;
-        let ctx = self
-            .txt_in_l2
-            .forward(&gelu_tanh(&self.txt_in_l1.forward(&ctx)?)?)?; // [b, cap, hidden]
-
-        // Fuse to the joint sequence and build the joint RoPE.
-        let combined = concatenate_axis(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
-        let rope = RopeTables::build_t2i(
-            cap_len as usize,
-            ht as usize,
-            wt as usize,
-            cfg.axes_dims_rope,
-            cfg.rope_theta as f64,
-        );
-        let (rcos, rsin) = rope.joint();
+        // Fuse the (precomputed) text stream to the joint sequence.
+        let combined = concatenate_axis(&[&prep.ctx, &img], 1)?; // [b, cap+img_len, hidden]
         Ok(JointInputs {
             combined,
             t,
             tvec,
-            rcos,
-            rsin,
-            cap_len,
-            img_len,
-            ht,
-            wt,
-            latent_ch,
-            p,
+            rcos: prep.rcos.clone(),
+            rsin: prep.rsin.clone(),
+            cap_len: prep.cap_len,
+            ht: prep.ht,
+            wt: prep.wt,
+            latent_ch: prep.latent_ch,
+            p: prep.p,
         })
     }
 
     /// Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
     fn finalize(&self, combined: &Array, t: &Array, j: &JointInputs) -> Result<Array> {
         let out = self.final_layer(combined, t)?; // [b, cap+img_len, in_channels]
-        let img_out = slice_axis1(&out, j.cap_len, j.cap_len + j.img_len)?;
+                                                  // The image tokens are the contiguous tail `[cap_len, cap_len+img_len)` — split at the caption
+                                                  // boundary rather than gathering an arange (F-114). `out` has length exactly `cap+img_len`.
+        let img_out = split_axis1(&out, j.cap_len)?.swap_remove(1);
         unpatchify(&img_out, j.ht, j.wt, j.p, j.latent_ch)
     }
 
@@ -398,7 +444,21 @@ struct JointInputs {
     rcos: Array,
     rsin: Array,
     cap_len: i32,
-    img_len: i32,
+    ht: i32,
+    wt: i32,
+    latent_ch: i32,
+    p: i32,
+}
+
+/// The **step-invariant** conditioning built once per denoise ([`KreaTransformer::prepare`]): the
+/// fused + projected text stream (`ctx`), the joint RoPE tables, and the patchify/slice geometry.
+/// None of it depends on the noise-latent values or the timestep, so it is reused across every step
+/// (F-079).
+pub struct JointPrep {
+    ctx: Array,
+    rcos: Array,
+    rsin: Array,
+    cap_len: i32,
     ht: i32,
     wt: i32,
     latent_ch: i32,
@@ -458,10 +518,10 @@ pub(crate) fn join(prefix: &str, name: &str) -> String {
     }
 }
 
-/// Slice `[b, L, ...]` along the sequence axis (axis 1) to `[start, end)`.
-pub(crate) fn slice_axis1(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+/// Split `[b, L, ...]` at the sequence-axis (axis 1) boundary `at`, returning `[x[..at], x[at..]]` —
+/// a contiguous split (`split_axis`), not an arange-gather (F-114). `at` must satisfy `0 ≤ at ≤ L`.
+pub(crate) fn split_axis1(x: &Array, at: i32) -> Result<Vec<Array>> {
+    Ok(x.split_axis(&[at], 1)?)
 }
 
 /// Expand `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`, repeating each kv head `groups` times

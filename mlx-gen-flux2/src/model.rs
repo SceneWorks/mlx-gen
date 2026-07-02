@@ -189,11 +189,14 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // (the loaders read the per-component `quantization` manifest, sc-5917). The VAE is identical.
     // Both dev variants (txt2img + edit) load the same snapshot through these loaders.
     let dev = variant.is_dev();
+    // For dev, parse the ~45 GB `text_encoder/` shard set ONCE and build the Mistral language tower,
+    // the Pixtral vision tower, and the multimodal projector from the same `Weights` (F-112) — the
+    // vision tower + projector are consumed after quantization below. klein has neither.
+    let mut dev_vision: Option<(PixtralVisionTower, Mistral3Projector)> = None;
     let (mut text_encoder, mut transformer) = if dev {
-        (
-            loader::load_text_encoder_dev(root)?,
-            loader::load_transformer_dev(root)?,
-        )
+        let (encoder, vision_tower, projector) = loader::load_dev_text_encoder_group(root)?;
+        dev_vision = Some((vision_tower, projector));
+        (encoder, loader::load_transformer_dev(root)?)
     } else {
         (
             loader::load_text_encoder(root)?,
@@ -230,13 +233,9 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> Result<Box<dyn Genera
     // (the `text_encoder/` snapshot's `vision_tower.*` / `multi_modal_projector.*`, full precision).
     // The Mistral generation head (final norm + LM head) was loaded into `text_encoder` by
     // `load_text_encoder_dev`. klein has no vision tower → `None` (caption upsampling is unavailable).
-    let (vision_tower, projector) = if dev {
-        (
-            Some(loader::load_vision_tower_dev(root)?),
-            Some(loader::load_multimodal_projector_dev(root)?),
-        )
-    } else {
-        (None, None)
+    let (vision_tower, projector) = match dev_vision {
+        Some((vt, proj)) => (Some(vt), Some(proj)),
+        None => (None, None),
     };
     // PiD decoder overlay (epic 7840, sc-7847): load the `flux2` student + Gemma caption encoder once
     // when the spec carries it. The student is shared across the whole FLUX.2 family (klein + dev).

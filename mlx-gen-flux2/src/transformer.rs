@@ -288,13 +288,10 @@ impl DoubleAttention {
         };
         let o = attention(&q, &k, &v, self.head_dim)?;
         let txt_seq = txt.shape()[1];
-        let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
-        let img_idx = Array::from_slice(
-            &(txt_seq..o.shape()[1]).collect::<Vec<i32>>(),
-            &[o.shape()[1] - txt_seq],
-        );
-        let txt_out = self.to_add_out.forward(&o.take_axis(&txt_idx, 1)?)?;
-        let img_out = self.to_out.forward(&o.take_axis(&img_idx, 1)?)?;
+        // `[txt ; img]` is a contiguous split at `txt_seq`; split rather than gather two aranges (F-111).
+        let parts = o.split_axis(&[txt_seq], 1)?;
+        let txt_out = self.to_add_out.forward(&parts[0])?;
+        let img_out = self.to_out.forward(&parts[1])?;
         Ok((img_out, txt_out))
     }
 }
@@ -428,14 +425,13 @@ impl SingleBlock {
 
         let sh = proj.shape();
         let (b, s) = (sh[0], sh[1]);
-        let take = |start: i32, end: i32| -> Result<Array> {
-            let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
-            Ok(proj.take_axis(&idx, 2)?)
-        };
-        let q = take(0, self.inner)?;
-        let k = take(self.inner, 2 * self.inner)?;
-        let v = take(2 * self.inner, 3 * self.inner)?;
-        let mlp = take(3 * self.inner, sh[2])?;
+        // `proj` is the fused `[q | k | v | mlp]` along axis 2 at contiguous boundaries; split at the
+        // three offsets rather than gathering four aranges (F-111).
+        let parts = proj.split_axis(&[self.inner, 2 * self.inner, 3 * self.inner], 2)?;
+        let q = parts[0].clone();
+        let k = parts[1].clone();
+        let v = parts[2].clone();
+        let mlp = parts[3].clone();
 
         let to_bhsd = |a: Array| -> Result<Array> {
             Ok(a.reshape(&[b, s, self.heads, self.head_dim])?
@@ -887,12 +883,9 @@ impl Flux2Transformer {
                 "flux2: combined sequence length {total_seq} is shorter than the text sequence {txt_seq}"
             )));
         }
-        let img_seq = total_seq - txt_seq;
-        let img_idx = Array::from_slice(
-            &(txt_seq..hidden.shape()[1]).collect::<Vec<i32>>(),
-            &[img_seq],
-        );
-        let hidden = hidden.take_axis(&img_idx, 1)?;
+        // Drop the text prefix: keep the contiguous image tail `[txt_seq, total)` via a split boundary,
+        // not an arange gather (F-111).
+        let hidden = hidden.split_axis(&[txt_seq], 1)?.swap_remove(1);
         let hidden = self.norm_out(&hidden, &temb)?;
         self.proj_out.forward(&hidden)
     }

@@ -46,6 +46,22 @@ use crate::vae;
 /// (Flux.2's 8× conv VAE composed with the 2× DiT patchify).
 pub const VAE_SCALE_FACTOR: u32 = 16;
 
+/// Whether a denoise step still needs the joint `[cond; uncond]` (B=2) DiT forward, or can run the
+/// conditional half alone (B=1). At exactly `guidance == 1.0` (the turbo default) the CFG combine
+/// `uncond + 1·(cond − uncond)` reduces to `cond` and the norm-rescale's ratio `‖cond‖/‖comb‖`
+/// reduces to `1`, so the entire uncond branch (its own 48-block DiT forward) is dead weight — skip
+/// it. Extracted as a pure predicate so the (otherwise real-weight-only) batching decision is unit
+/// testable (F-020).
+///
+/// NOTE (parity): this is NOT bit-identical to the un-skipped B=2 output. The un-skipped path computes
+/// `uncond + 1.0·(cond − uncond)` (a lossy subtract-then-add over the genuinely-different uncond DiT
+/// output) then multiplies by a ratio within ~1 ULP of 1; the skipped path feeds `cond` in for both
+/// operands, so the residual (~1 ULP, far below the ~1e-2 DiT parity tolerance) is dropped. The
+/// arithmetic still routes through `cfg_rescale(cond, cond, 1.0)` so the rescale op-order is preserved.
+fn needs_joint_cfg(guidance: f32) -> bool {
+    guidance != 1.0
+}
+
 /// Norm-rescaled classifier-free guidance for Lens — the per-token (channel-axis `[-1]`) geometry of
 /// `[B, seq, C]` predictions, delegating to the backend-neutral [`gen_core::guidance::cfg_rescale`]
 /// (epic 7434 P3, sc-7441). Replaces the bespoke `schedule::cfg_rescale`: the math now lives once in
@@ -328,22 +344,49 @@ impl LensPipeline {
         let transformer = &self.transformer;
         // FLOW velocity field: the norm-rescaled joint-CFG combination over one DiT forward. Lens feeds
         // the raw shifted sigma as the timestep directly (Sigma convention), matching the legacy loop.
+        // At guidance 1.0 (the turbo default) the uncond DiT forward is dead weight — run the cond
+        // half alone (B=1) and route it through `cfg_rescale(cond, cond, 1.0)` (F-020). Precompute the
+        // cond-only encoder features/mask (row 0 of the `[pos; neg]` stack) once, outside the closure.
+        let joint = needs_joint_cfg(guidance_scale);
+        let (cond_features, cond_mask): (Vec<Array>, Array) = if joint {
+            (Vec::new(), encoder_mask.clone())
+        } else {
+            let cf = encoder_features
+                .iter()
+                .map(|f| Ok(split(f, 2, 0)?.swap_remove(0)))
+                .collect::<Result<Vec<_>>>()?;
+            (cf, split(encoder_mask, 2, 0)?.swap_remove(0))
+        };
         let predict = |latents: &Array, sigma: f32| -> Result<Array> {
-            // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
-            let hidden = concatenate_axis(&[latents, latents], 0)?; // [2, seq, 128]
-            let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
-            let noise = transformer.forward(
-                &hidden,
-                encoder_features,
-                Some(encoder_mask),
-                &timestep,
-                1,
-                latent_h,
-                latent_w,
-            )?;
-            // chunk(2) → cond (positive, batch 0), uncond (negative, batch 1).
-            let parts = split(&noise, 2, 0)?;
-            cfg_rescale(&parts[0], &parts[1], guidance_scale)
+            if joint {
+                // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
+                let hidden = concatenate_axis(&[latents, latents], 0)?; // [2, seq, 128]
+                let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
+                let noise = transformer.forward(
+                    &hidden,
+                    encoder_features,
+                    Some(encoder_mask),
+                    &timestep,
+                    1,
+                    latent_h,
+                    latent_w,
+                )?;
+                // chunk(2) → cond (positive, batch 0), uncond (negative, batch 1).
+                let parts = split(&noise, 2, 0)?;
+                cfg_rescale(&parts[0], &parts[1], guidance_scale)
+            } else {
+                let timestep = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
+                let cond = transformer.forward(
+                    latents,
+                    &cond_features,
+                    Some(&cond_mask),
+                    &timestep,
+                    1,
+                    latent_h,
+                    latent_w,
+                )?;
+                cfg_rescale(&cond, &cond, guidance_scale)
+            }
         };
 
         // Adapt the framework's `Progress` callback to the pipeline's (completed, total) step callback.
@@ -497,25 +540,52 @@ pub(crate) fn render_sample(
     mlx_rs::random::seed(seed)?;
     let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
     let mut latents = init.as_dtype(dtype)?;
+    // At guidance 1.0 the uncond DiT forward is dead weight; run the cond half alone (B=1) and route
+    // through `cfg_rescale(cond, cond, 1.0)` (F-020; see `needs_joint_cfg`). Slice the cond-only
+    // features/mask (row 0 of the `[pos; neg]` stack) once outside the step loop.
+    let joint = needs_joint_cfg(guidance_scale);
+    let (cond_features, cond_mask): (Vec<Array>, Array) = if joint {
+        (Vec::new(), encoder_mask.clone())
+    } else {
+        let cf = encoder_features
+            .iter()
+            .map(|f| Ok(split(f, 2, 0)?.swap_remove(0)))
+            .collect::<Result<Vec<_>>>()?;
+        (cf, split(encoder_mask, 2, 0)?.swap_remove(0))
+    };
     for (i, &sigma) in timesteps.iter().enumerate() {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call (mirrors
-        // `LensPipeline::denoise`).
-        let hidden = concatenate_axis(&[&latents, &latents], 0)?;
-        let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
-        let noise = transformer.forward(
-            &hidden,
-            encoder_features,
-            Some(encoder_mask),
-            &timestep,
-            1,
-            latent,
-            latent,
-        )?;
-        let parts = split(&noise, 2, 0)?;
-        let noise_pred = cfg_rescale(&parts[0], &parts[1], guidance_scale)?;
+        let noise_pred = if joint {
+            // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call (mirrors
+            // `LensPipeline::denoise`).
+            let hidden = concatenate_axis(&[&latents, &latents], 0)?;
+            let timestep = Array::from_slice(&[sigma, sigma], &[2]).as_dtype(dtype)?;
+            let noise = transformer.forward(
+                &hidden,
+                encoder_features,
+                Some(encoder_mask),
+                &timestep,
+                1,
+                latent,
+                latent,
+            )?;
+            let parts = split(&noise, 2, 0)?;
+            cfg_rescale(&parts[0], &parts[1], guidance_scale)?
+        } else {
+            let timestep = Array::from_slice(&[sigma], &[1]).as_dtype(dtype)?;
+            let cond = transformer.forward(
+                &latents,
+                &cond_features,
+                Some(&cond_mask),
+                &timestep,
+                1,
+                latent,
+                latent,
+            )?;
+            cfg_rescale(&cond, &cond, guidance_scale)?
+        };
         latents = schedule.step(&latents, &noise_pred, i)?;
         latents.eval()?;
     }
@@ -579,4 +649,27 @@ fn decoded_to_image(decoded: &Array) -> Result<Image> {
         height: h as u32,
         pixels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_joint_cfg;
+
+    #[test]
+    fn joint_cfg_only_needed_above_unit_guidance() {
+        // The turbo default (1.0) skips the dead uncond branch; every other guidance keeps B=2.
+        assert!(
+            !needs_joint_cfg(1.0),
+            "guidance 1.0 must skip the uncond half"
+        );
+        assert!(
+            needs_joint_cfg(5.0),
+            "base guidance 5.0 must keep joint CFG"
+        );
+        assert!(needs_joint_cfg(1.5));
+        assert!(needs_joint_cfg(0.0));
+        // Not near-equal: a guidance a hair off 1.0 still runs the joint path (the combine no longer
+        // reduces to `cond`), so the skip is a strict `== 1.0` gate.
+        assert!(needs_joint_cfg(1.0 + f32::EPSILON));
+    }
 }

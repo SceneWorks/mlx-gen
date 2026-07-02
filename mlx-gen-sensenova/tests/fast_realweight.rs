@@ -96,49 +96,34 @@ fn fast_realweight_matches_reference() {
     let traj = model
         .t2i_trajectory(&tokenizer, prompt, width, height, &opts, Some(&raw_noise))
         .expect("generate trajectory");
-    assert_eq!(traj.len(), num_steps, "trajectory length");
-
-    // Step-by-step vs the torch fast trajectory. The merged weights are verified bit-near-exact
-    // (`distill_merge_realweight`), so any e2e drift is the cross-build (MLX-Metal f32-activation vs
-    // torch-bf16) precision difference *compounding* through the few-step distilled schedule. shift=3
-    // takes a few big decisive steps (the last jumps Δt≈0.3, ≈ replacing z with x_pred) in a sharp
-    // distilled velocity field, so a tiny early difference fans out by the final frame — the same
-    // chaos regime documented for high-CFG it2i (sc-3189), not a per-step bug. We therefore assert
-    // the trajectory stays finite/coherent and *agrees early*, and report the divergence profile.
+    // F-036: `denoise` (under `t2i_trajectory`) now retains only the final frame, so validate that
+    // frame against the torch trajectory's LAST step. The distilled shift=3 schedule takes a few big
+    // decisive steps (the last jumps Δt≈0.3, ≈ replacing z with x_pred) in a sharp velocity field, so
+    // even bit-near-exact merged weights fan the cross-build (MLX-Metal f32 vs torch-bf16) difference
+    // out to a low final-frame cosine — the chaos regime documented for high-CFG it2i (sc-3189), not a
+    // per-step bug. Per-step early agreement (the real merge/forward correctness gate) can no longer be
+    // asserted here since intermediate frames aren't returned; it is covered at the weight level by
+    // `distill_merge_realweight`. We assert the final frame is finite/coherent and report its cosine.
+    assert_eq!(
+        traj.len(),
+        1,
+        "denoise returns only the final frame (F-036)"
+    );
     let cos = |a: &[f32], b: &[f32]| -> f64 {
         let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
         let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
         let nb: f64 = b.iter().map(|&y| (y as f64).powi(2)).sum::<f64>().sqrt();
         dot / (na * nb + 1e-12)
     };
-    let mut cosines = Vec::new();
-    for (i, step) in traj.iter().enumerate() {
-        let got = flat(step);
-        let want = flat(golden.require(&format!("step.{i}")).unwrap());
-        assert_eq!(got.len(), want.len());
-        assert!(got.iter().all(|v| v.is_finite()), "step {i} non-finite");
-        let c = cos(&got, &want);
-        cosines.push(c);
-        println!("  step {i}: cosine={c:.5}");
-    }
-
-    // Early agreement proves the merged forward is correct (the divergence is *compounding*, not a
-    // step-0 bug); the per-weight merge fidelity is gated separately by `distill_merge_realweight`.
-    // A real merge/forward defect would drop the early steps, not just the chaos-amplified late ones,
-    // so gate the first half of the trajectory tightly. Observed: 0.9997 → 0.989 over steps 0–3,
-    // then the big decisive steps (shift=3 Δt≈0.2/0.3) fan the f32-vs-bf16 difference out to ~0.35.
-    let early = num_steps / 2;
-    for (i, &c) in cosines.iter().take(early).enumerate() {
-        assert!(
-            c > 0.98,
-            "early step {i} diverges (cosine {c:.5}) — merged forward is wrong, not just chaos"
-        );
-    }
+    let last = num_steps - 1;
+    let got = flat(traj.last().expect("final frame"));
+    let want = flat(golden.require(&format!("step.{last}")).unwrap());
+    assert_eq!(got.len(), want.len());
+    assert!(got.iter().all(|v| v.is_finite()), "final frame non-finite");
+    let c = cos(&got, &want);
     println!(
-        "fast trajectory: step0 cosine={:.5} → final cosine={:.5} (compounding precision chaos; \
-         weight-level merge fidelity gated by distill_merge_realweight)",
-        cosines[0],
-        cosines.last().unwrap()
+        "fast trajectory final step ({last}): cosine={c:.5} (compounding precision chaos; \
+         weight-level merge fidelity gated by distill_merge_realweight)"
     );
 }
 

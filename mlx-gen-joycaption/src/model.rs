@@ -109,12 +109,42 @@ pub struct JoyCaption {
     provider: Box<dyn TextLlm>,
 }
 
-fn normalized_request(req: &CaptionRequest) -> CaptionRequest {
-    let mut out = req.clone();
-    if out.prompt.trim().is_empty() {
-        out.prompt = joycaption::build_prompt(&out.options);
+/// The effective prompt for a request: the caller's prompt, or the rendered type/length/options
+/// template when it is empty. Returns just the `String` — the prior `normalized_request` cloned the
+/// WHOLE `CaptionRequest` (deep-copying the full image buffer) merely to override this one field, and
+/// `caption` then cloned the buffer a second time for the `ImageRef` (F-109).
+fn effective_prompt(req: &CaptionRequest) -> String {
+    if req.prompt.trim().is_empty() {
+        joycaption::build_prompt(&req.options)
+    } else {
+        req.prompt.clone()
     }
-    out
+}
+
+/// Validate `req` against the descriptor's capabilities using `prompt` as the effective prompt.
+/// `CaptionCapabilities::validate_request` reads only the image *dimensions* (never the pixels), the
+/// prompt, and the options, so a zero-pixel placeholder image carrying the real dimensions validates
+/// identically without copying the buffer (F-109).
+fn validate_with_prompt(
+    descriptor: &CaptionerDescriptor,
+    req: &CaptionRequest,
+    prompt: &str,
+) -> Result<()> {
+    let probe = CaptionRequest {
+        image: mlx_gen::media::Image {
+            width: req.image.width,
+            height: req.image.height,
+            pixels: Vec::new(),
+        },
+        prompt: prompt.to_owned(),
+        options: req.options.clone(),
+        sampling: req.sampling,
+        trigger_words: req.trigger_words.clone(),
+        cancel: req.cancel.clone(),
+    };
+    descriptor
+        .capabilities
+        .validate_request(descriptor.id, &probe)
 }
 
 impl Captioner for JoyCaption {
@@ -123,10 +153,7 @@ impl Captioner for JoyCaption {
     }
 
     fn validate(&self, req: &CaptionRequest) -> Result<()> {
-        let req = normalized_request(req);
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, &req)
+        validate_with_prompt(&self.descriptor, req, &effective_prompt(req))
     }
 
     fn caption(
@@ -134,10 +161,8 @@ impl Captioner for JoyCaption {
         req: &CaptionRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<CaptionOutput> {
-        let req = normalized_request(req);
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, &req)?;
+        let prompt = effective_prompt(req);
+        validate_with_prompt(&self.descriptor, req, &prompt)?;
         // Contract: an already-cancelled request errors before inference (the typed cancellation the
         // conformance suite checks).
         if req.cancel.is_cancelled() {
@@ -147,11 +172,12 @@ impl Captioner for JoyCaption {
         // One user turn carrying the image + the (product-policy) prompt text. The model's default
         // system prompt + LLaVA chat-input format are applied inside the provider, so the consumer
         // passes plain text and an image and nothing model-specific.
+        // The one necessary image-buffer copy: `ImageRef` owns its pixels and `req` is borrowed.
         let image = ImageRef::new(req.image.width, req.image.height, req.image.pixels.clone())
             .map_err(Error::Msg)?;
         let user = Message {
             role: Role::User,
-            content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
+            content: vec![Content::Image(image), Content::Text(prompt)],
             thinking: None,
             // sc-7898 mlx-llm bump: core_llm::Message gained `tool_calls` (Qwen3.6 tool-calling);
             // a caption turn carries none.
@@ -283,19 +309,16 @@ mod tests {
             },
             ..request()
         };
-        let req = normalized_request(&req);
+        let prompt = effective_prompt(&req);
         assert_eq!(
-            req.prompt,
+            prompt,
             joycaption::build_prompt(&CaptionOptions {
                 caption_type: "Straightforward".to_owned(),
                 caption_length: "short".to_owned(),
                 ..Default::default()
             })
         );
-        assert!(descriptor()
-            .capabilities
-            .validate_request(JOY_CAPTION_MODEL_ID, &req)
-            .is_ok());
+        assert!(validate_with_prompt(&descriptor(), &req, &prompt).is_ok());
     }
 
     #[test]

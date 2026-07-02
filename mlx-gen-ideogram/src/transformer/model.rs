@@ -109,6 +109,14 @@ impl Ideogram4Transformer {
     /// Velocity prediction `[B, L, in_channels]` (f32). Inputs follow the upstream packing:
     /// `llm_features [B,L,llm_dim]`, `x [B,L,in_ch]`, `t [B]`, `position_ids [B,L,3]`,
     /// `segment_ids [B,L]`, `indicator [B,L]`.
+    ///
+    /// The full public entry: builds the step-invariant conditioning ([`prepare`](Self::prepare)) and
+    /// the additive segment mask, then runs the denoise forward. Kept output-identical to the original
+    /// (the parity golden drives this path with a real `segment_ids`). The per-step denoise loop uses
+    /// [`prepare`](Self::prepare) + [`forward_prepared`](Self::forward_prepared) instead, hoisting the
+    /// role/MRoPE build out of the step loop and — because the packed Ideogram sequence is a single
+    /// segment (all `segment_ids == 1` ⇒ the mask is identically zero) — passing `None` for the mask
+    /// (F-029).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -121,26 +129,63 @@ impl Ideogram4Transformer {
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, l) = (sh[0], sh[1]);
-        let (llm_mask, img_mask, img_idx) = role_tensors(indicator, b, l)?;
+        let prep = self.prepare(position_ids, indicator, b, l)?;
+        // The general public path honours a non-trivial `segment_ids` (the DiT parity golden may carry
+        // one); pass the built additive mask. When all segments match, this mask is identically zero
+        // and `Some(zero)` is numerically identical to `None` (`logit + 0 == logit`).
+        let mask = segment_mask(segment_ids, b, l)?;
+        self.forward_prepared(llm_features, x, t, &prep, Some(&mask))
+    }
 
-        let llm_features = multiply(llm_features, &llm_mask)?;
-        let x = multiply(x, &img_mask)?;
-        let x = multiply(&self.input_proj.forward(&x)?, &img_mask)?;
+    /// Build the step-invariant conditioning tensors from the packed `position_ids`/`indicator`:
+    /// the MRoPE `(cos, sin)` and the role masks (`llm_mask`, `img_mask`, `img_idx`). None of these
+    /// depend on the noise latent `x` or the timestep `t`, so a denoise loop builds them once per
+    /// guidance branch and reuses them across every step (F-029) — the reference rebuilt them (a host
+    /// sync for the role tensors + a fresh MRoPE `cos/sin`) on every one of the ~96 forwards/image.
+    pub fn prepare(
+        &self,
+        position_ids: &Array,
+        indicator: &Array,
+        b: i32,
+        l: i32,
+    ) -> Result<PreparedConditioning> {
+        let (llm_mask, img_mask, img_idx) = role_tensors(indicator, b, l)?;
+        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
+        Ok(PreparedConditioning {
+            cos,
+            sin,
+            llm_mask,
+            img_mask,
+            img_idx,
+        })
+    }
+
+    /// Velocity prediction from precomputed [`PreparedConditioning`]. `mask` is the optional additive
+    /// attention mask (`None` = unmasked; the single-segment packed sequence needs no mask). Identical
+    /// compute to [`forward`](Self::forward) given the same `prep`/`mask`.
+    pub fn forward_prepared(
+        &self,
+        llm_features: &Array,
+        x: &Array,
+        t: &Array,
+        prep: &PreparedConditioning,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
+        let llm_features = multiply(llm_features, &prep.llm_mask)?;
+        let x = multiply(x, &prep.img_mask)?;
+        let x = multiply(&self.input_proj.forward(&x)?, &prep.img_mask)?;
 
         let t_cond = self.t_embedding(t)?.expand_dims(1)?; // [B,1,emb]
         let adaln_input = silu(&self.adaln_proj.forward(&t_cond)?)?; // [B,1,adaln]
 
         let llm = rms_norm(&llm_features, &self.llm_cond_norm, 1e-6)?;
-        let llm = multiply(&self.llm_cond_proj.forward(&llm)?, &llm_mask)?;
+        let llm = multiply(&self.llm_cond_proj.forward(&llm)?, &prep.llm_mask)?;
 
         let mut h = add(&x, &llm)?;
-        h = add(&h, &self.embed_image_indicator.forward(&img_idx)?)?;
-
-        let (cos, sin) = self.rotary_emb.forward(position_ids)?;
-        let mask = segment_mask(segment_ids, b, l)?;
+        h = add(&h, &self.embed_image_indicator.forward(&prep.img_idx)?)?;
 
         for layer in &self.layers {
-            h = layer.forward(&h, &cos, &sin, &mask, &adaln_input)?;
+            h = layer.forward(&h, &prep.cos, &prep.sin, mask, &adaln_input)?;
         }
 
         // Final layer: scale = 1 + adaln(silu(c)); linear(layernorm_no_affine(h) · scale).
@@ -152,6 +197,16 @@ impl Ideogram4Transformer {
         let out = self.final_linear.forward(&multiply(&normed, &scale)?)?;
         Ok(out.as_dtype(mlx_rs::Dtype::Float32)?)
     }
+}
+
+/// Step-invariant conditioning for one guidance branch: the MRoPE `(cos, sin)` and the role masks
+/// derived from the packed `position_ids`/`indicator`. Built once per denoise (F-029).
+pub struct PreparedConditioning {
+    cos: Array,
+    sin: Array,
+    llm_mask: Array,
+    img_mask: Array,
+    img_idx: Array,
 }
 
 /// Adapter (LoRA) host map for the Ideogram 4 DiT — the key→`AdaptableLinear` resolution the shared

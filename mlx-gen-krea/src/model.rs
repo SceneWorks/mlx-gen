@@ -27,7 +27,10 @@ use crate::pipeline::{turbo_schedule, KreaPipeline, TurboOptions};
 fn packed_quant_bits(root: &Path) -> Option<i32> {
     let cfg = std::fs::read(root.join("transformer").join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
-    v.get("quantization")?.get("bits")?.as_i64().map(|b| b as i32)
+    v.get("quantization")?
+        .get("bits")?
+        .as_i64()
+        .map(|b| b as i32)
 }
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's

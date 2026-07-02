@@ -111,22 +111,21 @@ fn t2i_denoise_matches_reference() {
             &mut cache, text_len, None, width, height, &raw_noise, &opts, None,
         )
         .expect("denoise");
-    assert_eq!(traj.len(), num_steps);
-
-    let mut worst = 0f32;
-    for (i, got) in traj.iter().enumerate() {
-        let want = want_traj
-            .take_axis(Array::from_slice(&[i as i32], &[1]), 0)
-            .unwrap()
-            .reshape(&[1, 3, height, width])
-            .unwrap();
-        let rel = peak_rel(got, &want);
-        println!("step {i}: peak-rel={rel:.3e}");
-        worst = worst.max(rel);
-    }
+    // F-036: `denoise` now retains only the final frame (the full trajectory was ~2.5 GB of dead
+    // retention; every production consumer takes `.last()`), returning a 1-element Vec. Validate that
+    // final frame against the reference trajectory's LAST step (the golden `traj` keeps all steps).
+    assert_eq!(traj.len(), 1, "denoise returns only the final frame");
+    let got = traj.last().expect("final frame");
+    let want = want_traj
+        .take_axis(Array::from_slice(&[(num_steps - 1) as i32], &[1]), 0)
+        .unwrap()
+        .reshape(&[1, 3, height, width])
+        .unwrap();
+    let rel = peak_rel(got, &want);
+    println!("final step ({}): peak-rel={rel:.3e}", num_steps - 1);
     // Cross-build (SDPA-vs-eager + MLX-Metal f32 matmul floor) accumulated over the denoise steps.
     assert!(
-        worst < 2e-2,
-        "T2I trajectory peak-rel {worst:.3e} exceeds 2e-2"
+        rel < 2e-2,
+        "T2I final-frame peak-rel {rel:.3e} exceeds 2e-2"
     );
 }

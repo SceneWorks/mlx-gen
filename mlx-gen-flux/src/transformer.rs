@@ -795,13 +795,11 @@ impl JointAttention {
         let (q, k) = apply_rope(&q, &k, rope)?;
         let out = attention(&q, &k, &v)?;
         let txt_seq = encoder.shape()[1];
-        let img_seq = hidden.shape()[1];
-        let txt_idx = Array::from_slice(&(0..txt_seq).collect::<Vec<i32>>(), &[txt_seq]);
-        let img_idx = Array::from_slice(
-            &(txt_seq..txt_seq + img_seq).collect::<Vec<i32>>(),
-            &[img_seq],
-        );
-        let attn_img = self.to_out.forward(&out.take_axis(&img_idx, 1)?)?;
+        // `out` is `[txt ; img]` along the sequence axis; split at `txt_seq` (a contiguous slice)
+        // rather than gathering two aranges (F-111). `out_txt` is consumed by `to_add_out` below.
+        let out_parts = out.split_axis(&[txt_seq], 1)?;
+        let out_txt = &out_parts[0];
+        let attn_img = self.to_out.forward(&out_parts[1])?;
         // The IP residual is computed here but returned separately — the block adds it raw to the
         // final output (after gate_msa + FF), per diffusers. Folding it into `attn_img` (which is
         // then gated by `gate_msa` and fed into the FF input) would both suppress it where the gate
@@ -815,11 +813,7 @@ impl JointAttention {
             )?,
             None => None,
         };
-        Ok((
-            attn_img,
-            self.to_add_out.forward(&out.take_axis(&txt_idx, 1)?)?,
-            ip_residual,
-        ))
+        Ok((attn_img, self.to_add_out.forward(out_txt)?, ip_residual))
     }
 
     fn quantize(&mut self, bits: i32) -> Result<()> {

@@ -10,7 +10,6 @@
 //! `Progress`. `spec.quantize` (Q4/Q8) quantizes the whole model in place after the dense load
 //! (sc-5989); a precision override and LoRA adapters are rejected rather than silently ignored.
 
-use mlx_gen::array::host_i32;
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
@@ -389,15 +388,21 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
     Ok(())
 }
 
-/// Host-extract the pipeline's `[H, W, 3]` u8 RGB array into an [`Image`].
+/// Host-extract the pipeline's `[H, W, 3]` u8 RGB array into an [`Image`]. The array is already
+/// `Uint8` (the `run_denoise` output), so the bytes are read directly (F-110) — the prior
+/// `Uint8 → Int32 → host i32 → u8` round-trip copied 4× the host bytes for no reason.
 fn array_to_image(img: &Array) -> Result<Image> {
     let sh = img.shape();
     let (h, w) = (sh[0] as u32, sh[1] as u32);
-    let px = host_i32(&img.as_dtype(Dtype::Int32)?)?;
+    let pixels = img
+        .as_dtype(Dtype::Uint8)?
+        .try_as_slice::<u8>()
+        .map(<[u8]>::to_vec)
+        .map_err(|e| Error::Msg(format!("ideogram: image array not readable as u8: {e}")))?;
     Ok(Image {
         width: w,
         height: h,
-        pixels: px.into_iter().map(|v| v as u8).collect(),
+        pixels,
     })
 }
 

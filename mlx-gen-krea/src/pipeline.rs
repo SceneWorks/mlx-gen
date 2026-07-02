@@ -141,6 +141,10 @@ impl KreaPipeline {
         // `from_ldm` early-stop (sc-7993): truncate to `keep` entries (σ=0 clean path runs them all).
         let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
         let sigmas = &full[..keep.min(full.len())];
+        // Hoist the step-invariant text fusion + joint RoPE out of the per-step closure (F-079): the
+        // context (and the latent geometry) are fixed across the denoise, so `prepare` runs ONCE and
+        // every step reuses `prep` via `forward_prepared` (bit-identical to the per-step `forward`).
+        let prep = self.dit.prepare(&context, None, &noise)?;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -151,7 +155,7 @@ impl KreaPipeline {
             on_progress,
             |x, timestep| {
                 let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward(x, &t, &context, None)?;
+                let v = self.dit.forward_prepared(x, &t, &prep)?;
                 Ok(v.as_dtype(Dtype::Float32)?)
             },
         )?;
