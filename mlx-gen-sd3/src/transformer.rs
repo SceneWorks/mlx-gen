@@ -140,7 +140,9 @@ fn attention(
     sdpa_checkpoint: bool,
 ) -> Result<Array> {
     let b = q.shape()[0];
-    let s = q.shape()[1];
+    // q is `[B,H,S,D]` here (post `process_qkv` transpose), so axis 1 is the head count, not the
+    // sequence dim. `num_heads * head_dim` reconstitutes the model dim in the final reshape below.
+    let num_heads = q.shape()[1];
     let scale = (head_dim as f32).powf(-0.5);
     let o = if sdpa_checkpoint {
         let mut seg = checkpoint(move |inp: &[Array]| -> MlxResult<Vec<Array>> {
@@ -156,7 +158,7 @@ fn attention(
         scaled_dot_product_attention(q, k, v, scale, None, None)?
     };
     Ok(o.transpose_axes(&[0, 2, 1, 3])?
-        .reshape(&[b, -1, s * head_dim])?)
+        .reshape(&[b, -1, num_heads * head_dim])?)
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -291,18 +293,15 @@ impl JointAttention {
         let v = concatenate_axis(&[&iv, &tv], 2)?;
         let o = attention(&q, &k, &v, self.head_dim, self.sdpa_checkpoint)?;
 
+        // The joint output is `[img ; txt]` concatenated along the sequence (axis 1). The two halves
+        // are contiguous, so a single `split_axis` at the image/text boundary reproduces exactly the
+        // sub-tensors the previous `0..img_seq` / `img_seq..` index-gathers produced — bit-identical,
+        // but without materializing the arange index arrays or running a gather (F-137, the F-111 twin).
         let img_seq = img.shape()[1];
-        let img_idx = Array::from_slice(&(0..img_seq).collect::<Vec<i32>>(), &[img_seq]);
-        let img_part = o.take_axis(&img_idx, 1)?;
-        let img_out = self.to_out.forward(&img_part)?;
+        let parts = o.split_axis(&[img_seq], 1)?;
+        let img_out = self.to_out.forward(&parts[0])?;
         let txt_out = match &self.to_add_out {
-            Some(to_add_out) => {
-                let txt_idx = Array::from_slice(
-                    &(img_seq..o.shape()[1]).collect::<Vec<i32>>(),
-                    &[o.shape()[1] - img_seq],
-                );
-                Some(to_add_out.forward(&o.take_axis(&txt_idx, 1)?)?)
-            }
+            Some(to_add_out) => Some(to_add_out.forward(&parts[1])?),
             None => None,
         };
         Ok((img_out, txt_out))
