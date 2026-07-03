@@ -33,6 +33,7 @@
 //! Group-B per-crate template (sc-8669 / sc-8763), a thin wrapper over the shared
 //! `mlx_gen::quant::{lin, DEFAULT_GROUP_SIZE}`.
 
+#[cfg(test)]
 use mlx_rs::ops::split;
 use mlx_rs::Array;
 
@@ -90,17 +91,39 @@ fn packed_bits_stacked(wq: &Array, scales: &Array) -> Result<i32> {
     Ok(bits)
 }
 
-/// One packed MoE expert projection's parts, sliced from a stacked `[E, …]` pre-quantized triple.
-/// `wq`/`scales`/`biases` are `[out, …]` (expert `e`'s slice, leading E axis dropped), `bias` is the
-/// dense `[out]` expert bias; `group_size`/`bits` describe the pack. Fed straight to
-/// [`crate::text_encoder::gpt_oss::Proj::from_packed_parts`].
-pub(crate) struct PackedExpertProj {
+/// A stacked packed MoE expert projection `[E, out, …]` for grouped GEMM (F-021, sc-9500) — the
+/// forward-time consumer of a packed turnkey. `wq`/`scales`/`biases` are `[E, out, …]`, `bias` is the
+/// dense `[E, out]` expert bias; `group_size`/`bits` describe the pack. Fed straight to
+/// [`crate::text_encoder::gpt_oss::GptOssMoe`]'s stacked `gather_qmm` bank (no per-expert split).
+pub(crate) struct StackedPack {
     pub wq: Array,
     pub scales: Array,
     pub biases: Array,
     pub bias: Array,
     pub group_size: i32,
     pub bits: i32,
+}
+
+/// Load the stacked packed `{name}_proj` for all `E` experts from
+/// `{prefix}.experts.{name}_proj.{weight,scales,biases}` `[E, out, …]` + the dense bias
+/// `{prefix}.experts.{name}_proj_bias` `[E, out]`, inferring `bits` from the shapes. Used as-is
+/// (no split) by the grouped-GEMM MoE forward — the on-disk stacked layout is exactly what
+/// `gather_qmm` indexes per token via `rhs_indices`.
+pub(crate) fn load_packed_stack(w: &Weights, prefix: &str, name: &str) -> Result<StackedPack> {
+    let base = format!("{prefix}.experts.{name}_proj");
+    let wq = w.require(&format!("{base}.weight"))?; // [E, out, in*bits/32]
+    let scales = w.require(&format!("{base}.scales"))?; // [E, out, in/gs]
+    let biases = w.require(&format!("{base}.biases"))?; // [E, out, in/gs]
+    let bias = w.require(&format!("{prefix}.experts.{name}_proj_bias"))?; // [E, out]
+    let bits = packed_bits_stacked(wq, scales)?;
+    Ok(StackedPack {
+        wq: wq.clone(),
+        scales: scales.clone(),
+        biases: biases.clone(),
+        bias: bias.clone(),
+        group_size: GROUP_SIZE,
+        bits,
+    })
 }
 
 /// Whether `{prefix}.experts.{name}_proj.scales` is present — i.e. this is a **packed** encoder
@@ -111,32 +134,23 @@ pub(crate) fn has_packed_experts(w: &Weights, prefix: &str, name: &str) -> bool 
         .is_some()
 }
 
-/// Load all `E` experts' packed `{name}_proj` from the stacked triple
-/// `{prefix}.experts.{name}_proj.{weight,scales,biases}` `[E, out, …]` + the dense bias
-/// `{prefix}.experts.{name}_proj_bias` `[E, out]`, returning one [`PackedExpertProj`] per expert.
-///
-/// The stack is split along axis 0 (E) into `[out, …]` per-expert parts — byte-identical to the
-/// dense path's per-expert `Proj::into_quantized`, because group-wise affine quantization is per-row
-/// (axis 0 = expert here), so slicing the packed stack commutes with quantizing each expert
-/// separately (the SDXL GEGLU row-slice argument, one axis up). `e` is read from the weight's shape.
-pub(crate) fn load_packed_experts(
-    w: &Weights,
-    prefix: &str,
-    name: &str,
-) -> Result<Vec<PackedExpertProj>> {
-    let base = format!("{prefix}.experts.{name}_proj");
-    load_packed_experts_from_stack(
-        w.require(&format!("{base}.weight"))?, // [E, out, in*bits/32]
-        w.require(&format!("{base}.scales"))?, // [E, out, in/gs]
-        w.require(&format!("{base}.biases"))?, // [E, out, in/gs]
-        w.require(&format!("{prefix}.experts.{name}_proj_bias"))?, // [E, out]
-    )
+/// One packed MoE expert projection's parts, sliced from a stacked `[E, …]` pre-quantized triple —
+/// **test-only** (the byte-identity round-trip oracle below). The forward path consumes the stack
+/// whole via [`load_packed_stack`]; only [`load_packed_experts_from_stack`] still slices per expert,
+/// to prove that slicing commutes with the load-time per-expert `Proj::into_quantized`.
+#[cfg(test)]
+pub(crate) struct PackedExpertProj {
+    pub wq: Array,
+    pub scales: Array,
+    pub biases: Array,
+    pub bias: Array,
 }
 
 /// Split a stacked packed expert triple + dense bias (`[E, out, …]` / `[E, out]`) into one
-/// [`PackedExpertProj`] per expert (axis-0 split + squeeze). Byte-identical to the per-expert
-/// load-time pack because affine quantization is per-row (axis 0 = expert), so the stack/split
-/// commutes with the per-expert quantize. Shared by [`load_packed_experts`] and the round-trip test.
+/// [`PackedExpertProj`] per expert (axis-0 split + squeeze) — **test-only**. Byte-identical to the
+/// per-expert load-time pack because affine quantization is per-row (axis 0 = expert), so the
+/// stack/split commutes with the per-expert quantize; the round-trip test asserts exactly this.
+#[cfg(test)]
 pub(crate) fn load_packed_experts_from_stack(
     wq: &Array,
     scales: &Array,
@@ -144,7 +158,7 @@ pub(crate) fn load_packed_experts_from_stack(
     bias: &Array,
 ) -> Result<Vec<PackedExpertProj>> {
     // Shape-validating (F-011) — must come before the `shape()[0]` read below.
-    let bits = packed_bits_stacked(wq, scales)?;
+    packed_bits_stacked(wq, scales)?;
     let e = wq.shape()[0];
 
     let wq_e = split(wq, e, 0)?;
@@ -159,8 +173,6 @@ pub(crate) fn load_packed_experts_from_stack(
             scales: sc_e[i].squeeze_axes(&[0])?,
             biases: bi_e[i].squeeze_axes(&[0])?,
             bias: bs_e[i].squeeze_axes(&[0])?,
-            group_size: GROUP_SIZE,
-            bits,
         });
     }
     Ok(out)
