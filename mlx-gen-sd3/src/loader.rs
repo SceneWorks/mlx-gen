@@ -32,9 +32,63 @@ use crate::vae::load_sd3_vae;
 
 /// CLIP context window (diffusers `tokenizer(..., max_length=77, padding="max_length")`).
 pub const CLIP_MAX_LENGTH: usize = 77;
-/// CLIP pad token id — `<|endoftext|>` (49407), the SD3 CLIP tokenizer's `pad_token`. diffusers pads
-/// CLIP to 77 with the EOS token; the encoder's pooled-at-argmax then still selects the FIRST EOS.
-pub const CLIP_PAD_ID: i32 = 49407;
+/// CLIP eos / `<|endoftext|>` id (49407) — the canonical CLIP-BPE vocab maximum, used as the
+/// per-encoder pad-id fallback when a `tokenizer_config.json` `pad_token` cannot be resolved.
+pub const CLIP_EOS_ID: i32 = 49407;
+/// CLIP pad token id — DEPRECATED alias of [`CLIP_EOS_ID`]. **Not** the correct pad for CLIP-bigG,
+/// which pads with `!` (0); see [`resolve_clip_pad_id`] (sc-9581). Kept only so no external caller
+/// breaks; the pipeline resolves the per-encoder pad token instead.
+pub const CLIP_PAD_ID: i32 = CLIP_EOS_ID;
+
+/// The per-encoder CLIP pad token ids for SD3.5 (sc-9581). SD3.5's two CLIP tokenizers pad with
+/// DIFFERENT tokens: CLIP-L (`tokenizer/`) pads with `<|endoftext|>` (49407) but OpenCLIP-bigG
+/// (`tokenizer_2/`) pads with `!` (id 0). Padding bigG with eos instead of `!` corrupts its
+/// penultimate hidden on every pad position (and thus the joint MMDiT context) for any prompt
+/// shorter than 77 tokens — the diffusers-parity harness in the candle sibling measured the joint
+/// context cosine dropping to ~0.98 (bigG penultimate ~0.40) under the wrong pad. Resolved from each
+/// `tokenizer_config.json` `pad_token` at load, mirroring candle-gen-sd3's `resolve_clip_pad_id`.
+#[derive(Debug, Clone, Copy)]
+pub struct Sd3ClipPad {
+    /// CLIP-L (`tokenizer/`) pad id — `<|endoftext|>` (49407).
+    pub pad_l: i32,
+    /// CLIP-bigG (`tokenizer_2/`) pad id — `!` (0). Differs from L.
+    pub pad_g: i32,
+}
+
+/// Resolve one CLIP tokenizer directory's configured pad token id (sc-9581): read
+/// `<dir>/tokenizer_config.json` `pad_token` (a bare string like `"!"`/`"<|endoftext|>"`, or an
+/// `AddedToken`-shaped object with a `content` field) and look that string up in `<dir>/vocab.json`.
+/// Falls back to [`CLIP_EOS_ID`] if the config or vocab entry is absent (diffusers pads bigG with `!`
+/// and L with eos; the fallback keeps L correct even without a config). NOT hardcoded to eos.
+pub fn resolve_clip_pad_id(dir: &Path) -> i32 {
+    let pad_str = std::fs::read_to_string(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| match &v["pad_token"] {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                o.get("content").and_then(|c| c.as_str().map(String::from))
+            }
+            _ => None,
+        });
+    let Some(pad_str) = pad_str else {
+        return CLIP_EOS_ID;
+    };
+    std::fs::read_to_string(dir.join("vocab.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<std::collections::HashMap<String, i32>>(&s).ok())
+        .and_then(|vocab| vocab.get(&pad_str).copied())
+        .unwrap_or(CLIP_EOS_ID)
+}
+
+/// Resolve BOTH CLIP encoders' pad ids for a snapshot (sc-9581): `tokenizer/` (L, eos=49407) and
+/// `tokenizer_2/` (bigG, `!`=0). See [`Sd3ClipPad`] / [`resolve_clip_pad_id`].
+pub fn load_clip_pad_ids(root: &Path) -> Sd3ClipPad {
+    Sd3ClipPad {
+        pad_l: resolve_clip_pad_id(&root.join("tokenizer")),
+        pad_g: resolve_clip_pad_id(&root.join("tokenizer_2")),
+    }
+}
 /// T5 sequence length for SD3 (diffusers `max_sequence_length=256`).
 pub const T5_MAX_LENGTH: usize = 256;
 /// T5 pad token id — `<pad>` (0).

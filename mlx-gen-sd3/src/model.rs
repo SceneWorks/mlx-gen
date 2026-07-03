@@ -86,6 +86,8 @@ pub struct Sd3Large {
     variant: Sd3Variant,
     descriptor: ModelDescriptor,
     clip_tokenizer: ClipBpeTokenizer,
+    /// Per-encoder CLIP pad ids (sc-9581): CLIP-L pads with eos (49407), bigG with `!` (0).
+    clip_pad: crate::loader::Sd3ClipPad,
     t5_tokenizer: TextTokenizer,
     encoders: Sd3TextEncoders,
     transformer: Sd3Transformer,
@@ -163,6 +165,7 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
         variant,
         descriptor: variant.descriptor(),
         clip_tokenizer: loader::load_clip_tokenizer(root)?,
+        clip_pad: loader::load_clip_pad_ids(root),
         t5_tokenizer: loader::load_t5_tokenizer(root)?,
         encoders,
         transformer,
@@ -197,6 +200,7 @@ impl Sd3Large {
         let cond = pipeline::encode_prompt(
             &self.encoders,
             &self.clip_tokenizer,
+            self.clip_pad,
             &self.t5_tokenizer,
             &req.prompt,
         )?;
@@ -206,6 +210,7 @@ impl Sd3Large {
             Some(pipeline::encode_prompt(
                 &self.encoders,
                 &self.clip_tokenizer,
+                self.clip_pad,
                 &self.t5_tokenizer,
                 neg,
             )?)

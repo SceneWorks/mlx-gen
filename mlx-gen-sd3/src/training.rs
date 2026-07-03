@@ -181,6 +181,9 @@ fn build_batch(x0: &Array, noise: &Array, t: f32) -> Result<(Array, Array)> {
 pub struct Sd3LoraTrainer {
     descriptor: TrainerDescriptor,
     clip_tokenizer: ClipBpeTokenizer,
+    /// Per-encoder CLIP pad ids (sc-9581): CLIP-L pads with eos (49407), bigG with `!` (0). Must
+    /// match the inference path so cached training conditioning is padded identically.
+    clip_pad: crate::loader::Sd3ClipPad,
     t5_tokenizer: mlx_gen::tokenizer::TextTokenizer,
     /// The three text encoders, in an `Option` so they can be **dropped after caching** — idle during
     /// training (every caption is cached) yet a multi-GB resident (T5-XXL dominates).
@@ -241,6 +244,7 @@ pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn 
     };
     let arch = variant.arch();
     let clip_tokenizer = loader::load_clip_tokenizer(&root)?;
+    let clip_pad = loader::load_clip_pad_ids(&root);
     let t5_tokenizer = loader::load_t5_tokenizer(&root)?;
     let mut encoders = loader::load_text_encoders(&root)?;
     encoders.quantize(TRAINER_ENCODER_BITS)?;
@@ -252,6 +256,7 @@ pub fn load_trainer_for(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn 
     Ok(Box::new(Sd3LoraTrainer {
         descriptor: trainer_descriptor_for(variant),
         clip_tokenizer,
+        clip_pad,
         t5_tokenizer,
         encoders: Some(encoders),
         transformer,
@@ -449,6 +454,7 @@ impl Sd3LoraTrainer {
             let cond = encode_prompt(
                 encoders,
                 &self.clip_tokenizer,
+                self.clip_pad,
                 &self.t5_tokenizer,
                 &item.caption,
             )?;
