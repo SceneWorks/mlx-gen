@@ -118,6 +118,14 @@ pub struct TrainingConfig {
     /// Guidance scale for preview samples. Guidance-distilled families (z-image-turbo,
     /// lens-turbo, …) ignore it / render at their fixed schedule; CFG families (sdxl, kolors) honor it.
     pub sample_guidance_scale: f32,
+    /// Mid-schedule **resume** (sc-9560 / F-125): when `true`, the family trainer looks in
+    /// [`output_dir`](TrainingRequest::output_dir) for the latest resume snapshot written by a prior
+    /// interrupted run of the **same** output adapter (`file_name`) at [`save_every`](Self::save_every)
+    /// — its trainable factors, optimizer state, and step/update index — and continues from there
+    /// instead of restarting at step 0. `false` (the default) always trains from scratch. Requires
+    /// `save_every > 0` on the interrupted run to have produced a snapshot; a run whose target `steps`
+    /// is already reached by the snapshot is a no-op.
+    pub resume: bool,
 }
 
 impl Default for TrainingConfig {
@@ -152,6 +160,9 @@ impl Default for TrainingConfig {
             sample_prompts: Vec::new(),
             sample_steps: 20,
             sample_guidance_scale: 1.0,
+            // Resume is OFF by default (F-125): a caller that does not opt in trains from scratch,
+            // exactly as before. The worker sets it from the plan when re-running an interrupted job.
+            resume: false,
         }
     }
 }

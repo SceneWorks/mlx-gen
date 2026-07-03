@@ -62,7 +62,7 @@ use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::gen_core;
 use mlx_gen::img2img::preprocess_init_image;
 use mlx_gen::media::Image;
-use mlx_gen::train::checkpoint::checkpoint_filename;
+use mlx_gen::train::checkpoint::{self, checkpoint_filename};
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
@@ -559,12 +559,26 @@ impl Sd3LoraTrainer {
             .unwrap_or("lora")
             .to_string();
 
+        // --- resume (F-125): continue from the latest snapshot of THIS adapter in output_dir, if any ---
+        let mut update_idx: u32 = 0;
+        let mut start_step: u32 = 0;
+        if cfg.resume {
+            if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &stem) {
+                let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut opt)?;
+                params = loaded;
+                start_step = meta.step;
+                update_idx = meta.update_idx;
+                eprintln!(
+                    "[F-125] resuming from step {start_step} (optimizer update {update_idx})"
+                );
+            }
+        }
+
         // --- train loop ---
         let mut accumulated: Option<LoraParams> = None;
-        let mut update_idx: u32 = 0;
         let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
+        let mut steps_run = start_step;
+        for step in start_step + 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -636,6 +650,7 @@ impl Sd3LoraTrainer {
                 std::fs::create_dir_all(&req.output_dir)?;
                 let ckpt = req.output_dir.join(checkpoint_filename(&stem, step));
                 adapter.save(&params, alpha, rank, cfg.decompose_factor, "", &ckpt)?;
+                checkpoint::save_resume(&req.output_dir, &stem, step, update_idx, &opt, &params)?;
                 on_progress(TrainingProgress::Checkpoint { step });
             }
         }

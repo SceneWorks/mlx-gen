@@ -1,17 +1,149 @@
-//! Intermediate-adapter checkpoint filename convention for training.
+//! Intermediate-adapter checkpoint filenames + mid-schedule **resume** (sc-9560 / F-125).
 //!
 //! The family trainers share the intermediate-adapter filename convention (driven by
 //! `config.save_every`); the trained adapter itself is written by the family trainer's `save_*`
-//! (PEFT/LoKr safetensors).
-//!
-//! NOTE: mid-schedule *resume* (optimizer-state snapshot/restore) is NOT implemented — no trainer
-//! wires it, and it would need real per-optimizer state snapshotting (incl. Prodigy/Rose), not a
-//! generic moment-buffer dump. Tracked in sc-9560; do not assume resume works from these helpers.
+//! (PEFT/LoKr safetensors). At each `save_every` a trainer additionally writes a **resume bundle**
+//! ([`save_resume`]) — the raw trainable factors + optimizer state ([`TrainOptimizer::save_state`]) +
+//! a [`ResumeMeta`] (step / update index / optimizer kind) — so a run interrupted mid-schedule can be
+//! continued with [`find_latest_resume`] + [`load_resume`] rather than restarting at step 0. The
+//! trainable factors are snapshotted **keyed exactly as the trainer holds them**, so reload is a
+//! direct round-trip with no per-family key remapping.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use mlx_rs::Array;
+
+use crate::train::lora::LoraParams;
+use crate::train::optim::TrainOptimizer;
+use crate::{Error, Result};
 
 /// `{stem}-step{step:06}.safetensors` — the intermediate adapter checkpoint filename (matches the
 /// Python kernel's `save_every` naming). Zero-padded so a lexical sort is a step-order sort.
 pub fn checkpoint_filename(stem: &str, step: u32) -> String {
     format!("{stem}-step{step:06}.safetensors")
+}
+
+/// The sibling optimizer-state snapshot for the checkpoint at `step`.
+pub fn optimizer_state_filename(stem: &str, step: u32) -> String {
+    format!("{stem}-step{step:06}.optim.safetensors")
+}
+
+/// The resume snapshot (raw trainable factors + [`ResumeMeta`]) for `step`.
+pub fn resume_snapshot_filename(stem: &str, step: u32) -> String {
+    format!("{stem}-step{step:06}.resume.safetensors")
+}
+
+/// Where an interrupted run left off — read from the resume snapshot's safetensors metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResumeMeta {
+    /// Micro-step the snapshot was taken at (resume continues at `step + 1`).
+    pub step: u32,
+    /// Optimizer update index at the snapshot (drives the LR-schedule position on resume).
+    pub update_idx: u32,
+    /// Optimizer kind tag ([`TrainOptimizer::kind_tag`]) — resume must restore into the same kind.
+    pub optimizer: String,
+}
+
+/// Write the resume bundle for micro-step `step` into `dir`: the trainable factors `params` (keyed
+/// exactly as the trainer holds them, so reload is a direct round-trip) with the [`ResumeMeta`] in the
+/// safetensors metadata, plus the optimizer state in a sibling `.optim.safetensors`. Called alongside
+/// the user-facing PEFT adapter checkpoint at each `config.save_every`.
+pub fn save_resume(
+    dir: &Path,
+    stem: &str,
+    step: u32,
+    update_idx: u32,
+    opt: &TrainOptimizer,
+    params: &LoraParams,
+) -> Result<()> {
+    opt.save_state(dir.join(optimizer_state_filename(stem, step)))?;
+
+    let entries: Vec<(String, &Array)> = params.iter().map(|(k, v)| (k.to_string(), v)).collect();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("step".to_string(), step.to_string());
+    meta.insert("update_idx".to_string(), update_idx.to_string());
+    meta.insert("optimizer".to_string(), opt.kind_tag().to_string());
+    Array::save_safetensors(
+        entries,
+        Some(&meta),
+        dir.join(resume_snapshot_filename(stem, step)),
+    )?;
+    Ok(())
+}
+
+/// Load a resume bundle written by [`save_resume`]. `snapshot` is the `.resume.safetensors` file; its
+/// sibling `.optim.safetensors` is derived by name. Restores the optimizer state into `opt` (built
+/// fresh from the same config; its [`kind_tag`](TrainOptimizer::kind_tag) must match the snapshot) and
+/// returns the trainable factors + [`ResumeMeta`].
+pub fn load_resume(snapshot: &Path, opt: &mut TrainOptimizer) -> Result<(LoraParams, ResumeMeta)> {
+    let (tensors, meta) = Array::load_safetensors_with_metadata(snapshot)?;
+    let field = |k: &str| -> Result<String> {
+        meta.get(k).cloned().ok_or_else(|| {
+            Error::Msg(format!(
+                "resume: snapshot {snapshot:?} missing metadata '{k}'"
+            ))
+        })
+    };
+    let parse = |k: &str| -> Result<u32> {
+        field(k)?
+            .parse::<u32>()
+            .map_err(|e| Error::Msg(format!("resume: metadata '{k}' is not a u32: {e}")))
+    };
+    let rmeta = ResumeMeta {
+        step: parse("step")?,
+        update_idx: parse("update_idx")?,
+        optimizer: field("optimizer")?,
+    };
+    if rmeta.optimizer != opt.kind_tag() {
+        return Err(Error::Msg(format!(
+            "resume: snapshot was saved with optimizer '{}' but this run uses '{}' — start a fresh \
+             run or resume with the matching optimizer",
+            rmeta.optimizer,
+            opt.kind_tag()
+        )));
+    }
+    opt.load_state(optim_sibling(snapshot)?)?;
+
+    let params: LoraParams = tensors
+        .into_iter()
+        .map(|(k, v)| (Rc::from(k.as_str()), v))
+        .collect();
+    Ok((params, rmeta))
+}
+
+/// The `.optim.safetensors` sibling path of a `.resume.safetensors` snapshot.
+fn optim_sibling(snapshot: &Path) -> Result<PathBuf> {
+    let name = snapshot
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| Error::Msg(format!("resume: bad snapshot path {snapshot:?}")))?;
+    Ok(snapshot.with_file_name(name.replace(".resume.safetensors", ".optim.safetensors")))
+}
+
+/// The highest-step resume snapshot for `stem` in `dir` (from a prior interrupted run), or `None`.
+/// Scans `{stem}-step{NNNNNN}.resume.safetensors` and returns `(path, step)` for the largest step.
+pub fn find_latest_resume(dir: &Path, stem: &str) -> Option<(PathBuf, u32)> {
+    let prefix = format!("{stem}-step");
+    let mut best: Option<(PathBuf, u32)> = None;
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".resume.safetensors") else {
+            continue;
+        };
+        let Ok(step) = digits.parse::<u32>() else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(_, b)| step > *b) {
+            best = Some((e.path(), step));
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -31,5 +163,81 @@ mod tests {
         // Lexical order == step order.
         assert!(checkpoint_filename("a", 9) < checkpoint_filename("a", 10));
         assert!(checkpoint_filename("a", 999) < checkpoint_filename("a", 1000));
+    }
+
+    #[test]
+    fn resume_bundle_round_trips_params_meta_and_optimizer_state() {
+        // A tiny synthetic training state: a few steps of Prodigy over one factor.
+        let mut params: LoraParams = LoraParams::new();
+        params.insert(
+            Rc::from("blk.lora_A"),
+            Array::from_slice(&[0.1, -0.2, 0.3], &[3]),
+        );
+        let grads: LoraParams = std::iter::once((
+            Rc::from("blk.lora_A"),
+            Array::from_slice(&[0.4, 0.1, -0.3], &[3]),
+        ))
+        .collect();
+        let mut opt = TrainOptimizer::from_config("prodigy", 1e-3, 0.0).unwrap();
+        opt.set_lr_scaled(1.0);
+        opt.step(&mut params, &grads).unwrap();
+        opt.step(&mut params, &grads).unwrap();
+
+        let dir = std::env::temp_dir().join("mlxgen_resume_bundle_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stem = "swatch";
+        save_resume(&dir, stem, 4, 2, &opt, &params).unwrap();
+
+        // Discovery finds the step-4 snapshot.
+        let (found, step) = find_latest_resume(&dir, stem).expect("latest resume");
+        assert_eq!(step, 4);
+
+        // Load into a fresh optimizer + compare.
+        let mut opt2 = TrainOptimizer::from_config("prodigy", 1e-3, 0.0).unwrap();
+        let (loaded, meta) = load_resume(&found, &mut opt2).unwrap();
+        assert_eq!(meta.step, 4);
+        assert_eq!(meta.update_idx, 2);
+        assert_eq!(meta.optimizer, "prodigy");
+        assert_eq!(loaded.len(), params.len());
+        assert_eq!(
+            loaded["blk.lora_A"].as_slice::<f32>(),
+            params["blk.lora_A"].as_slice::<f32>()
+        );
+
+        // The restored optimizer produces the same next step as the original would.
+        let mut a = params.clone();
+        let mut b = loaded;
+        opt.set_lr_scaled(1.0);
+        opt2.set_lr_scaled(1.0);
+        opt.step(&mut a, &grads).unwrap();
+        opt2.step(&mut b, &grads).unwrap();
+        for (x, y) in a["blk.lora_A"]
+            .as_slice::<f32>()
+            .iter()
+            .zip(b["blk.lora_A"].as_slice::<f32>())
+        {
+            assert!((x - y).abs() <= 1e-6, "resumed step diverged: {x} vs {y}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_resume_rejects_optimizer_mismatch() {
+        let mut params: LoraParams =
+            std::iter::once((Rc::from("blk.lora_A"), Array::from_slice(&[0.1, 0.2], &[2])))
+                .collect();
+        let grads = params.clone();
+        let mut opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+        opt.set_lr_scaled(1.0);
+        opt.step(&mut params, &grads).unwrap();
+        let dir = std::env::temp_dir().join("mlxgen_resume_mismatch_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        save_resume(&dir, "s", 1, 1, &opt, &params).unwrap();
+        let (found, _) = find_latest_resume(&dir, "s").unwrap();
+
+        let mut rose = TrainOptimizer::from_config("rose", 1e-3, 0.0).unwrap();
+        let err = load_resume(&found, &mut rose).unwrap_err().to_string();
+        assert!(err.contains("optimizer 'adamw'"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

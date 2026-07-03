@@ -124,6 +124,87 @@ fn run_cfg(
     (losses, out.steps, out.adapter_path)
 }
 
+/// Run the SDXL trainer once with `cfg` into a fresh `out_dir`, returning the final adapter path.
+/// Unlike [`run_cfg`] it asserts nothing about the loss curve — the resume test compares two runs.
+fn train_to(out_dir: &Path, cfg: TrainingConfig) -> PathBuf {
+    let items = make_dataset(&out_dir.join("ds"));
+    let mut trainer = mlx_gen::load_trainer("sdxl", &LoadSpec::new(WeightsSource::Dir(snapshot())))
+        .expect("sdxl trainer registered");
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: out_dir.join("out"),
+        file_name: "lora.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+    trainer
+        .train(&req, &mut |_| {})
+        .expect("training should succeed")
+        .adapter_path
+}
+
+/// F-125 mid-schedule resume, end-to-end on real SDXL: a run interrupted mid-schedule and resumed from
+/// its last checkpoint must reproduce the *uninterrupted* adapter — the schedule continues from the
+/// exact saved factors + optimizer state + step/update index. LoRA init is seeded by `cfg.seed`, so the
+/// reference and interrupted runs start identically; a correct resume then tracks the reference exactly.
+#[test]
+#[ignore = "needs real SDXL weights; validates F-125 end-to-end resume"]
+fn sdxl_resume_matches_uninterrupted() {
+    let base = std::env::temp_dir().join("sdxl_resume_e2e");
+    let _ = std::fs::remove_dir_all(&base);
+
+    let mk_cfg = |steps: u32, save_every: u32, resume: bool| TrainingConfig {
+        rank: 4,
+        alpha: 4.0,
+        learning_rate: 1e-3,
+        steps,
+        resolution: 64,
+        save_every,
+        seed: 7,
+        optimizer: "adamw".to_string(),
+        network_type: NetworkType::Lora,
+        decompose_factor: -1,
+        resume,
+        ..Default::default()
+    };
+
+    // Reference: 4 continuous steps, no checkpoints.
+    let ref_adapter = train_to(&base.join("ref"), mk_cfg(4, 0, false));
+    // Interrupted: 2 steps with save_every=1 -> a resume snapshot is written at step 1 (step 2 is the
+    // final step, which save_every skips). Then resume: SAME output_dir, resume=true, target 4 steps ->
+    // it finds the step-1 snapshot and continues steps 2..4 from the exact saved state.
+    let res_dir = base.join("res");
+    let _phase1 = train_to(&res_dir, mk_cfg(2, 1, false));
+    let res_adapter = train_to(&res_dir, mk_cfg(4, 1, true));
+
+    let a = Weights::from_file(&ref_adapter).unwrap();
+    let b = Weights::from_file(&res_adapter).unwrap();
+    let keys: Vec<String> = a
+        .keys()
+        .filter(|k| k.ends_with(".weight"))
+        .map(|k| k.to_string())
+        .collect();
+    assert!(!keys.is_empty(), "adapter should carry weight tensors");
+    let mut max_diff = 0f32;
+    for k in &keys {
+        let xa = a.require(k).unwrap();
+        let xb = b.require(k).unwrap();
+        for (x, y) in xa.as_slice::<f32>().iter().zip(xb.as_slice::<f32>()) {
+            max_diff = max_diff.max((x - y).abs());
+        }
+    }
+    println!(
+        "[F-125] sdxl resume vs uninterrupted: max |delta| = {max_diff:.3e} over {} tensors",
+        keys.len()
+    );
+    assert!(
+        max_diff < 1e-4,
+        "resumed adapter diverged from the uninterrupted run (max |delta| = {max_diff:.3e}) — resume \
+         is not continuing the exact optimizer/param/step state"
+    );
+}
+
 #[test]
 #[ignore = "needs real SDXL weights"]
 fn sdxl_trainer_trains_and_writes_lora_that_reloads() {
