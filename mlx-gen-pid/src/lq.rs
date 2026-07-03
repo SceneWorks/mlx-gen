@@ -226,6 +226,7 @@ pub struct PidNet {
     backbone: PixDiT,
     lq: LqAdapter,
     patch_size: i32,
+    lq_latent_channels: i32,
 }
 
 impl PidNet {
@@ -235,7 +236,14 @@ impl PidNet {
             backbone: PixDiT::from_weights(w, prefix, cfg)?,
             lq: LqAdapter::from_weights(w, &format!("{prefix}lq_proj"), cfg)?,
             patch_size: cfg.patch_size,
+            lq_latent_channels: cfg.lq_latent_channels,
         })
+    }
+
+    /// The LQ latent-branch channel count this net was built for (`[B, z, zH, zW]` → `z`), so the
+    /// decoder can validate a caller-supplied LQ latent's contract before the forward (F-100).
+    pub fn lq_latent_channels(&self) -> i32 {
+        self.lq_latent_channels
     }
 
     /// `x`: `[B, 3, H, W]`; `t`: `[B]`; `y`: caption embeddings `[B, Ltxt, txt_embed_dim]`;

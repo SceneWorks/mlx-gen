@@ -159,7 +159,7 @@ pub fn schedule_with(
     width: u32,
     height: u32,
     scheduler_name: Option<&str>,
-) -> FlowMatchEuler {
+) -> Result<FlowMatchEuler> {
     let native = schedule(num_steps, width, height);
     let mu = compute_mu(image_seq_len(width, height), num_steps);
     FlowMatchEuler::from_sigmas(resolve_flow_schedule(
@@ -196,7 +196,7 @@ pub fn preprocess_ref_image(image: &Image, target_width: u32, target_height: u32
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))

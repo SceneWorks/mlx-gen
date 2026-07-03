@@ -45,7 +45,7 @@ pub fn preprocess_init_image(
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     // /255 then [-1,1], as NHWC, then transpose to NCHW (the fork's `to_array` convention).
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();

@@ -100,7 +100,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             config.model_type
         )));
     }
-    let knobs = BerniniKnobs::from_dir(&root);
+    let knobs = BerniniKnobs::from_dir(&root)?;
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
         config,

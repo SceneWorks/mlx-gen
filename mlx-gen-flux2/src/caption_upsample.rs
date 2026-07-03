@@ -234,7 +234,7 @@ fn preprocess_upsample_image(references: &[&Image]) -> Result<(Array, (i32, i32)
         concat.width as usize,
         th as usize,
         tw as usize,
-    );
+    )?;
     // rescale + per-channel normalize, NHWC row-major (channel index is the innermost dim).
     let norm: Vec<f32> = resized
         .iter()

@@ -22,7 +22,7 @@
 //! reference, which sets `model.current_index = t_idx` before each step and lets the forward
 //! increment it. The understanding path ([`Path::Und`]) drives text decode.
 
-use mlx_rs::Array;
+use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{CancelFlag, Error, Result};
 
@@ -112,7 +112,11 @@ impl Qwen3Backbone {
         let hidden = self.forward_cached(&embeds, &[pos_t], &[0], &[0], Path::Und, cache, true)?;
         let logits = self.lm_head(&hidden)?; // [1, 1, vocab]
         let vocab = logits.shape()[2];
-        Ok(logits.reshape(&[vocab])?.as_slice::<f32>().to_vec())
+        // F-144: `as_slice::<f32>()` reinterprets the raw buffer — it is only correct if `logits` is
+        // f32. Today that holds by accident (the RoPE path promotes to f32), but make it explicit so a
+        // future bf16/f16 lm_head can't silently mis-read the bytes. A no-op when already f32.
+        let logits = logits.reshape(&[vocab])?.as_dtype(Dtype::Float32)?;
+        Ok(logits.as_slice::<f32>().to_vec())
     }
 
     /// Like [`decode_logits`](Self::decode_logits) but reduces to the greedy next token **on device**

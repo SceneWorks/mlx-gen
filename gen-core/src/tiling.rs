@@ -148,14 +148,14 @@ impl TilingConfig {
             return Some(Self::aggressive());
         }
         let spatial = needs_spatial.then(|| {
+            // F-057: this `auto` heuristic is mlx-gen-original — the frozen reference `TilingConfig`
+            // has no `auto` (it ships fixed `vae_encode_tile_size = 512`), so there is no parity
+            // constraint to preserve. The old `>1024 → 384 / >768 → 512 / else → 384` was non-monotone
+            // (a 700 px output got SMALLER tiles than a 1000 px one — a transposed threshold): larger
+            // outputs must not get larger tiles. Monotone now: bound memory by shrinking the tile once
+            // the output exceeds 1024 px, otherwise use the reference's 512.
             let max_dim = height.max(width);
-            let tile_px = if max_dim > 1024 {
-                384
-            } else if max_dim > 768 {
-                512
-            } else {
-                384
-            };
+            let tile_px = if max_dim > 1024 { 384 } else { 512 };
             SpatialTiling {
                 tile_px,
                 overlap_px: 64,

@@ -158,6 +158,13 @@ impl<L: LatentOps> Sampler<L> for Dpmpp2m {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             let x0 = denoise(&x, sigma)?;
+            if is_terminal(sigma) {
+                // Degenerate leading σ==0 (no real schedule starts here): land on x0, avoid the
+                // λ(0)/coeff_x = s_next/σ division. Mirrors every sibling solver's leading guard.
+                x = x0.clone();
+                old_x0 = Some(x0);
+                continue;
+            }
             if s_next == 0.0 {
                 // Terminal: land on the denoised estimate (the 1st-order limit).
                 x = x0.clone();

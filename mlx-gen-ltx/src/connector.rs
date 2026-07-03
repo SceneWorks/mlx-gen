@@ -187,6 +187,14 @@ impl Connector {
                 "ltx connector: sequence length {s} is smaller than the register count {num_reg}"
             )));
         }
+        // F-113: `tile(registers, [num_tiles, 1])` produces `(num_tiles·num_reg, dim)`; the following
+        // `reshape([1, s, dim])` only succeeds when `s` is an exact multiple of `num_reg`. A
+        // non-divisible length would otherwise reshape-error opaquely — reject it up front.
+        if s % num_reg != 0 {
+            return Err(Error::Msg(format!(
+                "ltx connector: sequence length {s} is not a multiple of the register count {num_reg}"
+            )));
+        }
         let num_tiles = s / num_reg;
         let reg_full = tile(&self.registers, &[num_tiles, 1])? // (s, dim)
             .reshape(&[1, s, dim])?

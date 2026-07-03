@@ -20,9 +20,20 @@ pub use gen_core::imageops::*;
 /// singleton temporal axis (5-D → 4-D) → NCHW→NHWC → `(x·255).round()` → `u8` (batch must be 1).
 /// Identical across the Z-Image and Qwen-Image pipelines (the decoded tensor must already be f32).
 pub fn decoded_to_image(decoded: &Array) -> Result<Image> {
+    // Rank + dtype hardening (F-064): the readback below is `as_slice::<f32>()`, which reinterprets
+    // the raw buffer — a bf16/f16 tensor (one missed `.as_dtype(Float32)` in any of ~20 provider
+    // decode paths) would mis-read the bytes and abort the process. Reject a wrong rank up front, and
+    // defensively cast to f32 before the arithmetic (a no-op for the f32 tensors every caller passes).
+    let rank = decoded.shape().len();
+    if rank != 4 && rank != 5 {
+        return Err(Error::Msg(format!(
+            "decoded_to_image: expected a 4-D (NCHW) or 5-D (NCTHW) tensor, got rank {rank}"
+        )));
+    }
+    let decoded = decoded.as_dtype(mlx_rs::Dtype::Float32)?;
     let half = scalar(0.5);
     // denormalize: clip(x*0.5 + 0.5, 0, 1)
-    let x = add(&multiply(decoded, &half)?, &half)?;
+    let x = add(&multiply(&decoded, &half)?, &half)?;
     let x = minimum(&maximum(&x, scalar(0.0))?, scalar(1.0))?;
     // drop the singleton temporal axis if present (5-D → 4-D)
     let x = if x.shape().len() == 5 {
@@ -115,11 +126,11 @@ mod tests {
                 })
         };
         let (saw_diff, saw_max) = cmp(
-            &resize_bicubic_u8(&saw, 512, 512, 384, 384),
+            &resize_bicubic_u8(&saw, 512, 512, 384, 384).unwrap(),
             g.require("pil384").unwrap().as_slice::<i32>(),
         );
         let (smo_diff, smo_max) = cmp(
-            &resize_bicubic_u8(&smo, 512, 512, 384, 384),
+            &resize_bicubic_u8(&smo, 512, 512, 384, 384).unwrap(),
             g.require("pil384_smooth").unwrap().as_slice::<i32>(),
         );
         println!("vs PIL 512->384: sawtooth {saw_diff} diff (max {saw_max}), smooth {smo_diff} diff (max {smo_max})");

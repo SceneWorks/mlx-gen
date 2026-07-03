@@ -411,6 +411,13 @@ impl RoPEAttention {
             (q_len, 1)
         };
         let (cos, sin) = axial_rope_tables_cached(head_dim, end_x, end_y);
+        // F-141 invariant: when `rope_k_repeat` is set the key stream is `repeat` stacked copies of the
+        // `q_len`-token grid, so `k_len` is an exact multiple of `q_len` and this integer division is
+        // exact — the tiled `[q_len·repeat, head_dim/2]` RoPE table then lines up 1:1 with the
+        // `rope_len (== k_len − num_k_exclude_rope)` keys `apply_rope` sees below. This holds by
+        // construction in the SAM2 memory-attention config (the mask/pointer tokens are the
+        // `num_k_exclude_rope` tail, excluded from the repeated grid); a `k_len` not divisible by
+        // `q_len` would truncate `repeat` and shape-error in `apply_rope`, surfacing the broken config.
         let repeat = if self.rope_k_repeat && q_len != 0 {
             k_len / q_len
         } else {

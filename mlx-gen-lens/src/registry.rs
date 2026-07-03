@@ -235,8 +235,14 @@ impl LensGenerator {
                             current: cur as u32,
                             total,
                         });
+                        // F-106: the pipeline decodes immediately after the final step returns (it only
+                        // exposes a step callback, not a Progress sink), so emit `Decoding` when the last
+                        // step lands — i.e. BEFORE the VAE/PiD decode, not after `generate_with_progress`
+                        // has already finished decoding.
+                        if cur as u32 >= total {
+                            on_progress(Progress::Decoding);
+                        }
                     })?;
-            on_progress(Progress::Decoding);
             let _ = i;
             images.push(image);
         }
@@ -340,6 +346,7 @@ mod tests {
                 adapters: Vec::new(),
                 extra_controls: Vec::new(),
                 pid: None,
+                identity: None,
             };
             let err = match mlx_gen::load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),
@@ -363,6 +370,7 @@ mod tests {
             adapters: Vec::new(),
             extra_controls: Vec::new(),
             pid: None,
+            identity: None,
         };
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
         // any weights load.

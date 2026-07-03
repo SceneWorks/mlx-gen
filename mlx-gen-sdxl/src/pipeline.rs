@@ -647,7 +647,7 @@ fn preprocess_image(
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     let norm: Vec<f32> = resized.iter().map(|&v| normalize(v)).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))

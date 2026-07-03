@@ -17,7 +17,8 @@ use mlx_gen_wan::WanVae;
 
 /// Drop the leading batch dim of a `WanVae::encode` output `[1, z, T, H, W]` → `[z, T, H, W]`, the
 /// `[C, F, H, W]` layout `patchify` / [`crate::forward`] expect (the target latent is batch-free too).
-fn drop_batch(z: &Array) -> Result<Array> {
+/// Shared by [`crate::bernini`] (which encodes source conditioning through the same VAE) — F-097.
+pub(crate) fn drop_batch(z: &Array) -> Result<Array> {
     Ok(z.reshape(&z.shape()[1..])?)
 }
 

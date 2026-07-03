@@ -642,7 +642,7 @@ impl Flux2 {
             None
         };
 
-        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref());
+        let sched = schedule_with(steps, req.width, req.height, req.scheduler.as_deref())?;
         let lat_h = (req.height / 16) as usize;
         let lat_w = (req.width / 16) as usize;
         let latent_ids = prepare_grid_ids(lat_h, lat_w, 0);

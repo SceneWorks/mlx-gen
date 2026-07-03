@@ -200,7 +200,7 @@ fn check_identity(errs: &mut Vec<String>, ctx: &str, fields: &[(&str, &str)]) {
         if !is_registry_ident(value) {
             errs.push(format!(
                 "{ctx}: {name} {value:?} is not a valid registry identifier \
-                 (non-empty lowercase [a-z0-9_.-])"
+                 (non-empty lowercase [a-z0-9_.-/])"
             ));
         }
     }

@@ -83,19 +83,30 @@ impl FlowMatchEuler {
     /// by the epic 7114 scheduler axis ([`crate::resolve_flow_schedule`]): an engine resolves a curated
     /// `req.scheduler` into a sigma vector and wraps it here to drive the same denoise loop, with the
     /// native schedule (the `None`/default path) returned byte-for-byte.
-    pub fn from_sigmas(sigmas: Vec<f32>) -> Self {
-        Self { sigmas }
+    pub fn from_sigmas(sigmas: Vec<f32>) -> Result<Self> {
+        // F-063: a schedule needs at least a start sigma + the trailing 0.0 (len >= 2); otherwise
+        // `num_steps()` underflows (`len - 1` on an empty vec) and the denoise loop indexes OOB.
+        // `new`/`for_image`/`for_static_shift` can't hit this (`build_flow_sigmas` clamps num_steps to
+        // >= 1 and always appends 0.0), so only this request-driven entry point needs the guard.
+        if sigmas.len() < 2 {
+            return Err(Error::Msg(format!(
+                "FlowMatchEuler::from_sigmas: need >= 2 sigmas (start + trailing 0.0), got {}",
+                sigmas.len()
+            )));
+        }
+        Ok(Self { sigmas })
     }
 
-    /// Number of denoising steps (loop iterations).
+    /// Number of denoising steps (loop iterations). `saturating_sub` so a (guarded-against but
+    /// defensively handled) empty schedule reports 0 rather than underflowing (F-063).
     pub fn num_steps(&self) -> usize {
-        self.sigmas.len() - 1
+        self.sigmas.len().saturating_sub(1)
     }
 
     /// The transformer timestep at step `t`: `1 - sigma[t]` (in `[0, 1]`; the model applies its
-    /// own `t_scale`).
+    /// own `t_scale`). Returns `1.0` for an out-of-range `t` rather than panicking (F-063).
     pub fn timestep(&self, t: usize) -> f32 {
-        1.0 - self.sigmas[t]
+        1.0 - self.sigmas.get(t).copied().unwrap_or(0.0)
     }
 
     /// One Euler step: `x_{t+1} = x_t + (sigma[t+1] - sigma[t]) * velocity`. Delegates to the shared

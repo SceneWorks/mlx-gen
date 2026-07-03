@@ -54,8 +54,8 @@ pub fn preprocess_clip_image_sized(image: &Image, size: usize) -> Result<Array> 
     let scale = size as f64 / iw.min(ih) as f64;
     let rw = ((iw as f64 * scale).round() as usize).max(size);
     let rh = ((ih as f64 * scale).round() as usize).max(size);
-    let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
-                                                                    // Center-crop size×size + normalize.
+    let resized = resize_bicubic_u8(&image.pixels, ih, iw, rh, rw)?; // HWC f32 [0,255]
+                                                                     // Center-crop size×size + normalize.
     let top = (rh - size) / 2;
     let left = (rw - size) / 2;
     let mut out = vec![0f32; size * size * 3];

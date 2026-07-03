@@ -145,6 +145,14 @@ pub fn denoise(
 /// `guidance == 1.0` (or `neg_cap_feats == None`) collapses to a single cond forward — identical to the
 /// Turbo loop — so a base request with `guidance=1` costs the same as Turbo. `start_step` mirrors the
 /// base loop (`0` for txt2img, [`init_time_step`] for img2img).
+///
+/// **CFG gate (F-093, reference-verified):** the `guidance != 1.0` skip is CORRECT and bit-identical,
+/// NOT the sana/diffusers `guidance_scale > 1.0`. mlx-gen (like the mflux fork) uses the *shifted*
+/// guidance convention `v = v_uncond + guidance·(v_cond − v_uncond)`, so `guidance == 1.0` yields
+/// exactly `v_cond` — running the uncond forward would be wasted. The diffusers `ZImagePipeline` gates
+/// on `_guidance_scale > 0` with the un-shifted formula `pred = cond + scale·(cond − uncond)`; its
+/// `scale == 0` (CFG off) is precisely this convention's `guidance == 1.0` (`scale = guidance − 1`), so
+/// the two gates agree. Do NOT "fix" this to `> 1.0`.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise_cfg_with_progress(
     transformer: &ZImageTransformer,

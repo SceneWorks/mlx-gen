@@ -90,7 +90,7 @@ pub fn preprocess_edit_image(
     let resized: Vec<u8> = if (image.height, image.width) == (ch, cw) {
         image.data.to_vec()
     } else {
-        resize_bicubic_u8(image.data, image.height, image.width, ch, cw)
+        resize_bicubic_u8(image.data, image.height, image.width, ch, cw)?
             .iter()
             .map(|&v| v as u8)
             .collect()
@@ -189,7 +189,7 @@ fn reference_image_nchw(image: &ImageInput, calc_w: u32, calc_h: u32) -> Result<
     let resized = if (image.height, image.width) == (ch, cw) {
         image.data.iter().map(|&p| p as f32).collect::<Vec<f32>>()
     } else {
-        resize_lanczos_u8(image.data, image.height, image.width, ch, cw)
+        resize_lanczos_u8(image.data, image.height, image.width, ch, cw)?
     };
     // [0,255] → [-1,1], laid out NCHW [1, 3, calc_h, calc_w].
     let plane = ch * cw;

@@ -3,7 +3,30 @@
 
 use std::path::Path;
 
+use mlx_gen::{Error, Result};
+
 use crate::forward::Mode;
+
+/// Read a knob sidecar JSON, distinguishing "absent" from "corrupt" (F-097). An **absent** file is a
+/// valid state — the loader falls back to the built-in defaults — and returns `Value::Null`. A
+/// **present but unreadable/invalid** file is a real error: reverting ALL knobs to defaults silently
+/// (the old `.ok().and_then(..ok())` behaviour) is worse than surfacing the corruption, so this
+/// returns `Err` instead of pretending the sidecar was absent.
+pub(crate) fn read_knob_sidecar(path: &Path) -> Result<serde_json::Value> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            Error::Msg(format!(
+                "bernini: {} is present but not valid JSON: {e}",
+                path.display()
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::Value::Null),
+        Err(e) => Err(Error::Msg(format!(
+            "bernini: reading {}: {e}",
+            path.display()
+        ))),
+    }
+}
 
 /// Bernini renderer inference knobs, read from the converter's `bernini_renderer.json` sidecar (else
 /// the upstream `BerniniRendererConfig` defaults).
@@ -33,13 +56,12 @@ impl Default for BerniniKnobs {
 }
 
 impl BerniniKnobs {
-    /// Read `<root>/bernini_renderer.json`; any missing field falls back to the default.
-    pub fn from_dir(root: &Path) -> Self {
+    /// Read `<root>/bernini_renderer.json`; any missing field falls back to the default. An absent
+    /// sidecar yields all-defaults; a **present-but-corrupt** sidecar is an error (F-097), not a
+    /// silent revert of every knob to its default.
+    pub fn from_dir(root: &Path) -> Result<Self> {
         let d = Self::default();
-        let v: serde_json::Value = std::fs::read(root.join("bernini_renderer.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(serde_json::Value::Null);
+        let v = read_knob_sidecar(&root.join("bernini_renderer.json"))?;
         let f = |k: &str, dv: f32| {
             v.get(k)
                 .and_then(serde_json::Value::as_f64)
@@ -48,7 +70,7 @@ impl BerniniKnobs {
         };
         let b = |k: &str, dv: bool| v.get(k).and_then(serde_json::Value::as_bool).unwrap_or(dv);
         let i = |k: &str, dv: i64| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(dv);
-        Self {
+        Ok(Self {
             switch_dit_boundary: f("switch_dit_boundary", d.switch_dit_boundary),
             shift: f("shift", d.shift),
             use_src_id_rotary_emb: b("use_src_id_rotary_emb", d.use_src_id_rotary_emb),
@@ -58,7 +80,7 @@ impl BerniniKnobs {
             // to a huge usize and drive an unbounded allocation downstream (F-080).
             max_sequence_length: i("max_sequence_length", d.max_sequence_length as i64).max(0)
                 as usize,
-        }
+        })
     }
 }
 
@@ -133,9 +155,22 @@ mod tests {
 
     #[test]
     fn knobs_default_when_sidecar_missing() {
-        let k = BerniniKnobs::from_dir(Path::new("/nonexistent"));
+        // An ABSENT sidecar is fine (defaults), not an error (F-097).
+        let k = BerniniKnobs::from_dir(Path::new("/nonexistent")).unwrap();
         assert_eq!(k.switch_dit_boundary, 0.875);
         assert_eq!(k.shift, 3.0);
         assert_eq!(k.max_trained_src_id, 5.0);
+    }
+
+    #[test]
+    fn corrupt_sidecar_is_an_error_not_a_silent_revert() {
+        // A PRESENT-but-corrupt sidecar must surface (F-097) rather than reverting every knob to
+        // default. Write a garbage file into a temp dir and confirm `from_dir` errors.
+        let dir = std::env::temp_dir().join(format!("bernini_knobs_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bernini_renderer.json"), b"{ not valid json").unwrap();
+        let r = BerniniKnobs::from_dir(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(r.is_err(), "corrupt sidecar must be an error");
     }
 }

@@ -43,7 +43,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 use crate::config::SanaTransformerConfig;
 
@@ -571,14 +571,28 @@ impl SanaTransformer {
                                                                        // Sprint: conditioning = timesteps_emb + guidance_emb (the guidance scalar through the same
                                                                        // sincos(256) projection + a parallel MLP). embedded_timestep (the output-modnorm input) is
                                                                        // this combined conditioning, exactly as diffusers `SanaCombinedTimestepGuidanceEmbeddings`.
-        let emb = match (&self.guidance_embedder, guidance) {
-            (Some((g1, g2)), Some(g)) => {
-                let g_proj = timestep_sincos(g, 256, 10_000.0, 0.0)?.as_dtype(dt)?;
-                let guidance_emb = g2.forward(&silu(&g1.forward(&g_proj)?)?)?;
-                add(&timesteps_emb, &guidance_emb)?
-            }
-            _ => timesteps_emb,
-        };
+        let emb =
+            match (&self.guidance_embedder, guidance) {
+                (Some((g1, g2)), Some(g)) => {
+                    let g_proj = timestep_sincos(g, 256, 10_000.0, 0.0)?.as_dtype(dt)?;
+                    let guidance_emb = g2.forward(&silu(&g1.forward(&g_proj)?)?)?;
+                    add(&timesteps_emb, &guidance_emb)?
+                }
+                (None, None) => timesteps_emb,
+                // F-092: the two remaining combinations are contract violations that previously fell into
+                // the `_ => timesteps_emb` arm and SILENTLY dropped the guidance conditioning. Surface them:
+                // a Sprint trunk (embedder loaded) MUST be given a guidance scalar, and a base trunk must
+                // NOT (the caller mis-routed the request).
+                (Some(_), None) => return Err(Error::Msg(
+                    "sana: guidance_embeds trunk requires a guidance scalar, but none was supplied"
+                        .into(),
+                )),
+                (None, Some(_)) => return Err(Error::Msg(
+                    "sana: a guidance scalar was supplied but this trunk has no guidance embedder \
+                     (base AdaLN-single config)"
+                        .into(),
+                )),
+            };
         let temb = self.time_linear.forward(&silu(&emb)?)?; // [B,6·dim]
 
         // 3. Caption projection + RMSNorm.
@@ -598,7 +612,9 @@ impl SanaTransformer {
         let parts = split_sections(&modg, &[1], 1)?; // 2 × [B,1,dim]
         let shift = parts[0].reshape(&[b, 1, dim])?;
         let scale = parts[1].reshape(&[b, 1, dim])?;
-        let normed = layer_norm(&hidden, None, None, 1e-6)?;
+        // F-092: use the config eps, not a hardcoded `1e-6`. (For every shipped SANA config
+        // `cfg.norm_eps == 1e-6`, so this is a no-op cleanup that removes the divergence risk.)
+        let normed = layer_norm(&hidden, None, None, cfg.norm_eps)?;
         let one = scalar(1.0).as_dtype(scale.dtype())?;
         let hidden = add(&multiply(&normed, &add(&scale, &one)?)?, &shift)?;
 

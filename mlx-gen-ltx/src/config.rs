@@ -305,7 +305,19 @@ impl LtxConfig {
         let t = root_cfg
             .get("transformer")
             .ok_or_else(|| Error::Msg("ltx: embedded_config.json missing `transformer`".into()))?;
-        Ok(Self::from_embedded_transformer(t))
+        let cfg = Self::from_embedded_transformer(t);
+        // F-075: `rope_type` is parsed but the transformer HARDCODES `apply_split_rotary_emb` (never
+        // reads `cfg.rope_type`). Rather than silently run split-RoPE on an interleaved checkpoint
+        // (wrong output, no error), reject the only value the engine does not implement. The 2.0
+        // interleaved path is not ported; a checkpoint that needs it must be added, not mis-run.
+        if cfg.rope_type != RopeType::Split {
+            return Err(Error::Msg(
+                "ltx: rope_type != \"split\" is not supported (only the LTX-2.3 split RoPE is \
+                 implemented); interleaved (2.0) RoPE is not ported"
+                    .into(),
+            ));
+        }
+        Ok(cfg)
     }
 }
 
@@ -347,10 +359,12 @@ pub struct LtxVaeConfig {
     pub latent_channels: i32,
     pub patch_size: i32,
     /// `false` for the shipped 2.3 checkpoint → the decoder runs without decode-time noise /
-    /// timestep modulation (no scale-shift tables in the weights). Kept config-gated so a future
-    /// ts-conditioned checkpoint is supported, not silently dropped.
+    /// timestep modulation (no scale-shift tables in the weights). The decoder implements ONLY this
+    /// non-ts path — a `true` checkpoint is **rejected at load** ([`Self::from_model_dir`], F-075),
+    /// not silently mis-run.
     pub timestep_conditioning: bool,
-    /// `"zeros"` for 2.3 (the 2.0 default was `"reflect"`). Spatial conv padding mode.
+    /// `"zeros"` for 2.3 (the 2.0 default was `"reflect"`). Spatial conv padding mode. The decoder
+    /// hardcodes `"zeros"`; any other value is **rejected at load** ([`Self::from_model_dir`], F-075).
     pub spatial_padding_mode: String,
     pub decoder_blocks: Vec<VaeBlock>,
     pub encoder_blocks: Vec<VaeBlock>,
@@ -425,7 +439,28 @@ impl LtxVaeConfig {
         let root_cfg: Value = serde_json::from_str(&text)
             .map_err(|e| Error::Msg(format!("ltx: parse embedded_config.json: {e}")))?;
         match root_cfg.get("vae") {
-            Some(v) => Ok(Self::from_embedded_vae(v)),
+            Some(v) => {
+                let cfg = Self::from_embedded_vae(v);
+                // F-075: `timestep_conditioning` / `spatial_padding_mode` are parsed but the VAE
+                // decoder HARDCODES the non-ts, zeros-padding path (neither field is read). Reject the
+                // values the engine does not implement instead of silently mis-running a ts-conditioned
+                // or reflect-padded checkpoint (the old doc claimed a "config gate" that never existed).
+                if cfg.timestep_conditioning {
+                    return Err(Error::Msg(
+                        "ltx: vae.timestep_conditioning=true is not supported (the decoder runs the \
+                         non-ts-conditioned 2.3 path only)"
+                            .into(),
+                    ));
+                }
+                if cfg.spatial_padding_mode != "zeros" {
+                    return Err(Error::Msg(format!(
+                        "ltx: vae.spatial_padding_mode={:?} is not supported (the decoder hardcodes \
+                         \"zeros\" padding)",
+                        cfg.spatial_padding_mode
+                    )));
+                }
+                Ok(cfg)
+            }
             None => Ok(Self::defaults()),
         }
     }

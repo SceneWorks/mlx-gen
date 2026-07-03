@@ -7,7 +7,7 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::decoder::LatentDecoder;
-use mlx_gen::{CancelFlag, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::lq::PidNet;
 use crate::sampler::Sampler;
@@ -75,7 +75,23 @@ impl LatentDecoder for PidDecoder {
     /// `latents`: the normalized VAE latent `[B, C, zH, zW]`. Returns super-resolved pixels
     /// `[B, 3, zH·vae_compression·scale, zW·vae_compression·scale]` in `[-1, 1]`.
     fn decode(&self, latents: &Array) -> Result<Array> {
-        let b = latents.shape()[0];
+        // F-100: `target_hw` reads `sh[2]`/`sh[3]` and the net's LQ branch expects a fixed channel
+        // count — validate the `[B, z, zH, zW]` contract up front so a mis-shaped caller latent fails
+        // with a clear error rather than an opaque panic/conv shape-mismatch deep in the forward.
+        let sh = latents.shape();
+        if sh.len() != 4 {
+            return Err(Error::Msg(format!(
+                "pid decode: expected a rank-4 [B, z, zH, zW] LQ latent, got shape {sh:?}"
+            )));
+        }
+        let expected_z = self.net.lq_latent_channels();
+        if sh[1] != expected_z {
+            return Err(Error::Msg(format!(
+                "pid decode: LQ latent has {} channels, expected {expected_z}",
+                sh[1]
+            )));
+        }
+        let b = sh[0];
         let (th, tw) = self.target_hw(latents);
         // PiD runs the released bf16 inference dtype, and the LQ-adapter convs require their input in
         // that dtype. An engine may hand us an f32 sampler latent (Qwen/Krea keep latents f32 through

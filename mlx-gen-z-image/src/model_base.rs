@@ -213,7 +213,7 @@ impl ZImage {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         // VAE-encode the init image once (constant across the count loop — only the noise varies).
         let clean = if is_img2img {

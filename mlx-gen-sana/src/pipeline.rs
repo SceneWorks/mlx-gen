@@ -243,9 +243,11 @@ pub fn denoise_sprint(
         )?;
         denoised = pred_x0.clone();
         // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
-        // `if len(self.timesteps) > 1` — here the trailing 0 means t_next == 0 on the last step, sin=0
-        // and a fresh-noise term, so we gate the noise draw on a non-terminal step / multi-step run).
-        latents = if scheduler.is_single_step() {
+        // `if len(self.timesteps) > 1`). On the last step `t_next == 0` ⇒ `cos(0)=1`, `sin(0)=0`, so the
+        // renoise reduces to exactly `pred_x0` — gate the noise DRAW on a non-terminal step (`i+1 < n`)
+        // so the final step doesn't burn a wasted `random::normal` + key derivation (F-092; bit-exact,
+        // the drawn noise was multiplied by `sin(0)=0` anyway).
+        latents = if scheduler.is_single_step() || i + 1 >= n {
             pred_x0
         } else {
             let noise = multiply(
@@ -379,6 +381,16 @@ impl SanaPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // F-091: `create_noise` derives the latent grid via `dim / SPATIAL_SCALE` integer division, so
+        // a width/height not a multiple of 32 silently truncates the latent (and the output image) to
+        // the floor multiple instead of honoring the request. Reject it up front (both the CFG and the
+        // Sprint path funnel through here) rather than returning a quietly-smaller image.
+        if !req.width.is_multiple_of(SPATIAL_SCALE) || !req.height.is_multiple_of(SPATIAL_SCALE) {
+            return Err(Error::Msg(format!(
+                "sana: width and height must be multiples of {SPATIAL_SCALE}, got {}x{}",
+                req.width, req.height
+            )));
+        }
         if self.sprint {
             return self.generate_sprint(req, cancel, on_progress);
         }
@@ -406,7 +418,7 @@ impl SanaPipeline {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         let latents = create_noise(seed, req.width, req.height)?;
         let latents = denoise_cfg(

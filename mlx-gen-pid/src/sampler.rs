@@ -78,6 +78,15 @@ impl Sampler {
         sigma: &Array,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        // F-100: the SDE loop consumes one `eps[ei]` per interior step; a caller that supplies fewer
+        // than `num_eps()` draws would panic OOB mid-loop. Validate the contract up front.
+        if eps.len() < self.num_eps() {
+            return Err(Error::Msg(format!(
+                "pid sampler: need {} eps draws for this schedule, got {}",
+                self.num_eps(),
+                eps.len()
+            )));
+        }
         let b = noise.shape()[0];
         let mut x = noise.clone();
         let mut ei = 0usize;

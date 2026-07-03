@@ -173,6 +173,34 @@ fn ge<T>(r: std::result::Result<T, mlx_rs::error::Exception>) -> gen_core::Resul
     r.map_err(|e| crate::Error::from(e).into())
 }
 
+/// The per-eval cancel + progress preamble shared by every curated-solver driver
+/// ([`run_curated_sampler`], [`run_cfgpp_sampler`], [`run_av_curated_sampler`]) — F-068 dedup. Each
+/// driver's `denoise` closure calls this at the top of every model eval, then performs its own
+/// (heterogeneous: single- vs two-stream) `eval` boundary.
+///
+/// - Cancellation: returns [`gen_core::Error::Canceled`] so a mid-render cancel surfaces as the typed
+///   variant (not stringified), landing within ~1 model eval.
+/// - Progress: `current` is the count of schedule nodes already descended past — monotone and robust
+///   to the multi-eval solvers (Heun / DPM++ SDE evaluate twice per step; the count stays ≤ `total`),
+///   which is why it is a `σ`-scan rather than a step counter. (F-131: this scan is O(sigmas) per eval;
+///   left as-is because a step-index shortcut cannot reproduce the correct value at the midpoint σ the
+///   2nd-order solvers pass in — behaviour must stay identical.)
+#[inline]
+fn step_gate(
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    sigmas: &[f32],
+    total: u32,
+    sigma: f32,
+) -> gen_core::Result<()> {
+    if cancel.is_cancelled() {
+        return Err(gen_core::Error::Canceled);
+    }
+    let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+    on_progress(Progress::Step { current, total });
+    Ok(())
+}
+
 impl LatentOps for MlxLatentOps {
     type Latent = Array;
 
@@ -306,18 +334,12 @@ pub fn run_curated_sampler(
         .unwrap_or_else(|| Box::new(Euler));
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<Array> {
-        if cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
+        step_gate(cancel, on_progress, sigmas, total, sigma)?;
         // Per-eval compute boundary: force the prior step's lazy graph now (MLX is lazy, so without
         // this the whole denoise is one un-cancellable graph that only runs at VAE decode). Output-
         // neutral. The multistep solvers reuse the previous denoised estimate, but the latent handed
         // back here is always the fresh node to integrate from, so evaluating it is safe.
         ge(mlx_rs::transforms::eval([x]))?;
-        // Progress as the count of schedule nodes already descended past — robust to the multi-eval
-        // solvers (Heun / DPM++ SDE call this twice per step; the count stays monotone and ≤ total).
-        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-        on_progress(Progress::Step { current, total });
         gc_denoise(&ops, ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })
@@ -367,12 +389,8 @@ pub fn run_cfgpp_sampler(
         .expect("base_supports_cfgpp(Euler) holds, so a sampler always resolves");
 
     let mut denoise_fn = |x: &Array, sigma: f32| -> gen_core::Result<(Array, Array)> {
-        if cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
+        step_gate(cancel, on_progress, sigmas, total, sigma)?;
         ge(mlx_rs::transforms::eval([x]))?;
-        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-        on_progress(Progress::Step { current, total });
         gc_cfgpp_denoise(&ops, ms, x, sigma, |xin, t| {
             predict_pair(xin, t).map_err(Into::into)
         })
@@ -508,12 +526,8 @@ pub fn run_av_curated_sampler(
         .unwrap_or_else(|| Box::new(Euler));
 
     let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
-        if cancel.is_cancelled() {
-            return Err(gen_core::Error::Canceled);
-        }
+        step_gate(cancel, on_progress, sigmas, total, sigma)?;
         ge(mlx_rs::transforms::eval([&x.video, &x.audio]))?;
-        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
-        on_progress(Progress::Step { current, total });
         gc_denoise(&ops, &ms, x, sigma, |xin, t| {
             predict(xin, t).map_err(Into::into)
         })

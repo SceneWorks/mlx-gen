@@ -794,6 +794,12 @@ fn compute_loss_grads(
     let capf = cap.clone();
     let lora_dtype = (dtype != Dtype::Float32).then_some(dtype);
     let loss_fn = move |p: LoraParams, _: i32| -> MlxResult<Vec<Array>> {
+        // F-149 invariant: NEVER check the cancel flag inside this traced grad closure. It returns
+        // `MlxResult`, so any early-out here would be stringified through `Exception::custom` and lose
+        // the typed `Error::Canceled` variant (the errors below are already forced through that lossy
+        // bridge). Cancellation is the caller's job at the step boundary (before/after this runs), where
+        // it stays a typed `Error::Canceled` — the whole grad graph is one atomic, uncancellable unit.
+        //
         // Install ALL targets: refiners/embedders train through this on the (non-checkpointed)
         // pre-main forward; the main-block adapters installed here are simply replaced inside each
         // checkpoint segment by the explicit-input factors, so they cost nothing on the ckpt path.

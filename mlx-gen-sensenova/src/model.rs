@@ -363,7 +363,7 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
         in_w as usize,
         out_h as usize,
         out_w as usize,
-    );
+    )?;
     let hwc = Array::from_slice(&hwc, &[out_h, out_w, 3]);
     let chw = hwc.transpose_axes(&[2, 0, 1])?; // HWC → CHW
     divide(&chw, Array::from_f32(255.0)).map_err(Error::from)

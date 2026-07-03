@@ -222,7 +222,7 @@ impl ZImageTurbo {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         // VAE-encode the init image once: the clean latents depend only on the init image + target
         // dims, not the per-image seed, so they're constant across the count loop (F-034). Only the

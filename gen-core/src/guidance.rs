@@ -259,6 +259,20 @@ pub fn normalized_guidance_chain<G: GuidanceOps>(
     shape: &[usize],
     axes: &[i32],
 ) -> Result<G::Latent> {
+    // The per-prediction parallel arrays (scales / bufs / norm_thresholds) must each be as long as
+    // `preds`; a short slice would panic on the `[i]` indexing below.
+    if scales.len() != preds.len()
+        || bufs.len() != preds.len()
+        || norm_thresholds.len() != preds.len()
+    {
+        return Err(crate::Error::Msg(format!(
+            "normalized_guidance_chain: preds={} but scales={} bufs={} norm_thresholds={} (all must match)",
+            preds.len(),
+            scales.len(),
+            bufs.len(),
+            norm_thresholds.len()
+        )));
+    }
     let mut result = uncond.clone();
     for (i, cond) in preds.iter().enumerate() {
         let base_prev = if i == 0 { uncond } else { &preds[i - 1] };
@@ -318,15 +332,25 @@ fn strides(shape: &[usize]) -> Vec<usize> {
 /// Σ `data` over `axes`, broadcast back to the full shape: every element receives the sum of its
 /// reduction group (the elements sharing its coordinates on the non-reduced axes). O(n·ndim) — a
 /// host reference, not a hot path.
-fn sum_over_broadcast(data: &[f32], shape: &[usize], axes: &[i32]) -> Vec<f32> {
+fn sum_over_broadcast(data: &[f32], shape: &[usize], axes: &[i32]) -> Result<Vec<f32>> {
     let ndim = shape.len();
     let total: usize = shape.iter().product();
-    debug_assert_eq!(data.len(), total, "sum_over_broadcast: data/shape mismatch");
+    if data.len() != total {
+        return Err(crate::Error::Msg(format!(
+            "sum_over_broadcast: data len {} != product(shape) {total}",
+            data.len()
+        )));
+    }
     let st = strides(shape);
-    // Normalize axes to a reduced-axis mask.
+    // Normalize axes to a reduced-axis mask, rejecting any axis outside `[-ndim, ndim)`.
     let mut reduced = vec![false; ndim];
     for &ax in axes {
         let a = if ax < 0 { ax + ndim as i32 } else { ax };
+        if a < 0 || a as usize >= ndim {
+            return Err(crate::Error::Msg(format!(
+                "sum_over_broadcast: axis {ax} out of range for {ndim}-D shape"
+            )));
+        }
         reduced[a as usize] = true;
     }
     // Map each flat index to its group-representative flat index (reduced coords zeroed).
@@ -344,9 +368,9 @@ fn sum_over_broadcast(data: &[f32], shape: &[usize], axes: &[i32]) -> Vec<f32> {
     for (flat, &v) in data.iter().enumerate() {
         group_sum[group_rep(flat)] += v as f64;
     }
-    (0..total)
+    Ok((0..total)
         .map(|flat| group_sum[group_rep(flat)] as f32)
-        .collect()
+        .collect())
 }
 
 impl GuidanceOps for CpuLatentOps {
@@ -380,7 +404,7 @@ impl GuidanceOps for CpuLatentOps {
 
     fn norm_over(&self, x: &Vec<f32>, shape: &[usize], axes: &[i32]) -> Result<Vec<f32>> {
         let sq: Vec<f32> = x.iter().map(|&v| v * v).collect();
-        Ok(sum_over_broadcast(&sq, shape, axes)
+        Ok(sum_over_broadcast(&sq, shape, axes)?
             .into_iter()
             .map(|s| s.sqrt())
             .collect())
@@ -395,7 +419,7 @@ impl GuidanceOps for CpuLatentOps {
     ) -> Result<Vec<f32>> {
         debug_assert_eq!(a.len(), b.len(), "GuidanceOps::dot_over shape mismatch");
         let prod: Vec<f32> = a.iter().zip(b).map(|(&x, &y)| x * y).collect();
-        Ok(sum_over_broadcast(&prod, shape, axes))
+        sum_over_broadcast(&prod, shape, axes)
     }
 }
 
@@ -433,16 +457,22 @@ mod tests {
         let shape = [2usize, 2];
         // Reduce channel axis 0 (per-column): col0=1+3=4, col1=2+4=6 → broadcast [[4,6],[4,6]].
         assert_eq!(
-            sum_over_broadcast(&data, &shape, &[0]),
+            sum_over_broadcast(&data, &shape, &[0]).unwrap(),
             vec![4.0, 6.0, 4.0, 6.0]
         );
         // Reduce last axis -1 (per-row): row0=3, row1=7 → [[3,3],[7,7]].
         assert_eq!(
-            sum_over_broadcast(&data, &shape, &[-1]),
+            sum_over_broadcast(&data, &shape, &[-1]).unwrap(),
             vec![3.0, 3.0, 7.0, 7.0]
         );
         // Whole-flattened: 10 everywhere.
-        assert_eq!(sum_over_broadcast(&data, &shape, &[0, 1]), vec![10.0; 4]);
+        assert_eq!(
+            sum_over_broadcast(&data, &shape, &[0, 1]).unwrap(),
+            vec![10.0; 4]
+        );
+        // Out-of-range axis → typed error, not a panic.
+        assert!(sum_over_broadcast(&data, &shape, &[2]).is_err());
+        assert!(sum_over_broadcast(&data, &shape, &[-3]).is_err());
     }
 
     #[test]

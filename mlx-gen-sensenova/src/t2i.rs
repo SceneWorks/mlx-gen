@@ -354,7 +354,9 @@ impl T2iModel {
         let last_hidden = hidden.take_axis(Array::from_slice(&[n - 1], &[1]), 1)?;
         let logits = self.backbone.lm_head(&last_hidden)?; // [1, 1, vocab]
         let vocab = logits.shape()[2];
-        let last = logits.reshape(&[vocab])?;
+        // F-144: explicit f32 so the `as_slice::<f32>()` readback in the think-mode caller can't
+        // mis-read a bf16/f16 lm_head buffer (safe-by-accident via f32 RoPE today). No-op when f32.
+        let last = logits.reshape(&[vocab])?.as_dtype(Dtype::Float32)?;
         Ok((cache, last, ids.len()))
     }
 

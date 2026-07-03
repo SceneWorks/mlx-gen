@@ -1,7 +1,7 @@
 //! sc-5148 e2e — the production [`LensTrainer`] (the `Trainer` contract realized on the base
 //! `microsoft/Lens` DiT), driven through the core registry exactly as the SceneWorks worker will.
 //!
-//! `#[ignore]`d — needs the real `microsoft/Lens` weights in the HF cache (or `LENS_SNAPSHOT`). Run:
+//! `#[ignore]`d — needs the real `SceneWorks/Lens` weights in the HF cache (or `LENS_SNAPSHOT`). Run:
 //!   cargo test -p mlx-gen-lens --release --test trainer_e2e -- --ignored --nocapture
 //!
 //! Proves the full prepare→load→cache→train→save lifecycle: a tiny captioned PNG dataset is
@@ -21,14 +21,16 @@ use mlx_gen::{
 use mlx_gen_lens::adapters::apply_lens_adapters;
 use mlx_gen_lens::dit::{LensDitConfig, LensTransformer};
 
-/// The base `microsoft/Lens` snapshot directory (the model the trainer fine-tunes — sc-1583): the
-/// `LENS_SNAPSHOT` override, else the newest snapshot in the HF cache.
+/// The base `SceneWorks/Lens` snapshot directory (the model the trainer fine-tunes — sc-1583): the
+/// `LENS_SNAPSHOT` override, else the newest snapshot in the HF cache. F-107: the base Lens weights
+/// were rehosted to `SceneWorks/Lens` (sc-8797) — the old `microsoft/Lens` cache path is stale (the
+/// `src/training.rs` snapshot() already points at the rehost; this is the matching test-side fix).
 fn snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("LENS_SNAPSHOT") {
         return PathBuf::from(p);
     }
     let base = PathBuf::from(std::env::var("HOME").unwrap())
-        .join(".cache/huggingface/hub/models--microsoft--Lens/snapshots");
+        .join(".cache/huggingface/hub/models--SceneWorks--Lens/snapshots");
     std::fs::read_dir(&base)
         .unwrap_or_else(|_| panic!("Lens snapshot dir {} (set LENS_SNAPSHOT)", base.display()))
         .filter_map(|e| e.ok())

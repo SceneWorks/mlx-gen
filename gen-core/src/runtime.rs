@@ -94,6 +94,12 @@ pub struct LoadSpec {
     /// only providers whose latent space has a PiD backbone read it (Qwen-Image / Krea today —
     /// sc-7845), and they ignore it when the request does not request PiD.
     pub pid: Option<PidWeights>,
+    /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, F-114) — the
+    /// EVA-CLIP tower, the identity encoder checkpoint, and the native face-analysis weight dir that a
+    /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model; the
+    /// PuLID-FLUX loader reads it, falling back to its historical `PULID_*` env vars only when unset,
+    /// so a caller can drive the load entirely through the spec (backend-neutral — just paths).
+    pub identity: Option<IdentityWeights>,
 }
 
 /// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
@@ -110,6 +116,22 @@ pub struct PidWeights {
     pub gemma: WeightsSource,
 }
 
+/// The identity-conditioning sub-model weights a face-ID provider (PuLID / InstantID family) needs on
+/// top of its diffusion backbone (F-114). Backend-neutral paths; the tensor load lives in the provider
+/// crate. Every field is optional so a caller can override just the pieces it has and let the provider
+/// fall back to its env-var defaults (`PULID_*`) for the rest.
+#[derive(Clone, Debug, Default)]
+pub struct IdentityWeights {
+    /// The identity-encoder checkpoint — a single `.safetensors` (PuLID's
+    /// `pulid_flux_v0.9.1.safetensors`). `None` → the provider's env-var / HF-cache fallback.
+    pub encoder: Option<WeightsSource>,
+    /// The converted EVA-CLIP vision tower — a single `.safetensors`. `None` → env-var fallback.
+    pub eva: Option<WeightsSource>,
+    /// The native face-analysis weight **directory** ([`WeightsSource::Dir`]) — must contain
+    /// `scrfd_10g` / `arcface_iresnet100` / `bisenet_parsing` safetensors. `None` → env-var fallback.
+    pub face_dir: Option<WeightsSource>,
+}
+
 impl LoadSpec {
     /// Dense bf16 load from the given source.
     pub fn new(weights: WeightsSource) -> Self {
@@ -122,6 +144,7 @@ impl LoadSpec {
             ip_adapter: None,
             adapters: Vec::new(),
             pid: None,
+            identity: None,
         }
     }
 

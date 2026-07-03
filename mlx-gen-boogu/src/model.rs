@@ -347,7 +347,9 @@ fn resolve_edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 /// floor (count/size range, negative/guidance/true_cfg flags, conditioning kinds).
 pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let id = desc.id;
-    if req.prompt.is_empty() {
+    // F-146: `trim()` so a whitespace-only prompt ("   ") is rejected too — it tokenizes to an empty
+    // (or padding-only) conditioning, the same degenerate state as `""`.
+    if req.prompt.trim().is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
     desc.capabilities.validate_request(id, req)?;

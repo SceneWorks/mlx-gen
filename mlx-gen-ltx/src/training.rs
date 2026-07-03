@@ -493,7 +493,7 @@ impl LtxTrainer {
             // sc-5637 — periodic best-effort preview frames from the in-progress adapter. Install the
             // current factors concretely for the forward-only render (the next step's traced `loss_fn`
             // re-installs them); a render failure logs and is skipped, never failing the training run.
-            if sampling_enabled && step % cfg.sample_every == 0 {
+            if sampling_enabled && cfg.sample_every > 0 && step % cfg.sample_every == 0 {
                 let lora_dtype = (compute_dtype != Dtype::Float32).then_some(compute_dtype);
                 install_train_lora(
                     &mut self.transformer,

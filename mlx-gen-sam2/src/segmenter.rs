@@ -32,7 +32,7 @@ pub fn preprocess(rgb: &[u8], in_h: usize, in_w: usize) -> Result<Array> {
             rgb.len()
         )));
     }
-    let resized = resize_bilinear_u8(rgb, in_h, in_w, SIZE, SIZE); // HWC f32 in [0,255]
+    let resized = resize_bilinear_u8(rgb, in_h, in_w, SIZE, SIZE)?; // HWC f32 in [0,255]
     let mut nchw = vec![0f32; 3 * SIZE * SIZE];
     for y in 0..SIZE {
         for x in 0..SIZE {

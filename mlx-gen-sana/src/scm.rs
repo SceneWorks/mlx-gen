@@ -68,10 +68,13 @@ impl ScmScheduler {
         max_timesteps: f32,
         intermediate_timesteps: f32,
     ) -> Self {
-        let timesteps = if num_steps == 2 {
+        // F-091: `num_steps == 0` makes the linear branch's `i/n` a `0/0` NaN (poisoning the whole
+        // schedule). Clamp to a minimum of one step (a request `steps=0` is a no-op-degenerate the
+        // pipeline should treat as single-step, not NaN) — matching gen-core's `build_flow_sigmas`.
+        let n = num_steps.max(1);
+        let timesteps = if n == 2 {
             vec![max_timesteps, intermediate_timesteps, 0.0]
         } else {
-            let n = num_steps;
             (0..=n)
                 .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
                 .collect()
@@ -90,9 +93,11 @@ impl ScmScheduler {
         }
     }
 
-    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`.
+    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`. `saturating_sub` so a
+    /// (degenerate) empty schedule from `from_timesteps(vec![])` reports 0 rather than underflowing
+    /// `usize` (F-091).
     pub fn num_steps(&self) -> usize {
-        self.timesteps.len() - 1
+        self.timesteps.len().saturating_sub(1)
     }
 
     /// Whether this is a true single-step schedule (one renoise-free step). diffusers skips the

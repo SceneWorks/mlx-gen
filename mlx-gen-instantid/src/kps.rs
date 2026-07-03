@@ -584,7 +584,7 @@ pub fn letterbox(image: &Image, width: u32, height: u32) -> Result<Image> {
         iw as usize,
         new_h as usize,
         new_w as usize,
-    ); // f32 HWC, integer-valued [0,255]
+    )?; // f32 HWC, integer-valued [0,255]
     let mut canvas = vec![0u8; (width as usize) * (height as usize) * 3];
     let ox = ((width - new_w) / 2) as usize;
     let oy = ((height - new_h) / 2) as usize;

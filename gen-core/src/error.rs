@@ -41,7 +41,19 @@ pub enum Error {
 impl Error {
     /// Lift a concrete backend error into [`Error::Backend`]. Backends call this (or rely on their
     /// own `From` impl) at the seam where an `mlx_rs`/candle `Result` crosses into gen-core.
+    ///
+    /// F-127 tripwire: a typed [`Error::Canceled`] must NEVER be laundered through here — that would
+    /// bury the cancellation contract inside an opaque `Backend` box and break the worker/testkit's
+    /// `matches!(_, Error::Canceled)` check. A backend's `From` impl maps `Canceled` across 1:1
+    /// *before* reaching this constructor, so a "cancelled"-stringified source landing here is a bug
+    /// in that bridge. Caught in debug builds only (zero release cost).
     pub fn backend(e: impl std::error::Error + Send + Sync + 'static) -> Error {
+        debug_assert_ne!(
+            e.to_string(),
+            "cancelled",
+            "Error::backend received a cancellation — map it to Error::Canceled at the bridge, \
+             don't bury it in Backend (F-127)"
+        );
         Error::Backend(Box::new(e))
     }
 }

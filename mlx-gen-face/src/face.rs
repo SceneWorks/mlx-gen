@@ -146,10 +146,13 @@ pub fn detector_blob(img: &[u8], h: usize, w: usize) -> Result<(Array, f32)> {
     }
     let det = DET_SIZE as usize;
     let im_ratio = h as f64 / w as f64;
+    // F-101: an extreme aspect ratio truncates the short side to 0 (e.g. a very wide image →
+    // `det * im_ratio` floors to 0), which would make `det_scale == 0` and drive `coords / det_scale`
+    // to ±inf downstream. Clamp both edges to at least 1 px.
     let (new_w, new_h) = if im_ratio > 1.0 {
-        ((det as f64 / im_ratio) as usize, det)
+        (((det as f64 / im_ratio) as usize).max(1), det)
     } else {
-        (det, (det as f64 * im_ratio) as usize)
+        (det, ((det as f64 * im_ratio) as usize).max(1))
     };
     let det_scale = new_h as f32 / h as f32;
     let resized = resize_bilinear_cv2(img, h, w, new_h, new_w)?;

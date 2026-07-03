@@ -326,14 +326,14 @@ impl Seedvr2Pipeline {
             let factor = 1.0 + softness.clamp(0.0, 1.0) * 7.0;
             let dw = ((width as f32 / factor) as usize).max(2);
             let dh = ((height as f32 / factor) as usize).max(2);
-            let down = resize_bicubic_u8(&image.pixels, ih, iw, dh, dw); // f32 [0,255]
+            let down = resize_bicubic_u8(&image.pixels, ih, iw, dh, dw)?; // f32 [0,255]
             let down_u8: Vec<u8> = down
                 .iter()
                 .map(|&v| v.round().clamp(0.0, 255.0) as u8)
                 .collect();
-            resize_bicubic_u8(&down_u8, dh, dw, oh, ow)
+            resize_bicubic_u8(&down_u8, dh, dw, oh, ow)?
         } else {
-            resize_bicubic_u8(&image.pixels, ih, iw, oh, ow)
+            resize_bicubic_u8(&image.pixels, ih, iw, oh, ow)?
         };
         // HWC [0,255] f32 → [-1,1] → (1,3,H,W)
         let arr = Array::from_slice(&resized, &[height, width, 3]);

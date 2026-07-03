@@ -875,7 +875,7 @@ impl InstantId {
             side as usize,
             crop_h,
             crop_w,
-        );
+        )?;
         let small: Vec<u8> = small_f.iter().map(|&v| v as u8).collect();
 
         // Feathered elliptical paste-back onto a copy of the base.

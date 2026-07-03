@@ -123,6 +123,13 @@ impl<L: LatentOps> CfgPpSampler<L> for Dpmpp2mCfgPp {
             let sigma = sigmas[i];
             let s_next = sigmas[i + 1];
             let (guided, uncond) = denoise(&x, sigma)?;
+            if is_terminal(sigma) {
+                // Degenerate leading σ==0: land on the guided x0, avoid the a = s_next/σ division.
+                // Mirrors EulerCfgPp's leading guard (and the base solvers').
+                x = guided;
+                old_uncond = Some(uncond);
+                continue;
+            }
             let a = s_next / sigma; // exp(−h)
                                     // x = a·x + guided − a·uncond  (the first-order CFG++ step)
             let mut x_next = ops.axpy(a, &x, 1.0, &guided)?;

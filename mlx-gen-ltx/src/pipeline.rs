@@ -400,7 +400,7 @@ pub fn preprocess_conditioning_image(
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     // /255 then [-1,1], as NHWC.
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
@@ -1115,6 +1115,14 @@ pub fn decode_audio_track(
     let mel = decoder.decode(audio_latents)?;
     let wav = vocoder.forward(&mel)?; // (B, channels, samples)
     let sh = wav.shape();
+    // F-113: the reshape below drops the batch axis (`(B,C,S) → (C,S)`), which only holds for B==1.
+    // A B>1 waveform would silently fold extra batches into the channel/sample layout — reject it.
+    if sh[0] != 1 {
+        return Err(Error::Msg(format!(
+            "decode_audio_track: expected batch size 1, got {}",
+            sh[0]
+        )));
+    }
     let (channels, samples) = (sh[1] as usize, sh[2]);
     // (1, C, S) → (S, C) → interleaved.
     let interleaved = contiguous(

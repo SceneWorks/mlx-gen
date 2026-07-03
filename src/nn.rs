@@ -511,6 +511,17 @@ impl TextRope {
 pub fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
     let am = crate::array::host_i32(attention_mask)?;
     let (b, s) = (b as usize, s as usize);
+    // F-061: `am[bi*s + j]` indexes this caller-supplied slice against the independent `b`/`s` params;
+    // a mask shorter than `b*s` (a provider bug) would otherwise panic (process abort) in shared core.
+    if am.len() != b * s {
+        return Err(Error::Msg(format!(
+            "build_mask: attention_mask has {} elements, expected b*s = {}*{} = {}",
+            am.len(),
+            b,
+            s,
+            b * s
+        )));
+    }
     let mut data = vec![0f32; b * s * s];
     for bi in 0..b {
         for i in 0..s {
@@ -530,6 +541,18 @@ pub fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
 /// [`window_unpartition`]. Shared by the SAM2/SAM3 vision trunks' windowed-attention blocks (6940).
 pub fn window_partition(x: &Array, window: i32) -> Result<(Array, (i32, i32))> {
     let sh = x.shape();
+    // F-062: mirror the F-041 sibling guards (`upsample_nearest`/`group_norm`). A non-NHWC input
+    // panics on `sh[1..4]`; `window <= 0` divides by zero in the pad/reshape math below.
+    if sh.len() != 4 {
+        return Err(Error::Msg(format!(
+            "window_partition: expected an NHWC (rank 4) tensor, got shape {sh:?}"
+        )));
+    }
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "window_partition: window must be > 0, got {window}"
+        )));
+    }
     let (b, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
     let pad_h = (window - h % window) % window;
     let pad_w = (window - w % window) % window;
@@ -556,7 +579,19 @@ pub fn window_unpartition(
 ) -> Result<Array> {
     let (hp, wp) = pad_hw;
     let (h, w) = hw;
+    // F-062: `window <= 0` divides by zero below, and a degenerate `pad_hw` (`hp*wp < window²`) makes
+    // `num_per_image == 0` → a second divide-by-zero on `windows.shape()[0] / num_per_image`.
+    if window <= 0 {
+        return Err(Error::Msg(format!(
+            "window_unpartition: window must be > 0, got {window}"
+        )));
+    }
     let num_per_image = (hp * wp) / window / window;
+    if num_per_image <= 0 {
+        return Err(Error::Msg(format!(
+            "window_unpartition: degenerate pad_hw {pad_hw:?} for window {window} (no whole windows)"
+        )));
+    }
     let b = windows.shape()[0] / num_per_image;
     let x = windows
         .reshape(&[b, hp / window, wp / window, window, window, -1])?

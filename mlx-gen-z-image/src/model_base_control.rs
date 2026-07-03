@@ -231,7 +231,7 @@ impl ZImageControl {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         // The 33ch control context is constant across steps + the batch + both CFG branches — build
         // once. It stays **f32** (the fork feeds it f32, which promotes the whole control branch to f32).

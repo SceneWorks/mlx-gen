@@ -221,7 +221,7 @@ impl Sd3Large {
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ));
+        ))?;
 
         let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);

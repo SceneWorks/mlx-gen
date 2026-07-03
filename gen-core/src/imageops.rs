@@ -147,27 +147,30 @@ fn resize_u8(
     out_w: usize,
     support_radius: f64,
     filter: &dyn Fn(f64) -> f64,
-) -> Vec<f32> {
+) -> crate::Result<Vec<f32>> {
     let c = 3usize;
     // Reject zero/degenerate dims up front (F-008/L-E): a 0 source edge makes the buffer guard below
     // vacuous (`in_h*in_w*c == 0`) and yields a silent uniform-black output instead of a rejection,
     // and a 0 target edge later divides by zero in `precompute_coeffs`. The shipped envelope never
-    // hits this (validate_request bounds size), but a request-supplied mask/conditioning image can.
-    assert!(
-        in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0,
-        "resize_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
-    );
+    // hits this (validate_request bounds size), but a request-supplied mask/conditioning image can —
+    // so this is a typed Err (matching `union_masks` in this file), not a panic (F-055).
+    if !(in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0) {
+        return Err(Error::Msg(format!(
+            "resize_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+        )));
+    }
     // The inner loops index `src[(y*in_w + xmin + k)*c + ch]` trusting the caller's `in_h`/`in_w`. A
     // buffer inconsistent with those dims (e.g. a request-supplied conditioning image whose
     // `pixels.len()` doesn't match `width*height*3`) would otherwise panic deep in the loop with an
     // opaque out-of-bounds index. Fail fast at the top with a clear message (F-007). All three public
     // entry points funnel through here, and this is a no-op for every well-formed image.
-    assert!(
-        src.len() >= in_h * in_w * c,
-        "resize_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} RGB image (need {})",
-        src.len(),
-        in_h * in_w * c
-    );
+    if src.len() < in_h * in_w * c {
+        return Err(Error::Msg(format!(
+            "resize_u8: pixel buffer too small — {} bytes for a {in_w}×{in_h} RGB image (need {})",
+            src.len(),
+            in_h * in_w * c
+        )));
+    }
     let bias = 1i64 << (PRECISION_BITS - 1);
 
     // Horizontal pass: (in_h, in_w) -> (in_h, out_w).
@@ -199,17 +202,18 @@ fn resize_u8(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// PIL `Image.BICUBIC` resize of a uint8 RGB HWC image. Returns f32 HWC, integer-valued `[0,255]`.
+/// `Err` (never a panic) on a zero dimension or a `src` buffer smaller than `in_h·in_w·3` (F-055).
 pub fn resize_bicubic_u8(
     src: &[u8],
     in_h: usize,
     in_w: usize,
     out_h: usize,
     out_w: usize,
-) -> Vec<f32> {
+) -> crate::Result<Vec<f32>> {
     resize_u8(src, in_h, in_w, out_h, out_w, 2.0, &cubic)
 }
 
@@ -221,7 +225,7 @@ pub fn resize_bilinear_u8(
     in_w: usize,
     out_h: usize,
     out_w: usize,
-) -> Vec<f32> {
+) -> crate::Result<Vec<f32>> {
     resize_u8(src, in_h, in_w, out_h, out_w, 1.0, &triangle)
 }
 
@@ -233,7 +237,7 @@ pub fn resize_lanczos_u8(
     in_w: usize,
     out_h: usize,
     out_w: usize,
-) -> Vec<f32> {
+) -> crate::Result<Vec<f32>> {
     resize_u8(src, in_h, in_w, out_h, out_w, 3.0, &lanczos3)
 }
 
@@ -248,16 +252,17 @@ pub fn resize_nearest_u8(
     in_w: usize,
     out_h: usize,
     out_w: usize,
-) -> Vec<f32> {
+) -> crate::Result<Vec<f32>> {
     // Fail fast on a zero/degenerate dimension (F-008): `c = src.len() / (in_h*in_w)` divides by zero
     // when a source edge is 0, `(in_h - 1)` / `(in_w - 1)` underflow `usize`, and a 0 target edge
     // divides by zero in the index map. Reachable from a request-supplied mask/conditioning image
     // (e.g. inpaint mask) — `validate_request`'s min-size does not cover conditioning images — so turn
-    // the opaque arithmetic panic into a clear one, matching the windowed `resize_u8` guard.
-    assert!(
-        in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0,
-        "resize_nearest_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
-    );
+    // the opaque arithmetic panic into a typed Err (matching `union_masks`), not a panic (F-055).
+    if !(in_h > 0 && in_w > 0 && out_h > 0 && out_w > 0) {
+        return Err(Error::Msg(format!(
+            "resize_nearest_u8: zero dimension — {in_w}×{in_h} → {out_w}×{out_h} (all edges must be > 0)"
+        )));
+    }
     let c = src.len() / (in_h * in_w);
     let mut out = vec![0f32; out_h * out_w * c];
     for oy in 0..out_h {
@@ -269,7 +274,7 @@ pub fn resize_nearest_u8(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Round-half-to-even (Python `round`), for pixel-geometry parity with the worker's `_contain_box`
@@ -387,54 +392,54 @@ mod tests {
         // gain grays that flip a binarize. 1×2 [0,255] → 1×4 replicates each pixel; 1×4 → 1×2 picks
         // the floor-sampled source indices (0 and 2).
         assert_eq!(
-            resize_nearest_u8(&[0u8, 255], 1, 2, 1, 4),
+            resize_nearest_u8(&[0u8, 255], 1, 2, 1, 4).unwrap(),
             vec![0.0, 0.0, 255.0, 255.0]
         );
         assert_eq!(
-            resize_nearest_u8(&[10u8, 20, 30, 40], 1, 4, 1, 2),
+            resize_nearest_u8(&[10u8, 20, 30, 40], 1, 4, 1, 2).unwrap(),
             vec![10.0, 30.0]
         );
     }
 
     #[test]
     fn resize_accepts_correctly_sized_buffer() {
-        // A well-formed 2×2 RGB buffer (12 bytes) resizes without panicking (the F-007 guard is a
+        // A well-formed 2×2 RGB buffer (12 bytes) resizes without erroring (the F-007 guard is a
         // no-op for valid inputs).
         let src = vec![0u8; 2 * 2 * 3];
-        let out = resize_bicubic_u8(&src, 2, 2, 4, 4);
+        let out = resize_bicubic_u8(&src, 2, 2, 4, 4).unwrap();
         assert_eq!(out.len(), 4 * 4 * 3);
     }
 
     #[test]
-    #[should_panic(expected = "pixel buffer too small")]
     fn resize_rejects_undersized_buffer() {
-        // F-007: claiming a 4×4 image from an 8-byte buffer must fail fast with a clear message,
-        // not an opaque out-of-bounds index deep in the resample loop.
+        // F-007/F-055: claiming a 4×4 image from an 8-byte buffer must fail fast with a typed Err,
+        // not an opaque out-of-bounds index deep in the resample loop (and not a panic).
         let src = vec![0u8; 8];
-        let _ = resize_bilinear_u8(&src, 4, 4, 2, 2);
+        let err = resize_bilinear_u8(&src, 4, 4, 2, 2).unwrap_err();
+        assert!(err.to_string().contains("pixel buffer too small"));
     }
 
     #[test]
-    #[should_panic(expected = "zero dimension")]
     fn resize_nearest_rejects_zero_source_dim() {
-        // F-008: a 0-width source would make `c = len / (in_h*in_w)` divide by zero. Fail fast.
-        let _ = resize_nearest_u8(&[], 4, 0, 4, 4);
+        // F-008/F-055: a 0-width source would make `c = len / (in_h*in_w)` divide by zero. Typed Err.
+        let err = resize_nearest_u8(&[], 4, 0, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("zero dimension"));
     }
 
     #[test]
-    #[should_panic(expected = "zero dimension")]
     fn resize_nearest_rejects_zero_target_dim() {
-        // F-008: a 0 target edge divides by zero in the index map.
+        // F-008/F-055: a 0 target edge divides by zero in the index map. Typed Err.
         let src = vec![0u8; 4 * 4 * 3];
-        let _ = resize_nearest_u8(&src, 4, 4, 0, 4);
+        let err = resize_nearest_u8(&src, 4, 4, 0, 4).unwrap_err();
+        assert!(err.to_string().contains("zero dimension"));
     }
 
     #[test]
-    #[should_panic(expected = "zero dimension")]
     fn resize_windowed_rejects_zero_source_dim() {
-        // L-E: the windowed path's buffer guard is vacuous when a source edge is 0 (`in_h*in_w*c ==
-        // 0`); the new dims guard rejects it instead of yielding silent uniform-black.
-        let _ = resize_bicubic_u8(&[], 0, 4, 4, 4);
+        // L-E/F-055: the windowed path's buffer guard is vacuous when a source edge is 0
+        // (`in_h*in_w*c == 0`); the dims guard returns a typed Err instead of silent uniform-black.
+        let err = resize_bicubic_u8(&[], 0, 4, 4, 4).unwrap_err();
+        assert!(err.to_string().contains("zero dimension"));
     }
 
     #[test]

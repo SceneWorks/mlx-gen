@@ -558,7 +558,13 @@ impl Generator {
         let mut x = self.up_loop(x)?;
 
         if self.bigvgan {
-            x = self.act_post.as_ref().unwrap().forward(&x)?;
+            // F-113: `bigvgan` implies `act_post` was loaded; guard the invariant with a typed error
+            // rather than an `unwrap()` panic if a checkpoint is inconsistent (bigvgan flag without the
+            // post-activation weights).
+            let act_post = self.act_post.as_ref().ok_or_else(|| {
+                Error::Msg("ltx vocoder: bigvgan=true but act_post weights are missing".into())
+            })?;
+            x = act_post.forward(&x)?;
             x = self.conv_post.forward(&x)?;
             if self.apply_final_activation {
                 x = if self.use_tanh_at_final {

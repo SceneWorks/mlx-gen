@@ -301,9 +301,14 @@ pub fn check_trainer_registry(t: &dyn Trainer) -> Result<(), String> {
 pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &TrainerProfile) {
     let mut failures: Vec<String> = Vec::new();
 
-    // validate + registry share one (unconsumed) instance.
+    // validate + registry share one (unconsumed) instance. Capture the descriptor id here (F-059) so
+    // the aggregated-failure panic below doesn't reload a multi-GB trainer a fourth time just to name
+    // it — a failing conformance run otherwise pays an extra multi-minute load (or a flaky reload
+    // replaces the panic message entirely).
+    let id;
     {
         let t = make();
+        id = t.descriptor().id;
         if let Err(e) = check_trainer_validate(t.as_ref(), profile) {
             failures.push(e);
         }
@@ -325,7 +330,6 @@ pub fn trainer_conformance(make: impl Fn() -> Box<dyn Trainer>, profile: &Traine
     }
 
     if !failures.is_empty() {
-        let id = make().descriptor().id;
         panic!(
             "gen-core trainer conformance FAILED for `{id}` (gen-core {}):\n  - {}",
             gen_core::VERSION,

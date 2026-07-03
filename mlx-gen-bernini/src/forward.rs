@@ -75,6 +75,14 @@ struct Combos {
     vi: Vec<(Array, f64)>,
 }
 
+/// A source conditioning segment's patch-embedded `(tokens, cos, sin)` with its source-id RoPE folded
+/// in — the reusable output of [`PackedForward::embed_sources`] (F-097 per-combo embedding cache).
+pub struct Segment {
+    tokens: Array,
+    cos: Array,
+    sin: Array,
+}
+
 impl PackedForward {
     pub fn new(
         head_dim: usize,
@@ -109,6 +117,29 @@ impl PackedForward {
         Ok((tokens, cos, sin, grid))
     }
 
+    /// Embed the conditioning `sources` (each `(latent, source_id)`) into their `(tokens, cos, sin)`
+    /// segments ONCE. These are independent of the noisy target and of the cond/uncond text K/V, so a
+    /// caller that reuses the same source set across combos + cond/uncond branches (every guidance
+    /// mode) embeds each source once instead of per-branch (F-097, bit-identical — the segments are
+    /// concatenated verbatim in [`Self::velocity_pre`]).
+    fn embed_sources(
+        &self,
+        dit: &WanTransformer,
+        sources: &[(Array, f64)],
+    ) -> Result<Vec<Segment>> {
+        sources
+            .iter()
+            .map(|(lat, sid)| {
+                let (tk, c, s, _) = self.embed_segment(dit, lat, *sid)?;
+                Ok(Segment {
+                    tokens: tk,
+                    cos: c,
+                    sin: s,
+                })
+            })
+            .collect()
+    }
+
     /// One packed forward: conditioning `sources` (each `(latent, source_id)`) + the noisy `target`
     /// (source_id 0), returning the **target** velocity `[16, T, H8, W8]` (the reference's
     /// `pred[:, target_mask, :]` then unpatchify). The target is concatenated last.
@@ -120,14 +151,27 @@ impl PackedForward {
         t: f32,
         cross_kv: &[(Array, Array)],
     ) -> Result<Array> {
+        let embedded = self.embed_sources(dit, sources)?;
+        self.velocity_pre(dit, target, &embedded, t, cross_kv)
+    }
+
+    /// [`Self::velocity`] over pre-embedded source [`Segment`]s (from [`Self::embed_sources`]) — the
+    /// hot path when the same sources feed multiple combos/branches in one step.
+    pub fn velocity_pre(
+        &self,
+        dit: &WanTransformer,
+        target: &Array,
+        sources: &[Segment],
+        t: f32,
+        cross_kv: &[(Array, Array)],
+    ) -> Result<Array> {
         let mut toks = Vec::with_capacity(sources.len() + 1);
         let mut coss = Vec::with_capacity(sources.len() + 1);
         let mut sins = Vec::with_capacity(sources.len() + 1);
-        for (lat, sid) in sources {
-            let (tk, c, s, _) = self.embed_segment(dit, lat, *sid)?;
-            toks.push(tk);
-            coss.push(c);
-            sins.push(s);
+        for seg in sources {
+            toks.push(seg.tokens.clone());
+            coss.push(seg.cos.clone());
+            sins.push(seg.sin.clone());
         }
         let (tk_t, c_t, s_t, grid_t) = self.embed_segment(dit, target, 0.0)?;
         let l_t = (grid_t.0 * grid_t.1 * grid_t.2) as i32;
@@ -229,9 +273,19 @@ pub fn guided_velocity(
     mbufs: &mut [MomentumBuffer],
 ) -> Result<Array> {
     let c = pf.build_combos(videos, images);
-    let v = |sources: &[(Array, f64)], cond: bool| -> Result<Array> {
+    // F-097: embed each distinct source combo ONCE (source embeddings are independent of `noisy` and
+    // of the cond/uncond text K/V), then reuse the segments across every `v(..)` call below — every
+    // mode calls the same combo for both the cond and uncond branch (and some twice more). Bit-
+    // identical: `velocity_pre` concatenates the identical segments `velocity` would have rebuilt.
+    let (ec_none, ec_v, ec_i, ec_vi) = (
+        pf.embed_sources(dit, &c.none)?,
+        pf.embed_sources(dit, &c.v)?,
+        pf.embed_sources(dit, &c.i)?,
+        pf.embed_sources(dit, &c.vi)?,
+    );
+    let v = |sources: &[Segment], cond: bool| -> Result<Array> {
         let kv = if cond { cross_kv_cond } else { cross_kv_uncond };
-        pf.velocity(dit, noisy, sources, t, kv)
+        pf.velocity_pre(dit, noisy, sources, t, kv)
     };
     // Weighted velocity sum for a list of (vel, weight) deltas: base + Σ w·(cur − prev).
     let chain = |terms: &[(&Array, f32)]| -> Result<Array> {
@@ -248,26 +302,26 @@ pub fn guided_velocity(
 
     match mode {
         Mode::T2v => {
-            let e0 = v(&c.none, false)?;
-            let et = v(&c.none, true)?;
+            let e0 = v(&ec_none, false)?;
+            let et = v(&ec_none, true)?;
             chain(&[(&e0, 0.0), (&et, g.omega_txt)])
         }
         Mode::V2v => {
-            let e_vi = v(&c.vi, false)?;
-            let e_vti = v(&c.vi, true)?;
+            let e_vi = v(&ec_vi, false)?;
+            let e_vti = v(&ec_vi, true)?;
             chain(&[(&e_vi, 0.0), (&e_vti, g.omega_txt)])
         }
         Mode::V2vChain => {
-            let e0 = v(&c.none, false)?;
-            let ev = v(&c.v, false)?;
-            let e_vti = v(&c.vi, true)?;
+            let e0 = v(&ec_none, false)?;
+            let ev = v(&ec_v, false)?;
+            let e_vti = v(&ec_vi, true)?;
             chain(&[(&e0, 0.0), (&ev, g.omega_vid), (&e_vti, g.omega_txt)])
         }
         Mode::Rv2v => {
-            let e0 = v(&c.none, false)?;
-            let ev = v(&c.v, false)?;
-            let e_vi = v(&c.vi, false)?;
-            let e_vti = v(&c.vi, true)?;
+            let e0 = v(&ec_none, false)?;
+            let ev = v(&ec_v, false)?;
+            let e_vi = v(&ec_vi, false)?;
+            let e_vti = v(&ec_vi, true)?;
             chain(&[
                 (&e0, 0.0),
                 (&ev, g.omega_vid),
@@ -276,8 +330,8 @@ pub fn guided_velocity(
             ])
         }
         Mode::T2vApg => {
-            let e0 = v(&c.none, false)?;
-            let et = v(&c.none, true)?;
+            let e0 = v(&ec_none, false)?;
+            let et = v(&ec_none, true)?;
             let x0 = to_x(noisy, sigma, &e0)?;
             let xt = to_x(noisy, sigma, &et)?;
             let xg = normalized_guidance(
@@ -291,8 +345,8 @@ pub fn guided_velocity(
             from_x(noisy, sigma, &xg)
         }
         Mode::V2vApg => {
-            let e0 = v(&c.vi, false)?;
-            let e_vti = v(&c.vi, true)?;
+            let e0 = v(&ec_vi, false)?;
+            let e_vti = v(&ec_vi, true)?;
             let x0 = to_x(noisy, sigma, &e0)?;
             let xvti = to_x(noisy, sigma, &e_vti)?;
             let xg = normalized_guidance(
@@ -306,9 +360,9 @@ pub fn guided_velocity(
             from_x(noisy, sigma, &xg)
         }
         Mode::R2vApg => {
-            let e0 = v(&c.none, false)?;
-            let ei = v(&c.i, false)?;
-            let eti = v(&c.i, true)?;
+            let e0 = v(&ec_none, false)?;
+            let ei = v(&ec_i, false)?;
+            let eti = v(&ec_i, true)?;
             let x0 = to_x(noisy, sigma, &e0)?;
             let xi = to_x(noisy, sigma, &ei)?;
             let xti = to_x(noisy, sigma, &eti)?;

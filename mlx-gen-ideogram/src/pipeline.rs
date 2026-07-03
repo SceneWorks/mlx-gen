@@ -125,7 +125,7 @@ fn preprocess_source_image(image: &Image, width: u32, height: u32) -> Result<Arr
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
     Ok(Array::from_slice(&norm, &[1, th as i32, tw as i32, 3]))
@@ -163,7 +163,7 @@ fn preprocess_mask_packed(mask: &Image, width: u32, height: u32) -> Result<Array
             mask.width as usize,
             h,
             w,
-        );
+        )?;
         let u8s: Vec<u8> = resized
             .iter()
             .map(|&v| v.round().clamp(0.0, 255.0) as u8)

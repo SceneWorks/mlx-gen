@@ -245,7 +245,7 @@ fn image_to_unit_nhwc(img: &Image, out_h: usize, out_w: usize) -> Result<Array> 
         img.width as usize,
         out_h,
         out_w,
-    ); // f32 HWC in [0,255]
+    )?; // f32 HWC in [0,255]
     let arr = Array::from_slice(&resized, &[1, out_h as i32, out_w as i32, 3]);
     Ok(divide(&arr, mlx_gen::array::scalar(255.0))?)
 }

@@ -965,7 +965,7 @@ pub fn preprocess_i2v_image(image: &Image, width: u32, height: u32) -> Result<Ar
     let resized: Vec<f32> = if (nh, nw) == (ih, iw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, nh, nw)
+        resize_lanczos_u8(&image.pixels, ih, iw, nh, nw)?
     };
     // Center-crop the (integer-valued) resized HWC buffer to (th, tw), then normalize → CHW [-1,1].
     let x1 = (nw - tw) / 2;

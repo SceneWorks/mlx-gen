@@ -54,7 +54,7 @@ pub fn preprocess_mask(mask: &Image, width: u32, height: u32) -> Result<Array> {
             mask.width as usize,
             h,
             w,
-        );
+        )?;
         // resize returns f32 HWC RGB in [0,255]; collect to u8 then luma.
         let u8s: Vec<u8> = resized
             .iter()
