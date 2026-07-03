@@ -166,8 +166,8 @@ mod tests {
     /// this exercises production code (matching the crate's `std::env::temp_dir()` test convention).
     /// `pad_token` selects the config's pad string (`"!"` = bigG, `"<|endoftext|>"` = L).
     fn synthetic_clip_tokenizer_dir(tag: &str, pad_token: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("mlx_gen_sd3_clip_tok_{}_{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mlx_gen_sd3_clip_tok_{}_{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Vocab: the two specials at their real CLIP ids, `!` at 0 (bigG's pad), plus a few
         // `</w>`-terminated word tokens so a non-empty prompt also tokenizes without an OOV error.
@@ -241,8 +241,10 @@ mod tests {
         assert_eq!(resolve_clip_pad_id(&g_dir), 0, "CLIP-bigG pad = `!` = 0");
 
         // Fallback: a dir whose config lacks `pad_token` -> eos.
-        let f_dir = std::env::temp_dir()
-            .join(format!("mlx_gen_sd3_clip_tok_{}_nofallback", std::process::id()));
+        let f_dir = std::env::temp_dir().join(format!(
+            "mlx_gen_sd3_clip_tok_{}_nofallback",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&f_dir).unwrap();
         std::fs::write(f_dir.join("tokenizer_config.json"), "{}").unwrap();
         assert_eq!(
@@ -267,7 +269,10 @@ mod tests {
         assert_eq!(g[0], 49406);
         // The pad region (after the real tokens) differs: L=eos, bigG=`!`(0).
         let pad_start = ids.len();
-        assert!(pad_start < CLIP_MAX_LENGTH, "prompt must be shorter than 77");
+        assert!(
+            pad_start < CLIP_MAX_LENGTH,
+            "prompt must be shorter than 77"
+        );
         assert!(
             l[pad_start..].iter().all(|&x| x == 49407),
             "L pads with eos"
