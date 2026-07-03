@@ -24,12 +24,13 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use mlx_rs::ops::{
     add, divide, max_axes, mean_axes, min_axes, multiply, r#where, sign, subtract, sum_axes,
 };
-use mlx_rs::optimizers::{AdamW, Optimizer};
+use mlx_rs::optimizers::{AdamW, Optimizer, OptimizerState};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
@@ -145,6 +146,53 @@ impl TrainOptimizer {
             TrainOptimizer::Rose(r) => r.step(params, grads),
             TrainOptimizer::Prodigy(p) => p.step(params, grads),
         }
+    }
+
+    /// A short tag naming which optimizer this is, written into the resume metadata so a restore can
+    /// verify it is loading state saved by the *same* optimizer kind (sc-9560 / F-125).
+    pub fn kind_tag(&self) -> &'static str {
+        match self {
+            TrainOptimizer::AdamW { .. } => "adamw",
+            TrainOptimizer::Rose(_) => "rose",
+            TrainOptimizer::Prodigy(_) => "prodigy",
+        }
+    }
+
+    /// Snapshot the optimizer's internal state to a safetensors file at `path`, for mid-schedule
+    /// resume (sc-9560 / F-125). Dispatched **per optimizer** — the generic mlx-rs `OptimizerState`
+    /// dump the old `save_optimizer_state` used could not capture Prodigy's global adapted-step
+    /// scalars + per-parameter buffers, and is meaningless for the stateless Rose:
+    ///   * **AdamW** — mlx-rs's own per-parameter moment state (`opt.state()`).
+    ///   * **Rose** — stateless (no buffers); a marker keeps the resume bundle a uniform, valid file.
+    ///   * **Prodigy** — the per-parameter Adam EMAs + `s` + `p0` and the global `d` / `d_max` /
+    ///     `d_numerator` (the learning-rate-free adaptation state).
+    pub fn save_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        match self {
+            TrainOptimizer::AdamW { opt, .. } => opt.state().save_safetensors(path)?,
+            TrainOptimizer::Rose(_) => {
+                // Nothing to persist; write a marker so resume sees a valid, uniform snapshot file.
+                let marker = c(0.0);
+                Array::save_safetensors(
+                    vec![("__stateless".to_string(), &marker)],
+                    None::<&HashMap<String, String>>,
+                    path,
+                )?;
+            }
+            TrainOptimizer::Prodigy(p) => p.save_state(path)?,
+        }
+        Ok(())
+    }
+
+    /// Restore optimizer state written by [`save_state`](Self::save_state) into this optimizer (built
+    /// fresh from the same config). The caller is responsible for restoring into the same optimizer
+    /// kind (checked via [`kind_tag`](Self::kind_tag) in the resume metadata).
+    pub fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        match self {
+            TrainOptimizer::AdamW { opt, .. } => opt.state_mut().load_safetensors(path)?,
+            TrainOptimizer::Rose(_) => {} // stateless — nothing to restore
+            TrainOptimizer::Prodigy(p) => p.load_state(path)?,
+        }
+        Ok(())
     }
 }
 
@@ -412,6 +460,72 @@ impl Prodigy {
         eval(refs)?;
         Ok(())
     }
+
+    /// Snapshot Prodigy's state (sc-9560 / F-125): the three global adaptation scalars as `[1]` arrays
+    /// (`__d`, `__d_max`, `__d_numerator`) plus, per parameter key `k`, its four buffers under
+    /// `{k}::exp_avg`, `{k}::exp_avg_sq`, `{k}::s`, `{k}::p0`. Only the *adapted* state is persisted;
+    /// the base/eps/betas/decay/growth are config, re-supplied by [`Prodigy::new`] on resume.
+    fn save_state(&self, path: impl AsRef<Path>) -> Result<()> {
+        let d = c(self.d);
+        let d_max = c(self.d_max);
+        let d_num = c(self.d_numerator);
+        let mut entries: Vec<(String, &Array)> = Vec::with_capacity(self.state.len() * 4 + 3);
+        entries.push(("__d".to_string(), &d));
+        entries.push(("__d_max".to_string(), &d_max));
+        entries.push(("__d_numerator".to_string(), &d_num));
+        for (k, st) in &self.state {
+            entries.push((format!("{k}::exp_avg"), &st.exp_avg));
+            entries.push((format!("{k}::exp_avg_sq"), &st.exp_avg_sq));
+            entries.push((format!("{k}::s"), &st.s));
+            entries.push((format!("{k}::p0"), &st.p0));
+        }
+        Array::save_safetensors(entries, None::<&HashMap<String, String>>, path)?;
+        Ok(())
+    }
+
+    /// Restore state written by [`save_state`](Self::save_state) into a fresh `Prodigy::new(...)`.
+    /// Rebuilds the per-parameter buffer map and the global scalars; the `{k}::exp_avg` keys carry the
+    /// parameter identity (a `k` never ends in `::exp_avg`, so the base key is unambiguous).
+    fn load_state(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let (tensors, _meta) = Array::load_safetensors_with_metadata(path.as_ref())?;
+        let scalar = |name: &str| -> Result<f32> {
+            let a = tensors.get(name).ok_or_else(|| {
+                crate::Error::Msg(format!("prodigy resume: snapshot missing global '{name}'"))
+            })?;
+            Ok(a.item::<f32>())
+        };
+        self.d = scalar("__d")?;
+        self.d_max = scalar("__d_max")?;
+        self.d_numerator = scalar("__d_numerator")?;
+
+        let mut state: HashMap<Rc<str>, ProdigyState> = HashMap::new();
+        for (name, arr) in &tensors {
+            let Some(base) = name.strip_suffix("::exp_avg") else {
+                continue;
+            };
+            let need = |suffix: &str| -> Result<Array> {
+                tensors
+                    .get(&format!("{base}{suffix}"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        crate::Error::Msg(format!(
+                            "prodigy resume: parameter '{base}' missing buffer '{suffix}'"
+                        ))
+                    })
+            };
+            state.insert(
+                Rc::from(base),
+                ProdigyState {
+                    exp_avg: arr.clone(),
+                    exp_avg_sq: need("::exp_avg_sq")?,
+                    s: need("::s")?,
+                    p0: need("::p0")?,
+                },
+            );
+        }
+        self.state = state;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -551,5 +665,94 @@ mod tests {
             before.iter().zip(after).any(|(b, a)| (b - a).abs() > 0.0),
             "parameters should move"
         );
+    }
+
+    /// F-125 core proof: for each optimizer, two continuous steps produce the SAME parameters as one
+    /// step → snapshot → fresh optimizer → restore → one step. This is the resume-correctness gate that
+    /// runs without real weights (the real-training-trajectory check needs Metal + a licensed
+    /// snapshot). AdamW state rides mlx-rs's own serialization; Rose is stateless; Prodigy restores its
+    /// global adapted-step scalars + per-parameter buffers.
+    fn assert_resume_matches_uninterrupted(opt_name: &str) {
+        let seed = || params(&[("w", &[0.10, -0.20, 0.30, 0.05], &[2, 2])]);
+        let g = params(&[("w", &[0.40, 0.10, -0.30, 0.20], &[2, 2])]);
+
+        // Continuous: two steps in one optimizer.
+        let mut cont = seed();
+        let mut o = TrainOptimizer::from_config(opt_name, 1e-3, 0.0).unwrap();
+        o.set_lr_scaled(1.0);
+        o.step(&mut cont, &g).unwrap();
+        o.step(&mut cont, &g).unwrap();
+
+        // Interrupted: one step, snapshot, fresh optimizer, restore, one step.
+        let mut resumed = seed();
+        let mut o1 = TrainOptimizer::from_config(opt_name, 1e-3, 0.0).unwrap();
+        o1.set_lr_scaled(1.0);
+        o1.step(&mut resumed, &g).unwrap();
+        let path = std::env::temp_dir().join(format!("mlxgen_resume_test_{opt_name}.safetensors"));
+        o1.save_state(&path).unwrap();
+        let mut o2 = TrainOptimizer::from_config(opt_name, 1e-3, 0.0).unwrap();
+        o2.set_lr_scaled(1.0);
+        o2.load_state(&path).unwrap();
+        o2.step(&mut resumed, &g).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let a = cont["w"].as_slice::<f32>().to_vec();
+        let b = resumed["w"].as_slice::<f32>().to_vec();
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                (x - y).abs() <= 1e-6,
+                "{opt_name} resume diverged at [{i}]: continuous {x} vs resumed {y} \
+                 (optimizer state was not restored faithfully)"
+            );
+        }
+    }
+
+    #[test]
+    fn adamw_resume_matches_uninterrupted() {
+        assert_resume_matches_uninterrupted("adamw");
+    }
+
+    #[test]
+    fn rose_resume_matches_uninterrupted() {
+        assert_resume_matches_uninterrupted("rose");
+    }
+
+    #[test]
+    fn prodigy_resume_matches_uninterrupted() {
+        assert_resume_matches_uninterrupted("prodigy");
+    }
+
+    #[test]
+    fn prodigy_snapshot_round_trips_globals_and_buffers() {
+        let mut prod = Prodigy::new(1.0, 0.0);
+        let mut p = params(&[("w", &[1.0, -1.0, 0.5, -0.5], &[2, 2])]);
+        let g = params(&[("w", &[0.2, -0.1, 0.3, -0.4], &[2, 2])]);
+        for _ in 0..3 {
+            prod.step(&mut p, &g).unwrap();
+        }
+        let path = std::env::temp_dir().join("mlxgen_prodigy_roundtrip.safetensors");
+        prod.save_state(&path).unwrap();
+        let mut restored = Prodigy::new(1.0, 0.0);
+        restored.load_state(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.d, prod.d, "d");
+        assert_eq!(restored.d_max, prod.d_max, "d_max");
+        assert_eq!(restored.d_numerator, prod.d_numerator, "d_numerator");
+        assert_eq!(restored.state.len(), prod.state.len(), "buffer count");
+        let a = prod.state.get("w").unwrap();
+        let b = restored.state.get("w").unwrap();
+        for (name, x, y) in [
+            ("exp_avg", &a.exp_avg, &b.exp_avg),
+            ("exp_avg_sq", &a.exp_avg_sq, &b.exp_avg_sq),
+            ("s", &a.s, &b.s),
+            ("p0", &a.p0, &b.p0),
+        ] {
+            assert_eq!(
+                x.as_slice::<f32>(),
+                y.as_slice::<f32>(),
+                "prodigy buffer {name} differs after round-trip"
+            );
+        }
     }
 }
