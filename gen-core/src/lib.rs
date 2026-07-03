@@ -53,8 +53,8 @@ pub use registry::{
 };
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, LoadSpec, MoeExpert, PidWeights, Precision, Progress,
-    Quant, WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadSpec, MoeExpert, PidWeights,
+    Precision, Progress, Quant, WeightsSource,
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};

@@ -210,10 +210,22 @@ pub struct Ltx {
     stat_dt: Dtype,
 }
 
-/// Locate the Gemma-3-12B text-encoder snapshot. `$LTX_GEMMA_DIR` wins; otherwise the newest
-/// `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF cache. `pub(crate)` so the trainer
-/// (sc-3047) resolves the TE snapshot exactly as inference does.
-pub(crate) fn resolve_gemma_dir() -> Result<std::path::PathBuf> {
+/// Locate the Gemma-3-12B text-encoder snapshot. A `LoadSpec::text_encoder` override (sc-8827) wins;
+/// then `$LTX_GEMMA_DIR`; otherwise the newest `mlx-community/gemma-3-12b-it-bf16` snapshot in the HF
+/// cache. `pub(crate)` so the trainer (sc-3047) resolves the TE snapshot exactly as inference does
+/// (it passes `None`, keeping the env/HF-cache path).
+pub(crate) fn resolve_gemma_dir(
+    override_src: Option<&WeightsSource>,
+) -> Result<std::path::PathBuf> {
+    if let Some(WeightsSource::Dir(p) | WeightsSource::File(p)) = override_src {
+        if !p.exists() {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: LoadSpec text_encoder path does not exist: {}",
+                p.display()
+            )));
+        }
+        return Ok(p.clone());
+    }
     if let Ok(d) = std::env::var("LTX_GEMMA_DIR") {
         return Ok(d.into());
     }
@@ -353,7 +365,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let audio_vae_config = AudioVaeConfig::from_model_dir(root)?;
     let vocoder_config = VocoderConfig::from_model_dir(root)?;
 
-    let gemma_dir = resolve_gemma_dir()?;
+    let gemma_dir = resolve_gemma_dir(spec.text_encoder.as_ref())?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
     // Selectively quantize the Gemma backbone iff the snapshot's `config.json` says so (the reference
     // `apply_quantization` path; sc-2686). The default `…-bf16` snapshot ⇒ `None` ⇒ dense bf16 TE.
@@ -1003,6 +1015,17 @@ mod tests {
             caps.schedulers.is_empty(),
             "LTX is sampler-only (no scheduler axis — the distilled schedule is baked)"
         );
+    }
+
+    #[test]
+    fn resolve_gemma_dir_rejects_nonexistent_spec_override() {
+        // sc-8827: a `LoadSpec::text_encoder` override is preferred over the env var / HF-cache scan,
+        // and a nonexistent override path errors with the spec-side message up front (not the env var
+        // name), so the worker can drive the TE location through the spec instead of `$LTX_GEMMA_DIR`.
+        let src = WeightsSource::Dir("/nonexistent/ltx_gemma".into());
+        let err = resolve_gemma_dir(Some(&src)).unwrap_err().to_string();
+        assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
     }
 
     #[test]

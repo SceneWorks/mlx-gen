@@ -138,7 +138,7 @@ fn load_trainer_from_dir(root: &Path) -> Result<LtxTrainer> {
     let cfg = LtxConfig::from_model_dir(root)?;
     let vae_config = LtxVaeConfig::from_model_dir(root)?;
 
-    let gemma_dir = crate::model::resolve_gemma_dir()?;
+    let gemma_dir = crate::model::resolve_gemma_dir(None)?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
     let gemma_quant = crate::model::resolve_gemma_quant(&gemma_dir)?;
     let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
