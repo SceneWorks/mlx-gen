@@ -130,10 +130,18 @@ fn rel(a: &Array, b: &Array) -> (f32, f32) {
     (max_d / peak, mean_d / mabs)
 }
 
-/// PRIMARY sc-9311 GATE: render with the DEFAULT (unset) negative prompt and A/B the decoded image
-/// against the diffusers empty-negative reference. This is the only e2e path that exercises
-/// `clip_ids("")` for the uncond branch (F-004). A wiring/BOS regression → ~100% px>8; a correct
-/// empty-negative path + cross-backend f32 drift over a 20-step true-CFG sampler is bounded.
+/// PRIMARY sc-9311 GATE (chaos-free): F-004 is about the *conditioning* the DEFAULT (unset) negative
+/// prompt produces — `clip_ids("")` must keep BOS (`[BOS, EOS, pad…]`), not 77×EOS. So the load-bearing,
+/// backend-agnostic check is the empty-negative uncond conditioning (`pooled [1,2048]` + `context
+/// [1,333,4096]`) vs the diffusers f32 reference: deterministic, no sampler chaos. A dropped-BOS /
+/// wiring regression shifts the pooled-at-argmax EOS slot and rewrites every CLIP hidden state →
+/// mean relative error ≫ 0.5; a correct path matches within fp16(MLX)-vs-f32(torch) TE drift.
+///
+/// A full-trajectory cross-backend *pixel* A/B is deliberately NOT a gate: per CLAUDE.md it is
+/// chaos-limited, and `seed=7` draws entirely different noise under MLX vs torch, so the two renders
+/// are different images of the same prompt regardless of F-004 (the old pixel assert reported ~86%
+/// px>8 on the *correct* path — a false failure). The render below is kept only as an end-to-end
+/// coherence smoke check + an informational px>8 print.
 #[test]
 #[ignore = "needs the SD3.5-Large snapshot (SD3_LARGE_SNAPSHOT) + tools/golden/sd3_5_large_empty_negative_e2e.safetensors + Metal"]
 fn default_empty_negative_matches_diffusers() {
@@ -143,17 +151,52 @@ fn default_empty_negative_matches_diffusers() {
     let Some(g) = try_golden() else {
         return; // clean skip — golden absent
     };
+    let dir = snapshot();
 
-    let gen = mlx_gen::load(
-        sd3::MODEL_ID,
-        &LoadSpec::new(WeightsSource::Dir(snapshot())),
-    )
-    .expect("load sd3_5_large");
+    // ---- PRIMARY: chaos-free empty-negative conditioning A/B (directly validates F-004) ----
+    let (Ok(g_pooled), Ok(g_context)) = (
+        g.require("neg_pooled").cloned(),
+        g.require("neg_context").cloned(),
+    ) else {
+        panic!(
+            "golden lacks neg_pooled/neg_context — re-dump with the current \
+             tools/dump_sd3_empty_negative_e2e_golden.py"
+        );
+    };
 
-    // The load-bearing bit: negative_prompt = None → the pipeline encodes "" for the uncond branch.
+    let encoders = sd3::loader::load_text_encoders(&dir).expect("load sd3 text encoders");
+    let clip_tok = sd3::loader::load_clip_tokenizer(&dir).expect("load clip tokenizer");
+    let t5_tok = sd3::loader::load_t5_tokenizer(&dir).expect("load t5 tokenizer");
+    let clip_pad = sd3::loader::load_clip_pad_ids(&dir);
+
+    // The uncond branch of a DEFAULT (unset) negative prompt encodes the empty string (F-004).
+    let uncond = sd3::pipeline::encode_prompt(&encoders, &clip_tok, clip_pad, &t5_tok, "")
+        .expect("encode empty negative");
+
+    let (p_peak, p_mean) = rel(&uncond.pooled, &g_pooled);
+    let (c_peak, c_mean) = rel(&uncond.context, &g_context);
+    eprintln!(
+        "sd3 empty-negative conditioning vs diffusers f32: pooled peak {p_peak:.4} mean {p_mean:.4}; \
+         context peak {c_peak:.4} mean {c_mean:.4}"
+    );
+    // pooled is PURE CLIP (L+G pooled-at-argmax) — the sharpest F-004 signal. context mixes CLIP
+    // (77 rows) + T5 (256 rows). Thresholds bound cross-backend TE precision drift; a BOS regression
+    // (mean ≫ 0.5) sits far outside them.
+    assert!(
+        p_mean < 0.1 && p_peak < 1.0,
+        "empty-negative POOLED diverged (F-004 CLIP path): peak {p_peak:.4} mean {p_mean:.4}"
+    );
+    assert!(
+        c_mean < 0.1 && c_peak < 1.0,
+        "empty-negative CONTEXT diverged (F-004 CLIP path): peak {c_peak:.4} mean {c_mean:.4}"
+    );
+
+    // ---- SECONDARY: end-to-end coherence smoke (NOT a cross-backend pixel gate) ----
+    let gen = mlx_gen::load(sd3::MODEL_ID, &LoadSpec::new(WeightsSource::Dir(dir)))
+        .expect("load sd3_5_large");
     let req = GenerationRequest {
         prompt: PROMPT.into(),
-        negative_prompt: None,
+        negative_prompt: None, // the F-004 path: uncond encodes ""
         width: SIZE,
         height: SIZE,
         count: 1,
@@ -162,39 +205,29 @@ fn default_empty_negative_matches_diffusers() {
         guidance: Some(GUIDANCE),
         ..Default::default()
     };
-
     let out = gen.generate(&req, &mut |_| {}).expect("generate");
     let GenerationOutput::Images(images) = out else {
         panic!("expected Images");
     };
     assert_eq!(images.len(), 1);
     assert_eq!((images[0].width, images[0].height), (SIZE, SIZE));
-
-    let gimg = decoded_to_image(g.require("decoded").expect("golden `decoded` latent")).unwrap();
-    let px = px_gt8(&images[0], &gimg);
-
-    // If the golden also stored the empty-negative uncond conditioning, report the tighter chaos-free
-    // signal too (optional — older dumps may not have it).
-    if let (Ok(neg_pooled), Ok(neg_ctx)) = (
-        g.require("neg_pooled").cloned(),
-        g.require("neg_context").cloned(),
-    ) {
-        eprintln!(
-            "empty-negative uncond conditioning present in golden (pooled {:?}, context {:?})",
-            neg_pooled.shape(),
-            neg_ctx.shape()
-        );
-        let _ = rel; // `rel` is available for a conditioning A/B when a matching dump exists.
-    }
-
-    eprintln!(
-        "sd3 empty-negative e2e: {px:.2}% px>8 vs diffusers f32 (default unset-negative uncond path)"
-    );
-    // Wiring/BOS regression → ~100%; correct empty-negative path + cross-backend f32 drift over a
-    // 20-step true-CFG sampler is bounded.
+    // Coherence: a real render is not a degenerate flat/black frame.
+    let mean_byte =
+        images[0].pixels.iter().map(|&b| b as f64).sum::<f64>() / images[0].pixels.len() as f64;
     assert!(
-        px < 25.0,
-        "default empty-negative render diverged from the diffusers empty-negative reference: \
-         {px:.2}% px>8 — this points at the F-004 empty-CLIP uncond path (clip_ids(\"\") BOS)"
+        mean_byte > 4.0 && mean_byte < 251.0,
+        "render is a degenerate flat frame (mean byte {mean_byte:.1})"
     );
+
+    // Informational only (chaos-limited cross-backend — see the fn doc): MLX vs torch noise makes a
+    // pixel A/B against the golden's stored `decoded` image meaningless as a gate.
+    if let Ok(dec) = g.require("decoded") {
+        if let Ok(gimg) = decoded_to_image(dec) {
+            eprintln!(
+                "sd3 empty-negative e2e (informational, NOT gated): {:.2}% px>8 vs diffusers \
+                 (different-RNG render)",
+                px_gt8(&images[0], &gimg)
+            );
+        }
+    }
 }

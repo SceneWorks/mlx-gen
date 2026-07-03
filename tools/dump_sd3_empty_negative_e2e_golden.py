@@ -25,6 +25,8 @@ path). Honors HF_HUB_CACHE / HF_HOME via the standard huggingface resolution.
 
 from __future__ import annotations
 
+import os
+
 import mlx.core as mx
 import numpy as np
 import torch
@@ -40,7 +42,10 @@ SEED, STEPS, SIZE, GUIDANCE = 7, 20, 256, 3.5
 OUT = fixture("tools/golden/sd3_5_large_empty_negative_e2e.safetensors")
 
 pipe = StableDiffusion3Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float32)
-pipe.to("cpu")  # f32 reference; move to "cuda"/"mps" if available for speed (still f32 math)
+# f32 reference. `cpu` is the safe default; set SD3_DUMP_DEVICE=mps (or cuda) for speed — the math
+# stays f32 (MPS/CUDA matmul is f32), well within the e2e test's chaos-limited px>8 tolerance.
+DEVICE = os.environ.get("SD3_DUMP_DEVICE", "cpu")
+pipe.to(DEVICE)
 
 # Capture the empty-negative uncond conditioning (pooled + context) for the optional tighter A/B.
 with torch.no_grad():
@@ -57,7 +62,7 @@ with torch.no_grad():
         negative_prompt_2=NEGATIVE,
         negative_prompt_3=NEGATIVE,
         do_classifier_free_guidance=True,
-        device="cpu",
+        device=DEVICE,
         num_images_per_prompt=1,
     )
 
