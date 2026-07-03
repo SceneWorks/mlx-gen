@@ -23,6 +23,11 @@
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::{CancelFlag, Error, Result};
+// The token sampler (temperature / top-k / top-p / repetition penalty) + seeded PRNG live in the core
+// crate's shared `text_sample` module (sc-9561 / F-105) so the lens PromptReasoner reuses them rather
+// than cloning. `SampleParams` stays part of this crate's public API via the re-export.
+pub use mlx_gen::text_sample::SampleParams;
+use mlx_gen::text_sample::{sample_token, SplitMix64};
 
 use crate::gemma::GemmaModel;
 use crate::tokenizer::LtxTokenizer;
@@ -72,44 +77,6 @@ impl Default for EnhanceConfig {
         Self {
             max_tokens: DEFAULT_MAX_TOKENS,
             seed: DEFAULT_SEED,
-        }
-    }
-}
-
-/// Sampling parameters. `top_k <= 0` and `top_p >= 1.0` disable those filters (the reference default
-/// for both variants). `repetition_penalty` / `repetition_context` are the censored path's
-/// `make_logits_processors(None, 1.3, 20)`; the uncensored path leaves `repetition_penalty` `None`.
-#[derive(Clone, Copy, Debug)]
-pub struct SampleParams {
-    pub temperature: f32,
-    pub top_k: i32,
-    pub top_p: f32,
-    pub repetition_penalty: Option<f32>,
-    pub repetition_context: usize,
-}
-
-impl SampleParams {
-    /// The censored `enhance_t2v` sampler: `make_sampler(temp, 1.0, top_k=-1)` +
-    /// `make_logits_processors(None, repetition_penalty=1.3, repetition_context_size=20)`.
-    pub fn censored(temperature: f32) -> Self {
-        Self {
-            temperature,
-            top_k: -1,
-            top_p: 1.0,
-            repetition_penalty: Some(1.3),
-            repetition_context: 20,
-        }
-    }
-
-    /// The uncensored `enhance_with_model` sampler: `make_sampler(temp, 1.0, 0.0, 1, top_k=0)` — pure
-    /// temperature sampling, no repetition penalty.
-    pub fn uncensored(temperature: f32) -> Self {
-        Self {
-            temperature,
-            top_k: 0,
-            top_p: 1.0,
-            repetition_penalty: None,
-            repetition_context: 0,
         }
     }
 }
@@ -179,7 +146,9 @@ pub fn enhance(
         if cancel.is_some_and(CancelFlag::is_cancelled) {
             return Err(Error::Canceled);
         }
-        let next = sample_token(&logits, &history, sampler, &mut rng)?;
+        // Pull the `[vocab]` logits to the host once, then draw from the shared host-side sampler.
+        let logits_host = logits.as_dtype(Dtype::Float32)?.as_slice::<f32>().to_vec();
+        let next = sample_token(&logits_host, &history, sampler, &mut rng);
         generated.push(next);
         history.push(next);
         if STOP_TOKENS.contains(&next) {
@@ -193,125 +162,6 @@ pub fn enhance(
 
     let text = tokenizer.decode(&generated)?;
     Ok(clean_response(&text))
-}
-
-/// Sample the next token id from `(1, vocab)` logits, applying the repetition penalty over the tail of
-/// `history`, then temperature + optional top-k / top-p. Host-side (CPU) for a faithful repetition
-/// penalty + nucleus filter; deterministic given `rng` (no numeric-parity requirement).
-fn sample_token(
-    logits: &Array,
-    history: &[i32],
-    p: &SampleParams,
-    rng: &mut SplitMix64,
-) -> Result<i32> {
-    let lf = logits.as_dtype(Dtype::Float32)?;
-    let mut v: Vec<f32> = lf.as_slice::<f32>().to_vec();
-    let vocab = v.len();
-
-    // Repetition penalty over the last `repetition_context` tokens (incl. the prompt tail).
-    if let Some(pen) = p.repetition_penalty {
-        if pen > 0.0 && p.repetition_context > 0 {
-            let start = history.len().saturating_sub(p.repetition_context);
-            for &t in &history[start..] {
-                let idx = t as usize;
-                if idx < vocab {
-                    v[idx] = if v[idx] < 0.0 {
-                        v[idx] * pen
-                    } else {
-                        v[idx] / pen
-                    };
-                }
-            }
-        }
-    }
-
-    // Greedy when temperature collapses to 0 (reference `make_sampler` argmaxes at temp == 0).
-    if p.temperature <= 0.0 {
-        return Ok(argmax_f32(&v));
-    }
-
-    // Candidate set: all tokens, optionally narrowed by top-k then top-p. Disabled at the reference
-    // defaults (`top_k <= 0`, `top_p >= 1.0`), in which case every token is a candidate.
-    let mut idx: Vec<usize> = (0..vocab).collect();
-    if p.top_k > 0 && (p.top_k as usize) < vocab {
-        let k = p.top_k as usize;
-        idx.select_nth_unstable_by(k - 1, |&a, &b| v[b].total_cmp(&v[a]));
-        idx.truncate(k);
-    }
-    // Temperature-scaled softmax over the candidates (numerically stable).
-    let max = idx.iter().map(|&i| v[i]).fold(f32::NEG_INFINITY, f32::max);
-    let inv_t = 1.0 / p.temperature;
-    let mut probs: Vec<(usize, f32)> = idx
-        .iter()
-        .map(|&i| (i, ((v[i] - max) * inv_t).exp()))
-        .collect();
-    // Nucleus (top-p): sort by prob desc, keep the smallest prefix whose cumulative mass ≥ top_p.
-    if p.top_p < 1.0 {
-        probs.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        let total: f32 = probs.iter().map(|x| x.1).sum();
-        let threshold = p.top_p * total;
-        let mut cum = 0.0;
-        let mut keep = probs.len();
-        for (n, x) in probs.iter().enumerate() {
-            cum += x.1;
-            if cum >= threshold {
-                keep = n + 1;
-                break;
-            }
-        }
-        probs.truncate(keep.max(1));
-    }
-
-    // Sample from the (unnormalized) categorical via inverse-CDF. Fall back to greedy if the mass is
-    // not a positive finite number (all-filtered / NaN / inf).
-    let total: f32 = probs.iter().map(|x| x.1).sum();
-    if total <= 0.0 || !total.is_finite() {
-        return Ok(argmax_f32(&v));
-    }
-    let mut target = rng.next_f32() * total;
-    for (i, prob) in &probs {
-        target -= prob;
-        if target <= 0.0 {
-            return Ok(*i as i32);
-        }
-    }
-    Ok(probs.last().map(|x| x.0).unwrap_or(0) as i32)
-}
-
-/// Argmax over a logit vector (greedy fallback).
-fn argmax_f32(v: &[f32]) -> i32 {
-    let mut best = 0usize;
-    let mut best_v = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() {
-        if x > best_v {
-            best_v = x;
-            best = i;
-        }
-    }
-    best as i32
-}
-
-/// SplitMix64 — a tiny deterministic PRNG for host-side categorical sampling. (Generation is
-/// stochastic and not parity-gated; this just makes the rewrite reproducible given a seed.)
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform f32 in `[0, 1)` (24-bit mantissa).
-    fn next_f32(&mut self) -> f32 {
-        ((self.next_u64() >> 40) as f32) / ((1u64 << 24) as f32)
-    }
 }
 
 #[cfg(test)]
@@ -371,24 +221,6 @@ mod tests {
         assert!(I2V_SYSTEM_PROMPT.contains("image-to-video"));
     }
 
-    #[test]
-    fn sampler_param_presets_match_reference() {
-        let c = SampleParams::censored(0.7);
-        assert_eq!(c.repetition_penalty, Some(1.3));
-        assert_eq!(c.repetition_context, 20);
-        let u = SampleParams::uncensored(0.7);
-        assert_eq!(u.repetition_penalty, None);
-        assert_eq!(u.top_k, 0);
-    }
-
-    #[test]
-    fn splitmix64_is_deterministic_and_in_range() {
-        let mut a = SplitMix64::new(42);
-        let mut b = SplitMix64::new(42);
-        for _ in 0..100 {
-            let x = a.next_f32();
-            assert_eq!(x, b.next_f32());
-            assert!((0.0..1.0).contains(&x));
-        }
-    }
+    // `SampleParams` presets + `SplitMix64` determinism are covered in the shared
+    // `mlx_gen::text_sample` tests (the sampler now lives there — sc-9561 / F-105).
 }

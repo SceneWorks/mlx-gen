@@ -227,6 +227,9 @@ impl LensGenerator {
                 // The local reasoner (sc-3176) is a standalone opt-in; the registry path leaves it off
                 // (matching the vendor default), so no reasoner is attached here.
                 enable_reasoner: false,
+                // Inert while `enable_reasoner` is false; carries the vendor default so a caller that
+                // attaches a reasoner via the struct API samples at 0.7 (F-105).
+                reasoner_temperature: crate::pipeline::DEFAULT_REASONER_TEMPERATURE,
             };
             // Re-encode per image is cheap relative to denoise and keeps the RNG order matching the
             // struct API (one noise draw per image, no shared state). Progress is streamed via the

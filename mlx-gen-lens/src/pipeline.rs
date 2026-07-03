@@ -85,6 +85,12 @@ fn cfg_rescale(cond: &Array, uncond: &Array, guidance: f32) -> Result<Array> {
 /// worker passes the live date; the value is image-irrelevant.)
 pub const DEFAULT_DATE: &str = "2025-01-01";
 
+/// Default reasoner decode temperature (F-105) — the vendor `PromptReasoner.__init__` default `0.7`
+/// (stochastic sampling). `0.0` selects deterministic greedy decode. Only consulted when
+/// [`GenerateOptions::enable_reasoner`] is set; image parity is unaffected (the reasoner only rewrites
+/// the prompt text before encoding).
+pub const DEFAULT_REASONER_TEMPERATURE: f32 = 0.7;
+
 /// Options for a single [`LensPipeline::generate`] call.
 pub struct GenerateOptions<'a> {
     pub prompt: &'a str,
@@ -110,6 +116,11 @@ pub struct GenerateOptions<'a> {
     /// before encoding (sc-3176, the vendor `enable_reasoner`). Requires
     /// [`attach_reasoner`](LensPipeline::attach_reasoner); off by default.
     pub enable_reasoner: bool,
+    /// Reasoner decode temperature (F-105); consulted only when `enable_reasoner` is set. `> 0` samples
+    /// (seeded by [`seed`](Self::seed)) — the vendor `PromptReasoner` behavior; `0.0` is deterministic
+    /// greedy. Defaults to [`DEFAULT_REASONER_TEMPERATURE`] (the vendor `0.7`). The reasoner only
+    /// rewrites the prompt text, so this does not affect image sampling.
+    pub reasoner_temperature: f32,
 }
 
 /// A loaded Lens pipeline: the four components, shared by both variants, plus the **optional** local
@@ -458,6 +469,8 @@ impl LensPipeline {
                 opts.prompt,
                 crate::reasoner::DEFAULT_MAX_NEW_TOKENS,
                 opts.date,
+                opts.reasoner_temperature,
+                opts.seed,
                 Some(cancel),
             )?;
             &refined

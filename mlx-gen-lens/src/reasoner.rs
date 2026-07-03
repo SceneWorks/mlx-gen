@@ -5,10 +5,11 @@
 //!
 //! Turning the encoder-only gpt-oss into a **generating** model adds: the full 24-layer stack + final
 //! `norm` + `lm_head`, an incremental KV-cache decode ([`GptOssDecoderLayer::forward_cached`] over a
-//! per-layer [`KvCache`]), **greedy** decoding (the vendor's `temperature=0.7` sampling is NOT ported —
-//! greedy-only; tracked in sc-9561), the harmony `reasoning_effort="low"`
+//! per-layer [`KvCache`]), both **greedy** ([`LensReasonerModel::generate_greedy`]) and
+//! **temperature-sampled** ([`LensReasonerModel::generate_sampled`], the vendor `PromptReasoner`'s
+//! `temperature=0.7` decode — sc-9561 / F-105) decoding, the harmony `reasoning_effort="low"`
 //! template ([`crate::text::LensTokenizer::encode_reasoner`]), and the harmony-channel output parse
-//! ([`crate::text::clean_reasoner_output`]).
+//! ([`crate::text::clean_reasoner_output`]). The greedy path is retained as the KV-cache parity oracle.
 //!
 //! The MoE experts can be quantized (Q4/Q8, sc-3172) so the reasoner loads at the same `~12 GB` as the
 //! encoder.
@@ -17,6 +18,7 @@ use mlx_rs::ops::indexing::{argmax, argmax_axis};
 use mlx_rs::ops::{matmul, split_sections};
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::text_sample::{sample_token, SampleParams, SplitMix64};
 use mlx_gen::weights::Weights;
 use mlx_gen::CancelFlag;
 use mlx_gen::{Error, Quant, Result};
@@ -25,8 +27,7 @@ use crate::config::GptOssConfig;
 use crate::text::{LensTokenizer, HARMONY_RETURN};
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer, KvCache};
 
-/// Generation default from the vendor `PromptReasoner.__init__`. (The vendor's `temperature=0.7` is
-/// not ported — this decode is greedy-only; see the module doc.)
+/// Generation default from the vendor `PromptReasoner.__init__` (`max_new_tokens`).
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
 
 /// The generating gpt-oss-20b model: the full decoder stack + final norm + LM head (the
@@ -182,6 +183,78 @@ impl LensReasonerModel {
         }
         Ok(out)
     }
+
+    /// Host `[vocab]` logits at the **last** position of `hidden` `[1, T, hidden]`
+    /// (`lm_head(norm(h_last))`), pulled to `Vec<f32>` for the *sampled* decode path
+    /// ([`generate_sampled`](Self::generate_sampled)). The greedy [`argmax_token`](Self::argmax_token)
+    /// keeps its on-device `argmax` (the KV-cache parity oracle) and is deliberately left untouched.
+    fn last_logits_host(&self, hidden: &Array) -> Result<Vec<f32>> {
+        let t = hidden.shape()[1];
+        let last = if t > 1 {
+            split_sections(hidden, &[t - 1], 1)?[1].clone() // [1, 1, hidden]
+        } else {
+            hidden.clone()
+        };
+        let normed = mlx_rs::fast::rms_norm(&last, &self.final_norm, self.cfg.rms_eps)?;
+        let logits = matmul(&normed, self.lm_head.t())?; // [1, 1, vocab]
+        let vocab = logits.shape()[2];
+        Ok(logits
+            .reshape(&[vocab])?
+            .as_dtype(Dtype::Float32)?
+            .as_slice::<f32>()
+            .to_vec())
+    }
+
+    /// **Temperature-sampled** autoregressive generation (F-105): the same prefill + KV-cache decode as
+    /// [`generate_greedy`](Self::generate_greedy), but each token is drawn from the shared seeded
+    /// host-side sampler ([`mlx_gen::text_sample`]) rather than argmax — matching the vendor
+    /// `PromptReasoner`'s `temperature`-sampled decode. Deterministic given `seed`. Returns the **new**
+    /// tokens (including the trailing `<|return|>` stop). The greedy path is retained: it is the
+    /// KV-cache parity oracle and the `temperature <= 0` route.
+    pub fn generate_sampled(
+        &self,
+        input_ids: &[i32],
+        max_new_tokens: usize,
+        params: &SampleParams,
+        seed: u64,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Vec<i32>> {
+        let mut caches: Vec<KvCache> = (0..self.cfg.num_layers).map(|_| KvCache::new()).collect();
+
+        // Prefill (positions 0..input_len).
+        let prompt = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+        let hidden = self.embed_tokens.take_axis(&prompt, 0)?;
+        let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
+
+        // `history` carries the prompt + generated tokens; the sampler's repetition penalty (when a
+        // preset enables it) looks at its tail. `rng` makes the run reproducible given `seed`.
+        let mut history: Vec<i32> = input_ids.to_vec();
+        let mut rng = SplitMix64::new(seed);
+        let logits = self.last_logits_host(&hidden)?; // as_slice forces the eval (cancel-lifecycle)
+        let mut next = sample_token(&logits, &history, params, &mut rng);
+        history.push(next);
+
+        let mut position = input_ids.len() as i32;
+        let mut out = vec![next];
+        while out.len() < max_new_tokens && next != HARMONY_RETURN {
+            // Cooperative cancel between decode steps (the reasoner can run up to ~4096 tokens);
+            // `last_logits_host` pulls the logits to the host each step, forcing the eval this observes.
+            if let Some(c) = cancel {
+                if c.is_cancelled() {
+                    return Err(Error::Canceled);
+                }
+            }
+            let tok = Array::from_slice(&[next], &[1, 1]);
+            let h = self.embed_tokens.take_axis(&tok, 0)?; // [1, 1, hidden]
+            let h = self.run_layers(h, &mut caches, position, false)?;
+            position += 1;
+            let logits = self.last_logits_host(&h)?;
+            next = sample_token(&logits, &history, params, &mut rng);
+            history.push(next);
+            out.push(next);
+        }
+        Ok(out)
+    }
 }
 
 /// The local PromptReasoner: the generating model + the tokenizer (harmony reasoner template +
@@ -207,23 +280,36 @@ impl LensReasoner {
         Ok(Self { model, tokenizer })
     }
 
-    /// Refine one prompt via the local gpt-oss (greedy decode). `date` fills the harmony preamble
-    /// (`Current date:`). Returns the cleaned final-channel rewrite, or the original `prompt` when the
-    /// reasoner produced no usable final text (the vendor `clean_text_out or prompt`).
+    /// Refine one prompt via the local gpt-oss. `date` fills the harmony preamble (`Current date:`).
+    /// `temperature` selects the decode: `<= 0` ⇒ deterministic greedy (also the KV-cache parity
+    /// oracle); `> 0` ⇒ temperature sampling seeded by `seed`, matching the vendor `PromptReasoner`'s
+    /// stochastic decode (F-105). Returns the cleaned final-channel rewrite, or the original `prompt`
+    /// when the reasoner produced no usable final text (the vendor `clean_text_out or prompt`).
     pub fn refine(
         &self,
         prompt: &str,
         max_new_tokens: usize,
         date: &str,
+        temperature: f32,
+        seed: u64,
         cancel: Option<&CancelFlag>,
     ) -> Result<String> {
         let input_ids = self.tokenizer.encode_reasoner(prompt, date)?;
         if input_ids.is_empty() {
             return Err(Error::Msg("lens reasoner: empty tokenization".into()));
         }
-        let new_tokens = self
-            .model
-            .generate_greedy(&input_ids, max_new_tokens, cancel)?;
+        let new_tokens = if temperature <= 0.0 {
+            self.model
+                .generate_greedy(&input_ids, max_new_tokens, cancel)?
+        } else {
+            self.model.generate_sampled(
+                &input_ids,
+                max_new_tokens,
+                &SampleParams::temperature(temperature),
+                seed,
+                cancel,
+            )?
+        };
         let raw = self.tokenizer.decode(&new_tokens)?;
         let cleaned = crate::text::clean_reasoner_output(&raw);
         Ok(if cleaned.is_empty() {

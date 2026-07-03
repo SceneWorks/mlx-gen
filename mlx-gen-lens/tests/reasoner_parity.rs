@@ -16,6 +16,7 @@
 
 use mlx_rs::Dtype;
 
+use mlx_gen::text_sample::SampleParams;
 use mlx_gen::weights::Weights;
 use mlx_gen_lens::config::GptOssConfig;
 use mlx_gen_lens::reasoner::LensReasonerModel;
@@ -130,4 +131,38 @@ fn lens_reasoner_matches_reference() {
         got_new.len()
     );
     eprintln!("ALL PASS");
+}
+
+/// Sampled decode (sc-9561 / F-105) is **seed-reproducible**: two `generate_sampled` runs with the
+/// same seed + temperature produce identical tokens; a different seed (overwhelmingly) diverges.
+/// Deterministic-given-seed is the property we can gate without a torch reference — sampling is
+/// stochastic, so there is no bit-exact cross-backend oracle (the greedy parity test above covers the
+/// decode's correctness; this covers the sampler wiring + seeding).
+#[test]
+#[ignore = "needs the Lens-Turbo text_encoder snapshot (~40GB bf16 load)"]
+fn sampled_decode_is_seed_reproducible() {
+    let snap = snapshot_root();
+    let tok = LensTokenizer::from_file(snap.join("tokenizer").join("tokenizer.json")).expect("tok");
+    let input_ids = tok
+        .encode_reasoner("a cat on a mat", "2026-07-03")
+        .expect("encode_reasoner");
+
+    let w = Weights::from_dir(snap.join("text_encoder")).expect("text_encoder shards");
+    let model =
+        LensReasonerModel::from_weights(&w, &GptOssConfig::lens(), Dtype::Bfloat16, None).unwrap();
+
+    let params = SampleParams::temperature(0.7);
+    let a = model
+        .generate_sampled(&input_ids, 48, &params, 1234, None)
+        .expect("sampled a");
+    let b = model
+        .generate_sampled(&input_ids, 48, &params, 1234, None)
+        .expect("sampled b");
+    assert_eq!(a, b, "same seed must reproduce the same sampled tokens");
+
+    let c = model
+        .generate_sampled(&input_ids, 48, &params, 5678, None)
+        .expect("sampled c");
+    assert_ne!(a, c, "a different seed should (overwhelmingly) diverge");
+    eprintln!("sampled decode seed-reproducible ✓ ({} tokens)", a.len());
 }

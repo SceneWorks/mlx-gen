@@ -35,6 +35,7 @@ pub mod nn;
 pub mod quant;
 pub mod sampler;
 pub mod scheduler;
+pub mod text_sample;
 pub mod weights;
 
 // Split modules: contract types in gen-core, MLX impls + lifts local (caption→joycaption,
