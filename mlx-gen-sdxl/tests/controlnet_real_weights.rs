@@ -200,7 +200,7 @@ fn controlnet_scale_zero_equals_img2img() {
     let ctrl0 = run(&base_req(vec![Conditioning::Control {
         image: init.clone(),
         kind: ControlKind::Other("tile".to_string()),
-        scale: 0.0,
+        scale: Some(0.0),
     }]));
     let diff = plain
         .pixels
@@ -245,7 +245,7 @@ fn multicontrolnet_two_branches_sum_equals_single() {
     let ctrl = |scale: f32| Conditioning::Control {
         image: init.clone(),
         kind: ControlKind::Other("tile".to_string()),
-        scale,
+        scale: Some(scale),
     };
     let run = |model: &dyn mlx_gen::Generator, req: &GenerationRequest| match model
         .generate(req, &mut |_| {})

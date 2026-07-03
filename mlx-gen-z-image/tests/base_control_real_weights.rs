@@ -168,7 +168,7 @@ fn steering_run(spec: &LoadSpec, kind: ControlKind, tag: &str) {
     let ctrl = |shift: u32, scale: f32| Conditioning::Control {
         image: synthetic_control(w, h, shift),
         kind: kind.clone(),
-        scale,
+        scale: Some(scale),
     };
 
     let mut req_a = base();

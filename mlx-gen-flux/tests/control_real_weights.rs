@@ -254,7 +254,7 @@ fn assert_mode_steers(label: &str, control: Image, kind: ControlKind, min_steer:
         conditioning: vec![Conditioning::Control {
             image: control,
             kind,
-            scale,
+            scale: Some(scale),
         }],
         ..base_req.clone()
     };

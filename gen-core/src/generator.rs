@@ -357,11 +357,14 @@ pub enum Conditioning {
     MultiReference { images: Vec<Image> },
     /// FLUX.1-Redux references, each with its own strength.
     ReduxRefs { refs: Vec<(Image, f32)> },
-    /// ControlNet / pose conditioning.
+    /// ControlNet / pose conditioning. `scale` mirrors [`Reference::strength`]: `None` means "use the
+    /// per-model default control scale" and `Some(x)` is an explicit override — including `Some(0.0)`,
+    /// a deliberately inert control branch. The `Option` is what distinguishes explicit-inert from
+    /// unset (the old bare `f32` could not; F-085).
     Control {
         image: Image,
         kind: ControlKind,
-        scale: f32,
+        scale: Option<f32>,
     },
     /// FLUX.1-Depth.
     Depth { image: Image },

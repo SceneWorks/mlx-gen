@@ -196,20 +196,10 @@ impl Flux1DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // `resolve_control` resolves an unset (`None`) scale to `default_control_scale()` (the Shakker
+        // `DEFAULT_CONTROL_SCALE`); an explicit `Some(0.0)` now flows through as a deliberately inert
+        // branch (F-085 — the `Option<f32>` field distinguishes it from unset, so no 0.0 reject).
         let (control_image, control_scale) = self.resolve_control(req)?;
-        // F-085: `Conditioning::Control.scale` is a bare f32, so an *explicit* 0.0 is
-        // indistinguishable from an unset default — the old remap (0.0 → 0.7) silently overrode a
-        // caller asking for an inert branch. Reject 0.0 loudly instead (the story's sanctioned
-        // alternative to an `Option<f32>` scale, which would change the shared gen-core type):
-        // drop the `Control` conditioning for "no control", or pass the intended scale.
-        if control_scale == 0.0 {
-            return Err(Error::Msg(format!(
-                "flux1_dev_control: control scale 0.0 is ambiguous (the bare f32 field cannot \
-                 distinguish an explicit 0 from unset) and would run an inert control branch — \
-                 drop the Control conditioning for no control, or pass an explicit scale \
-                 (Shakker recommends {DEFAULT_CONTROL_SCALE})"
-            )));
-        }
 
         let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
         let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
@@ -348,6 +338,12 @@ impl ControlBranch for Flux1DevControl {
             "{FLUX1_DEV_CONTROL_ID} supports pose/canny/depth control (Fun-Controlnet-Union), got {kind:?}"
         )
     }
+
+    fn default_control_scale(&self) -> f32 {
+        // The Shakker Union-Pro-2.0 recommendation for an unset (`scale = None`) control (F-085); an
+        // explicit `Some(x)` — including `Some(0.0)` for an inert branch — wins over this.
+        DEFAULT_CONTROL_SCALE
+    }
 }
 
 impl Generator for Flux1DevControl {
@@ -451,7 +447,7 @@ mod tests {
                     pixels: vec![0u8; 64 * 64 * 3],
                 },
                 kind: ControlKind::Pose,
-                scale: 1.0,
+                scale: Some(1.0),
             }],
             ..Default::default()
         };

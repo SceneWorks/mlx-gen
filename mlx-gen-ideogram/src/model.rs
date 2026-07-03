@@ -584,7 +584,7 @@ mod tests {
             conditioning: vec![Conditioning::Control {
                 image: img(512, 512),
                 kind: mlx_gen::ControlKind::Pose,
-                scale: 1.0,
+                scale: Some(1.0),
             }],
             ..req(512, 512)
         };

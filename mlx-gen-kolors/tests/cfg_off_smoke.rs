@@ -168,7 +168,7 @@ fn controlnet_pose_cfg_off_runs() {
     let req = cfg_off_req(vec![Conditioning::Control {
         image: synthetic_image(),
         kind: ControlKind::Pose,
-        scale: 0.7,
+        scale: Some(0.7),
     }]);
     let out = generator
         .generate(&req, &mut |_| {})

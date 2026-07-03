@@ -187,7 +187,7 @@ fn dev_control_renders_coherent_pose_image() {
         conditioning: vec![Conditioning::Control {
             image: synthetic_pose(size),
             kind: ControlKind::Pose,
-            scale,
+            scale: Some(scale),
         }],
         ..Default::default()
     };

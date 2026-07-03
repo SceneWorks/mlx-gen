@@ -93,10 +93,12 @@ pub trait ControlBranch: crate::Generator {
         )
     }
 
-    /// Extract the single [`Conditioning::Control`] image + its scale from a request, applying
-    /// [`accepted_control_kinds`](Self::accepted_control_kinds). Errors when: a control `kind` is not
-    /// admitted (rejected, not silently coerced); more than one `Control` is present; or none is
-    /// present (uses [`missing_control_message`](Self::missing_control_message)).
+    /// Extract the single [`Conditioning::Control`] image + its resolved scale from a request, applying
+    /// [`accepted_control_kinds`](Self::accepted_control_kinds). The request-side `scale` is an
+    /// `Option<f32>`: `None` resolves to [`default_control_scale`](Self::default_control_scale) and
+    /// `Some(x)` — including `Some(0.0)`, a deliberately inert branch — is used verbatim (F-085).
+    /// Errors when: a control `kind` is not admitted (rejected, not silently coerced); more than one
+    /// `Control` is present; or none is present (uses [`missing_control_message`](Self::missing_control_message)).
     fn resolve_control<'a>(&self, req: &'a GenerationRequest) -> Result<(&'a Image, f32)> {
         let accepted = self.accepted_control_kinds();
         let mut found = None;
@@ -111,10 +113,18 @@ pub trait ControlBranch: crate::Generator {
                         self.model_id()
                     )));
                 }
-                found = Some((image, *scale));
+                found = Some((image, scale.unwrap_or_else(|| self.default_control_scale())));
             }
         }
         found.ok_or_else(|| Error::Msg(self.missing_control_message()))
+    }
+
+    /// The control-conditioning scale applied when a request's [`Conditioning::Control`] leaves
+    /// `scale = None` (unset). Defaults to the Fun-Controlnet-Union full-strength `1.0`; a branch with
+    /// a different recommended default (e.g. the FLUX.1 Shakker path uses `0.7`) overrides this. An
+    /// explicit `Some(0.0)` is honoured as an inert branch and never reaches this default.
+    fn default_control_scale(&self) -> f32 {
+        1.0
     }
 
     /// The message for a control `kind` rejected by [`accepted_control_kinds`](Self::accepted_control_kinds).
@@ -308,7 +318,7 @@ mod tests {
         let r = req_with(vec![Conditioning::Control {
             image: img(),
             kind: ControlKind::Pose,
-            scale: 0.7,
+            scale: Some(0.7),
         }]);
         let (_, scale) = s.resolve_control(&r).unwrap();
         assert_eq!(scale, 0.7);
@@ -317,7 +327,7 @@ mod tests {
         let r = req_with(vec![Conditioning::Control {
             image: img(),
             kind: ControlKind::Canny,
-            scale: 1.0,
+            scale: Some(1.0),
         }]);
         assert!(s.resolve_control(&r).is_err());
 
@@ -326,12 +336,12 @@ mod tests {
             Conditioning::Control {
                 image: img(),
                 kind: ControlKind::Pose,
-                scale: 1.0,
+                scale: Some(1.0),
             },
             Conditioning::Control {
                 image: img(),
                 kind: ControlKind::Pose,
-                scale: 1.0,
+                scale: Some(1.0),
             },
         ]);
         let err = s.resolve_control(&r).unwrap_err().to_string();
@@ -345,12 +355,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_control_scale_default_and_explicit_inert() {
+        let any = stub(AcceptedControlKinds::Any);
+
+        // `None` → the per-model default (the trait default is full-strength 1.0).
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: None,
+        }]);
+        let (_, scale) = any.resolve_control(&r).unwrap();
+        assert_eq!(scale, 1.0);
+
+        // `Some(0.0)` → an explicit inert branch, distinct from unset, used verbatim (F-085).
+        let r = req_with(vec![Conditioning::Control {
+            image: img(),
+            kind: ControlKind::Pose,
+            scale: Some(0.0),
+        }]);
+        let (_, scale) = any.resolve_control(&r).unwrap();
+        assert_eq!(scale, 0.0);
+    }
+
+    #[test]
     fn require_control_present_checks_presence() {
         let s = stub(AcceptedControlKinds::Any);
         let r = req_with(vec![Conditioning::Control {
             image: img(),
             kind: ControlKind::Pose,
-            scale: 1.0,
+            scale: Some(1.0),
         }]);
         s.require_control_present(&r).unwrap();
 

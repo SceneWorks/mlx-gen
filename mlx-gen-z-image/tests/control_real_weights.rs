@@ -698,7 +698,7 @@ fn full_pipeline(golden_path: &str, quant: Option<Quant>, bits_label: &str, max_
         conditioning: vec![Conditioning::Control {
             image: control_image(&g),
             kind: ControlKind::Pose,
-            scale,
+            scale: Some(scale),
         }],
         ..Default::default()
     };

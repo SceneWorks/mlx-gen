@@ -242,7 +242,7 @@ fn registry_controlnet() {
     req.conditioning = vec![Conditioning::Control {
         image: test_image(),
         kind: ControlKind::Pose,
-        scale: 0.7,
+        scale: Some(0.7),
     }];
     assert_coherent(run(&spec, &req), 1);
     println!("✓ registry ControlNet (Control/Pose) renders coherently");

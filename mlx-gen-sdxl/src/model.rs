@@ -48,6 +48,10 @@ const INPAINT_DEFAULT_STRENGTH: f32 = 0.85;
 /// Default `ip_adapter_scale` (sc-3059) when a request doesn't override it (the worker's plus-face
 /// default ≈ 0.6). In IP mode the `Reference` strength field carries the IP scale.
 const IP_DEFAULT_SCALE: f32 = 0.6;
+/// Default per-branch `conditioning_scale` for a ControlNet `Conditioning::Control` that leaves
+/// `scale = None` (F-085) — the diffusers `controlnet_conditioning_scale` full-strength default. An
+/// explicit `Some(x)`, including `Some(0.0)` for an inert branch, overrides it.
+const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 
 /// SDXL-base-1.0 production defaults (the SceneWorks `MlxSdxlAdapter`): 30 inference steps,
 /// CFG 7.0, native 1024². Used when a request omits the corresponding field (consumed by the
@@ -831,7 +835,9 @@ impl Sdxl {
         let mut controls = Vec::new();
         for c in &req.conditioning {
             if let Conditioning::Control { image, scale, .. } = c {
-                controls.push((image, *scale));
+                // `None` → the diffusers `controlnet_conditioning_scale` default (full strength);
+                // `Some(x)` — including `Some(0.0)` for an inert branch — is used verbatim (F-085).
+                controls.push((image, scale.unwrap_or(DEFAULT_CONTROLNET_SCALE)));
             }
         }
         Ok(controls)

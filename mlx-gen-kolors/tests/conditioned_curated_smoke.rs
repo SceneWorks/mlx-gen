@@ -236,7 +236,7 @@ fn controlnet_curated_is_coherent_and_distinct() {
         vec![Conditioning::Control {
             image: pose.clone(),
             kind: ControlKind::Pose,
-            scale: 0.7,
+            scale: Some(0.7),
         }]
     });
 }
@@ -274,7 +274,7 @@ fn combined_pose_curated_is_coherent_and_distinct() {
             Conditioning::Control {
                 image: pose.clone(),
                 kind: ControlKind::Pose,
-                scale: 0.7,
+                scale: Some(0.7),
             },
             Conditioning::Reference {
                 image: reference.clone(),

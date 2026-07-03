@@ -40,6 +40,10 @@ const DEFAULT_GUIDANCE: f32 = 5.0;
 /// Default IP-Adapter scale when a request doesn't override it (carried on the `Reference` strength
 /// field in IP mode, mirroring the SDXL IP-Adapter convention).
 const IP_DEFAULT_SCALE: f32 = 0.6;
+/// Default ControlNet `conditioning_scale` for a `Conditioning::Control` that leaves `scale = None`
+/// (F-085) — the diffusers full-strength default. An explicit `Some(x)`, including `Some(0.0)` for an
+/// inert branch, overrides it.
+const DEFAULT_CONTROLNET_SCALE: f32 = 1.0;
 /// Default img2img init strength for the combined strict-pose tier (sc-5012) when `req.strength` is
 /// unset — the torch `_run_pose` default 1.0 (at full strength the init only seeds latent
 /// dimensions; identity comes from the IP-Adapter, structure from the ControlNet).
@@ -593,7 +597,8 @@ impl KolorsGenerator {
                         "kolors: only Pose ControlNet is wired (got {kind:?})"
                     )));
                 }
-                control = Some((image, *scale));
+                // `None` → the full-strength default; `Some(x)` — incl. `Some(0.0)` — verbatim (F-085).
+                control = Some((image, scale.unwrap_or(DEFAULT_CONTROLNET_SCALE)));
             }
         }
         Ok(control)

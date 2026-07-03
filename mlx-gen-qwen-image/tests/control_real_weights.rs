@@ -273,7 +273,7 @@ fn public_generate_runs() {
         conditioning: vec![Conditioning::Control {
             image: skeleton,
             kind: ControlKind::Pose,
-            scale: 1.0,
+            scale: Some(1.0),
         }],
         ..Default::default()
     };
