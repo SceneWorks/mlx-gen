@@ -94,12 +94,18 @@ pub struct LoadSpec {
     /// only providers whose latent space has a PiD backbone read it (Qwen-Image / Krea today —
     /// sc-7845), and they ignore it when the request does not request PiD.
     pub pid: Option<PidWeights>,
-    /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, F-114) — the
+    /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, sc-8827) — the
     /// EVA-CLIP tower, the identity encoder checkpoint, and the native face-analysis weight dir that a
     /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model; the
     /// PuLID-FLUX loader reads it, falling back to its historical `PULID_*` env vars only when unset,
     /// so a caller can drive the load entirely through the spec (backend-neutral — just paths).
     pub identity: Option<IdentityWeights>,
+    /// Auxiliary **external text-encoder** snapshot directory (sc-8827) — a separate TE snapshot a
+    /// provider loads alongside its main checkpoint, e.g. LTX-2.3's Gemma-3-12B encoder (which is not
+    /// bundled in the checkpoint dir). `None` → the provider's historical env-var / `<root>` fallback
+    /// (`LTX_GEMMA_DIR`, else `<root>/text_encoder`). Backend-neutral (just a path), so a caller can
+    /// drive the TE location through the spec instead of a process-global env var.
+    pub text_encoder: Option<WeightsSource>,
 }
 
 /// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
@@ -145,6 +151,7 @@ impl LoadSpec {
             adapters: Vec::new(),
             pid: None,
             identity: None,
+            text_encoder: None,
         }
     }
 

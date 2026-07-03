@@ -86,6 +86,7 @@ fn spec(base: PathBuf, control: Option<PathBuf>) -> LoadSpec {
         extra_controls: Vec::new(),
         pid: None,
         identity: None,
+        text_encoder: None,
     }
 }
 

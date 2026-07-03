@@ -65,6 +65,7 @@ fn base_spec() -> LoadSpec {
         extra_controls: Vec::new(),
         pid: None,
         identity: None,
+        text_encoder: None,
     }
 }
 
