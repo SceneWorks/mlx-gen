@@ -49,8 +49,6 @@ pub trait WanScheduler {
     fn timesteps(&self) -> &[f32];
     /// One denoise step; advances the internal step index. `model_output` is the velocity `v`.
     fn step(&mut self, model_output: &Array, sample: &Array) -> Result<Array>;
-    /// Reset to step 0 (clears multistep history).
-    fn reset(&mut self);
 }
 
 /// Guard the per-step `sigmas_f64[step_index(+1)]` indexing every `step` impl performs (F-019).
@@ -165,9 +163,6 @@ impl WanScheduler for FlowMatchEuler {
         self.step_index += 1;
         Ok(x_next)
     }
-    fn reset(&mut self) {
-        self.step_index = 0;
-    }
 }
 
 // =====================================================================================
@@ -276,10 +271,6 @@ impl WanScheduler for FlowDpmpp2m {
         self.prev_x0 = Some(x0);
         self.step_index += 1;
         Ok(x_next)
-    }
-    fn reset(&mut self) {
-        self.step_index = 0;
-        self.prev_x0 = None;
     }
 }
 
@@ -522,13 +513,6 @@ impl WanScheduler for FlowUniPC {
         }
         self.step_index += 1;
         Ok(x_next)
-    }
-    fn reset(&mut self) {
-        self.step_index = 0;
-        self.lower_order_nums = 0;
-        self.model_outputs = vec![None; self.solver_order];
-        self.last_sample = None;
-        self.this_order = 1;
     }
 }
 

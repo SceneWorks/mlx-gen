@@ -310,7 +310,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
     let cfg = DiffusionConfig::sdxl_base();
     let alpha_schedule =
-        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end)?;
+        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,

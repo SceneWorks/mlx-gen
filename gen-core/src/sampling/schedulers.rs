@@ -387,7 +387,7 @@ mod tests {
     };
 
     fn sdxl() -> DiscreteModelSampling {
-        DiscreteModelSampling::sdxl(&AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap())
+        DiscreteModelSampling::sdxl(&AlphaSchedule::scaled_linear(1000, 0.00085, 0.012))
     }
 
     fn is_descending_to_zero(sigs: &[f32]) -> bool {

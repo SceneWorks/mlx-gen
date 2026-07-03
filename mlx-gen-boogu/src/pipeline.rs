@@ -361,10 +361,12 @@ impl BooguPipeline {
         self.decode_latents(&lat, decoder)
     }
 
-    /// Generate one RGB image via the **Edit** path: VAE-encode a reference image into a clean
-    /// reference latent, then flow-match denoise (true-CFG) with that reference packed into the DiT's
-    /// image sequence (`forward_edit`). The reference shapes the output spatially; the instruction
-    /// drives the edit. Same static-v1 scheduler / true-CFG as [`Self::generate`].
+    /// Generate one RGB image via the **Edit** path: the single-reference convenience over
+    /// [`Self::generate_edit_multi`] (byte-identical to it with one reference). VAE-encode a reference
+    /// image into a clean reference latent, then flow-match denoise (true-CFG) with that reference
+    /// packed into the DiT's image sequence (`forward_edit_multi`). The reference shapes the output
+    /// spatially; the instruction drives the edit. Same static-v1 scheduler / true-CFG as
+    /// [`Self::generate`].
     ///
     /// Faithful Boogu edit (the default, `opts.condition_on_image`) feeds the reference image through
     /// the Qwen3-VL **vision tower** so the MLLM "sees" it — the instruction features are
@@ -395,26 +397,6 @@ impl BooguPipeline {
             None,
             &CancelFlag::new(),
             &mut |_| {},
-        )
-    }
-
-    /// [`Self::generate_edit`] with [`Progress`] streaming and per-step cooperative cancellation
-    /// ([`Error::Canceled`]).
-    pub fn generate_edit_with_progress(
-        &self,
-        reference: &Image,
-        instruction: &str,
-        opts: &EditOptions,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Image> {
-        self.generate_edit_multi_with_progress(
-            std::slice::from_ref(reference),
-            instruction,
-            opts,
-            None,
-            cancel,
-            on_progress,
         )
     }
 
@@ -474,7 +456,7 @@ impl BooguPipeline {
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
 
         // Same unified-framework routing as the Base path (epic 7114), with the spatial reference latent
-        // threaded through `forward_edit`. Native static-shift schedule is the byte-exact default;
+        // threaded through `forward_edit_multi`. Native static-shift schedule is the byte-exact default;
         // velocity is negated into the noise-fraction FLOW convention. The output resolution starts from
         // pure noise (the reference shapes the DiT sequence, not the init latent), so there is no
         // start-step slicing.

@@ -223,7 +223,7 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
                 None,
                 Dtype::Bfloat16,
             )?),
-            schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)?,
+            schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
         },
     }))
 }
@@ -387,8 +387,7 @@ mod first_step_repro {
                     ChatGlmModel::from_weights(&te_w, ChatGlmConfig::chatglm3_6b(), None, dtype)
                         .unwrap(),
                 ),
-                schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)
-                    .unwrap(),
+                schedule: AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END),
             },
         };
         let cfg = TrainingConfig {

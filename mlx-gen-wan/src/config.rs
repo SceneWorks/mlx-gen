@@ -39,14 +39,6 @@ impl GuideScale {
         }
     }
 
-    /// Whether CFG is disabled (all relevant scales ≤ 1.0 → the B=1 fast path).
-    pub fn cfg_disabled(self) -> bool {
-        match self {
-            GuideScale::Single(s) => s <= 1.0,
-            GuideScale::Dual { low, high } => low <= 1.0 && high <= 1.0,
-        }
-    }
-
     /// Resolve a request's optional scalar override against this config scale for a **single-model**
     /// (dense) run: an explicit `req_guidance` wins; otherwise the representative [`effective`] scale
     /// (a config `Dual` collapses to its `low`, which is unreachable for the dense models that take

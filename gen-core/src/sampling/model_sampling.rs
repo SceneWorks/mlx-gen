@@ -419,7 +419,7 @@ mod tests {
     use crate::sampling::CpuLatentOps;
 
     fn sdxl_sched() -> AlphaSchedule {
-        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap()
+        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012)
     }
 
     #[test]

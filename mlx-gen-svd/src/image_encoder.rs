@@ -34,6 +34,10 @@ pub struct SvdImageEncoder {
 impl SvdImageEncoder {
     /// Load from the SVD `image_encoder/model.safetensors` (`vision_model.*` body +
     /// `vision_model.post_layernorm.*` + top-level `visual_projection.weight`).
+    ///
+    /// The tower is FIXED to OpenCLIP ViT-H/14 (the only image encoder SVD ships); `_cfg` is accepted
+    /// for API symmetry with the other component loaders but is intentionally NOT consulted — the
+    /// architecture is not config-driven here. (`ImageEncoderConfig::default()` documents the shape.)
     pub fn from_weights(w: &Weights, _cfg: &ImageEncoderConfig) -> Result<Self> {
         let body = ClipVisionEncoder::from_weights(w, &VisionConfig::vit_h_14())?;
         Ok(Self {

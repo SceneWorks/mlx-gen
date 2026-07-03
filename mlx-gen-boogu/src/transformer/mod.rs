@@ -1,10 +1,11 @@
 //! The Boogu mixed single/double-stream DiT (`BooguImageTransformer2DModel`) forward.
 //!
 //! Two entry points share one inner path: [`BooguTransformer::forward`] (text-to-image) and
-//! [`BooguTransformer::forward_edit`] (single-reference text+image-to-image). Edit VAE-encodes a
-//! reference image, patch-embeds it through `ref_image_patch_embedder` + `image_index_embedding`,
-//! refines it in `ref_image_refiner`, and prepends those tokens — `[ref; noise]` — to the image
-//! sequence (with the noise positions shifted by `max(ref_h, ref_w)` in the unified RoPE).
+//! [`BooguTransformer::forward_edit_multi`] (text+image-to-image, `N ∈ [1, 5]` references). Edit
+//! VAE-encodes each reference image, patch-embeds it through `ref_image_patch_embedder` +
+//! `image_index_embedding`, refines it in `ref_image_refiner`, and prepends those tokens —
+//! `[ref₀; …; noise]` — to the image sequence (with the noise positions shifted by `max(ref_h, ref_w)`
+//! in the unified RoPE).
 //!
 //! Text-to-image flow (the reference-image blocks stay dormant):
 //! ```text
@@ -124,31 +125,11 @@ impl BooguTransformer {
         self.forward_inner(latent, &[], timestep, instruction_hidden, instruction_mask)
     }
 
-    /// Edit (single-reference text+image-to-image) velocity prediction. Identical to [`Self::forward`]
-    /// but with a clean reference latent `ref_latent` (`[1, 16, rH, rW]`, the VAE-encoded reference)
-    /// packed — after its own `ref_image_patch_embedder` + `image_index_embedding` + `ref_image_refiner`
-    /// — *before* the noise tokens in the combined image sequence the DiT denoises against.
-    pub fn forward_edit(
-        &self,
-        latent: &Array,
-        ref_latent: &Array,
-        timestep: &Array,
-        instruction_hidden: &Array,
-        instruction_mask: &Array,
-    ) -> Result<Array> {
-        self.forward_inner(
-            latent,
-            std::slice::from_ref(ref_latent),
-            timestep,
-            instruction_hidden,
-            instruction_mask,
-        )
-    }
-
     /// Edit velocity prediction with **multiple** reference latents (`N ∈ [1, 5]`, OmniGen2 lineage).
-    /// Each `ref_latentⱼ` (`[1, 16, rHⱼ, rWⱼ]`) is patch-embedded, gets `image_index_embedding[j]`,
-    /// is refined independently, and is packed — in order — before the noise tokens:
-    /// `[ref₀; …; ref_{N-1}; noise]`. `N = 1` is byte-identical to [`Self::forward_edit`].
+    /// Identical to [`Self::forward`] but with clean reference latents packed — each after its own
+    /// `ref_image_patch_embedder` + `image_index_embedding[j]` + `ref_image_refiner` — *before* the
+    /// noise tokens: `[ref₀; …; ref_{N-1}; noise]` (`[1, 16, rHⱼ, rWⱼ]` each). `N = 1` is the
+    /// single-reference edit case.
     pub fn forward_edit_multi(
         &self,
         latent: &Array,

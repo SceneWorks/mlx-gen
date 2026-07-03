@@ -88,6 +88,16 @@ impl LensTextEncoder {
                 cfg.num_layers
             )));
         }
+        // Duplicates leave a capture slot unfilled in `encode` (`position` matches only the first
+        // occurrence), which would later panic on the `expect("every selected layer captured")`.
+        // Reject them here so a bad list is a typed error, not a mid-encode panic.
+        for (j, &layer) in selected_layers.iter().enumerate() {
+            if selected_layers[..j].contains(&layer) {
+                return Err(Error::Msg(format!(
+                    "lens encoder: selected_layers must be unique (layer {layer} repeated)"
+                )));
+            }
+        }
 
         let embed_tokens = w.require("model.embed_tokens.weight")?.as_dtype(dtype)?;
         let mut layers = Vec::with_capacity(max_layer + 1);

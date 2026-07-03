@@ -49,9 +49,7 @@ pub use config::Krea2Config;
 pub use loader::{load_text_encoder, load_transformer};
 pub use model::{descriptor, load, Krea, KREA_2_TURBO_ID};
 pub use pipeline::{KreaPipeline, TurboOptions};
-pub use schedule::{
-    dynamic_sampler, krea_sigmas, turbo_sampler, turbo_sigmas, TURBO_MU, TURBO_STEPS,
-};
+pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};
 pub use transformer::Krea2Transformer;

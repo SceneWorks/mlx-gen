@@ -364,6 +364,16 @@ impl DiffLossFm {
         img_cfg: Option<f32>,
         noise_base: &Array,
     ) -> Result<Array> {
+        // The externally-supplied noise must be `[n, in_channels]` (the head denoises in-channel-space);
+        // a mismatch is a caller bug that would otherwise surface as an opaque matmul error. Anchors the
+        // `in_channels` field.
+        let noise_ch = *noise_base.shape().last().unwrap();
+        if noise_ch != self.in_channels {
+            return Err(Error::Msg(format!(
+                "bernini clip-diff: noise_base last dim must be {} (in_channels), got {noise_ch}",
+                self.in_channels
+            )));
+        }
         self.scheduler.set_timesteps(num_steps);
         let dtype = z.dtype();
         let tiles = if img_cfg.is_some() && cfg > 1.0 {
@@ -387,10 +397,6 @@ impl DiffLossFm {
             samples = self.scheduler.step(&pred, i, &samples)?;
         }
         Ok(samples)
-    }
-
-    pub fn in_channels(&self) -> i32 {
-        self.in_channels
     }
 
     /// Quantize the net's linears (Q4/Q8). (sc-5146)

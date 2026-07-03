@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn apply_coeffs_reproduces_legacy_policy_steps_bit_exact() {
         let ops = CpuLatentOps;
-        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
         let x = vec![0.3_f32, -1.2, 2.5, 0.07];
         let out = vec![0.7_f32, 0.1, -0.4, 1.3];
         // Deterministic coeff sets (a_noise = 0) from each policy family.

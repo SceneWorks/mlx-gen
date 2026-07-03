@@ -389,6 +389,12 @@ impl Qwen3Backbone {
 
     /// Run the full stack on a single path. `embeds` `[B,S,hidden]`; `temporal`/`height`/`width`
     /// are the three position rows (each length `S`).
+    ///
+    /// PARITY ORACLE (test-only): this dense, un-cached forward is the reference the cached production
+    /// path ([`Self::forward_cached`] / [`Self::forward_prepared`]) is validated against — the runtime
+    /// denoise loops use the cached path, not this one. It stays `pub` only because the integration
+    /// tests (`tests/backbone_parity.rs`, `tests/runtime_parity.rs`, `tests/quant_smoke.rs`) live in
+    /// separate crates and need to reach it; it is not a runtime entry point.
     pub fn forward_path(
         &self,
         embeds: &Array,
@@ -634,6 +640,8 @@ impl Qwen3Backbone {
         a.o_proj.forward(&out)
     }
 
+    /// Un-cached full-sequence attention — the [`Self::forward_path`] parity oracle's inner op (the
+    /// production path uses [`Self::attention_cached`]). Only reached via `forward_path`.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,

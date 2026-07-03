@@ -24,8 +24,6 @@
 //! Turbo e2e; Raw CFG inference is a later P3 concern) — this module owns only the schedule + the
 //! core-sampler construction, the family-neutral seam the rest of the workspace shares.
 
-use mlx_gen::FlowMatchSampler;
-
 /// Turbo's fixed timestep-shift `mu` — the value the TDM distillation was trained at (reference CLI
 /// default `--mu`, applied resolution-independently for the distilled student).
 pub const TURBO_MU: f64 = 1.15;
@@ -79,23 +77,9 @@ pub fn turbo_sigmas(steps: usize) -> Vec<f32> {
     krea_sigmas(steps, TURBO_MU)
 }
 
-/// Build the core flow-match Euler sampler for the **Turbo** schedule. The sampler walks the descending
-/// sigmas `x + v·(σ_{i+1} − σ_i)` (= the reference `img + (tprev − tcurr)·v`) with `timestep(i) = σ_i`
-/// passed raw to the DiT.
-pub fn turbo_sampler(steps: usize) -> FlowMatchSampler {
-    FlowMatchSampler::new(turbo_sigmas(steps))
-}
-
-/// Build the resolution-**dynamic** (Raw) flow-match sampler: `mu` interpolated in `seq_len` (image
-/// token count) via [`dynamic_mu`], then the same exponential shift.
-pub fn dynamic_sampler(steps: usize, seq_len: f64) -> FlowMatchSampler {
-    FlowMatchSampler::new(krea_sigmas(steps, dynamic_mu(seq_len)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::DiffusionSampler;
 
     /// Assert a sigma schedule matches the reference values (kept at the f64 precision the reference
     /// `sampling.py` prints, so the literals stay verbatim) to within f32-narrowing tolerance.
@@ -138,18 +122,6 @@ mod tests {
     fn dynamic_schedule_matches_reference() {
         let want = [1.0, 0.88130659, 0.71223223, 0.45205718, 0.0];
         assert_close(&krea_sigmas(4, dynamic_mu(4096.0)), &want);
-    }
-
-    /// The schedule drives the core flow-match sampler: `num_steps = steps`, `timestep(i) = σ_i`.
-    #[test]
-    fn turbo_sampler_wires_core_flow_match() {
-        let sigmas = turbo_sigmas(TURBO_STEPS);
-        let s = turbo_sampler(TURBO_STEPS);
-        assert_eq!(s.num_steps(), TURBO_STEPS);
-        for (i, &sig) in sigmas.iter().take(TURBO_STEPS).enumerate() {
-            assert!((s.timestep(i) - sig).abs() < 1e-6, "timestep[{i}]");
-            assert!((s.sigma(i) - sig).abs() < 1e-6, "sigma[{i}]");
-        }
     }
 
     /// `steps = 1` is the degenerate `[1.0, 0.0]` (a single Euler hop) — not a panic.

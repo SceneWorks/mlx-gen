@@ -75,10 +75,6 @@ impl Flux2KvCache {
         self.num_ref_tokens.set(num_ref_tokens as i32);
     }
 
-    pub fn mode(&self) -> Option<CacheMode> {
-        self.mode.get()
-    }
-
     /// The cache hook a single attention layer calls, **after RoPE, before SDPA**, with its freshly
     /// projected `(key, value)` in `[B, H, S, D]`. Returns the `(key, value)` to attend over:
     /// - [`CacheMode::Extract`]: stores the trailing `num_ref` slice for `(stream, layer_idx)` and

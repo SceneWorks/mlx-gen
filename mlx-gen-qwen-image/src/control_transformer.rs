@@ -75,6 +75,9 @@ pub struct QwenFunControlBranch {
     /// Base block indices each control hint injects into (`control_layers`); `places[n]` is the base
     /// index for hint `n`.
     places: Vec<usize>,
+    /// Expected packed control-context width (`control_in_dim`, 132 for the shipped Union); asserted
+    /// against `control_context`'s last dim in [`Self::forward_control`].
+    control_in_dim: i32,
 }
 
 impl QwenFunControlBranch {
@@ -118,6 +121,7 @@ impl QwenFunControlBranch {
             after_proj,
             before_proj: linear_from(w, &p("control_blocks.0.before_proj"), true)?,
             places: cfg.control_layers.clone(),
+            control_in_dim: cfg.control_in_dim,
         })
     }
 
@@ -173,6 +177,16 @@ impl QwenFunControlBranch {
         mask: Option<&Array>,
         modulate_index: Option<&Array>,
     ) -> Result<Vec<Array>> {
+        // The packed control context must match the branch's `control_img_in` in-features
+        // (`control_in_dim`), else the patch-embed matmul is silently ill-shaped. Anchors the config
+        // field as load-bearing.
+        let cc_dim = *control_context.shape().last().unwrap();
+        if cc_dim != self.control_in_dim {
+            return Err(Error::Msg(format!(
+                "qwen 2512-fun control: control_context last dim must be {} (control_in_dim), got {cc_dim}",
+                self.control_in_dim
+            )));
+        }
         // c = control_img_in(control_context); seed block 0 with `before_proj(c) + img_embed`.
         let mut c = add(
             &self

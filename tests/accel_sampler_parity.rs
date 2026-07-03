@@ -40,7 +40,7 @@ fn peak_rel(a: &Array, b: &Array) -> f32 {
 }
 
 fn sched() -> AlphaSchedule {
-    AlphaSchedule::scaled_linear(N_TRAIN, BETA_START, BETA_END).unwrap()
+    AlphaSchedule::scaled_linear(N_TRAIN, BETA_START, BETA_END)
 }
 
 #[test]

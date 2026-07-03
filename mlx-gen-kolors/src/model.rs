@@ -432,7 +432,7 @@ impl Kolors {
         // Kolors DDPM schedule: `scaled_linear` betas (β₀=0.00085, β₁=0.014) over 1100 train timesteps
         // — the same `EulerDiscreteScheduler` config the native sampler interpolates, here as the
         // discrete `ModelSampling` the curated solvers integrate over (ε-prediction, σ_data = 1).
-        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END)?;
+        let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
         let ms = DiscreteModelSampling::sdxl(&sched);
         let scheduler = scheduler_name
             .and_then(Scheduler::from_name)

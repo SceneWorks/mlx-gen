@@ -423,6 +423,14 @@ fn patchify_control(cc: &Array, patch_size: i32, f_patch_size: i32) -> Result<Ar
     let (pf, ph, pw) = (f_patch_size, patch_size, patch_size);
     let sh = cc.shape();
     let (c, f, h, w) = (sh[0], sh[1], sh[2], sh[3]);
+    // The control context is the `[control_latent(16) | mask(1) | inpaint(16)]` channel-concat; the
+    // control patch embedder is built for exactly this width, so a mismatch is a caller bug, not a
+    // silently-wrong run. Anchors `CONTROL_IN_DIM` as load-bearing.
+    if c != CONTROL_IN_DIM {
+        return Err(Error::Msg(format!(
+            "z-image control_context must have {CONTROL_IN_DIM} channels, got {c}"
+        )));
+    }
     let (ft, ht, wt) = (f / pf, h / ph, w / pw);
     let tokens = cc
         .reshape(&[c, ft, pf, ht, ph, wt, pw])?

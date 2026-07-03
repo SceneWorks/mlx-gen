@@ -51,11 +51,6 @@ impl EdmSchedule {
         Self { sigmas, timesteps }
     }
 
-    /// Number of denoise steps (`n`).
-    pub fn num_steps(&self) -> usize {
-        self.timesteps.len()
-    }
-
     /// `init_noise_sigma` for the `leading` spacing SVD uses: `sqrt(max(σ)² + 1)` (the init latents are
     /// `noise · init_noise_sigma`). `sigmas[0]` is the max.
     pub fn init_noise_sigma(&self) -> f32 {

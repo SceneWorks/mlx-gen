@@ -22,8 +22,6 @@
 //! match the original mlx-gen code; the FlowMatch `a_out` is an `f32` subtraction of `f32` sigmas so
 //! the backend's byte-parity rule reproduces `flow_match_euler_step` exactly (F-009 / FLUX goldens).
 
-use crate::Result;
-
 // =================================================================================================
 // Unified sampler/scheduler framework (epic 7114, P1). ADDITIVE alongside the legacy `SamplerPolicy`
 // layer below: the callback `Sampler` + `ModelSampling` + `LatentOps` decouple the integration
@@ -118,11 +116,7 @@ impl AlphaSchedule {
     /// **sequential host f32 accumulation** (`acc *= 1 - beta`, f32 each step) — torch CPU `cumprod`
     /// semantics — which keeps the table tensor-free here while matching the reference to f32 (the
     /// original mlx-gen ran the same product through `Array::cumprod`).
-    pub fn scaled_linear(
-        num_train_timesteps: usize,
-        beta_start: f32,
-        beta_end: f32,
-    ) -> Result<Self> {
+    pub fn scaled_linear(num_train_timesteps: usize, beta_start: f32, beta_end: f32) -> Self {
         let n = num_train_timesteps;
         // betas = linspace(√β₀, √β₁, N)²  (the √ endpoints taken in f64 like diffusers' Python).
         let (a, b) = ((beta_start as f64).sqrt(), (beta_end as f64).sqrt());
@@ -139,7 +133,7 @@ impl AlphaSchedule {
             acc *= 1.0 - beta;
             alphas_cumprod.push(acc);
         }
-        Ok(Self { alphas_cumprod })
+        Self { alphas_cumprod }
     }
 
     /// `alphas_cumprod[t]` as f64.
@@ -640,7 +634,7 @@ mod tests {
     use super::*;
 
     fn sdxl_sched() -> AlphaSchedule {
-        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap()
+        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012)
     }
 
     #[test]

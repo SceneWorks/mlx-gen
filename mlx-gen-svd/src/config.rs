@@ -1,50 +1,38 @@
 //! SVD (img2vid-xt) component configs — transcribed from the checkpoint JSON
 //! (`stabilityai/stable-video-diffusion-img2vid-xt`): `unet/config.json`, `vae/config.json`,
-//! `image_encoder/config.json`, `scheduler/scheduler_config.json`. Static defaults (no JSON parse on
-//! the hot path); the loader can still override from disk if a future checkpoint differs.
+//! `image_encoder/config.json`, `scheduler/scheduler_config.json`. Static defaults, constructed via
+//! `::default()` at load — there is NO disk-JSON override path; a future checkpoint that differs would
+//! need one added here.
 
-/// `UNetSpatioTemporalConditionModel` config.
+/// `UNetSpatioTemporalConditionModel` config — only the fields the loader actually reads
+/// (`SvdUnet::from_weights`). Channel counts / cross-attn dim / frame count are fixed by the weight
+/// shapes and the request, so they are not carried here.
 #[derive(Clone, Debug)]
 pub struct UnetConfig {
-    /// 8 = 4 noise latent + 4 image-conditioning latent (channel-concat).
-    pub in_channels: usize,
-    pub out_channels: usize,
     pub block_out_channels: Vec<usize>,
     pub layers_per_block: usize,
-    pub cross_attention_dim: usize,
     pub num_attention_heads: Vec<usize>,
     pub transformer_layers_per_block: usize,
     /// Each fps/motion_bucket/noise_aug id → a 256-dim sinusoid; 3 of them concat → 768.
     pub addition_time_embed_dim: usize,
-    /// 3 · `addition_time_embed_dim` = 768 (the `add_embedding` MLP input).
-    pub projection_class_embeddings_input_dim: usize,
-    /// SVD-XT default frame count.
-    pub num_frames: usize,
 }
 
 impl Default for UnetConfig {
     fn default() -> Self {
         Self {
-            in_channels: 8,
-            out_channels: 4,
             block_out_channels: vec![320, 640, 1280, 1280],
             layers_per_block: 2,
-            cross_attention_dim: 1024,
             num_attention_heads: vec![5, 10, 20, 20],
             transformer_layers_per_block: 1,
             addition_time_embed_dim: 256,
-            projection_class_embeddings_input_dim: 768,
-            num_frames: 25,
         }
     }
 }
 
-/// `AutoencoderKLTemporalDecoder` config (2D encoder + temporal decoder).
+/// `AutoencoderKLTemporalDecoder` config (2D encoder + temporal decoder) — only the fields the loader
+/// reads (`SvdVae::from_weights`); channel counts are fixed by the weight shapes.
 #[derive(Clone, Debug)]
 pub struct VaeConfig {
-    pub in_channels: usize,
-    pub out_channels: usize,
-    pub latent_channels: usize,
     pub block_out_channels: Vec<usize>,
     pub layers_per_block: usize,
     pub scaling_factor: f32,
@@ -53,9 +41,6 @@ pub struct VaeConfig {
 impl Default for VaeConfig {
     fn default() -> Self {
         Self {
-            in_channels: 3,
-            out_channels: 3,
-            latent_channels: 4,
             block_out_channels: vec![128, 256, 512, 512],
             layers_per_block: 2,
             scaling_factor: 0.18215,

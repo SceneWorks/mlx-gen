@@ -44,20 +44,23 @@ struct Defaults {
     guidance: f32,
 }
 
+// The step/guidance numbers are the single source of truth in [`crate::schedule`] (`TURBO`/`BASE`);
+// the registry just re-tags them with the model id.
 const TURBO_DEFAULTS: Defaults = Defaults {
     id: MODEL_ID_TURBO,
-    steps: 4,
-    guidance: 1.0,
+    steps: crate::schedule::TURBO.num_steps as u32,
+    guidance: crate::schedule::TURBO.guidance_scale,
 };
 const BASE_DEFAULTS: Defaults = Defaults {
     id: MODEL_ID_BASE,
-    steps: 20,
-    guidance: 5.0,
+    steps: crate::schedule::BASE.num_steps as u32,
+    guidance: crate::schedule::BASE.guidance_scale,
 };
 
 /// Lens' identity + capabilities for `id` — constructible without loading weights (registry
-/// introspection). Advertises **only** the wired + parity-proven surface: T2I with negative-prompt /
-/// guidance CFG, no conditioning, no quant (yet), no LoRA.
+/// introspection). Advertises the wired + parity-proven surface: T2I with negative-prompt /
+/// guidance CFG, no conditioning, LoRA + LoKr (DiT joint-attention, sc-3174), and Q4/Q8 load-time
+/// quant (gpt-oss MoE experts sc-3172 + DiT linears sc-3175).
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
@@ -243,7 +246,6 @@ impl LensGenerator {
                             on_progress(Progress::Decoding);
                         }
                     })?;
-            let _ = i;
             images.push(image);
         }
         Ok(GenerationOutput::Images(images))

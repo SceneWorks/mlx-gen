@@ -318,16 +318,10 @@ fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
     // `steps < 2` with a clear error (F-113); clamp here so this helper never emits a NaN schedule
     // even when called directly (F-004), yielding a valid 2-step schedule instead.
     let n = num_steps.max(2);
-    // linspace(1.0, 1.0/n, n)
+    // linspace(1.0, 1.0/n, n). `n >= 2` (clamped above), so `n - 1 != 0` — no single-node special case.
     let (start, end) = (1.0_f32, 1.0_f32 / n as f32);
     let linspace: Vec<f32> = (0..n)
-        .map(|i| {
-            if n == 1 {
-                start
-            } else {
-                start + (end - start) * (i as f32) / ((n - 1) as f32)
-            }
-        })
+        .map(|i| start + (end - start) * (i as f32) / ((n - 1) as f32))
         .collect();
 
     let mu = qwen_mu(width, height);

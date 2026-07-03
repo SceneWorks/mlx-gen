@@ -236,7 +236,8 @@ fn planner_knobs(pkg: &Path) -> serde_json::Value {
                 .unwrap_or("masked_tgt_embed_with_qwen_txt_vit_tokens"),
         "num_mask_token": i("num_mask_token", 4096),
         "max_sequence_length": i("max_sequence_length", 512),
-        "use_src_id_rotary_emb": b("use_src_id_rotary_emb", true),
+        // `use_src_id_rotary_emb` is intentionally not emitted: the renderer applies source-id rotary
+        // unconditionally (the reference ships it `true`), so a toggle here would be inert.
         "interpolate_src_id": b("interpolate_src_id", true),
         "max_trained_src_id": i("max_trained_src_id", 5),
         // dual-expert + flow schedule (full pipeline uses boundary_ratio for the planner stage,

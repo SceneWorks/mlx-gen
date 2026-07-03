@@ -36,7 +36,10 @@ pub struct BerniniKnobs {
     pub switch_dit_boundary: f32,
     /// UniPC flow-shift (the reference builds the scheduler with `flow_shift = config.shift`).
     pub shift: f32,
-    pub use_src_id_rotary_emb: bool,
+    // NOTE: the reference `use_src_id_rotary_emb` toggle is NOT carried here — this port applies the
+    // source-id rotary embedding UNCONDITIONALLY (see `rope.rs` / `forward.rs::apply_source_id`),
+    // matching the Bernini renderer's shipped config (always `true`). Parsing it into a field the
+    // runtime then ignored would advertise a toggle that does nothing, so it is intentionally dropped.
     pub interpolate_src_id: bool,
     pub max_trained_src_id: f64,
     pub max_sequence_length: usize,
@@ -47,7 +50,6 @@ impl Default for BerniniKnobs {
         Self {
             switch_dit_boundary: 0.875,
             shift: 3.0,
-            use_src_id_rotary_emb: true,
             interpolate_src_id: true,
             max_trained_src_id: 5.0,
             max_sequence_length: 512,
@@ -73,7 +75,6 @@ impl BerniniKnobs {
         Ok(Self {
             switch_dit_boundary: f("switch_dit_boundary", d.switch_dit_boundary),
             shift: f("shift", d.shift),
-            use_src_id_rotary_emb: b("use_src_id_rotary_emb", d.use_src_id_rotary_emb),
             interpolate_src_id: b("interpolate_src_id", d.interpolate_src_id),
             max_trained_src_id: f("max_trained_src_id", d.max_trained_src_id as f32) as f64,
             // Clamp to >=0 before the usize cast: a negative `max_sequence_length` in JSON would wrap

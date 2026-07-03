@@ -176,9 +176,9 @@ impl FluxControlNet {
 }
 
 /// The FLUX.1-dev base MMDiT + its Fun-Controlnet-Union control branch (sc-8238). Composes the
-/// parity-proven [`FluxTransformer`] with a [`FluxControlNet`]; [`forward`](Self::forward) computes the
-/// control residuals once and threads them (+ an optional identity injector — compose-ready, constraint
-/// 2) into the base double stream, and [`quantize`](Self::quantize) packs both.
+/// parity-proven [`FluxTransformer`] with a [`FluxControlNet`]; [`forward_composed`](Self::forward_composed)
+/// computes the control residuals once and threads them (+ an optional identity injector — compose-ready,
+/// constraint 2) into the base double stream, and [`quantize`](Self::quantize) packs both.
 pub struct FluxControlTransformer {
     base: FluxTransformer,
     branch: FluxControlNet,
@@ -210,34 +210,6 @@ impl FluxControlTransformer {
     /// Number of control double blocks (residuals); `interval = ceil(num_double / num_residuals)`.
     pub fn num_residuals(&self) -> usize {
         self.branch.num_residuals()
-    }
-
-    /// Control forward (no identity injector): the convenience entry E2's generator wires.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        hidden_states: &Array,
-        control_cond: &Array,
-        prompt_embeds: &Array,
-        pooled_prompt_embeds: &Array,
-        sigma: f32,
-        guidance: f32,
-        width: u32,
-        height: u32,
-        control_scale: f32,
-    ) -> Result<Array> {
-        self.forward_composed(
-            hidden_states,
-            control_cond,
-            prompt_embeds,
-            pooled_prompt_embeds,
-            sigma,
-            guidance,
-            width,
-            height,
-            control_scale,
-            None,
-        )
     }
 
     /// Control forward THAT ALSO threads an optional identity injector (PuLID / XLabs IP-Adapter) — the

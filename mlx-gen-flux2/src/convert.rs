@@ -479,14 +479,6 @@ fn is_te_quant_target(base: &str) -> bool {
     base.ends_with(".embed_tokens") || TE_LINEAR_SUFFIXES.iter().any(|s| base.ends_with(s))
 }
 
-/// Selectively Q4/Q8-quantize a weight map in place per `is_target`: each matched, group-quantizable
-/// `{base}.weight` (cast to bf16 for fork parity, matching [`AdaptableLinear::quantize`]) becomes the
-/// packed triple `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases` via MLX `quantize`;
-/// every other tensor (norms, non-2-D, non-divisible, or non-target) passes through unchanged. The
-/// result is the exact packed layout the [`crate::loader`] reads back. `group_size` is the
-/// mflux/reference default of 64.
-///
-/// [`AdaptableLinear::quantize`]: mlx_gen::adapters::AdaptableLinear::quantize
 /// Pre-quantize a FLUX.2-dev **transformer** weight map (the on-disk diffusers key layout, before
 /// the loader's `to_out.0`/`timestep_embedder` renames). Packs every Linear, leaves the qk-RMSNorms
 /// dense. See [`quantize_map`].

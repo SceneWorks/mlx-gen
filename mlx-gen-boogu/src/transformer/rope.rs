@@ -48,27 +48,6 @@ impl RopeTables {
         from_positions(&positions, axes_dim, theta, cap_len as i32, Vec::new())
     }
 
-    /// Build the joint table for an **edit** forward with a single reference image — a thin wrapper
-    /// over [`Self::build_edit_multi`] (kept for the single-reference call sites / tests).
-    pub fn build_edit(
-        cap_len: usize,
-        ref_h: usize,
-        ref_w: usize,
-        h_tokens: usize,
-        w_tokens: usize,
-        axes_dim: usize,
-        theta: f32,
-    ) -> Self {
-        Self::build_edit_multi(
-            cap_len,
-            &[(ref_h, ref_w)],
-            h_tokens,
-            w_tokens,
-            axes_dim,
-            theta,
-        )
-    }
-
     /// Build the joint table for a **multi-reference** edit forward: `cap_len` text positions, then
     /// each reference grid `(ref_hᵢ, ref_wᵢ)` placed at t-axis `pe_shift` and advancing `pe_shift` by
     /// `max(ref_hᵢ, ref_wᵢ)` per reference (the OmniGen2 `pe_shift`), then the `h × w` target grid at

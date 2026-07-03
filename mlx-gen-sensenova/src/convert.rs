@@ -214,11 +214,20 @@ fn write_merge_marker(dst_root: &Path, lora_path: &Path, bits: i32, applied: usi
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| DISTILL_LORA_FILE.to_string());
-    let body = format!(
-        "{{\n  \"distill_merged\": true,\n  \"tier\": \"{tier}\",\n  \"lora_repo\": \
-         \"{DISTILL_LORA_REPO}\",\n  \"lora_file\": \"{lora_name}\",\n  \"targets_merged\": \
-         {applied}\n}}\n"
-    );
+    // Serialize via serde_json so `tier`/`lora_file` are always well-escaped (a `"` or `\` in a file
+    // name can't corrupt the JSON), rather than hand-formatting the object.
+    let marker = serde_json::json!({
+        "distill_merged": true,
+        "tier": tier,
+        "lora_repo": DISTILL_LORA_REPO,
+        "lora_file": lora_name,
+        "targets_merged": applied,
+    });
+    let body = serde_json::to_string_pretty(&marker).map_err(|e| {
+        Error::Msg(format!(
+            "sensenova convert: failed to serialize merge marker: {e}"
+        ))
+    })?;
     std::fs::write(dst_root.join(DISTILL_MERGED_MARKER), body)?;
     Ok(())
 }

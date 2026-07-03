@@ -71,12 +71,6 @@ pub struct LokrFile {
 }
 
 impl LokrFile {
-    /// `alpha/rank` — the scale the fork bakes into the reconstructed delta (PEFT default `alpha=rank`
-    /// ⇒ 1.0). The per-adapter user `strength` multiplies this separately at the residual/merge site.
-    pub fn delta_scale(&self) -> f32 {
-        self.alpha / self.rank
-    }
-
     /// Reconstruct one module's `[out,in]` delta at `out_dtype` from its grouped factors, baking in
     /// `alpha/rank` (the user `strength` is applied separately). `base_shape` is the target linear's
     /// logical weight shape. Returns the [`reconstruct_lokr_delta`] result.

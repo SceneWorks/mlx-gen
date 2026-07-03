@@ -201,8 +201,7 @@ fn lightning_hyper_match_torch_teacher_forced() {
     let dt = Dtype::Float16;
     let snap = snapshot();
     let cfg = DiffusionConfig::sdxl_base();
-    let sched =
-        AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end).unwrap();
+    let sched = AlphaSchedule::scaled_linear(cfg.num_train_steps, cfg.beta_start, cfg.beta_end);
 
     // NO-LoRA backend baseline: base SDXL + Euler-trailing (30-step, CFG 1), teacher-forced from
     // torch's init latent + torch's CLIP conditioning. This is the torch↔MLX SDXL U-Net backend floor

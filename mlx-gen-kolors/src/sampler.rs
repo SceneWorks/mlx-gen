@@ -108,7 +108,7 @@ impl KolorsEulerSampler {
         if num_steps == 0 {
             return Err(Error::Msg("kolors sampler: num_steps must be >= 1".into()));
         }
-        let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end)?;
+        let sched = AlphaSchedule::scaled_linear(num_train_timesteps, beta_start, beta_end);
         // Per-train-step Karras sigma √((1-ᾱ)/ᾱ) (the `alphas_cumprod` field is public).
         let full: Vec<f64> = sched
             .alphas_cumprod

@@ -242,7 +242,7 @@ impl InstantId {
                 cfg.num_train_steps,
                 cfg.beta_start,
                 cfg.beta_end,
-            )?,
+            ),
             face: None,
             pid: None,
         })

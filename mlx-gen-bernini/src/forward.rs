@@ -48,11 +48,6 @@ impl Mode {
             _ => return None,
         })
     }
-
-    /// Whether this mode routes through APG (x-space) vs a plain weighted velocity sum.
-    pub fn is_apg(self) -> bool {
-        matches!(self, Mode::T2vApg | Mode::V2vApg | Mode::R2vApg)
-    }
 }
 
 /// The packed-forward engine: holds the spatial RoPE table + the patch geometry so it can patch-embed

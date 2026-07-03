@@ -34,14 +34,6 @@ fn render_chat(system: &str, user: &str) -> String {
     format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n")
 }
 
-/// Render the ChatML string for an image-conditioned `(system, user)` turn, with the reference image
-/// block (`<|vision_start|>` + `num_image_tokens`×`<|image_pad|>` + `<|vision_end|>`) prepended to the
-/// user text — exactly the Qwen3-VL chat template + processor expansion for `content = [image, text]`
-/// (verified against the golden `input_ids`: image first, no separator, then the instruction).
-fn render_chat_with_image(system: &str, user: &str, num_image_tokens: usize) -> String {
-    render_chat_with_images(system, user, &[num_image_tokens])
-}
-
 /// Render the ChatML string for a **multi-image**-conditioned `(system, user)` turn: one bare vision
 /// block (`<|vision_start|>` + `nⱼ`×`<|image_pad|>` + `<|vision_end|>`) per reference image, in order
 /// and back-to-back (no separator, no "Picture N:" label — the reference leaves `add_vision_id` off),
@@ -107,30 +99,14 @@ impl BooguTokenizer {
         ids_to_arrays(self.encode(&render_chat(SYSTEM_PROMPT_DROP, instruction))?)
     }
 
-    /// Encode the **image-conditioned edit** instruction → `(input_ids, attention_mask)` `[1, L]`,
-    /// with the reference image's `num_image_tokens` (= merged vision tokens) `<|image_pad|>`
-    /// placeholders spliced into the user turn. The same unified TI2I system prompt
-    /// ([`SYSTEM_PROMPT_DROP`]) is used for the positive instruction and — when the reference image
-    /// is also used on the CFG-negative (`use_input_images_4_neg_instruct`) — the empty instruction.
-    /// The text encoder then replaces the `<|image_pad|>` embeddings with the vision tower's output
-    /// ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image`]).
-    pub fn encode_edit_with_image(
-        &self,
-        instruction: &str,
-        num_image_tokens: usize,
-    ) -> Result<(Array, Array)> {
-        ids_to_arrays(self.encode(&render_chat_with_image(
-            SYSTEM_PROMPT_DROP,
-            instruction,
-            num_image_tokens,
-        ))?)
-    }
-
     /// Encode a **multi-image** edit instruction → `(input_ids, attention_mask)` `[1, L]`, with one
     /// `<|image_pad|>` block per reference image (`num_image_tokens[j]` = merged vision tokens for
-    /// reference `j`). The text encoder then replaces each block with that reference's vision-tower
-    /// embeds ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image_multi`]). The single-ref
-    /// [`Self::encode_edit_with_image`] is the `num_image_tokens.len() == 1` case.
+    /// reference `j`). The same unified TI2I system prompt ([`SYSTEM_PROMPT_DROP`]) is used for the
+    /// positive instruction and — when the references are also used on the CFG-negative
+    /// (`use_input_images_4_neg_instruct`) — the empty instruction. The text encoder then replaces each
+    /// block with that reference's vision-tower embeds
+    /// ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_image_multi`]). `num_image_tokens.len()
+    /// == 1` is the single-reference edit case.
     pub fn encode_edit_with_images(
         &self,
         instruction: &str,
@@ -161,10 +137,11 @@ fn ids_to_arrays(ids: Vec<i32>) -> Result<(Array, Array)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_chat_with_image, render_chat_with_images, SYSTEM_PROMPT_DROP};
+    use super::render_chat_with_images;
 
     /// One image block per reference, back-to-back (no separator, no "Picture N:" label), each with
-    /// its own `<|image_pad|>` count, then the instruction.
+    /// its own `<|image_pad|>` count, then the instruction. The single-reference edit is the
+    /// one-element case of this render.
     #[test]
     fn multi_image_render_emits_one_block_per_reference() {
         let s = render_chat_with_images("S", "hi", &[2, 1]);
@@ -173,15 +150,6 @@ mod tests {
             "<|im_start|>system\nS<|im_end|>\n<|im_start|>user\n\
              <|vision_start|><|image_pad|><|image_pad|><|vision_end|>\
              <|vision_start|><|image_pad|><|vision_end|>hi<|im_end|>\n"
-        );
-    }
-
-    /// The single-image render is exactly the one-element case of the multi render.
-    #[test]
-    fn single_image_render_is_multi_with_one() {
-        assert_eq!(
-            render_chat_with_image(SYSTEM_PROMPT_DROP, "make it green", 64),
-            render_chat_with_images(SYSTEM_PROMPT_DROP, "make it green", &[64])
         );
     }
 }

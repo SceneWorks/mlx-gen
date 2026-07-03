@@ -907,7 +907,7 @@ mod tests {
     use super::*;
 
     fn sdxl_sched() -> AlphaSchedule {
-        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap()
+        AlphaSchedule::scaled_linear(1000, 0.00085, 0.012)
     }
 
     fn scalar1(v: f32) -> Array {
@@ -1144,7 +1144,7 @@ mod tests {
     /// path relies on (the `to_d` round-trip cancels: `d = (x − (x − σ·ε))/σ = ε`).
     #[test]
     fn run_curated_sampler_eps_euler_matches_legacy_discrete_step() {
-        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
         let ms = DiscreteModelSampling::sdxl(&sched);
         // A descending σ schedule (length steps+1, trailing 0) — not the native table, any valid ramp.
         let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];

@@ -5,7 +5,8 @@
 //!
 //! Turning the encoder-only gpt-oss into a **generating** model adds: the full 24-layer stack + final
 //! `norm` + `lm_head`, an incremental KV-cache decode ([`GptOssDecoderLayer::forward_cached`] over a
-//! per-layer [`KvCache`]), greedy / temperature sampling, the harmony `reasoning_effort="low"`
+//! per-layer [`KvCache`]), **greedy** decoding (the vendor's `temperature=0.7` sampling is NOT ported —
+//! greedy-only; tracked in sc-9561), the harmony `reasoning_effort="low"`
 //! template ([`crate::text::LensTokenizer::encode_reasoner`]), and the harmony-channel output parse
 //! ([`crate::text::clean_reasoner_output`]).
 //!
@@ -24,9 +25,9 @@ use crate::config::GptOssConfig;
 use crate::text::{LensTokenizer, HARMONY_RETURN};
 use crate::text_encoder::gpt_oss::{attention_mask, GptOssDecoderLayer, KvCache};
 
-/// Generation defaults from the vendor `PromptReasoner.__init__`.
+/// Generation default from the vendor `PromptReasoner.__init__`. (The vendor's `temperature=0.7` is
+/// not ported — this decode is greedy-only; see the module doc.)
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 
 /// The generating gpt-oss-20b model: the full decoder stack + final norm + LM head (the
 /// encoder-only [`crate::text_encoder::encoder::LensTextEncoder`] truncates the stack and drops these).

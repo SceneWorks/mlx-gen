@@ -320,22 +320,6 @@ impl Ideogram4Pipeline {
         Ok(EditInit { z0, mask, strength })
     }
 
-    /// [`tokenize`](Self::tokenize) the prompt, then [`generate`](Self::generate) — the top-level
-    /// text-to-image entry point.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_from_prompt(
-        &self,
-        prompt: &str,
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-    ) -> Result<Array> {
-        let ids = self.tokenize(prompt)?;
-        self.generate(&ids, height, width, num_steps, guidance, seed)
-    }
-
     /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
     /// `uint8` array. No progress/cancellation — see
     /// [`generate_with_progress`](Self::generate_with_progress).

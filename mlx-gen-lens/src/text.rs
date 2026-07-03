@@ -155,8 +155,6 @@ fn render_reasoner(prompt: &str, date: &str) -> String {
 
 /// Harmony stop token id — the assistant turn terminates with `<|return|>` (the model's `eos`).
 pub const HARMONY_RETURN: i32 = 200002;
-/// Harmony `<|end|>` — also terminates a message.
-pub const HARMONY_END: i32 = 200007;
 
 /// Port of the vendor `reasoner._clean_reasoner_output`: pull the **final**-channel text out of the
 /// raw harmony decode, drop any `<think>` block + residual harmony control tokens, and tidy
