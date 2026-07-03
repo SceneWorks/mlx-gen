@@ -170,13 +170,17 @@ mod tests {
             std::env::temp_dir().join(format!("mlx_gen_sd3_clip_tok_{}_{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Vocab: the two specials at their real CLIP ids, `!` at 0 (bigG's pad), plus a few
-        // `</w>`-terminated word tokens so a non-empty prompt also tokenizes without an OOV error.
+        // SINGLE-character `</w>` word tokens. The synthetic `merges.txt` has NO merges, so the
+        // char-level BPE leaves each word as its per-character sub-tokens; only single-char words
+        // (which become one `<char></w>` unigram) map to a vocab entry. A multi-char word like
+        // `"fox"` would BPE to `["f", "o", "x</w>"]` — none in this vocab — and error. So the
+        // non-empty test prompt below uses only single-char words (`"a b"`).
         let vocab = serde_json::json!({
             "!": 0,
             "<|startoftext|>": 49406,
             "<|endoftext|>": 49407,
             "a</w>": 320,
-            "fox</w>": 3363,
+            "b</w>": 321,
         });
         std::fs::write(dir.join("vocab.json"), vocab.to_string()).unwrap();
         // merges.txt: a header line + no merges (single-token words need none).
@@ -259,7 +263,14 @@ mod tests {
         // sc-9581 core regression: with a sub-77-token prompt, the bigG row must be padded with `!`
         // (0), NOT eos (49407). The pre-fix code shared one eos-padded row for both encoders.
         let tok = synthetic_clip_tokenizer();
-        let ids = clip_token_ids(&tok, "a fox").unwrap();
+        // Single-char words only (`"a b"` -> [BOS, 320, 321, EOS], len 4) so the no-merges synthetic
+        // BPE tokenizes without an OOV error; still a sub-77 prompt with a real pad region.
+        let ids = clip_token_ids(&tok, "a b").unwrap();
+        assert_eq!(
+            ids,
+            vec![49406, 320, 321, 49407],
+            "synthetic tokenize(\"a b\")"
+        );
         let l_row = pad_clip_row(&ids, 49407);
         let g_row = pad_clip_row(&ids, 0);
         eval([&l_row, &g_row]).unwrap();
