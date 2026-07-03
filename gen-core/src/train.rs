@@ -124,7 +124,9 @@ pub struct TrainingConfig {
     /// — its trainable factors, optimizer state, and step/update index — and continues from there
     /// instead of restarting at step 0. `false` (the default) always trains from scratch. Requires
     /// `save_every > 0` on the interrupted run to have produced a snapshot; a run whose target `steps`
-    /// is already reached by the snapshot is a no-op.
+    /// is already reached by the snapshot is a no-op. Resume is bit-exact when a snapshot lands on an
+    /// optimizer-update boundary (always for `gradient_accumulation = 1`; for `> 1`, use a `save_every`
+    /// that is a multiple of it) — the in-flight accumulation buffer is not snapshotted.
     pub resume: bool,
 }
 

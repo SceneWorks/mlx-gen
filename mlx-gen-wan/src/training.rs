@@ -44,6 +44,7 @@ use std::path::Path;
 use mlx_gen::adapters::AdaptableHost;
 use mlx_gen::media::Image;
 use mlx_gen::tokenizer::TextTokenizer;
+use mlx_gen::train::checkpoint;
 use mlx_gen::train::dataset::{bucket_resolution, center_crop_square};
 use mlx_gen::train::lora::{
     accumulate_grads, average_grads, build_lokr_targets, build_lora_targets, LoraParams,
@@ -581,10 +582,36 @@ impl WanMoeTrainer {
             .map(|e| format!(".{e}"))
             .unwrap_or_else(|| ".safetensors".to_string());
 
+        // --- resume (F-125): restore each expert's own optimizer + factors from its own snapshot ---
+        let mut start_step: u32 = 0;
+        if cfg.resume {
+            let mut resumed = false;
+            for st in &mut states {
+                let rstem = resume_stem(&stem, st.suffix);
+                if let Some((snapshot, _)) = checkpoint::find_latest_resume(&req.output_dir, &rstem)
+                {
+                    let (loaded, meta) = checkpoint::load_resume(&snapshot, &mut st.opt)?;
+                    st.params = loaded;
+                    st.update_idx = meta.update_idx;
+                    start_step = meta.step; // shared: every expert is snapshotted at the same global step
+                    resumed = true;
+                }
+            }
+            if resumed {
+                // Each expert's `micro` is per-expert (steps routed to it), so it is NOT the global
+                // step — replay the deterministic selection to restore it exactly (same rule as the loop).
+                for s in 1..=start_step {
+                    let ei = if dual && s % 2 == 1 { 1 } else { 0 };
+                    states[ei].micro += 1;
+                }
+                eprintln!("[F-125] wan resuming from step {start_step}");
+            }
+        }
+
         // --- train loop: alternate experts (high on odd steps, low on even — the reference's step%2) ---
         let mut last_loss = 0.0f32;
-        let mut steps_run = 0u32;
-        for step in 1..=cfg.steps {
+        let mut steps_run = start_step;
+        for step in start_step + 1..=cfg.steps {
             if req.cancel.is_cancelled() {
                 break;
             }
@@ -664,6 +691,19 @@ impl WanMoeTrainer {
                     rank,
                     cfg,
                 )?;
+                // F-125: per-expert resume bundle — each expert carries its own optimizer + factors +
+                // update index, keyed by a per-expert stem so `find_latest_resume` isolates them.
+                for st in &states {
+                    let rstem = resume_stem(&stem, st.suffix);
+                    checkpoint::save_resume(
+                        &req.output_dir,
+                        &rstem,
+                        step,
+                        st.update_idx,
+                        &st.opt,
+                        &st.params,
+                    )?;
+                }
                 on_progress(TrainingProgress::Checkpoint { step });
             }
 
@@ -815,6 +855,17 @@ fn expert_filename(stem: &str, ext: &str, suffix: &str, step: Option<u32>) -> St
         format!("{base}{ext}")
     } else {
         format!("{base}.{suffix}{ext}")
+    }
+}
+
+/// The per-expert resume-snapshot stem: the base `stem` for the dense expert, `{stem}-{suffix}` for
+/// each MoE expert (`high_noise`/`low_noise`), so `find_latest_resume`/`save_resume` isolate them
+/// (F-125). Distinct from the adapter [`expert_filename`], which the user consumes.
+fn resume_stem(stem: &str, suffix: &str) -> String {
+    if suffix.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{stem}-{suffix}")
     }
 }
 

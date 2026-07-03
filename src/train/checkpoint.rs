@@ -8,6 +8,13 @@
 //! continued with [`find_latest_resume`] + [`load_resume`] rather than restarting at step 0. The
 //! trainable factors are snapshotted **keyed exactly as the trainer holds them**, so reload is a
 //! direct round-trip with no per-family key remapping.
+//!
+//! **Exactness bound.** The snapshot captures the factors + optimizer state + step/update index — but
+//! NOT the in-flight gradient-accumulation buffer. Resume is therefore **bit-exact when the snapshot
+//! lands on an optimizer-update boundary**: always for `gradient_accumulation = 1` (the default —
+//! validated bit-exact on real SDXL), and for `> 1` when `save_every` is a multiple of it. A snapshot
+//! taken mid-accumulation-window drops that window's partial gradients — a bounded drift affecting only
+//! the first post-resume update (training still continues correctly, just not bit-identically).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -238,6 +245,43 @@ mod tests {
         let mut rose = TrainOptimizer::from_config("rose", 1e-3, 0.0).unwrap();
         let err = load_resume(&found, &mut rose).unwrap_err().to_string();
         assert!(err.contains("optimizer 'adamw'"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The wan dual-expert trainer snapshots each expert under a per-expert stem (`{stem}`,
+    /// `{stem}-high_noise`, `{stem}-low_noise`) in ONE `output_dir`. `find_latest_resume` must isolate
+    /// them: a lookup for the base stem must NOT match a suffixed expert's snapshot (F-125 / sc-9651).
+    #[test]
+    fn find_latest_resume_isolates_per_expert_stems() {
+        let dir = std::env::temp_dir().join("mlxgen_resume_isolation_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = |v: f32| -> LoraParams {
+            std::iter::once((Rc::from("blk.lora_A"), Array::from_slice(&[v], &[1]))).collect()
+        };
+        let opt = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+
+        // A dense stem plus the two MoE expert stems, all at step 40, in the same directory.
+        save_resume(&dir, "lora", 40, 20, &opt, &one(1.0)).unwrap();
+        save_resume(&dir, "lora-high_noise", 40, 20, &opt, &one(2.0)).unwrap();
+        save_resume(&dir, "lora-low_noise", 40, 20, &opt, &one(3.0)).unwrap();
+
+        // Each lookup resolves ONLY its own stem's snapshot (no cross-match on the `-` boundary).
+        for (stem, want) in [
+            ("lora", 1.0),
+            ("lora-high_noise", 2.0),
+            ("lora-low_noise", 3.0),
+        ] {
+            let (found, step) = find_latest_resume(&dir, stem).expect("resume for stem");
+            assert_eq!(step, 40);
+            let mut o = TrainOptimizer::from_config("adamw", 1e-3, 0.0).unwrap();
+            let (loaded, _) = load_resume(&found, &mut o).unwrap();
+            assert_eq!(
+                loaded["blk.lora_A"].as_slice::<f32>()[0],
+                want,
+                "stem {stem} loaded the wrong expert's factors"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
