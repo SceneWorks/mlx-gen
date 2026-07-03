@@ -94,7 +94,7 @@ pub struct LoadSpec {
     /// only providers whose latent space has a PiD backbone read it (Qwen-Image / Krea today —
     /// sc-7845), and they ignore it when the request does not request PiD.
     pub pid: Option<PidWeights>,
-    /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, F-114) — the
+    /// Auxiliary **identity-conditioning** sub-model weights (PuLID / InstantID family, sc-8827) — the
     /// EVA-CLIP tower, the identity encoder checkpoint, and the native face-analysis weight dir that a
     /// face-ID provider needs on top of its diffusion backbone. `None` for a plain base model; the
     /// PuLID-FLUX loader reads it, falling back to its historical `PULID_*` env vars only when unset,
