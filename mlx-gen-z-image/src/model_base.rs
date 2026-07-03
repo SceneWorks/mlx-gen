@@ -25,13 +25,11 @@
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
-    Capabilities, ConditioningKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
-    Result, WeightsSource,
+    Capabilities, ConditioningKind, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator,
+    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
 };
 use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
 
-use crate::loader;
 use crate::model::validate_request;
 use crate::pipeline::{self, denoise_cfg_with_progress, encode_init_latents, init_time_step};
 use crate::text_encoder::TextEncoder;
@@ -116,45 +114,22 @@ pub struct ZImage {
 /// schedule + CFG differ. `spec.quantize` (Q4/Q8) quantizes the **whole model** after the dense bf16
 /// load, exactly as Turbo.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
-             internally (drop the precision override)"
-                .into(),
-        ));
-    }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => return Err(Error::Msg(
-            "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
-                 not a single .safetensors file"
-                .into(),
-        )),
-    };
-    let mut transformer = loader::load_transformer(root)?;
-    let mut text_encoder = loader::load_text_encoder(root)?;
-    let mut vae = loader::load_vae(root)?;
-    if let Some(q) = spec.quantize {
-        let bits = q.bits();
-        transformer.quantize(bits)?;
-        text_encoder.quantize(bits)?;
-        vae.quantize(bits)?;
-    }
-    if !spec.adapters.is_empty() {
-        crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
-    }
-    let pid = spec
-        .pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()?;
+    // F-090: the non-control load body is byte-identical to the plain Turbo loader (same loaders,
+    // whole-model quant order, adapter path, PiD overlay); share it, passing only the per-id error text.
+    let c = crate::model::load_components(
+        spec,
+        "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
+         internally (drop the precision override)",
+        "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+                 not a single .safetensors file",
+    )?;
     Ok(Box::new(ZImage {
         descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(root)?,
-        text_encoder,
-        transformer,
-        vae,
-        pid,
+        tokenizer: c.tokenizer,
+        text_encoder: c.text_encoder,
+        transformer: c.transformer,
+        vae: c.vae,
+        pid: c.pid,
     }))
 }
 
@@ -325,6 +300,7 @@ mod tests {
 
     #[test]
     fn load_rejects_single_file_source() {
+        use mlx_gen::WeightsSource;
         let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");

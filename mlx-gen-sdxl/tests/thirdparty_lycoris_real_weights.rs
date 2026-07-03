@@ -7,26 +7,13 @@
 //! `networkType`) resolves against the real UNet module names and folds a delta into the weight. Run:
 //!   SDXL_SNAPSHOT=… cargo test -p mlx-gen-sdxl --test thirdparty_lycoris_real_weights -- --ignored --nocapture
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::{AdapterKind, AdapterSpec};
 use mlx_gen_sdxl::{apply_sdxl_adapters, load_unet};
 use mlx_rs::Array;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 #[test]
 #[ignore = "needs real SDXL weights"]

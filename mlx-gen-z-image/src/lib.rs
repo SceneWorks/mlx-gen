@@ -71,58 +71,17 @@ pub use training::{LoraTarget, ZImageTurboTrainer};
 pub use transformer::{ZImageTransformer, ZImageTransformerConfig};
 pub use transformer_block::{ZImageBlockConfig, ZImageTransformerBlock};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the DiT's fusable elementwise *glue* —
-/// the SwiGLU FFN activation (`silu(h1)·h3`), the gated residuals (`x+gate·norm(out)`), the complex
-/// RoPE rotation, and the control-branch hint injection (`x+hint·scale`) — runs through `mx.compile`
-/// so MLX fuses each chain into a single Metal kernel (vs one kernel per primitive op when eager).
-/// The big GEMMs / SDPA / `mx.fast` RMSNorms stay eager, and the tiny adaLN scale/gate ops are left
-/// eager (no fusion to win). **Bit-exact** to the eager form. **Enabled by the production denoise
-/// loops** (turbo + control, [`pipeline`]); left **off by default** so the reference-parity gates run
-/// eager. The **mixed-precision dtype flow is preserved** — base bf16, f32 `control_context` (sc-2720):
-/// the compiled closures cast nothing the eager form didn't, so dtype flows from inputs unchanged.
-///
-/// **Concurrency (F-087):** correct under the single-threaded MLX-device model — one generate runs on
-/// the device at a time — so `Relaxed` suffices (no cross-thread ordering to establish) and
-/// [`CompileGlueGuard`] restores the prior value on drop, so the flag IS reset between renders. A
-/// future concurrent caller would need `SeqCst` + strict per-call scoping; revisit before adding one.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; set before the denoise loop.
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// RAII guard (sc-4036 / F-036) that enables compiled glue for its lifetime and restores the prior
-/// `COMPILE_GLUE` value on drop. The production render holds one across the whole count loop so the
-/// toggle is set once (not redundantly per image) and — unlike a bare [`set_compile_glue`]`(true)`
-/// that leaked the process-global on — code running after `generate` returns (e.g. the
-/// reference-parity gates the doc above promises run eager) sees the toggle restored, even on an
-/// early `?` return.
-#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
-pub(crate) struct CompileGlueGuard {
-    prev: bool,
-}
-
-impl CompileGlueGuard {
-    /// Turn compiled glue on, remembering the prior value to restore on drop.
-    pub(crate) fn enable() -> Self {
-        Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for CompileGlueGuard {
-    fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
-    }
-}
+// sc-2963 compiled-glue toggle (rollout of the Wan sc-2957 template): when on, the DiT's fusable
+// elementwise *glue* — the SwiGLU FFN activation (`silu(h1)·h3`), the gated residuals
+// (`x+gate·norm(out)`), the complex RoPE rotation, and the control-branch hint injection
+// (`x+hint·scale`) — runs through `mx.compile` so MLX fuses each chain into a single Metal kernel.
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own
+// `AtomicBool`. **Bit-exact** to the eager form; **enabled by the production denoise loops** (turbo +
+// control, [`pipeline`]); left **off by default** so the reference-parity gates run eager. The
+// mixed-precision dtype flow (base bf16, f32 `control_context`, sc-2720) is preserved unchanged.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 #[cfg(test)]
 mod compile_glue_guard_tests {

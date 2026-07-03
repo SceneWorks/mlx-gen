@@ -19,25 +19,14 @@
 //! ```
 //! Override geometry with `SDXL_PERF_SIZE` (square px, default 1024) / `SDXL_PERF_BATCH` (default 2).
 
-use std::path::PathBuf;
+mod common;
+
 use std::time::Instant;
 
 use mlx_gen_sdxl::{load_unet_dtype, set_compile_glue};
 use mlx_rs::{random, Array, Dtype};
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-}
+use common::snapshot_opt as snapshot;
 
 fn env_i32(var: &str, default: i32) -> i32 {
     std::env::var(var)

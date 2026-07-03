@@ -5,6 +5,8 @@
 //! and this gates the whole-forward composition on the tiny seeded S5 weights, in CI, no real
 //! checkpoint).
 
+mod common;
+
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::transformer::set_compile_glue;
@@ -34,12 +36,7 @@ fn load(name: &str) -> Weights {
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
 
-fn max_abs(got: &[f32], exp: &[f32]) -> f32 {
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0f32, f32::max)
-}
+use common::max_abs;
 
 #[test]
 fn compiled_glue_bit_identical_to_eager() {

@@ -66,58 +66,20 @@ pub use unet::{ControlNet, ControlResiduals, UNet2DConditionModel};
 pub use vae::Autoencoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the UNet's remaining fusable elementwise
-/// glue — the **SiLU** activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output
-/// head) — runs through `mx.compile`, fusing each into one kernel. The GEGLU/erf-GELU activations are
-/// **already** `mx.compile`'d in core `nn` (`gelu_exact`/`gelu_quick`, sc-2721), and the GEGLU
-/// `multiply` is a single op (no fusion to win), so SiLU is the only chain left.
-///
-/// ⚠️ SDXL is **fp16 and precision-load-bearing** ([[sdxl-fp16-sc2721]]): a fused fp16 kernel can round
-/// differently from the same ops unfused (that 1-ULP gap is exactly why `gelu_exact` is compiled). The
-/// reference runs SiLU eager, so the fp16 golden matches **eager** SiLU — fusing SiLU is only safe if
-/// it is **bit-identical** to eager. It is: `tests/compile_parity.rs` proves `max|Δ| = 0` for the
-/// compiled SiLU in fp16 AND f32 (the fused `sigmoid`+`multiply` rounds identically — unlike the
-/// erf/divide GELU chain). So enabling it cannot move the golden. The VAE SiLUs (f32, once per
-/// generation, outside the denoise loop) are left eager. **Enabled by the production denoise loop**
-/// ([`pipeline::denoise`]); **off by default**.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; prefer the scoped
-/// [`CompileGlueGuard`] in production (the raw setter is for the A/B `compile_parity`/`perf` gates).
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// RAII guard (F-006/F-007, mirroring core `mlx_gen::nn::CompileGlueGuard` and z-image's) that enables
-/// compiled glue for its lifetime and **restores the prior [`COMPILE_GLUE`] value on drop** — even on
-/// an early `?`. The production [`pipeline::denoise`](crate::pipeline::denoise) binds one across the
-/// render so the toggle is scoped, not left stuck `true` process-wide, and same-process eager code
-/// (the `compile_parity`/`perf` gates) sees the restored value.
-#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
-pub(crate) struct CompileGlueGuard {
-    prev: bool,
-}
-
-impl CompileGlueGuard {
-    /// Turn compiled glue on, remembering the prior value to restore on drop.
-    pub(crate) fn enable() -> Self {
-        Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for CompileGlueGuard {
-    fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
-    }
-}
+// sc-2963 compiled-glue toggle: when on, the UNet's remaining fusable elementwise glue — the **SiLU**
+// activations (`x·sigmoid(x)`: ResNet GN→SiLU, the time-embedding MLP, the output head) — runs through
+// `mx.compile`, fusing each into one kernel. The GEGLU/erf-GELU activations are already `mx.compile`'d
+// in core `nn`, so SiLU is the only chain left.
+//
+// ⚠️ SDXL is **fp16 and precision-load-bearing** ([[sdxl-fp16-sc2721]]): the reference runs SiLU eager,
+// so the fp16 golden matches **eager** SiLU — fusing SiLU is only safe because it is **bit-identical**
+// to eager (`tests/compile_parity.rs` proves `max|Δ|=0` in fp16 AND f32). **Enabled by the production
+// denoise loop** ([`pipeline::denoise`]); **off by default**.
+//
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// SiLU `x·sigmoid(x)` — one fused kernel when the sc-2963 glue toggle is on, else the eager core
 /// [`mlx_gen::nn::silu`]. Bit-identical to eager in fp16 AND f32 (proven `max|Δ|=0`,

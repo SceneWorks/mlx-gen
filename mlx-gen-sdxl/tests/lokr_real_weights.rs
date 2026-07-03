@@ -8,6 +8,8 @@
 //! Gates: merge count (16 synthesized modules); render parity vs the reference (cross-build floor);
 //! scale-0 bit-exact no-op; **stacks with LoRA** (LCM-LoRA 515 + LoKr 16 = 531, render parity).
 
+mod common;
+
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
@@ -24,20 +26,7 @@ fn golden(name: &str) -> Weights {
     Weights::from_file(&p).unwrap()
 }
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn spec(g: &Weights, key: &str, scale: f32, kind: AdapterKind) -> AdapterSpec {
     AdapterSpec {

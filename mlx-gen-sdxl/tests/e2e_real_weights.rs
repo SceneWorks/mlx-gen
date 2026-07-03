@@ -13,7 +13,7 @@
 //!   to the reference draw-for-draw. These pinned the one-ULP prior-op-order bug behind an apparent
 //!   "chaotic" divergence (sc-2400 S5).
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource};
@@ -36,20 +36,7 @@ const GOLDEN: &str = concat!(
 /// same dtype so they reproduce the fp16 golden's intermediates.
 const DT: Dtype = Dtype::Float16;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn peak_rel(a: &Array, b: &Array) -> f32 {
     let n = b.shape().iter().product::<i32>();

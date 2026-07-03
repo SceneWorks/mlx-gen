@@ -13,8 +13,10 @@
 
 use std::path::Path;
 
-use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
-use mlx_gen::{Error, Result};
+use mlx_gen::quant::{
+    copy_dir, copy_turnkey_assets, load_dir_map, quantize_map, save_map, write_quantized_config,
+};
+use mlx_gen::Result;
 
 use crate::quant::GROUP_SIZE;
 
@@ -64,25 +66,6 @@ fn is_vae_target(base: &str) -> bool {
 // Per-component dir converters.
 // ============================================================================================
 
-/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}`
-/// block added (HF/diffusers-compat; the Rust loaders auto-detect via `{base}.scales` and ignore
-/// it). A missing source config starts from an empty object.
-fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
-    let src_cfg = src.join("config.json");
-    let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
-            .map_err(|e| Error::Msg(format!("z-image: parse {}: {e}", src_cfg.display())))?
-    } else {
-        serde_json::json!({})
-    };
-    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
-    let text = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Msg(format!("z-image: serialize config.json: {e}")))?;
-    std::fs::create_dir_all(dst)?;
-    std::fs::write(dst.join("config.json"), text)?;
-    Ok(())
-}
-
 /// Pre-quantize the DiT `transformer` dir (sharded `*.safetensors` + `config.json`) → a packed
 /// `model.safetensors` + annotated `config.json` in `dst`. `bits` = 4 (Q4) or 8 (Q8); group size is
 /// the codebase default 64. Packs every Linear, leaves the RMSNorms / pad tokens dense.
@@ -116,26 +99,6 @@ pub fn quantize_z_image_vae(src: &Path, dst: &Path, bits: i32) -> Result<()> {
     write_quantized_config(src, dst, bits, GROUP_SIZE)
 }
 
-/// Recursively copy a directory's files (one level of nesting is enough for the tokenizer/scheduler
-/// dirs).
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir(&path, &target)?;
-        } else {
-            // Resolve symlinks (HF snapshots symlink into `../../blobs/…`) to real bytes so the
-            // assembled tier is self-contained.
-            let real = std::fs::canonicalize(&path)?;
-            std::fs::copy(&real, &target)?;
-        }
-    }
-    Ok(())
-}
-
 /// Assemble a full pre-quantized turnkey snapshot in `dst_root`: pack the transformer, text encoder,
 /// and VAE, and copy the dense tokenizer / scheduler / `model_index.json` verbatim. The result loads
 /// via [`crate::model::load`] (the packed weights auto-detect) with no dense transient. Pass a `bits`
@@ -160,14 +123,8 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
             copy_dir(&s, &dst_root.join(rel))?;
         }
     }
-    for f in ["model_index.json", "LICENSE.md", "LICENSE", "README.md"] {
-        let s = src_root.join(f);
-        if s.exists() {
-            let real = std::fs::canonicalize(&s)?;
-            std::fs::copy(&real, dst_root.join(f))?;
-        }
-    }
-    Ok(())
+    // Canonical non-weight asset tail (incl. `LICENSE.txt`, previously dropped here — F-045 drift fix).
+    copy_turnkey_assets(src_root, dst_root)
 }
 
 #[cfg(test)]

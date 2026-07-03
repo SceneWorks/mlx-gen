@@ -117,22 +117,50 @@ pub struct ZImageTurbo {
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    let c = load_components(
+        spec,
+        "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
+         runs f32 internally (drop the precision override)",
+        "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
+         transformer/ vae/), not a single .safetensors file",
+    )?;
+    Ok(Box::new(ZImageTurbo {
+        descriptor: descriptor(),
+        tokenizer: c.tokenizer,
+        text_encoder: c.text_encoder,
+        transformer: c.transformer,
+        vae: c.vae,
+        pid: c.pid,
+    }))
+}
+
+/// The non-control Z-Image model components loaded from a snapshot — the shared body of the plain
+/// [`load`] and the full-model [`crate::model_base::load`] (F-090). Both build the identical set with
+/// the identical loaders, quantize order, adapter path and PiD overlay; they differ only in the model
+/// struct they wrap these in, the descriptor, and the two precision/file error strings (passed in).
+pub(crate) struct ZImageComponents {
+    pub tokenizer: TextTokenizer,
+    pub text_encoder: TextEncoder,
+    pub transformer: ZImageTransformer,
+    pub vae: Vae,
+    pub pid: Option<PidEngine>,
+}
+
+/// Shared non-control load body (F-090): precision guard → resolve the snapshot dir → dense load of
+/// transformer/text-encoder/VAE → whole-model Q4/Q8 → LoRA/LoKr residuals → optional PiD overlay.
+/// Byte-identical to the block the plain-Turbo and full-model loaders each open-coded; the only
+/// per-variant text (the precision override + single-file rejection messages) is passed in.
+pub(crate) fn load_components(
+    spec: &LoadSpec,
+    precision_msg: &str,
+    file_msg: &str,
+) -> Result<ZImageComponents> {
     if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "z_image_turbo: only dense bf16 is wired in the Rust port; the text encoder already \
-             runs f32 internally (drop the precision override)"
-                .into(),
-        ));
+        return Err(Error::Msg(precision_msg.into()));
     }
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(
-                "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
-                 transformer/ vae/), not a single .safetensors file"
-                    .into(),
-            ))
-        }
+        WeightsSource::File(_) => return Err(Error::Msg(file_msg.into())),
     };
     // Q4/Q8 quantizes the **whole model** in place after the dense bf16 load — the fork's
     // `nn.quantize` over (transformer, text_encoder, vae), group_size 64, every quantizable Linear
@@ -162,14 +190,14 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         .as_ref()
         .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
         .transpose()?;
-    Ok(Box::new(ZImageTurbo {
-        descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(root)?,
+    let tokenizer = loader::load_tokenizer(root)?;
+    Ok(ZImageComponents {
+        tokenizer,
         text_encoder,
         transformer,
         vae,
         pid,
-    }))
+    })
 }
 
 mlx_gen::impl_generator!(ZImageTurbo {

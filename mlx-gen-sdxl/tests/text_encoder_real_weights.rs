@@ -9,7 +9,7 @@
 //! `te2.pooled` (projected EOS). Reference + Rust both f32, so tolerances are tight — this isolates
 //! the encoder math (the production fp16 rounding is absorbed into the e2e gate, S5).
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::{load_text_encoder_1, load_text_encoder_2};
@@ -21,20 +21,7 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/sdxl_text_encoder_golden.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Peak-relative error `max|a-b| / max|b|`.
 fn peak_rel(a: &Array, b: &Array) -> f32 {

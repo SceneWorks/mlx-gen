@@ -18,7 +18,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
-use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
+use mlx_gen::quant::{
+    copy_asset, copy_dir, load_dir_map, quantize_map, save_map, write_quantized_config,
+};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 use mlx_rs::Array;
@@ -305,30 +307,6 @@ fn quantize_targets(
     })
 }
 
-/// Copy `src_dir/config.json` to `dst_dir/config.json` with a `"quantization": {bits, group_size}`
-/// manifest block added (informational; the loader auto-detects packed weights per-key). A missing
-/// source config starts empty.
-fn write_quantized_config(
-    src_dir: &Path,
-    dst_dir: &Path,
-    bits: i32,
-    group_size: i32,
-) -> Result<()> {
-    let src_cfg = src_dir.join("config.json");
-    let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
-            .map_err(|e| Error::Msg(format!("krea: parse {}: {e}", src_cfg.display())))?
-    } else {
-        serde_json::json!({})
-    };
-    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
-    let text = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Msg(format!("krea: serialize config.json: {e}")))?;
-    std::fs::create_dir_all(dst_dir)?;
-    std::fs::write(dst_dir.join("config.json"), text)?;
-    Ok(())
-}
-
 /// Offline one-shot: read the dense `{src_root}/transformer/` (all shards) and write a pre-quantized
 /// `{dst_root}/transformer/diffusion_pytorch_model.safetensors` (packed Q4/Q8) + `config.json`.
 pub fn quantize_transformer(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
@@ -380,33 +358,13 @@ fn read_te_num_layers(src_root: &Path) -> Result<usize> {
         .unwrap_or(36))
 }
 
-/// Copy a single file `src → dst` (creating `dst`'s parent).
-fn copy_file(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::copy(src, dst).map_err(|e| {
-        Error::Msg(format!(
-            "krea turnkey copy {} → {}: {e}",
-            src.display(),
-            dst.display()
-        ))
-    })?;
-    Ok(())
-}
-
-/// Copy every regular file in `src_dir` (non-recursive) into `dst_dir`. Missing source = no-op.
-fn copy_dir_flat(src_dir: &Path, dst_dir: &Path) -> Result<()> {
-    if !src_dir.exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(dst_dir)?;
-    for entry in std::fs::read_dir(src_dir)? {
-        let path = entry?.path();
-        if path.is_file() {
-            let name = path.file_name().expect("dir entry has a name");
-            copy_file(&path, &dst_dir.join(name))?;
-        }
+/// Copy the dense component dir `{src_root}/{rel}` → `{dst_root}/{rel}` if it exists, via the shared
+/// symlink-resolving [`copy_dir`] (F-045: krea's copy previously did not deref HF-cache symlinks).
+/// Missing source = no-op.
+fn copy_component_dir(src_root: &Path, dst_root: &Path, rel: &str) -> Result<()> {
+    let src = src_root.join(rel);
+    if src.exists() {
+        copy_dir(&src, &dst_root.join(rel))?;
     }
     Ok(())
 }
@@ -429,13 +387,10 @@ fn copy_dir_flat(src_dir: &Path, dst_dir: &Path) -> Result<()> {
 pub fn assemble_quantized_snapshot(src_root: &Path, dst_root: &Path, bits: i32) -> Result<()> {
     quantize_transformer(src_root, dst_root, bits)?;
     quantize_text_encoder(src_root, dst_root, bits)?;
-    copy_dir_flat(&src_root.join("vae"), &dst_root.join("vae"))?;
-    copy_dir_flat(&src_root.join("tokenizer"), &dst_root.join("tokenizer"))?;
-    copy_dir_flat(&src_root.join("scheduler"), &dst_root.join("scheduler"))?;
-    let idx = src_root.join("model_index.json");
-    if idx.exists() {
-        copy_file(&idx, &dst_root.join("model_index.json"))?;
-    }
+    copy_component_dir(src_root, dst_root, "vae")?;
+    copy_component_dir(src_root, dst_root, "tokenizer")?;
+    copy_component_dir(src_root, dst_root, "scheduler")?;
+    copy_asset(src_root, dst_root, "model_index.json")?;
     Ok(())
 }
 

@@ -16,6 +16,8 @@
 //!   class as base T2I, slightly amplified by the extra delta matmul through the ancestral sampler).
 //! - `scale_zero_lora_is_bit_exact_noop` — a scale-0 LoRA leaves the render bit-identical to base.
 
+mod common;
+
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
@@ -33,20 +35,7 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/sdxl_lora_fp16_golden.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// The LoRA path is recorded in the golden metadata (so the test always matches the dumped golden).
 fn lora_spec(g: &Weights, scale: f32) -> AdapterSpec {

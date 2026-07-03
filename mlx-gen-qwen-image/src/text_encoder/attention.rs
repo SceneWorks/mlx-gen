@@ -2,10 +2,9 @@
 //! o_proj, HF half-split RoPE, masked SDPA. No per-head q_norm/k_norm (that's Qwen3 / Z-Image).
 
 use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{add, broadcast_to, concatenate_axis, multiply, split};
 use mlx_rs::Array;
 
-use mlx_gen::nn::linear;
+use mlx_gen::nn::{apply_text_rope as apply_rope, linear, repeat_kv};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
@@ -82,26 +81,5 @@ impl QwenTextAttention {
         matmul_t(&o, &self.o_w)
     }
 }
-
-/// HF half-split RoPE: `x*cos + rotate_half(x)*sin`, `rotate_half(x) = [-x2, x1]`. `cos`/`sin`
-/// `[1,s,hd]` → broadcast over heads (axis 2).
-fn apply_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
-    let cos = cos.expand_dims(2)?; // [1,s,1,hd]
-    let sin = sin.expand_dims(2)?;
-    let parts = split(x, 2, 3)?; // halves along the head dim
-    let rot = concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
-    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
-}
-
-/// Expand `[b,s,hkv,hd]` → `[b,s,hkv*groups,hd]`, repeating each kv head `groups` times
-/// consecutively (matching `mx.repeat(x, groups, axis=2)`).
-fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, s, hkv, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(3)?; // [b,s,hkv,1,hd]
-    let x = broadcast_to(&x, &[b, s, hkv, groups, hd])?;
-    Ok(x.reshape(&[b, s, hkv * groups, hd])?)
-}
+// F-078: the HF half-split RoPE apply + GQA `repeat_kv` were open-coded identically here and in the
+// Krea TE; both now come from `mlx_gen::nn::{apply_text_rope, repeat_kv}`.

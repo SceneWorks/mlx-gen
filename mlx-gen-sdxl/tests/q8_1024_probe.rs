@@ -11,25 +11,12 @@
 //! `#[ignore]`d — needs the SDXL base snapshot. Run:
 //!   cargo test -p mlx-gen-sdxl --release --test q8_1024_probe -- --ignored --nocapture
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, WeightsSource};
 use mlx_gen_sdxl as _;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn std_dev(img: &Image) -> f32 {
     let n = img.pixels.len() as f64;

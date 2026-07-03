@@ -24,8 +24,6 @@
 //! is **0.31.2** (which reworked the NAX bf16 kernels), so bf16 parity is exact only up to that
 //! cross-version kernel difference (f32 is bit-exact across the two) until the pin moves to 0.31.2.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use mlx_gen::adapters::{AdaptableHost, AdaptableLinear, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::train::lora::LoraParams;
@@ -45,50 +43,17 @@ use crate::patchify::{patchify, unpatchify};
 use crate::rope::RopeTable;
 use crate::text_encoder::gelu_tanh;
 
-/// sc-2957: when on, the Wan DiT's fusable elementwise *glue* (adaLN affine, gated residual,
-/// gated-GELU FFN activation, RoPE rotation) runs through `mx.compile` so MLX fuses each chain into a
-/// single kernel (vs one Metal kernel per primitive op when eager) — **bit-exact** and **+14.1% /
-/// step** at production geometry (480p×25f A14B: 23.07→19.81 s/step, matching Python's whole-model
-/// `mx.compile` ceiling; `tests/perf.rs`). **Enabled by the production denoise loops** ([`denoise`](
-/// crate::pipeline::denoise) / [`denoise_moe`](crate::pipeline::denoise_moe)); left **off by default**
-/// so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2957). Process-global; prefer the scoped
-/// [`CompileGlueGuard`] in production (the raw setter is for the A/B `compile_parity`/`perf` gates).
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// RAII guard (F-006/F-007, mirroring core `mlx_gen::nn::CompileGlueGuard` and z-image's) that enables
-/// compiled glue for its lifetime and **restores the prior [`COMPILE_GLUE`] value on drop** — even on
-/// an early `?`. The production denoise loops ([`denoise`](crate::pipeline::denoise) /
-/// [`denoise_moe`](crate::pipeline::denoise_moe)) bind one across the render so the toggle is scoped,
-/// not left stuck `true` process-wide, and same-process eager code (the `compile_parity`/`perf` gates)
-/// sees the restored value.
-#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
-pub(crate) struct CompileGlueGuard {
-    prev: bool,
-}
-
-impl CompileGlueGuard {
-    /// Turn compiled glue on, remembering the prior value to restore on drop.
-    pub(crate) fn enable() -> Self {
-        Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for CompileGlueGuard {
-    fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
-    }
-}
+// sc-2957: when on, the Wan DiT's fusable elementwise *glue* (adaLN affine, gated residual,
+// gated-GELU FFN activation, RoPE rotation) runs through `mx.compile` so MLX fuses each chain into a
+// single kernel (vs one Metal kernel per primitive op when eager) — **bit-exact** and **+14.1% /
+// step** at production geometry. **Enabled by the production denoise loops** ([`denoise`](
+// crate::pipeline::denoise) / [`denoise_moe`](crate::pipeline::denoise_moe)); left **off by default**
+// so the tiny reference-parity gates run the eager form and `compile_parity.rs` can A/B both.
+//
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// adaLN affine `m·(1+e_scale)+e_shift` — one fused kernel when compiled, else 2 eager ops. The
 /// `mx.compile` graph is bit-exact to the eager form (proven `max|Δ|=0`, `tests/compile_micro.rs`).

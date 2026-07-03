@@ -17,6 +17,8 @@
 //!   px>8 vs the torch image (from `dump_sdxl_accel_golden.py render`). Interpreted against the
 //!   ancestral baseline torch↔MLX gap, also printed.
 
+mod common;
+
 use std::path::PathBuf;
 
 use mlx_rs::{Array, Dtype};
@@ -27,20 +29,7 @@ use mlx_gen::{
 };
 use mlx_gen_sdxl as _;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// The newest snapshot file for an HF repo whose basename matches `file` (the LoRA `.safetensors`).
 fn cache_file(repo: &str, file: &str) -> PathBuf {

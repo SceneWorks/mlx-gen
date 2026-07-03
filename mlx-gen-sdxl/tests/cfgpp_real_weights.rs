@@ -8,6 +8,8 @@
 //! `#[ignore]`d — needs the real `stabilityai/stable-diffusion-xl-base-1.0` snapshot:
 //!   SDXL_SNAPSHOT=/path cargo test -p mlx-gen-sdxl --release --test cfgpp_real_weights -- --ignored --nocapture
 
+mod common;
+
 use std::path::PathBuf;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
@@ -22,19 +24,7 @@ const PROMPT: &str =
 /// A CFG++-compatible base solver (euler/ddim/dpmpp_2m); the curated path drives `dpmpp_2m_cfg++`.
 const SAMPLER: &str = "dpmpp_2m";
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-}
+use common::snapshot_opt as snapshot;
 
 fn render(cfg: f32, guidance_method: Option<&str>) -> Image {
     let root = snapshot().expect("SDXL snapshot");

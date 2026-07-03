@@ -84,62 +84,20 @@ pub use vae::LtxVideoVae;
 // accidental `use mlx_gen_ltx::Generator` would then compile and mean the wrong thing (F-059).
 pub use vocoder::{Generator as VocoderGenerator, LtxVocoder, VocoderWithBwe};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the AvDiT's fusable elementwise *glue* —
-/// adaLN affine (`x·(1+scale)+shift`), the gated residuals (`x+out·gate`), the **tanh-GELU FFN
-/// activation**, and the split (rotate-halves) RoPE rotation — runs through `mx.compile` so MLX fuses
-/// each chain into a single Metal kernel. The big quantized GEMMs / SDPA / `mx.fast` norms stay eager.
-///
-/// This is the same machine that gave Wan **+14%/step**: at video sequence the FFN GELU runs on a
-/// `[B, S, ffn]` tensor of tens-to-hundreds of millions of elements (S up to ~15k at 1280×720), so
-/// fusing its ~8 elementwise ops into one kernel is the dominant win. **Bit-exact** to the eager form.
-/// **Enabled by the production denoise loops** ([`pipeline::denoise`] / [`pipeline::denoise_av`]);
-/// **off by default** so the reference-parity gates run eager. Dtype-preserving (the closures cast
-/// nothing) — the f32 / bf16 / quantized compute paths flow through unchanged.
-///
-/// **Concurrency / single-job invariant (F-007, matches core `mlx_gen::nn` + z-image/qwen):** this is
-/// a process-global `AtomicBool` shared by every in-process render; the `Relaxed` ordering and the
-/// [`CompileGlueGuard`] scoping below are correct only under the one-job-per-thread /
-/// `RUST_TEST_THREADS=1` model — one render on the shared MLX device at a time. A future concurrent
-/// caller would need `SeqCst` + strict per-call scoping (mirroring the thread-local `RopeMemo`);
-/// revisit before adding one.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; prefer the scoped
-/// [`CompileGlueGuard`] in production (the raw setter is for the A/B parity/perf gates).
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// RAII guard (sc-4045 / F-049) that enables compiled glue for its lifetime and restores the prior
-/// `COMPILE_GLUE` value on drop. The production `generate_*_latents` entry points hold one across the
-/// render so the toggle is enabled once and — unlike a bare [`set_compile_glue`]`(true)` that leaked
-/// the process-global on — code running after the generate returns (e.g. the reference-parity gates
-/// the doc above promises run eager) sees the toggle restored, even on an early `?` return.
-#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
-pub(crate) struct CompileGlueGuard {
-    prev: bool,
-}
-
-impl CompileGlueGuard {
-    /// Turn compiled glue on, remembering the prior value to restore on drop.
-    pub(crate) fn enable() -> Self {
-        Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for CompileGlueGuard {
-    fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
-    }
-}
+// sc-2963 (rollout of the Wan sc-2957 template): when on, the AvDiT's fusable elementwise *glue* —
+// adaLN affine (`x·(1+scale)+shift`), the gated residuals (`x+out·gate`), the **tanh-GELU FFN
+// activation**, and the split (rotate-halves) RoPE rotation — runs through `mx.compile` so MLX fuses
+// each chain into a single Metal kernel. The big quantized GEMMs / SDPA / `mx.fast` norms stay eager.
+//
+// This is the same machine that gave Wan **+14%/step**. **Bit-exact** to the eager form. **Enabled by
+// the production denoise loops** ([`pipeline::denoise`] / [`pipeline::denoise_av`]); **off by default**
+// so the reference-parity gates run eager. Dtype-preserving — f32 / bf16 / quantized paths flow through
+// unchanged.
+//
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 #[cfg(test)]
 mod compile_glue_guard_tests {

@@ -504,6 +504,35 @@ impl TextRope {
     }
 }
 
+/// HF **half-split** RoPE apply: `x·cos + rotate_half(x)·sin`, where `rotate_half([x1, x2]) =
+/// [-x2, x1]` splits `x` on the head dim. `x` is `[b, s, heads, head_dim]`; `cos`/`sin` are
+/// `[1, s, head_dim]` (from [`TextRope::forward`]) and broadcast over the head axis (2). This is the
+/// GQA text-encoder RoPE convention (distinct from the DiT's interleaved rotation); shared by the
+/// Qwen-Image and Krea Qwen3-VL text-encoder attentions, which open-coded the identical op sequence
+/// (F-078).
+pub fn apply_text_rope(x: &Array, cos: &Array, sin: &Array) -> Result<Array> {
+    let cos = cos.expand_dims(2)?; // [1,s,1,hd]
+    let sin = sin.expand_dims(2)?;
+    let parts = mlx_rs::ops::split(x, 2, 3)?; // halves along the head dim
+    let rot = mlx_rs::ops::concatenate_axis(&[&parts[1].negative()?, &parts[0]], 3)?;
+    Ok(add(&multiply(x, &cos)?, &multiply(&rot, &sin)?)?)
+}
+
+/// Grouped-query-attention key/value expansion: `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`,
+/// repeating each kv head `groups` times consecutively (`repeat_interleave` over the head axis,
+/// matching `mx.repeat(x, groups, axis=2)` / torch `enable_gqa`). `groups == 1` is the identity.
+/// Shared by the Qwen-Image / Krea text-encoder attentions and the Krea DiT (F-078).
+pub fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
+    if groups == 1 {
+        return Ok(x.clone());
+    }
+    let sh = x.shape();
+    let (b, s, hkv, hd) = (sh[0], sh[1], sh[2], sh[3]);
+    let x = x.expand_dims(3)?; // [b,s,hkv,1,hd]
+    let x = broadcast_to(&x, &[b, s, hkv, groups, hd])?;
+    Ok(x.reshape(&[b, s, hkv * groups, hd])?)
+}
+
 /// Additive attention mask `[b, 1, s, s]` for a **causal** LM: `0` where a query may attend (the key
 /// is at or before the query position **and** is not padding per `attention_mask` `[b, s]` of 0/1),
 /// `-inf` otherwise. Built on the host from the i32 attention mask, mirroring the fork's

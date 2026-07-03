@@ -22,62 +22,22 @@ pub use norm_out::AdaLayerNormContinuous;
 pub use rope::QwenRope3d;
 pub use transformer::{QwenTransformer, QwenTransformerConfig};
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
-/// sc-2963 (rollout of the Wan sc-2957 template): when on, the MMDiT's fusable elementwise *glue* —
-/// adaLN affine (`x·(1+scale)+shift`), gated residual (`x+gate·y`), the tanh-GELU FFN activation, and
-/// the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain into a single Metal
-/// kernel (vs one kernel per primitive op when eager). The big GEMMs / SDPA / `mx.fast` norms stay
-/// eager. **Bit-exact** to the eager form (`tests/compile_parity.rs` gates `max|Δ|=0`). **Enabled by
-/// the production denoise loops** (T2I + Edit, [`crate::pipeline`]); left **off by default** so the
-/// reference-parity gates run eager and `compile_parity` can A/B both. The dtype flow (bf16 weights,
-/// f32 latents) is preserved — the compiled closures cast nothing the eager form didn't.
-///
-/// **Concurrency (F-087):** correct under the single-threaded MLX-device model — one generate runs on
-/// the device at a time — so `Relaxed` suffices (no cross-thread ordering to establish). The flag is
-/// process-global; the production denoise scopes it with [`CompileGlueGuard`] (F-006/F-007) so it is
-/// not left stuck `true` after a generate. A future concurrent caller would still need `SeqCst` +
-/// strict per-call scoping — revisit before adding one.
-static COMPILE_GLUE: AtomicBool = AtomicBool::new(false);
-
-/// Enable/disable compiled elementwise glue (sc-2963). Process-global; prefer the scoped
-/// [`CompileGlueGuard`] in production (the raw setter is for the A/B `compile_parity`/`perf` gates).
-pub fn set_compile_glue(on: bool) {
-    COMPILE_GLUE.store(on, Ordering::Relaxed);
-}
-
-pub(crate) fn compile_glue() -> bool {
-    COMPILE_GLUE.load(Ordering::Relaxed)
-}
-
-/// RAII guard (F-006/F-007, mirroring core `mlx_gen::nn::CompileGlueGuard` and z-image's) that enables
-/// this crate's compiled elementwise glue for its lifetime and **restores the prior [`COMPILE_GLUE`]
-/// value on drop** — even on an early `?`. The production denoise binds one across the render so the
-/// toggle is scoped, not left stuck `true` process-wide (F-006), and same-process eager code (the
-/// `compile_parity`/`perf` gates) sees the restored value.
-#[must_use = "dropping the guard restores the prior compile-glue setting; bind it for the render's lifetime"]
-pub(crate) struct CompileGlueGuard {
-    prev: bool,
-}
-
-impl CompileGlueGuard {
-    /// Turn compiled glue on, remembering the prior value to restore on drop.
-    pub(crate) fn enable() -> Self {
-        Self {
-            prev: COMPILE_GLUE.swap(true, Ordering::Relaxed),
-        }
-    }
-}
-
-impl Drop for CompileGlueGuard {
-    fn drop(&mut self) {
-        COMPILE_GLUE.store(self.prev, Ordering::Relaxed);
-    }
-}
+// sc-2963 compiled-glue toggle (rollout of the Wan sc-2957 template): when on, the MMDiT's fusable
+// elementwise *glue* — adaLN affine (`x·(1+scale)+shift`), gated residual (`x+gate·y`), the tanh-GELU
+// FFN activation, and the complex RoPE rotation — runs through `mx.compile` so MLX fuses each chain
+// into a single Metal kernel. The big GEMMs / SDPA / `mx.fast` norms stay eager. **Bit-exact** to the
+// eager form (`tests/compile_parity.rs` gates `max|Δ|=0`). **Enabled by the production denoise loops**
+// (T2I + Edit, [`crate::pipeline`]); left **off by default** so the reference-parity gates run eager.
+// The dtype flow (bf16 weights, f32 latents) is preserved unchanged.
+//
+// The toggle + its RAII [`CompileGlueGuard`] are hoisted into core (F-104); re-export core's so the
+// process-global is shared with the FLUX family rather than each crate hand-rolling its own `AtomicBool`.
+pub(crate) use mlx_gen::nn::compile_glue;
+pub use mlx_gen::nn::{set_compile_glue, CompileGlueGuard};
 
 /// Load a Linear at `{prefix}.weight` (+ `{prefix}.bias` when `has_bias`) into an
 /// [`AdaptableLinear`] — the dense-or-quantizable base every transformer Linear uses, so the whole

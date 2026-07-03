@@ -4,9 +4,10 @@
 use mlx_rs::fast::rms_norm;
 use mlx_rs::{Array, Dtype};
 
-use mlx_gen::array::host_i32;
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
+
+use mlx_gen::nn::build_mask;
 
 use super::{join, QwenEncoderLayer, TextRope};
 
@@ -126,26 +127,6 @@ impl QwenTextEncoder {
     }
 }
 
-/// Additive attention mask `[b, 1, s, s]`: `0` where a query may attend (key is causal **and**
-/// not padding), `-inf` otherwise.
-///
-/// Built host-side (a one-time `O(b·s²)` fill per prompt encode, **not** per denoise step).
-/// Deliberately kept on the host rather than constructed with on-device broadcast ops: at realistic
-/// prompt lengths this is negligible against the denoise loop, and a plain fill is the simplest way
-/// to stay bit-exact with the fork (sc-2583). Revisit only if profiling ever flags it.
-fn build_mask(attention_mask: &Array, b: i32, s: i32) -> Result<Array> {
-    let am = host_i32(attention_mask)?;
-    let (b, s) = (b as usize, s as usize);
-    let mut data = vec![0f32; b * s * s];
-    for bi in 0..b {
-        for i in 0..s {
-            for j in 0..s {
-                let allowed = j <= i && am[bi * s + j] == 1;
-                if !allowed {
-                    data[(bi * s + i) * s + j] = f32::NEG_INFINITY;
-                }
-            }
-        }
-    }
-    Ok(Array::from_slice(&data, &[b as i32, 1, s as i32, s as i32]))
-}
+// F-078: the local additive-causal-mask builder was byte-identical to `mlx_gen::nn::build_mask`
+// (shared with the Qwen3-VL text encoders); use the core one. Same host-side `O(b·s²)` fill, plus a
+// length guard that returns a typed error instead of panicking on a short mask (F-061).

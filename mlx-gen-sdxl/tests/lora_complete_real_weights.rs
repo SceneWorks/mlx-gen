@@ -26,6 +26,8 @@
 //! - `complete_render_differs_from_vendored_and_is_sane` — the extra mid/ff/conv signal actually
 //!   changes the rendered image (and the render is a full, non-empty buffer).
 
+mod common;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -44,20 +46,7 @@ use mlx_gen_sdxl::{
 // Force-link the provider so its `inventory::submit!` registers `"sdxl"`.
 use mlx_gen_sdxl as _;
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn lora_path() -> PathBuf {
     if let Ok(p) = std::env::var("SDXL_LORA") {

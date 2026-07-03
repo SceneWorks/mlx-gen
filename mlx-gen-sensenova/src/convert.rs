@@ -26,7 +26,7 @@
 
 use std::path::Path;
 
-use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
+use mlx_gen::quant::{copy_asset, load_dir_map, quantize_map, save_map, write_quantized_config};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
 
@@ -92,19 +92,6 @@ fn is_backbone_linear(base: &str) -> bool {
     false
 }
 
-/// Copy a source file (dereferencing HF-cache symlinks to real bytes) into `dst_root` under its
-/// original name. Missing optional assets are skipped silently (a snapshot may ship `LICENSE` but not
-/// `LICENSE.md`, etc.). Returns whether the file existed and was copied.
-fn copy_asset(src_root: &Path, dst_root: &Path, name: &str) -> Result<bool> {
-    let src = src_root.join(name);
-    if !src.exists() {
-        return Ok(false);
-    }
-    let real = std::fs::canonicalize(&src)?;
-    std::fs::copy(&real, dst_root.join(name))?;
-    Ok(true)
-}
-
 /// Assemble a full pre-quantized turnkey SenseNova-U1 snapshot in `dst_root`: pack the backbone
 /// decoder-stack Linears (both paths) into one `model.safetensors`, and copy the config / tokenizer /
 /// chat-template / license assets verbatim (deref symlinks). The result loads via
@@ -135,6 +122,11 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
             )));
         }
     }
+    // F-045 drift fix: annotate config.json with the `"quantization"` marker the sibling converters
+    // write (the flat SenseNova config was previously copied verbatim, with no provenance block). This
+    // overwrites the verbatim copy above with the merged value; the loader auto-detects packed weights
+    // regardless, so the block is provenance/HF-compat only.
+    write_quantized_config(src_root, dst_root, bits, GROUP_SIZE)?;
     Ok(())
 }
 

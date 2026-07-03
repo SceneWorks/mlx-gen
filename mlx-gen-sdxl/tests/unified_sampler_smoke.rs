@@ -15,7 +15,7 @@
 //!   SDXL_SNAPSHOT=/path/to/sdxl-base-1.0 \
 //!     cargo test -p mlx-gen-sdxl --release --test unified_sampler_smoke -- --ignored --nocapture
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 // Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
@@ -27,19 +27,7 @@ const STEPS: u32 = 8;
 const SEED: u64 = 42;
 const PROMPT: &str = "a fox sitting in a forest, photorealistic";
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-}
+use common::snapshot_opt as snapshot;
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) over an RGB8 buffer — a coherent natural
 /// image has a broad histogram AND spatial smoothness; pure noise has a high adjacent Δ and a flat std.

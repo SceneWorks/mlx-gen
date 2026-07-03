@@ -23,7 +23,7 @@
 //! cache yet — `tests/wanvace_e2e.rs`, `#[ignore]`); the engine pieces are validated component-wise
 //! (S1 transformer structural parity, S2 conditioning byte-parity).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
@@ -35,11 +35,12 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::adapters::{merge_vace_adapters, merge_vace_adapters_expert, warn_skipped_adapters};
-use crate::config::WanVaceConfig;
+use crate::config::{WanModelConfig, WanVaceConfig};
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted_z16, decode_to_frames, frames_to_images, preprocess_i2v_image,
     resolve_sampler_knobs,
 };
+use crate::scheduler::SolverKind;
 use crate::text_encoder::encode_text_staged;
 use crate::vace::{
     build_vace_control, denoise_vace, denoise_vace_moe, prepare_masks, prepare_video_latents,
@@ -67,6 +68,149 @@ fn drop_reference_frames(latents: Array, num_ref: usize, t_total: i32) -> Result
     } else {
         Ok(latents)
     }
+}
+
+/// The pre-DiT setup shared by both VACE generators (F-072): everything from knob resolution through
+/// the z16-VAE control latent and the seeded init noise — byte-identical between the single- and
+/// dual-expert paths, which differ only in how they resolve `guidance` (single vs low/high) and thus
+/// `cfg_disabled` (computed by each caller and passed in). Fields are exactly the locals each
+/// `generate_impl` binds; the DiT stage and decode tail read them unchanged.
+struct VacePrep {
+    width: u32,
+    height: u32,
+    steps: usize,
+    shift: f32,
+    kind: SolverKind,
+    context: Array,
+    context_null: Option<Array>,
+    control: Array,
+    t_total: i32,
+    scales: Vec<f32>,
+    init_noise: Array,
+    num_ref: usize,
+}
+
+/// Run the shared VACE pre-DiT setup (Stages 1–2 + noise seeding). `cfg_disabled` is the caller's
+/// guidance decision (single-expert `guidance ≤ 1.0`; dual-expert `low ≤ 1.0 && high ≤ 1.0`) — the
+/// only place the two paths diverge before the DiT stage. Byte-identical to the code both
+/// `generate_impl`s previously open-coded.
+fn vace_prep(
+    root: &Path,
+    config: &WanVaceConfig,
+    req: &GenerationRequest,
+    cfg_disabled: bool,
+) -> Result<VacePrep> {
+    let base = &config.base;
+    let clip = req.control_clip().expect("validated present");
+
+    // --- Resolve knobs ---
+    // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
+    let width = align_dim(req.width, base.patch_size.2, VAE_S);
+    let height = align_dim(req.height, base.patch_size.1, VAE_S);
+    let (steps, shift, kind, seed) =
+        resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
+    let neg_prompt = req
+        .negative_prompt
+        .clone()
+        .unwrap_or_else(|| base.sample_neg_prompt.clone());
+
+    // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [3, F, H, W].
+    let control_video = preprocess_clip(clip.frames, width, height)?;
+    let mask = preprocess_clip(clip.mask, width, height)?;
+    let half = Array::from_slice(&[0.5f32], &[1]);
+    let mask = multiply(&add(&mask, Array::from_slice(&[1.0f32], &[1]))?, &half)?; // (m+1)/2 ∈ [0,1]
+
+    // Reference images (optional) → channels-first [3, H, W] each.
+    let references: Vec<Array> = req
+        .conditioning
+        .iter()
+        .filter_map(|c| match c {
+            mlx_gen::Conditioning::Reference { image, .. } => Some(image),
+            _ => None,
+        })
+        .map(|im| preprocess_i2v_image(im, width, height))
+        .collect::<Result<_>>()?;
+    let num_ref = references.len();
+
+    // --- Stage 1: UMT5 text encode ---
+    let (context, context_null) =
+        encode_text_staged(root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
+
+    // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
+    let control = {
+        let w = Weights::from_file(root.join("vae.safetensors"))?;
+        let vae = WanVae::from_weights(&w)?;
+        let video_latents = prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
+        let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
+        let c = build_vace_control(&video_latents, &mask_latents)?;
+        mlx_rs::transforms::eval([&c])?;
+        c
+    };
+    // Control latent dims: [96, T_lat(+num_ref), h, w] → the noisy latent matches its frame/space.
+    let csh = control.shape();
+    let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
+    // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
+    // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
+    let scales = vec![req.control_scale.unwrap_or(1.0); config.vace_layers.len()];
+
+    // Seeded init noise [z16, T_lat(+num_ref), h, w].
+    let key = random::key(seed)?;
+    let init_noise = random::normal::<f32>(
+        &[base.vae_z_dim as i32, t_total, h_lat, w_lat],
+        None,
+        None,
+        Some(&key),
+    )?;
+
+    Ok(VacePrep {
+        width,
+        height,
+        steps,
+        shift,
+        kind,
+        context,
+        context_null,
+        control,
+        t_total,
+        scales,
+        init_noise,
+        num_ref,
+    })
+}
+
+/// The shared VACE decode tail (Stage 4, F-072): drop the leading reference latent frames, then
+/// z16-VAE-decode the denoised latents → RGB8 frames → a `Video` output. Byte-identical to the code
+/// both `generate_impl`s previously open-coded after their (single- vs dual-expert) DiT stage.
+fn vace_decode_tail(
+    root: &Path,
+    base: &WanModelConfig,
+    latents: Array,
+    prep: &VacePrep,
+    req: &GenerationRequest,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<GenerationOutput> {
+    // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
+    let latents = drop_reference_frames(latents, prep.num_ref, prep.t_total)?;
+
+    // --- Stage 4: z16 VAE decode → RGB8 frames ---
+    on_progress(Progress::Decoding);
+    // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
+    // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
+    let out_frames = latents.shape()[1] * VAE_T as i32;
+    let tiling = auto_tiling_budgeted_z16(prep.height as i32, prep.width as i32, out_frames)?;
+    let frames_u8 = {
+        let w = Weights::from_file(root.join("vae.safetensors"))?;
+        let vae = WanVae::from_weights(&w)?;
+        decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
+    };
+    let images = frames_to_images(&frames_u8)?;
+
+    let fps = req.fps.unwrap_or(base.sample_fps);
+    Ok(GenerationOutput::Video {
+        frames: images,
+        fps,
+        audio: None,
+    })
 }
 
 /// Stable identity + advertised capabilities for `wan_vace`.
@@ -204,42 +348,14 @@ fn preprocess_clip(frames: &[Image], width: u32, height: u32) -> Result<Array> {
     Ok(concatenate_axis(&refs, 1)?) // [3, F, H, W]
 }
 
+// F-072: `WanVace`'s validate body was byte-identical to the documented-shared `validate_vace_clip`
+// (with `id = MODEL_ID_VACE`), which the dual-expert `WanVaceFun` already uses — so point both at it.
 mlx_gen::impl_generator!(WanVace {
-    validate: |s, req| s.validate_impl(req),
+    validate: |s, req| validate_vace_clip(&s.descriptor, MODEL_ID_VACE, req),
     generate: generate_impl,
 });
 
 impl WanVace {
-    /// Validate body — kept on the crate's own [`mlx_gen::Error`] so `?` on the capability check
-    /// lifts transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
-    fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(MODEL_ID_VACE, req)?;
-        let clip = req.control_clip().ok_or_else(|| {
-            Error::Msg(
-                "wan_vace: needs a ControlClip (the masked control video — the worker builds it per \
-                 mode: replace_person / pose-depth control / extend-bridge)"
-                    .into(),
-            )
-        })?;
-        if clip.frames.len() != clip.mask.len() {
-            return Err(Error::Msg(format!(
-                "wan_vace: control frames ({}) and mask frames ({}) length mismatch",
-                clip.frames.len(),
-                clip.mask.len()
-            )));
-        }
-        // num_frames must be 1 + 4·k (one z16 VAE temporal chunk + 4× per chunk).
-        if clip.frames.len() % VAE_T != 1 {
-            return Err(Error::Msg(format!(
-                "wan_vace: control clip frame count must be 1 + 4·k (got {})",
-                clip.frames.len()
-            )));
-        }
-        Ok(())
-    }
-
     /// The VACE pipeline (port of diffusers `WanVACEPipeline.__call__`): stage the phases to bound
     /// memory — (1) UMT5 encode the prompt (+ neg unless CFG off); (2) load the z16 VAE, build the
     /// 96-ch control latent from the control clip + mask + reference images; (3) load the VACE DiT,
@@ -252,69 +368,13 @@ impl WanVace {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let base = &self.config.base;
-        let clip = req.control_clip().expect("validated present");
 
-        // --- Resolve knobs ---
-        // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
-        let width = align_dim(req.width, base.patch_size.2, VAE_S);
-        let height = align_dim(req.height, base.patch_size.1, VAE_S);
-        let (steps, shift, kind, seed) =
-            resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
+        // Single-expert guidance: a scalar request `guidance` overrides the config; CFG off ⇒ ≤ 1.0.
         let guidance = base.sample_guide_scale.resolve_single(req.guidance);
         let cfg_disabled = guidance <= 1.0;
-        let neg_prompt = req
-            .negative_prompt
-            .clone()
-            .unwrap_or_else(|| base.sample_neg_prompt.clone());
 
-        // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [3, F, H, W].
-        let control_video = preprocess_clip(clip.frames, width, height)?;
-        let mask = preprocess_clip(clip.mask, width, height)?;
-        let half = Array::from_slice(&[0.5f32], &[1]);
-        let mask = multiply(&add(&mask, Array::from_slice(&[1.0f32], &[1]))?, &half)?; // (m+1)/2 ∈ [0,1]
-
-        // Reference images (optional) → channels-first [3, H, W] each.
-        let references: Vec<Array> = req
-            .conditioning
-            .iter()
-            .filter_map(|c| match c {
-                mlx_gen::Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .map(|im| preprocess_i2v_image(im, width, height))
-            .collect::<Result<_>>()?;
-        let num_ref = references.len();
-
-        // --- Stage 1: UMT5 text encode ---
-        let (context, context_null) =
-            encode_text_staged(&self.root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
-
-        // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
-        let control = {
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            let video_latents =
-                prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
-            let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
-            let c = build_vace_control(&video_latents, &mask_latents)?;
-            mlx_rs::transforms::eval([&c])?;
-            c
-        };
-        // Control latent dims: [96, T_lat(+num_ref), h, w] → the noisy latent matches its frame/space.
-        let csh = control.shape();
-        let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
-        // Per-vace-layer control_hidden_states_scale (diffusers `conditioning_scale`), broadcast from
-        // the request (sc-3441). `None` ⇒ the diffusers default 1.0.
-        let scales = vec![req.control_scale.unwrap_or(1.0); self.config.vace_layers.len()];
-
-        // Seeded init noise [z16, T_lat(+num_ref), h, w].
-        let key = random::key(seed)?;
-        let init_noise = random::normal::<f32>(
-            &[base.vae_z_dim as i32, t_total, h_lat, w_lat],
-            None,
-            None,
-            Some(&key),
-        )?;
+        // Stages 1–2 + noise seeding (shared with the dual-expert path, F-072).
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
 
         // --- Stage 3: load the VACE DiT, embed contexts, CFG denoise ---
         let latents = {
@@ -330,7 +390,7 @@ impl WanVace {
             if let Some(q) = self.quantize {
                 dit.quantize(q.bits(), None)?;
             }
-            let total = steps as u32;
+            let total = prep.steps as u32;
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
                     current: i as u32,
@@ -339,43 +399,23 @@ impl WanVace {
             };
             denoise_vace(
                 &dit,
-                &control,
-                &scales,
-                kind,
+                &prep.control,
+                &prep.scales,
+                prep.kind,
                 base.num_train_timesteps,
-                steps,
-                shift,
+                prep.steps,
+                prep.shift,
                 guidance,
-                &context,
-                context_null.as_ref(),
-                &init_noise,
+                &prep.context,
+                prep.context_null.as_ref(),
+                &prep.init_noise,
                 &req.cancel,
                 &mut on_step,
             )?
         };
 
-        // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
-        let latents = drop_reference_frames(latents, num_ref, t_total)?;
-
-        // --- Stage 4: z16 VAE decode → RGB8 frames ---
-        on_progress(Progress::Decoding);
-        // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
-        // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
-        let out_frames = latents.shape()[1] * VAE_T as i32;
-        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
-        let frames_u8 = {
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
-        };
-        let images = frames_to_images(&frames_u8)?;
-
-        let fps = req.fps.unwrap_or(base.sample_fps);
-        Ok(GenerationOutput::Video {
-            frames: images,
-            fps,
-            audio: None,
-        })
+        // Stage 4: drop reference frames + z16-VAE decode → RGB8 (shared with the dual-expert path).
+        vace_decode_tail(&self.root, base, latents, &prep, req, on_progress)
     }
 }
 
@@ -500,66 +540,13 @@ impl WanVaceFun {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let base = &self.config.base;
-        let clip = req.control_clip().expect("validated present");
 
-        // --- Resolve knobs ---
-        // VACE aligns to patch · VAE_S with no max-area cap (the dense paths' `resolve_capped_dims`).
-        let width = align_dim(req.width, base.patch_size.2, VAE_S);
-        let height = align_dim(req.height, base.patch_size.1, VAE_S);
-        let (steps, shift, kind, seed) =
-            resolve_sampler_knobs(req, base.sample_steps, base.sample_shift);
         // A scalar request `guidance` overrides both experts; otherwise the config (low, high) pair.
         let (low_gs, high_gs) = base.sample_guide_scale.resolve_dual(req.guidance);
         let cfg_disabled = low_gs <= 1.0 && high_gs <= 1.0;
-        let neg_prompt = req
-            .negative_prompt
-            .clone()
-            .unwrap_or_else(|| base.sample_neg_prompt.clone());
 
-        // Control video [-1,1] + mask [0,1] (diffusers `clamp((m+1)/2)`), each [3, F, H, W].
-        let control_video = preprocess_clip(clip.frames, width, height)?;
-        let mask = preprocess_clip(clip.mask, width, height)?;
-        let half = Array::from_slice(&[0.5f32], &[1]);
-        let mask = multiply(&add(&mask, Array::from_slice(&[1.0f32], &[1]))?, &half)?;
-
-        // Reference images (optional) → channels-first [3, H, W] each.
-        let references: Vec<Array> = req
-            .conditioning
-            .iter()
-            .filter_map(|c| match c {
-                mlx_gen::Conditioning::Reference { image, .. } => Some(image),
-                _ => None,
-            })
-            .map(|im| preprocess_i2v_image(im, width, height))
-            .collect::<Result<_>>()?;
-        let num_ref = references.len();
-
-        // --- Stage 1: UMT5 text encode (shared z16/UMT5 components, same as wan_vace) ---
-        let (context, context_null) =
-            encode_text_staged(&self.root, base, &req.prompt, &neg_prompt, cfg_disabled)?;
-
-        // --- Stage 2: z16 VAE encode the control + mask → 96-ch control latent ---
-        let control = {
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            let video_latents =
-                prepare_video_latents(&vae, &control_video, Some(&mask), &references)?;
-            let mask_latents = prepare_masks(&mask, VAE_T, VAE_S, base.patch_size.1, num_ref)?;
-            let c = build_vace_control(&video_latents, &mask_latents)?;
-            mlx_rs::transforms::eval([&c])?;
-            c
-        };
-        let csh = control.shape();
-        let (t_total, h_lat, w_lat) = (csh[1], csh[2], csh[3]);
-        let scales = vec![req.control_scale.unwrap_or(1.0); self.config.vace_layers.len()];
-
-        let key = random::key(seed)?;
-        let init_noise = random::normal::<f32>(
-            &[base.vae_z_dim as i32, t_total, h_lat, w_lat],
-            None,
-            None,
-            Some(&key),
-        )?;
+        // Stages 1–2 + noise seeding (shared with the single-expert path, F-072).
+        let prep = vace_prep(&self.root, &self.config, req, cfg_disabled)?;
 
         // --- Stage 3: load BOTH experts, embed contexts per expert, dual-expert MoE VACE denoise ---
         let latents = {
@@ -588,7 +575,7 @@ impl WanVaceFun {
                 low_dit.quantize(q.bits(), None)?;
             }
             let boundary_timestep = base.boundary * base.num_train_timesteps as f32;
-            let total = steps as u32;
+            let total = prep.steps as u32;
             let mut on_step = |i: usize| {
                 on_progress(Progress::Step {
                     current: i as u32,
@@ -598,45 +585,25 @@ impl WanVaceFun {
             denoise_vace_moe(
                 &low_dit,
                 &high_dit,
-                &control,
-                &scales,
-                kind,
+                &prep.control,
+                &prep.scales,
+                prep.kind,
                 base.num_train_timesteps,
-                steps,
-                shift,
+                prep.steps,
+                prep.shift,
                 boundary_timestep,
                 low_gs,
                 high_gs,
-                &context,
-                context_null.as_ref(),
-                &init_noise,
+                &prep.context,
+                prep.context_null.as_ref(),
+                &prep.init_noise,
                 &req.cancel,
                 &mut on_step,
             )?
         };
 
-        // Drop the leading reference latent frames (diffusers `latents[:, :, num_reference_images:]`).
-        let latents = drop_reference_frames(latents, num_ref, t_total)?;
-
-        // --- Stage 4: z16 VAE decode → RGB8 frames ---
-        on_progress(Progress::Decoding);
-        // sc-6894 — the z16 VAE is non-causal in time (out_f = T_lat·VAE_T, ×4), NOT the causal 4·T−3
-        // (task 6897); only the tiling heuristic reads out_frames. Budgeted, catchable selector (F-009).
-        let out_frames = latents.shape()[1] * VAE_T as i32;
-        let tiling = auto_tiling_budgeted_z16(height as i32, width as i32, out_frames)?;
-        let frames_u8 = {
-            let w = Weights::from_file(self.root.join("vae.safetensors"))?;
-            let vae = WanVae::from_weights(&w)?;
-            decode_to_frames(&vae, &latents, tiling.as_ref(), Some(&req.cancel))?
-        };
-        let images = frames_to_images(&frames_u8)?;
-
-        let fps = req.fps.unwrap_or(base.sample_fps);
-        Ok(GenerationOutput::Video {
-            frames: images,
-            fps,
-            audio: None,
-        })
+        // Stage 4: drop reference frames + z16-VAE decode → RGB8 (shared with the single-expert path).
+        vace_decode_tail(&self.root, base, latents, &prep, req, on_progress)
     }
 }
 

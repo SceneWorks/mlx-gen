@@ -4,7 +4,8 @@
 use std::path::Path;
 
 use mlx_gen::weights::Weights;
-use mlx_gen::{Error, Result};
+use mlx_gen::Result;
+use mlx_gen_z_image::loader::{remap_vae_decoder, remap_vae_encoder};
 use mlx_gen_z_image::vae::{Vae, VaeDecoderConfig, VaeEncoderConfig};
 
 use crate::config::BooguConfig;
@@ -71,86 +72,5 @@ pub fn load_vae(root: impl AsRef<Path>) -> Result<Vae> {
     )
 }
 
-/// Remap the diffusers `AutoencoderKL` **decoder** keys to the z-image module tree: rename the
-/// entry/exit conv + out-norm, and transpose every conv weight NCHW→NHWC. Generic to the FLUX.1
-/// `AutoencoderKL` layout (same remap the flux loader applies).
-fn remap_vae_decoder(w: &mut Weights) -> Result<()> {
-    let keys: Vec<String> = w
-        .keys()
-        .filter(|k| k.starts_with("decoder."))
-        .map(String::from)
-        .collect();
-    for k in keys {
-        let rest = k.strip_prefix("decoder.").ok_or_else(|| {
-            Error::Msg(format!(
-                "boogu vae remap: key `{k}` lost its decoder. prefix"
-            ))
-        })?;
-        let (target, transpose): (String, bool) = match rest {
-            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
-            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
-            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
-            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
-            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
-            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
-            _ => {
-                let is_conv_w = rest.ends_with(".weight")
-                    && (rest.contains(".conv1.")
-                        || rest.contains(".conv2.")
-                        || rest.contains(".conv_shortcut.")
-                        || rest.contains(".upsamplers.0.conv."));
-                (rest.to_string(), is_conv_w)
-            }
-        };
-        let t = w.require(&k)?.clone();
-        let t = if transpose {
-            t.transpose_axes(&[0, 2, 3, 1])?
-        } else {
-            t
-        };
-        w.insert(target, t);
-    }
-    Ok(())
-}
-
-/// Remap the diffusers `AutoencoderKL` **encoder** keys (img2img path) to the z-image tree, keeping
-/// the `encoder.` prefix and transposing conv weights NCHW→NHWC.
-fn remap_vae_encoder(w: &mut Weights) -> Result<()> {
-    let keys: Vec<String> = w
-        .keys()
-        .filter(|k| k.starts_with("encoder."))
-        .map(String::from)
-        .collect();
-    for k in keys {
-        let rest = k.strip_prefix("encoder.").ok_or_else(|| {
-            Error::Msg(format!(
-                "boogu vae remap: key `{k}` lost its encoder. prefix"
-            ))
-        })?;
-        let (suffix, transpose): (String, bool) = match rest {
-            "conv_in.weight" => ("conv_in.conv.weight".into(), true),
-            "conv_in.bias" => ("conv_in.conv.bias".into(), false),
-            "conv_out.weight" => ("conv_out.conv.weight".into(), true),
-            "conv_out.bias" => ("conv_out.conv.bias".into(), false),
-            "conv_norm_out.weight" => ("conv_norm_out.norm.weight".into(), false),
-            "conv_norm_out.bias" => ("conv_norm_out.norm.bias".into(), false),
-            _ => {
-                let is_conv_w = rest.ends_with(".weight")
-                    && (rest.contains(".conv1.")
-                        || rest.contains(".conv2.")
-                        || rest.contains(".conv_shortcut.")
-                        || rest.contains(".downsamplers.0.conv."));
-                (rest.to_string(), is_conv_w)
-            }
-        };
-        let target = format!("encoder.{suffix}");
-        let t = w.require(&k)?.clone();
-        let t = if transpose {
-            t.transpose_axes(&[0, 2, 3, 1])?
-        } else {
-            t
-        };
-        w.insert(target, t);
-    }
-    Ok(())
-}
+// F-086: the diffusers→NHWC decoder/encoder key remaps were line-for-line copies of the FLUX.1
+// loader's; both now call the shared `mlx_gen_z_image::vae::{remap_vae_decoder, remap_vae_encoder}`.

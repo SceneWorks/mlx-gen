@@ -98,85 +98,66 @@ pub fn text_embedders() -> impl Iterator<Item = &'static TextEmbedderRegistratio
     inventory::iter::<TextEmbedderRegistration>.into_iter()
 }
 
-/// Load a generator by model id (e.g. `"z_image_turbo"`).
-///
-/// The link-time registry is **first-wins** on duplicate ids; a debug-build assertion surfaces a
-/// duplicate registration (a provider-crate mistake) instead of silently shadowing one (sc-6983).
-pub fn load(id: &str, spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let mut matches = generators().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate generator id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+/// Define a first-wins `load_*` resolver over a registration iterator (F-056). The six load fns were
+/// byte-identical modulo the iterator, the returned trait-object type, and the `$kind` label that
+/// appears in both the "no {kind} registered" error and the duplicate-id debug assertion — so they
+/// share one body here. **The generated behavior (first-wins, the debug-build duplicate assertion,
+/// and the EXACT per-kind error text) is unchanged** — the worker/tests match on the error string.
+macro_rules! define_load {
+    (
+        $(#[$meta:meta])*
+        $vis:vis fn $name:ident via $iter:ident as $kind:literal => $trait:ty
+    ) => {
+        $(#[$meta])*
+        $vis fn $name(id: &str, spec: &LoadSpec) -> Result<Box<$trait>> {
+            let mut matches = $iter().filter(|r| (r.descriptor)().id == id);
+            let reg = matches.next().ok_or_else(|| {
+                Error::Msg(format!(
+                    concat!("no ", $kind, " registered for id '{id}'"),
+                    id = id
+                ))
+            })?;
+            debug_assert!(
+                matches.next().is_none(),
+                concat!("duplicate ", $kind, " id '{id}' registered (first-wins shadows the rest)"),
+                id = id
+            );
+            (reg.load)(spec)
+        }
+    };
 }
 
-/// Load a transform by id.
-pub fn load_transform(id: &str, spec: &LoadSpec) -> Result<Box<dyn Transform>> {
-    let mut matches = transforms().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no transform registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate transform id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+define_load! {
+    /// Load a generator by model id (e.g. `"z_image_turbo"`).
+    ///
+    /// The link-time registry is **first-wins** on duplicate ids; a debug-build assertion surfaces a
+    /// duplicate registration (a provider-crate mistake) instead of silently shadowing one (sc-6983).
+    pub fn load via generators as "generator" => dyn Generator
 }
 
-/// Load a trainer by model id (e.g. `"z_image_turbo"`) with its (frozen) base model.
-pub fn load_trainer(id: &str, spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
-    let mut matches = trainers().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no trainer registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate trainer id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+define_load! {
+    /// Load a transform by id.
+    pub fn load_transform via transforms as "transform" => dyn Transform
 }
 
-/// Load a captioner by model id (e.g. `"joy_caption"`).
-pub fn load_captioner(id: &str, spec: &LoadSpec) -> Result<Box<dyn Captioner>> {
-    let mut matches = captioners().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no captioner registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate captioner id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+define_load! {
+    /// Load a trainer by model id (e.g. `"z_image_turbo"`) with its (frozen) base model.
+    pub fn load_trainer via trainers as "trainer" => dyn Trainer
 }
 
-/// Load an image embedder by id (e.g. `"clip_vit_l14"`).
-pub fn load_image_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
-    let mut matches = image_embedders().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no image embedder registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate image embedder id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+define_load! {
+    /// Load a captioner by model id (e.g. `"joy_caption"`).
+    pub fn load_captioner via captioners as "captioner" => dyn Captioner
 }
 
-/// Load a text embedder by id (e.g. `"clip_vit_l14_text"`).
-pub fn load_text_embedder(id: &str, spec: &LoadSpec) -> Result<Box<dyn TextEmbedder>> {
-    let mut matches = text_embedders().filter(|r| (r.descriptor)().id == id);
-    let reg = matches
-        .next()
-        .ok_or_else(|| Error::Msg(format!("no text embedder registered for id '{id}'")))?;
-    debug_assert!(
-        matches.next().is_none(),
-        "duplicate text embedder id '{id}' registered (first-wins shadows the rest)"
-    );
-    (reg.load)(spec)
+define_load! {
+    /// Load an image embedder by id (e.g. `"clip_vit_l14"`).
+    pub fn load_image_embedder via image_embedders as "image embedder" => dyn ImageEmbedder
+}
+
+define_load! {
+    /// Load a text embedder by id (e.g. `"clip_vit_l14_text"`).
+    pub fn load_text_embedder via text_embedders as "text embedder" => dyn TextEmbedder
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -11,6 +11,8 @@
 //! onto a fresh Kolors-loaded U-Net (Kolors' U-Net == the SDXL `UNet2DConditionModel`) — merging into
 //! every trained target and forwarding finite under Kolors conditioning shapes.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
@@ -35,20 +37,7 @@ fn kolors_time_ids(batch: i32, height: i32, width: i32) -> Array {
     Array::from_slice(&v, &[batch, 6])
 }
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir`.
 fn make_dataset(dir: &Path) -> Vec<TrainingItem> {

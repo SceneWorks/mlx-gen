@@ -11,26 +11,13 @@
 //!   2. **mask = all-black ⇒ output = VAE round-trip of the init.** Every step pins the latent to the
 //!      init (final step to the clean `x₀`), so decoding equals `decode(encode(init))`.
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::{Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 use mlx_gen_sdxl as _;
 use mlx_gen_sdxl::{decode_image, encode_init_latents, load_vae}; // force-link the provider so `inventory` registers "sdxl"
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Deterministic init image (a diagonal RGB gradient), `w`×`h` RGB8.
 fn init_image(w: u32, h: u32) -> Image {

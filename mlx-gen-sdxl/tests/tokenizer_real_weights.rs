@@ -8,7 +8,7 @@
 //! The tokenizer must reproduce the vendored ids *exactly* (not "close") — any divergence shifts
 //! the conditioning sequence and breaks downstream parity.
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::ClipBpeTokenizer;
@@ -19,20 +19,7 @@ const GOLDEN: &str = concat!(
 );
 
 /// Locate the SDXL-base-1.0 snapshot dir (env override, else the HF cache).
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 #[test]
 #[ignore = "needs the real SDXL snapshot + tokenizer golden"]

@@ -16,8 +16,10 @@
 
 use std::path::Path;
 
-use mlx_gen::quant::{load_dir_map, quantize_map, save_map};
-use mlx_gen::{Error, Result};
+use mlx_gen::quant::{
+    copy_dir, copy_turnkey_assets, load_dir_map, quantize_map, save_map, write_quantized_config,
+};
+use mlx_gen::Result;
 
 use crate::quant::GROUP_SIZE;
 
@@ -43,25 +45,6 @@ fn is_vae_target(base: &str) -> bool {
         || base.ends_with(".to_out.0")
 }
 
-/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
-/// added (HF/diffusers-compat; the Rust loaders auto-detect via `{base}.scales` and ignore it). A
-/// missing source config starts from an empty object.
-fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
-    let src_cfg = src.join("config.json");
-    let mut v: serde_json::Value = if src_cfg.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?)
-            .map_err(|e| Error::Msg(format!("flux: parse {}: {e}", src_cfg.display())))?
-    } else {
-        serde_json::json!({})
-    };
-    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
-    let text = serde_json::to_string_pretty(&v)
-        .map_err(|e| Error::Msg(format!("flux: serialize config.json: {e}")))?;
-    std::fs::create_dir_all(dst)?;
-    std::fs::write(dst.join("config.json"), text)?;
-    Ok(())
-}
-
 /// Pre-quantize one component dir (`src` sharded/single `*.safetensors` + `config.json`) → a packed
 /// `model.safetensors` + annotated `config.json` in `dst`. `is_target` is the component's pack
 /// predicate; `bits` = 4 (Q4) or 8 (Q8) at group size [`GROUP_SIZE`].
@@ -75,24 +58,6 @@ fn quantize_component(
     let map = quantize_map(load_dir_map(src)?, bits, GROUP_SIZE, is_target)?;
     save_map(&dst.join("model.safetensors"), &map)?;
     write_quantized_config(src, dst, bits, GROUP_SIZE)
-}
-
-/// Recursively copy a directory's files, resolving symlinks (HF snapshots symlink into
-/// `../../blobs/…`) to real bytes so the assembled tier is self-contained and HF-uploadable.
-fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir(&path, &target)?;
-        } else {
-            let real = std::fs::canonicalize(&path)?;
-            std::fs::copy(&real, &target)?;
-        }
-    }
-    Ok(())
 }
 
 /// Assemble a full pre-quantized turnkey snapshot in `dst_root`: pack the transformer, CLIP text
@@ -132,20 +97,7 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
             copy_dir(&s, &dst_root.join(rel))?;
         }
     }
-    for f in [
-        "model_index.json",
-        "LICENSE",
-        "LICENSE.md",
-        "LICENSE.txt",
-        "README.md",
-    ] {
-        let s = src_root.join(f);
-        if s.exists() {
-            let real = std::fs::canonicalize(&s)?;
-            std::fs::copy(&real, dst_root.join(f))?;
-        }
-    }
-    Ok(())
+    copy_turnkey_assets(src_root, dst_root)
 }
 
 #[cfg(test)]

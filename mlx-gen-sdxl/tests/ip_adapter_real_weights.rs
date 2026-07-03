@@ -11,6 +11,8 @@
 //!   2. Resampler image tokens `[1, 16, 2048]` (from both the golden penultimate — isolating the
 //!      Resampler — and the Rust encoder's own penultimate — the full image→tokens chain).
 
+mod common;
+
 use std::path::PathBuf;
 
 use mlx_gen::weights::Weights;
@@ -24,20 +26,7 @@ const GOLDEN: &str = concat!(
 );
 
 /// The `h94/IP-Adapter` snapshot dir (override with `IP_ADAPTER_SNAPSHOT`).
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("IP_ADAPTER_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps =
-        PathBuf::from(home).join(".cache/huggingface/hub/models--h94--IP-Adapter/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir for h94/IP-Adapter")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn f32_weights(path: PathBuf) -> Weights {
     let mut w = Weights::from_file(&path).unwrap_or_else(|e| panic!("load {path:?}: {e}"));

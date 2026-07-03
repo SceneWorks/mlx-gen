@@ -6,6 +6,8 @@
 //! Runs in CI on the tiny seeded S5 weights (no real checkpoint). It also exercises the cached path
 //! (`prepare_cross_kv` / `prepare_rope` / `forward_cached`) against the legacy recompute `forward`.
 
+mod common;
+
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::WanTransformer;
@@ -35,12 +37,7 @@ fn load(name: &str) -> Weights {
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
 
-fn max_abs(got: &[f32], exp: &[f32]) -> f32 {
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0f32, f32::max)
-}
+use common::max_abs;
 
 #[test]
 fn batched_b2_forward_bit_identical_to_two_b1_forwards() {

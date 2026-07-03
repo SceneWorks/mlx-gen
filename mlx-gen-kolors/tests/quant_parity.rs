@@ -12,7 +12,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-kolors --release --test quant_parity -- --ignored --nocapture`
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_kolors::chatglm3::{ChatGlmConfig, ChatGlmModel};
@@ -23,20 +23,7 @@ use mlx_rs::{Array, Dtype};
 
 const PROMPT: &str = "A cat playing a grand piano on a city rooftop at sunset.";
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Cosine similarity + relative-L2 of two same-shape tensors (flattened, f32).
 fn cos_rel(a: &Array, b: &Array) -> (f64, f64) {

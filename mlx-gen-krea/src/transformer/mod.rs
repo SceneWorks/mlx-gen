@@ -524,18 +524,10 @@ pub(crate) fn split_axis1(x: &Array, at: i32) -> Result<Vec<Array>> {
     Ok(x.split_axis(&[at], 1)?)
 }
 
-/// Expand `[b, s, hkv, hd]` → `[b, s, hkv·groups, hd]`, repeating each kv head `groups` times
-/// consecutively (`repeat_interleave` over the head axis, matching the reference's `enable_gqa`).
-pub(crate) fn repeat_kv(x: &Array, groups: i32) -> Result<Array> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let sh = x.shape();
-    let (b, s, hkv, hd) = (sh[0], sh[1], sh[2], sh[3]);
-    let x = x.expand_dims(3)?; // [b, s, hkv, 1, hd]
-    let x = mlx_rs::ops::broadcast_to(&x, &[b, s, hkv, groups, hd])?;
-    Ok(x.reshape(&[b, s, hkv * groups, hd])?)
-}
+// F-078: the GQA kv-head expansion was open-coded identically here and in the two Qwen3-VL text
+// encoders; re-export the shared `mlx_gen::nn::repeat_kv` (byte-identical `repeat_interleave` over
+// the head axis, matching the reference's `enable_gqa`).
+pub(crate) use mlx_gen::nn::repeat_kv;
 
 /// Reference `temb`: `freqs = exp(−ln(1e4)·arange(half)/half)`, `args = (timestep·1e3)·freqs`,
 /// `concat([cos, sin], −1)` (cos-first). `timestep`: `[b]` → `[b, 1, dim]` (a per-sample vector that

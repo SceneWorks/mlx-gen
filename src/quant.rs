@@ -176,6 +176,94 @@ pub fn quantize_map(
     Ok(out)
 }
 
+// ============================================================================================
+// Turnkey-assembly glue — the Group-B converter tail the provider `convert.rs` modules used to
+// clone verbatim (sc-9108 / F-045). Each provider still owns its per-component pack predicates and
+// its `prequantize_turnkey` wiring, but routes the config annotation, the symlink-resolving
+// directory copy, and the non-weight asset tail through these shared helpers so the six converters
+// stay byte-identical (they had drifted: z-image dropped `LICENSE.txt`; krea's copy skipped the
+// symlink deref; sensenova never annotated its config).
+// ============================================================================================
+
+/// The canonical set of top-level non-weight assets a turnkey snapshot copies verbatim from the
+/// dense source (in addition to the component dirs it packs / passes through): the diffusers pipeline
+/// manifest and every license/readme variant an upstream repo might ship. A converter iterates this,
+/// copying each that exists (deref'ing HF-cache symlinks). Owning it here fixes the F-045 drift where
+/// z-image omitted `LICENSE.txt` and shipped license-less rehosted tiers.
+pub const TURNKEY_ASSET_FILES: &[&str] = &[
+    "model_index.json",
+    "LICENSE",
+    "LICENSE.md",
+    "LICENSE.txt",
+    "README.md",
+];
+
+/// Copy `src/config.json` to `dst/config.json` with a `"quantization": {"bits", "group_size"}` block
+/// added (HF/diffusers-compat; the Rust loaders auto-detect packed weights via `{base}.scales` and
+/// ignore this block — it is provenance/informational). A missing source config starts from an empty
+/// object. The written bytes are `serde_json::to_string_pretty` of the merged value, byte-identical
+/// across every provider that packs per-component dirs.
+pub fn write_quantized_config(src: &Path, dst: &Path, bits: i32, group_size: i32) -> Result<()> {
+    let src_cfg = src.join("config.json");
+    let mut v: serde_json::Value = if src_cfg.exists() {
+        serde_json::from_str(&std::fs::read_to_string(&src_cfg)?).map_err(|e| {
+            crate::Error::Msg(format!("quant convert: parse {}: {e}", src_cfg.display()))
+        })?
+    } else {
+        serde_json::json!({})
+    };
+    v["quantization"] = serde_json::json!({ "bits": bits, "group_size": group_size });
+    let text = serde_json::to_string_pretty(&v)
+        .map_err(|e| crate::Error::Msg(format!("quant convert: serialize config.json: {e}")))?;
+    std::fs::create_dir_all(dst)?;
+    std::fs::write(dst.join("config.json"), text)?;
+    Ok(())
+}
+
+/// Recursively copy a directory's files, resolving symlinks (HF snapshots symlink into
+/// `../../blobs/…`) to real bytes so the assembled tier is self-contained and HF-uploadable. This is
+/// the symlink-resolving copy the six sibling converters share (the F-045 unification point where
+/// krea's non-deref'ing copy is brought into line).
+pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dst.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            let real = std::fs::canonicalize(&path)?;
+            std::fs::copy(&real, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a single top-level asset `name` from `src_root` to `dst_root` if it exists, deref'ing an
+/// HF-cache symlink to real bytes. Returns whether the file was present and copied. The per-file
+/// building block behind [`copy_turnkey_assets`] (some converters — e.g. sensenova — need the copied?
+/// signal per file).
+pub fn copy_asset(src_root: &Path, dst_root: &Path, name: &str) -> Result<bool> {
+    let src = src_root.join(name);
+    if !src.exists() {
+        return Ok(false);
+    }
+    let real = std::fs::canonicalize(&src)?;
+    std::fs::create_dir_all(dst_root)?;
+    std::fs::copy(&real, dst_root.join(name))?;
+    Ok(true)
+}
+
+/// Copy every [`TURNKEY_ASSET_FILES`] entry that exists from `src_root` to `dst_root` (deref'ing
+/// symlinks). The shared non-weight tail of `prequantize_turnkey`.
+pub fn copy_turnkey_assets(src_root: &Path, dst_root: &Path) -> Result<()> {
+    for name in TURNKEY_ASSET_FILES {
+        copy_asset(src_root, dst_root, name)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,6 +7,8 @@
 //!
 //! Runs in CI on the tiny seeded S5 fixture (no real checkpoint).
 
+mod common;
+
 use mlx_gen::weights::Weights;
 use mlx_gen_wan::config::WanModelConfig;
 use mlx_gen_wan::patchify::unpatchify;
@@ -35,12 +37,7 @@ fn load(name: &str) -> Weights {
         .unwrap_or_else(|e| panic!("read {path}: {e} (run dump_s5_fixtures.py)"))
 }
 
-fn max_abs(got: &[f32], exp: &[f32]) -> f32 {
-    got.iter()
-        .zip(exp.iter())
-        .map(|(g, e)| (g - e).abs())
-        .fold(0f32, f32::max)
-}
+use common::max_abs;
 
 #[test]
 fn forward_packed_matches_dense_forward_for_target_only() {

@@ -112,3 +112,7 @@ sceneworks-gen-core = { workspace = true }
 thiserror = { workspace = true }
 inventory = { workspace = true }
 tokenizers = { workspace = true }
+# The hoisted turnkey converter glue (quant::write_quantized_config, F-045) writes the packed
+# snapshot's config.json `"quantization"` marker; the per-crate converters already used serde_json,
+# now the shared core copy does.
+serde_json = { workspace = true }

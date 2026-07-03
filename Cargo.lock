@@ -593,6 +593,7 @@ dependencies = [
  "pmetal-mlx-rs",
  "pmetal-mlx-sys",
  "sceneworks-gen-core",
+ "serde_json",
  "thiserror",
  "tokenizers",
 ]

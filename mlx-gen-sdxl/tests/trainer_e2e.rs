@@ -10,6 +10,8 @@
 //! written that reloads through the REAL SDXL inference path (`apply_sdxl_adapters[_with]`) onto a
 //! fresh U-Net — merging into every trained target and forwarding finite.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use mlx_gen::weights::Weights;
@@ -21,20 +23,7 @@ use mlx_gen_sdxl::{
     apply_sdxl_adapters, apply_sdxl_adapters_with, load_unet, text_time_ids, LoraCoverage,
 };
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Two solid-colour swatch PNGs + captions in `dir`.
 fn make_dataset(dir: &Path) -> Vec<TrainingItem> {

@@ -170,31 +170,7 @@ pub struct Sana {
 /// silently ignored (none are wired for SANA yet).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let descriptor = descriptor();
-    let id = descriptor.id;
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(format!(
-            "{id}: only the default dense precision is wired (drop the precision override)"
-        )));
-    }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{id}: load-time quantization is not supported (the 2-bit quant is not ported)"
-        )));
-    }
-    if !spec.adapters.is_empty() {
-        return Err(Error::Msg(format!(
-            "{id}: LoRA/LoKr adapters are not supported"
-        )));
-    }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.as_path(),
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{id} expects a snapshot directory (transformer/ vae/ text_encoder/), not a \
-                 single .safetensors file"
-            )))
-        }
-    };
+    let root = load_components(spec, descriptor.id)?;
     let pipeline = build_pipeline(root)?;
     Ok(Box::new(Sana {
         descriptor,
@@ -207,7 +183,19 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// (guidance embedder + rms-norm-across-heads) and driven by the CFG-free SCM few-step pipeline.
 pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let descriptor = sprint_descriptor();
-    let id = descriptor.id;
+    let root = load_components(spec, descriptor.id)?;
+    let pipeline = build_sprint_pipeline(root)?;
+    Ok(Box::new(Sana {
+        descriptor,
+        pipeline,
+    }))
+}
+
+/// Shared load preamble for [`load`] / [`load_sprint`] (F-090): reject the unsupported precision /
+/// quantization / adapter overrides (none are wired for SANA), then resolve the `LoadSpec` to the
+/// snapshot directory. Byte-identical to the guard+resolution block both entry points open-coded (the
+/// `{id}` in each message comes from the descriptor, so the two paths' error text differs only by id).
+fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
@@ -223,20 +211,13 @@ pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             "{id}: LoRA/LoKr adapters are not supported"
         )));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p.as_path(),
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{id} expects a snapshot directory (transformer/ vae/ text_encoder/), not a \
-                 single .safetensors file"
-            )))
-        }
-    };
-    let pipeline = build_sprint_pipeline(root)?;
-    Ok(Box::new(Sana {
-        descriptor,
-        pipeline,
-    }))
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p.as_path()),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{id} expects a snapshot directory (transformer/ vae/ text_encoder/), not a \
+             single .safetensors file"
+        ))),
+    }
 }
 
 /// Assemble the [`SanaPipeline`] from the snapshot tree — factored out so the load path is a single

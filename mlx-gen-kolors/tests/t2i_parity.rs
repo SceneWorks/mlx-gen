@@ -17,7 +17,7 @@
 //!
 //! Run: `cargo test -p mlx-gen-kolors --release --test t2i_parity -- --ignored --nocapture`
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::DiffusionSampler;
@@ -32,20 +32,7 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/kolors_t2i_golden.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn rel(a: &Array, b: &Array) -> (f32, f32) {
     let n = b.shape().iter().product::<i32>();

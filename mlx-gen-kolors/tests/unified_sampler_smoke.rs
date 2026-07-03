@@ -16,7 +16,7 @@
 //!   KOLORS_SNAPSHOT=/path/to/Kolors-diffusers \
 //!     cargo test -p mlx-gen-kolors --release --test unified_sampler_smoke -- --ignored --nocapture
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::{GenerationOutput, GenerationRequest, Image, LoadSpec, WeightsSource};
 // Reference the provider crate so its `inventory` registration links (`mlx_gen::load` resolves it).
@@ -28,19 +28,7 @@ const STEPS: u32 = 8;
 const SEED: u64 = 42;
 const PROMPT: &str = "a fox sitting in a forest, photorealistic";
 
-fn snapshot() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return Some(PathBuf::from(p));
-    }
-    let home = std::env::var("HOME").ok()?;
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-}
+use common::snapshot_opt as snapshot;
 
 /// (std, distinct-level-count, mean horizontal-adjacent-|Δ|) over an RGB8 buffer.
 fn image_stats(px: &[u8], w: u32) -> (f32, usize, f32) {

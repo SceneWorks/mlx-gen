@@ -14,6 +14,8 @@
 //! (`w + 0·delta = w`), but f32 keeps the `scale=1` forward free of fp16 chaos so the effect read is
 //! clean. The merge surface is the registry's production **Complete** coverage.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use mlx_gen::{
@@ -23,20 +25,7 @@ use mlx_gen::{
 use mlx_gen_sdxl::{apply_sdxl_adapters_with, load_unet_kolors_dtype, LoraCoverage};
 use mlx_rs::{ops, random, Array, Dtype};
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("KOLORS_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--Kwai-Kolors--Kolors-diffusers/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 /// Train a tiny real LoRA (the sc-4568 path) and return its adapter file.
 fn train_lora(tmp: &Path) -> PathBuf {

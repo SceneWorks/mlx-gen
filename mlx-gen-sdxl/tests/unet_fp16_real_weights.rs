@@ -9,7 +9,7 @@
 //! Run with:
 //!   cargo test -p mlx-gen-sdxl --release --test unet_fp16_real_weights -- --ignored --nocapture
 
-use std::path::PathBuf;
+mod common;
 
 use mlx_gen::weights::Weights;
 use mlx_gen_sdxl::load_unet_dtype;
@@ -20,20 +20,7 @@ const GOLDEN: &str = concat!(
     "/../tools/golden/sdxl_unet_golden_fp16.safetensors"
 );
 
-fn snapshot() -> PathBuf {
-    if let Ok(p) = std::env::var("SDXL_SNAPSHOT") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap();
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--stabilityai--stable-diffusion-xl-base-1.0/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("HF cache snapshots dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a snapshot dir")
-}
+use common::snapshot;
 
 fn f32v(a: &Array) -> Vec<f32> {
     let n = a.shape().iter().product::<i32>();
