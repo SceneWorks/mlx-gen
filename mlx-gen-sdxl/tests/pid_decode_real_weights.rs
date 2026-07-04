@@ -180,6 +180,94 @@ fn sdxl_pid_decode_vs_vae() {
 }
 
 #[test]
+#[ignore = "needs an SDXL-family snapshot + converted sdxl PiD checkpoint + gemma-2-2b-it"]
+fn sdxl_pid_from_ldm_early_stop() {
+    // sc-8049: the **integrated** from_ldm early-stop for the SDXL variance-preserving space (the VP
+    // sibling of the qwenimage/flux flow-match gates, and the epic's strongest go/no-go). Same model +
+    // request as the clean-decode test but with `pid_capture_sigma` — the DEFAULT ancestral denoise exits
+    // early at a partially-denoised x_k, which (uniquely for SDXL) is ALREADY renormalized to the VP frame
+    // `(x0+σε)/√(σ²+1)`, so it is handed to PiD as-is at the achieved degrade σ = `σ/√(1+σ²)` (validated
+    // frame-wise, weight-free, by `sampler::tests::ancestral_stored_latent_is_the_vp_frame`). Chaos-
+    // limited, so this is a coherence/shape smoke + side-by-side dump vs the clean σ=0 PiD decode.
+    let size: u32 = std::env::var("SDXL_PID_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    // Enough ancestral steps for the σ ceiling to land mid-schedule. Env-tunable so this doubles as the
+    // per-backbone gate characterization.
+    let steps: u32 = std::env::var("SDXL_PID_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let capture_sigma: f32 = std::env::var("SDXL_PID_CAPTURE_SIGMA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5);
+
+    let spec = LoadSpec::new(WeightsSource::Dir(sdxl_dir())).with_pid(
+        WeightsSource::File(pid_checkpoint()),
+        WeightsSource::Dir(gemma_dir()),
+    );
+    let model = mlx_gen::load(MODEL_ID, &spec).expect("load sdxl + PiD");
+
+    let base = GenerationRequest {
+        prompt: "a red fox in a snowy pine forest at dawn, photorealistic".into(),
+        width: size,
+        height: size,
+        count: 1,
+        seed: Some(7),
+        steps: Some(steps),
+        use_pid: true,
+        ..Default::default()
+    };
+
+    // Clean σ=0 PiD decode (full ancestral denoise) for the side-by-side.
+    let t = Instant::now();
+    let clean = one_image(
+        model
+            .generate(&base, &mut |_| {})
+            .expect("clean pid generate"),
+    );
+    let clean_dt = t.elapsed().as_secs_f32();
+
+    // from_ldm early-stop at the (env-tunable) VP-frame capture ceiling.
+    let early_req = GenerationRequest {
+        pid_capture_sigma: Some(capture_sigma),
+        ..base.clone()
+    };
+    let t = Instant::now();
+    let early = one_image(
+        model
+            .generate(&early_req, &mut |_| {})
+            .expect("from_ldm pid generate"),
+    );
+    let early_dt = t.elapsed().as_secs_f32();
+
+    let (clo, chi, _cmu) = stats(&clean);
+    let (elo, ehi, _emu) = stats(&early);
+    eprintln!(
+        "clean σ=0: {}x{} in {clean_dt:.2}s [{clo},{chi}]   from_ldm σ≤{capture_sigma}: {}x{} in {early_dt:.2}s [{elo},{ehi}]  ({:.0}% wall-clock vs clean)",
+        clean.width,
+        clean.height,
+        early.width,
+        early.height,
+        100.0 * (1.0 - early_dt / clean_dt.max(1e-3)),
+    );
+    assert_eq!(early.width, size * 4, "from_ldm width == 4× native");
+    assert_eq!(early.height, size * 4, "from_ldm height == 4× native");
+    assert!(ehi as i32 - elo as i32 > 40, "from_ldm output near-flat");
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
+    let _ = std::fs::create_dir_all(dir);
+    save_png(&clean, &format!("{dir}/sdxl_pid_clean_{}.png", clean.width));
+    save_png(
+        &early,
+        &format!("{dir}/sdxl_pid_fromldm_{}.png", early.width),
+    );
+    eprintln!("wrote {dir}/sdxl_pid_clean_*.png + sdxl_pid_fromldm_*.png");
+}
+
+#[test]
 #[ignore = "needs an SDXL-family snapshot (no PiD weights) — proves the error path"]
 fn use_pid_without_loaded_pid_errors() {
     // Loading WITHOUT spec.pid, then requesting use_pid, must error clearly (not silently VAE-decode).

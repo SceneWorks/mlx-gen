@@ -95,6 +95,31 @@ impl KolorsEulerSampler {
         Ok(add(&x0, &multiply(&noise, scalar(self.start_sigma))?)?)
     }
 
+    /// The per-node EDM/k-diffusion σ schedule of this baked run — `[σ(t₀), …, σ(t_{n-1}), 0]`
+    /// (`self.sigmas`, length `num_steps + 1`, strictly descending to the terminal `0`). Used by the
+    /// PiD `from_ldm` early-stop (epic 7840, sc-8049) to resolve the variance-preserving capture plan
+    /// ([`mlx_gen::gen_core::sampling::vp_capture_plan`]) against the *exact* leading-Euler schedule this
+    /// run denoises, so the `keep` index and the achieved degrade σ agree with the truncated trajectory.
+    /// Kolors stores RAW variance-exploding latents (`x0 + σ·ε`) at every node (plain k-diffusion
+    /// `x + eps·dt`; `scale_model_input` only divides the U-Net input by `√(σ²+1)`), so the captured
+    /// latent is mapped into the student's VP frame by the plan's rescale before decode.
+    pub fn edm_sigmas(&self) -> &[f32] {
+        &self.sigmas
+    }
+
+    /// Truncate the baked schedule to its first `run_steps` steps — the PiD `from_ldm` early-stop
+    /// (epic 7840, sc-8049). This keeps the FULL schedule's spacing and stops after `run_steps` denoise
+    /// steps, leaving `x_k` at node `run_steps` (EDM σ = `edm_sigmas()[run_steps]`) — unlike rebuilding
+    /// with fewer steps, which would re-space the whole leading-Euler schedule. `run_steps >=
+    /// self.timesteps.len()` is a no-op (`Vec::truncate` clamps, so neither truncate panics), the clean
+    /// full-denoise path. `timesteps` keeps `num_steps` entries and `sigmas` keeps `num_steps + 1`
+    /// (the trailing `0`), matching the invariant `step`/`scale_model_input` index into.
+    pub fn truncate_to(mut self, run_steps: usize) -> Self {
+        self.timesteps.truncate(run_steps);
+        self.sigmas.truncate(run_steps + 1);
+        self
+    }
+
     pub fn new(
         num_train_timesteps: usize,
         beta_start: f32,
@@ -179,5 +204,80 @@ impl DiffusionSampler for KolorsEulerSampler {
         let x = x.as_dtype(Dtype::Float32)?;
         let dt = self.sigmas[i + 1] - self.sigmas[i];
         Ok(add(&x, &multiply(&eps, scalar(dt))?)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edm_sigmas_descend_to_zero_with_node_count() {
+        // The from_ldm VP capture (sc-8049) resolves `vp_capture_plan` against this per-node σ schedule
+        // — one σ per node, descending, trailing terminal 0 (mirrors the SDXL anchor's assertion).
+        let s = KolorsEulerSampler::kolors(8, Dtype::Float32).unwrap();
+        let edm = s.edm_sigmas();
+        assert_eq!(
+            edm.len(),
+            s.num_steps() + 1,
+            "one σ per node incl. terminal 0"
+        );
+        assert_eq!(edm.len(), 9);
+        assert_eq!(*edm.last().unwrap(), 0.0, "terminal node σ=0");
+        assert!(edm.windows(2).all(|w| w[0] >= w[1]), "descending");
+        assert!(edm[0] > 0.0, "starts at a positive σ");
+    }
+
+    #[test]
+    fn truncate_to_preserves_full_schedule_spacing() {
+        // The from_ldm early-stop truncates the FULL leading-Euler schedule (keeping its spacing)
+        // rather than rebuilding with fewer steps (which would re-space it) — sc-8049.
+        let full_edm = KolorsEulerSampler::kolors(8, Dtype::Float32)
+            .unwrap()
+            .edm_sigmas()
+            .to_vec();
+        let trunc = KolorsEulerSampler::kolors(8, Dtype::Float32)
+            .unwrap()
+            .truncate_to(3);
+        assert_eq!(trunc.num_steps(), 3, "3 steps kept");
+        let trunc_edm = trunc.edm_sigmas();
+        assert_eq!(trunc_edm.len(), 4, "3 steps → 4 nodes (incl. trailing 0)");
+        for i in 0..4 {
+            assert!(
+                (trunc_edm[i] - full_edm[i]).abs() < 1e-6,
+                "node {i}: truncation must keep the full schedule's leading nodes"
+            );
+        }
+        // A natively-built 3-step schedule re-spaces (leading spacing → different interior node), so its
+        // interior node differs from the truncation.
+        let native3 = KolorsEulerSampler::kolors(3, Dtype::Float32)
+            .unwrap()
+            .edm_sigmas()
+            .to_vec();
+        assert!(
+            (trunc_edm[1] - native3[1]).abs() > 1e-4,
+            "truncation must NOT equal a re-spaced 3-step schedule"
+        );
+    }
+
+    #[test]
+    fn truncate_to_full_or_larger_is_a_noop() {
+        // `run_steps >= timesteps.len()` leaves the schedule intact (the clean full-denoise path); the
+        // `sigmas.truncate(run_steps + 1)` must not panic past the end (Vec::truncate clamps).
+        let full = KolorsEulerSampler::kolors(4, Dtype::Float32)
+            .unwrap()
+            .edm_sigmas()
+            .to_vec();
+        for rs in [4usize, 5, 100] {
+            let t = KolorsEulerSampler::kolors(4, Dtype::Float32)
+                .unwrap()
+                .truncate_to(rs);
+            assert_eq!(t.num_steps(), 4, "run_steps {rs}: no-op keeps all 4 steps");
+            assert_eq!(
+                t.edm_sigmas(),
+                full.as_slice(),
+                "run_steps {rs}: schedule unchanged"
+            );
+        }
     }
 }

@@ -166,6 +166,7 @@ fn kolors_controlnet_scale0_is_base() {
             cfg,
             h,
             w,
+            None,
             &mlx_gen::CancelFlag::new(),
             &mut |_p| {},
         )
@@ -182,6 +183,7 @@ fn kolors_controlnet_scale0_is_base() {
             0.0,
             h,
             w,
+            None,
             &mlx_gen::CancelFlag::new(),
             &mut |_p| {},
         )
@@ -213,6 +215,7 @@ fn kolors_controlnet_scale0_is_base() {
             0.7,
             h,
             w,
+            None,
             &mlx_gen::CancelFlag::new(),
             &mut |_p| {},
         )
