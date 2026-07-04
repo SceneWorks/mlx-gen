@@ -16,7 +16,7 @@ use mlx_gen::{
     ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{
@@ -252,18 +252,39 @@ impl Ideogram4 {
         // Tokenize once — the JSON caption is identical across the count loop; only the seed varies.
         let ids = self.pipeline.tokenize(&req.prompt)?;
 
-        // PiD decode overlay (epic 7840, sc-7847): one decoder serves the whole count loop (same
-        // prompt). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
-        // (the default) → the byte-exact native VAE path. Applies to both T2I and edit.
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder serves
+        // the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't loaded with
+        // `LoadSpec::pid`; `None` (the default) → the byte-exact native VAE path. Applies to both T2I and
+        // edit. When `pid_capture_sigma` asks for an early exit, mint the decoder at the achieved degrade
+        // σ and stop the denoise at `run_from` so PiD receives the partially-denoised latent. NOTE:
+        // Ideogram's `LogitNormalSchedule` is *inverted* (larger `eval` = cleaner), so `fromldm_capture`
+        // converts the executed σ trajectory into the standard descending flow-match frame PiD expects
+        // (`σ = 1 − eval`; `vp_frame=false`) before resolving the plan — the packed-128ch BN decode seam
+        // (sc-7847) is unchanged. `None`/no-benefit → clean σ=0, full range, byte-identical.
+        let (capture_sigma, run_from) = self
+            .pipeline
+            .fromldm_capture(
+                req.height,
+                req.width,
+                steps,
+                edit_init.as_ref().map(|e| e.strength),
+                req.use_pid.then_some(req.pid_capture_sigma).flatten(),
+            )
+            .map_or((0.0, 0), |(sigma, from)| (sigma, from));
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let seed = base_seed.wrapping_add(n as u64);
             let arr = match &edit_init {
-                Some(edit) => self.pipeline.generate_edit_with_progress(
+                Some(edit) => self.pipeline.generate_edit_with_progress_from(
                     &ids,
                     req.height,
                     req.width,
@@ -271,17 +292,19 @@ impl Ideogram4 {
                     guidance,
                     seed,
                     edit,
+                    run_from,
                     pid_ref,
                     &req.cancel,
                     on_progress,
                 )?,
-                None => self.pipeline.generate_with_progress(
+                None => self.pipeline.generate_with_progress_from(
                     &ids,
                     req.height,
                     req.width,
                     steps,
                     guidance,
                     seed,
+                    run_from,
                     pid_ref,
                     &req.cancel,
                     on_progress,

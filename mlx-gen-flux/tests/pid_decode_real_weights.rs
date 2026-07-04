@@ -173,3 +173,98 @@ fn flux_dev_pid_decode_vs_vae() {
         pid_dt / vae_dt.max(1e-3)
     );
 }
+
+#[test]
+#[ignore = "needs the FLUX.1-dev snapshot + converted flux PiD checkpoint + gemma-2-2b-it"]
+fn flux_dev_pid_from_ldm_early_stop() {
+    // sc-8048: the **integrated** from_ldm early-stop for the flux flow-match space (the sibling of the
+    // qwenimage `qwen_image_pid_from_ldm_early_stop` gate). Same model+request as the clean-decode test
+    // but with `pid_capture_sigma` — the denoise exits early at a partially-denoised x_k and PiD decodes
+    // it at the achieved degrade σ (flux is `vp_frame=false`, so the schedule σ *is* the degrade σ).
+    // Chaos-limited (no local reference for an arbitrary mid-trajectory capture), so this is a
+    // coherence/shape smoke + a side-by-side dump vs the clean σ=0 PiD decode — the go/no-go gate.
+    let size: u32 = std::env::var("FLUX_PID_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(512);
+    // A multi-step schedule so the σ ceiling has fine steps to land on (the regime where sc-7993 found
+    // the early-stop worth it). Env-tunable so this doubles as the per-backbone gate characterization.
+    let steps: usize = std::env::var("FLUX_PID_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(28);
+    let capture_sigma: f32 = std::env::var("FLUX_PID_CAPTURE_SIGMA")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.5);
+    let mut spec = LoadSpec::new(WeightsSource::Dir(flux_dev_dir()));
+    if let Some(q) = quant_from_env() {
+        spec = spec.with_quant(q);
+    }
+    spec = spec.with_pid(
+        WeightsSource::File(pid_checkpoint()),
+        WeightsSource::Dir(gemma_dir()),
+    );
+    let model = load_dev(&spec).expect("load FLUX.1-dev + PiD");
+
+    let base = GenerationRequest {
+        prompt: "a mountain valley landscape at golden hour with a winding river and pine forest"
+            .into(),
+        width: size,
+        height: size,
+        count: 1,
+        seed: Some(7),
+        steps: Some(steps as u32),
+        use_pid: true,
+        ..Default::default()
+    };
+
+    // Clean σ=0 PiD decode (full denoise) for the side-by-side.
+    let t = Instant::now();
+    let clean = match model
+        .generate(&base, &mut |_| {})
+        .expect("clean pid generate")
+    {
+        GenerationOutput::Images(v) => v.into_iter().next().unwrap(),
+        _ => panic!("expected images"),
+    };
+    let clean_dt = t.elapsed().as_secs_f32();
+
+    // from_ldm early-stop at the (env-tunable) capture ceiling.
+    let early_req = GenerationRequest {
+        pid_capture_sigma: Some(capture_sigma),
+        ..base.clone()
+    };
+    let t = Instant::now();
+    let early = match model
+        .generate(&early_req, &mut |_| {})
+        .expect("from_ldm pid generate")
+    {
+        GenerationOutput::Images(v) => v.into_iter().next().unwrap(),
+        _ => panic!("expected images"),
+    };
+    let early_dt = t.elapsed().as_secs_f32();
+
+    let (clo, chi, _cmu) = stats(&clean);
+    let (elo, ehi, _emu) = stats(&early);
+    eprintln!(
+        "clean σ=0: {}x{} in {clean_dt:.2}s [{clo},{chi}]   from_ldm σ≤{capture_sigma}: {}x{} in {early_dt:.2}s [{elo},{ehi}]  ({:.0}% wall-clock vs clean)",
+        clean.width,
+        clean.height,
+        early.width,
+        early.height,
+        100.0 * (1.0 - early_dt / clean_dt.max(1e-3)),
+    );
+    assert_eq!(early.width, size * 4, "from_ldm width == 4× native");
+    assert_eq!(early.height, size * 4, "from_ldm height == 4× native");
+    assert!(ehi as i32 - elo as i32 > 40, "from_ldm output near-flat");
+
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../tools/golden/pid");
+    let _ = std::fs::create_dir_all(dir);
+    save_png(&clean, &format!("{dir}/flux_pid_clean_{}.png", clean.width));
+    save_png(
+        &early,
+        &format!("{dir}/flux_pid_fromldm_{}.png", early.width),
+    );
+    eprintln!("wrote {dir}/flux_pid_clean_*.png + flux_pid_fromldm_*.png");
+}

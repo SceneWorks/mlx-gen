@@ -18,7 +18,7 @@ use mlx_gen::{
     Progress, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_flux::{build_linear_sigmas, create_noise, unpack_latents, T5TextEncoder};
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, concatenate_axis, multiply, subtract};
 use mlx_rs::Array;
@@ -221,6 +221,38 @@ impl Chroma {
         )
     }
 
+    /// Build the flow-match σ schedule for a render (native + optional curated re-shape), factored out
+    /// of [`Self::denoise_with_sampler`] so the `generate_impl` PiD `from_ldm` early-stop (sc-8048) can
+    /// mint the decoder at the achieved capture σ and truncate the denoise — the schedule must be known
+    /// where the decoder is resolved. Native schedule is the byte-exact default (epic 7114 N1): Base's
+    /// beta re-spacing, or HD/Flash's static-shift linspace; a curated `scheduler_name` then re-shapes σ
+    /// over the variant's static shift (HD `ln(3)`; Base/Flash `ln(1) = 0`).
+    fn build_schedule(
+        &self,
+        width: u32,
+        height: u32,
+        steps: u32,
+        scheduler_name: Option<&str>,
+    ) -> Result<Vec<f32>> {
+        let native = if self.variant.use_beta_sigmas() {
+            crate::beta::base_sigmas(steps as usize)
+        } else {
+            let shift = self.variant.sigma_shift();
+            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
+            for v in s.iter_mut().take(steps as usize) {
+                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
+            }
+            s
+        };
+        let mu = self.variant.sigma_shift().ln();
+        Ok(resolve_flow_schedule(
+            scheduler_name,
+            mu,
+            steps as usize,
+            &native,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn denoise_with_sampler(
         &self,
@@ -233,6 +265,41 @@ impl Chroma {
         latents: Array,
         sampler_name: &str,
         scheduler_name: Option<&str>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let sigmas = self.build_schedule(width, height, steps, scheduler_name)?;
+        self.denoise_with_schedule(
+            prompt,
+            negative,
+            width,
+            height,
+            guidance,
+            latents,
+            sampler_name,
+            sigmas,
+            seed,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// [`Self::denoise_with_sampler`] over a pre-built σ schedule — the seam the `generate_impl` PiD
+    /// `from_ldm` early-stop (sc-8048) hands a *truncated* schedule (`&sigmas[..keep]`) so the denoise
+    /// stops at the achieved capture σ. Passing the full schedule is byte-identical to the prior inline
+    /// path (chroma is flow-match `vp_frame=false`, so the schedule σ *is* the degrade σ).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_with_schedule(
+        &self,
+        prompt: &str,
+        negative: &str,
+        width: u32,
+        height: u32,
+        guidance: f32,
+        latents: Array,
+        sampler_name: &str,
+        sigmas: Vec<f32>,
         seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -255,23 +322,6 @@ impl Chroma {
         } else {
             None
         };
-
-        // Native schedule (the byte-exact default, epic 7114 N1): Base's beta re-spacing, or HD/Flash's
-        // static-shift linspace. A curated `req.scheduler` then re-shapes σ over the variant's static
-        // shift (HD `ln(3)`; Base/Flash `ln(1) = 0`, since Base's shift is identity before the beta
-        // re-spacing and Flash is unshifted).
-        let native = if self.variant.use_beta_sigmas() {
-            crate::beta::base_sigmas(steps as usize)
-        } else {
-            let shift = self.variant.sigma_shift();
-            let mut s = build_linear_sigmas(steps as usize, width, height, false)?;
-            for v in s.iter_mut().take(steps as usize) {
-                *v = shift * *v / (1.0 + (shift - 1.0) * *v);
-            }
-            s
-        };
-        let mu = self.variant.sigma_shift().ln();
-        let sigmas = resolve_flow_schedule(scheduler_name, mu, steps as usize, &native);
 
         // Scoped compiled-glue enable (F-007): restored on drop instead of leaking the global on.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
@@ -482,11 +532,28 @@ impl Chroma {
             .unwrap_or_else(|| self.variant.default_true_cfg());
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        // PiD decode overlay (epic 7840, sc-7846): Chroma shares the FLUX.1 VAE latent space (the `flux`
-        // student), so the decode can route through PiD when `use_pid` is set + an overlay was loaded;
-        // errors loudly if requested without one. `None` → the native VAE. Shared across the count loop.
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        let name = resolve_sampler_name(self.variant, req.sampler.as_deref());
+        // Build the flow-match σ schedule once — it is seed-independent (same steps/dims/scheduler for
+        // every image), and the PiD `from_ldm` early-stop below needs it to mint the decoder at the
+        // achieved capture σ and truncate the denoise.
+        let sigmas = self.build_schedule(req.width, req.height, steps, req.scheduler.as_deref())?;
+        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): Chroma shares the
+        // FLUX.1 VAE latent space (the `flux` student), so the decode can route through PiD when
+        // `use_pid` is set + an overlay was loaded; errors loudly if requested without one. `None` → the
+        // native VAE. When `pid_capture_sigma` asks for an early exit on this flow-match schedule (Chroma
+        // is `vp_frame=false`, so the schedule σ *is* the degrade σ), stop the denoise at the achieved-σ
+        // step and hand PiD the partially-denoised x_k; else the clean σ=0 full-denoise path
+        // (`capture_sigma = 0`, full schedule). txt2img here → `start_step = 0`. Shared across the count
+        // loop (same prompt → same caption embeds); per-image variation is the per-seed denoised latent.
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
+        let denoise_sigmas = &sigmas[..keep];
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -496,17 +563,15 @@ impl Chroma {
             }
             let seed = base_seed.wrapping_add(i as u64);
             let latents = create_noise(seed, req.width, req.height)?;
-            let name = resolve_sampler_name(self.variant, req.sampler.as_deref());
-            let final_latents = self.denoise_with_sampler(
+            let final_latents = self.denoise_with_schedule(
                 &req.prompt,
                 negative,
                 req.width,
                 req.height,
-                steps,
                 guidance,
                 latents,
                 name,
-                req.scheduler.as_deref(),
+                denoise_sigmas.to_vec(),
                 seed,
                 &req.cancel,
                 on_progress,

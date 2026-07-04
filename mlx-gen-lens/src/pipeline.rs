@@ -281,6 +281,22 @@ impl LensPipeline {
     /// - `encoder_mask`: `[2, S_txt]` (`1` = valid).
     /// - `init_latents`: `[1, latent_h · latent_w, 128]`.
     ///
+    /// Resolve the descending flow-match σ schedule for a generation (`num_steps + 1` entries, trailing
+    /// `0.0`) — the exact vector [`denoise_with_sampler`](Self::denoise_with_sampler) feeds the solver.
+    /// Factored out so the registry can compute the PiD `from_ldm` early-stop capture plan (sc-8048)
+    /// against the same σ trajectory the denoise runs, then truncate the loop to `keep`.
+    pub fn resolve_sigmas(
+        &self,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        scheduler_name: Option<&str>,
+    ) -> Vec<f32> {
+        let native = lens_schedule(num_steps, latent_h, latent_w).sigmas;
+        let mu = compute_mu(latent_h * latent_w, num_steps);
+        resolve_flow_schedule(scheduler_name, mu, num_steps, &native)
+    }
+
     /// Returns the final latents `[1, latent_h · latent_w, 128]` (patch-space; feed to [`vae::decode`]).
     #[allow(clippy::too_many_arguments)]
     pub fn denoise(
@@ -326,6 +342,9 @@ impl LensPipeline {
     ///   default).
     /// - `seed`: drives the per-step noise of the stochastic solvers (`euler_ancestral` / `dpmpp_sde` /
     ///   `lcm`); the deterministic solvers ignore it.
+    ///
+    /// The full-schedule entry; [`denoise_with_sampler_keep`](Self::denoise_with_sampler_keep) is the
+    /// PiD `from_ldm` early-stop (sc-8048) variant that additionally truncates the descending schedule.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_with_sampler(
         &self,
@@ -342,14 +361,58 @@ impl LensPipeline {
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize, usize),
     ) -> Result<Array> {
+        self.denoise_with_sampler_keep(
+            encoder_features,
+            encoder_mask,
+            init_latents,
+            latent_h,
+            latent_w,
+            num_steps,
+            guidance_scale,
+            sampler_name,
+            scheduler_name,
+            seed,
+            None, // full schedule — no PiD early-stop capture
+            cancel,
+            on_step,
+        )
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) denoise: as [`denoise_with_sampler`](Self::denoise_with_sampler)
+    /// but truncates the descending flow-match schedule to `keep` (`Some(k)` → run over `sigmas[..k]`,
+    /// leaving the latent at the capture σ `sigmas[k-1]`; `None` → the full schedule, byte-identical).
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_with_sampler_keep(
+        &self,
+        encoder_features: &[Array],
+        encoder_mask: &Array,
+        init_latents: &Array,
+        latent_h: usize,
+        latent_w: usize,
+        num_steps: usize,
+        guidance_scale: f32,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        seed: u64,
+        keep: Option<usize>,
+        cancel: &CancelFlag,
+        on_step: &mut dyn FnMut(usize, usize),
+    ) -> Result<Array> {
         // The native Lens schedule is the byte-exact N1 default: empirical-μ flow-match sigmas (length
         // num_steps + 1, trailing 0). A curated `scheduler_name` re-shapes σ over the SAME empirical μ
         // (`compute_mu(seq_len, steps)`), so `karras` / `exponential` / … stay consistent with Lens's
         // resolution-/step-dependent shift instead of degrading to a linear ramp; an unset / legacy /
         // unknown name returns this native schedule verbatim.
-        let native = lens_schedule(num_steps, latent_h, latent_w).sigmas;
-        let mu = compute_mu(latent_h * latent_w, num_steps);
-        let sigmas = resolve_flow_schedule(scheduler_name, mu, num_steps, &native);
+        let sigmas = self.resolve_sigmas(latent_h, latent_w, num_steps, scheduler_name);
+        // PiD `from_ldm` early-stop (sc-8048): `keep` truncates the descending schedule so the denoise
+        // stops at the achieved-σ step and hands PiD the partially-denoised latent (`sigmas[keep-1]` is
+        // the capture σ; Lens is `vp_frame=false` so the schedule σ *is* the degrade σ). `None` → the
+        // full schedule → byte-identical clean path. Lens is pure T2I (no img2img blend), so the slice
+        // is `..keep` and there is no `start_step` offset.
+        let sigmas: &[f32] = match keep {
+            Some(k) => &sigmas[..k],
+            None => &sigmas,
+        };
 
         let dtype = self.dtype;
         let transformer = &self.transformer;
@@ -414,7 +477,7 @@ impl LensPipeline {
         run_flow_sampler(
             sampler_name,
             TimestepConvention::Sigma,
-            &sigmas,
+            sigmas,
             init_latents.as_dtype(dtype)?,
             seed,
             cancel,
@@ -426,18 +489,21 @@ impl LensPipeline {
     /// Generate a single image (no cancellation / progress). Draws the initial latents from the
     /// global RNG seeded with `opts.seed`. Native-VAE decode (no PiD overlay).
     pub fn generate(&self, opts: &GenerateOptions) -> Result<Image> {
-        self.generate_with_progress(opts, None, &CancelFlag::default(), &mut |_| {})
+        self.generate_with_progress(opts, None, None, &CancelFlag::default(), &mut |_| {})
     }
 
     /// Generate a single image, threading a cancel flag and a per-step progress callback
     /// (`on_step(completed_step)`). The registry loops `count` with per-image seeds over this.
     ///
     /// `pid_decoder`: an optional PiD super-resolving decoder (epic 7840, sc-7847) that replaces the
-    /// native Flux.2 VAE decode (4× SR). `None` → the byte-exact VAE path.
+    /// native Flux.2 VAE decode (4× SR). `None` → the byte-exact VAE path. `keep`: the PiD `from_ldm`
+    /// early-stop truncation (sc-8048) — `Some(k)` runs the denoise over `sigmas[..k]` so the latent
+    /// sits at the capture σ; `None` runs the full schedule (byte-identical clean path).
     pub fn generate_with_progress(
         &self,
         opts: &GenerateOptions,
         pid_decoder: Option<&dyn mlx_gen::LatentDecoder>,
+        keep: Option<usize>,
         cancel: &CancelFlag,
         on_step: &mut dyn FnMut(usize),
     ) -> Result<Image> {
@@ -484,7 +550,7 @@ impl LensPipeline {
         mlx_rs::random::seed(opts.seed)?;
         let init = mlx_rs::random::normal::<f32>(&[1, seq_len, 128], None, None, None)?;
 
-        let latents = self.denoise_with_sampler(
+        let latents = self.denoise_with_sampler_keep(
             &encoder_features,
             &encoder_mask,
             &init,
@@ -495,6 +561,7 @@ impl LensPipeline {
             opts.sampler,
             opts.scheduler,
             opts.seed,
+            keep,
             cancel,
             &mut |cur, _total| on_step(cur),
         )?;

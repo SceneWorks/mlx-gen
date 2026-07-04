@@ -16,9 +16,11 @@ use mlx_gen::{
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
     LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
-use crate::pipeline::{BooguPipeline, EditOptions, GenerateOptions, TurboOptions};
+use crate::pipeline::{
+    base_flow_schedule, BooguPipeline, EditOptions, GenerateOptions, TurboOptions,
+};
 
 /// Registry id for the Base text-to-image variant (true-CFG). Matches the SceneWorks worker's
 /// `payload.model`.
@@ -227,15 +229,44 @@ impl Boogu {
         validate_request(&self.descriptor, req)?;
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        // PiD decode overlay (epic 7840, sc-7846): resolve once; `Some` only when `use_pid` is set AND a
-        // PiD overlay was loaded (errors loudly if requested without one), else `None` → the native VAE.
-        // Shared across the `count` loop and all three variant paths (same prompt → same caption).
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
         let mut images = Vec::with_capacity(req.count as usize);
 
+        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): resolve the decoder
+        // once per variant, `Some` only when `use_pid` is set AND a PiD overlay was loaded (errors loudly
+        // if requested without one), else `None` → the native VAE. Shared across the `count` loop (same
+        // prompt → same caption). The Base/Edit variants are true-flow-match (`vp_frame=false`), so the
+        // schedule σ *is* the degrade σ: when `pid_capture_sigma` asks for an early exit, `flow_capture_
+        // for_request` folds the σ ceiling + schedule into `(capture_sigma, keep)` — mint the decoder at
+        // `capture_sigma` and truncate the denoise to `keep`; the clean path yields `(0.0, sigmas.len())`
+        // → full schedule, σ=0, byte-identical. Boogu starts from pure noise (`start_step = 0`). The Turbo
+        // few-step DMD path does NOT support the early-stop (its loop yields clean x0 estimates, not a
+        // σ>0 latent, and it is decode-bound) — it rejects `pid_capture_sigma` and decodes at σ=0.
         if self.descriptor.id == BOOGU_IMAGE_TURBO_ID {
+            // The Turbo few-step DMD loop predicts a CLEAN x0 estimate each step (`x += (1−σ)·v`) and
+            // re-noises to the next level; there is no "noisy x_k at σ>0" to hand PiD. Stopping early
+            // would leave a ~clean latent while the decoder was minted at `capture_sigma > 0` — a σ
+            // mismatch that produces wrong output. Turbo is also decode-bound (sc-7993), so the
+            // `from_ldm` early-stop has no benefit here. Reject `pid_capture_sigma` loudly rather than
+            // silently degrade; the Base variant is the supported path for from_ldm (sc-8048).
+            if req.use_pid && req.pid_capture_sigma.is_some() {
+                return Err(Error::Msg(format!(
+                    "{}: pid_capture_sigma (from_ldm early-stop) is not supported on the Boogu Turbo \
+                     few-step DMD path — it is decode-bound with no early-stop benefit and the DMD \
+                     loop produces clean x0 estimates, not a σ>0 latent; use the Base variant for \
+                     from_ldm (sc-8048)",
+                    self.descriptor.id
+                )));
+            }
             let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
+            // No early-stop on Turbo: the PiD decoder (when `use_pid`) is minted at the clean terminal
+            // σ=0 (the DMD loop's final x0 estimate), matching the full-loop latent it decodes.
+            let pid_decoder = resolve_pid_decoder_at_sigma(
+                self.pid.as_ref(),
+                req,
+                base_seed,
+                self.descriptor.id,
+                0.0,
+            )?;
             for n in 0..req.count {
                 let opts = TurboOptions {
                     height: req.height,
@@ -263,6 +294,16 @@ impl Boogu {
                 resolve_edit_references(req)?.into_iter().cloned().collect();
             let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
             let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+            let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+            let pid_decoder = resolve_pid_decoder_at_sigma(
+                self.pid.as_ref(),
+                req,
+                base_seed,
+                self.descriptor.id,
+                capture_sigma,
+            )?;
+            let denoise_sigmas = &sigmas[..keep];
             for n in 0..req.count {
                 let opts = EditOptions {
                     height: req.height,
@@ -279,6 +320,7 @@ impl Boogu {
                     &references,
                     &req.prompt,
                     &opts,
+                    denoise_sigmas,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &req.cancel,
                     on_progress,
@@ -288,6 +330,16 @@ impl Boogu {
         } else {
             let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
             let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+            let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+            let pid_decoder = resolve_pid_decoder_at_sigma(
+                self.pid.as_ref(),
+                req,
+                base_seed,
+                self.descriptor.id,
+                capture_sigma,
+            )?;
+            let denoise_sigmas = &sigmas[..keep];
             for n in 0..req.count {
                 let opts = GenerateOptions {
                     height: req.height,
@@ -301,6 +353,7 @@ impl Boogu {
                 let img = self.pipeline.generate_with_progress(
                     &req.prompt,
                     &opts,
+                    denoise_sigmas,
                     pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &req.cancel,
                     on_progress,

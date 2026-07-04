@@ -27,7 +27,7 @@ use mlx_gen::{
     ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::pipeline::{GenerateOptions, LensPipeline, DEFAULT_DATE, VAE_SCALE_FACTOR};
 
@@ -202,10 +202,29 @@ impl LensGenerator {
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let total = steps as u32;
 
-        // PiD decode overlay (epic 7840, sc-7847): one decoder serves the whole count loop (same
-        // prompt). Errors if `req.use_pid` but the model wasn't loaded with `LoadSpec::pid`; `None`
-        // (the default) → the byte-exact native Flux.2 VAE path.
-        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.defaults.id)?;
+        // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder serves
+        // the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't loaded with
+        // `LoadSpec::pid`; `None` (the default) → the byte-exact native Flux.2 VAE path. When
+        // `pid_capture_sigma` asks for an early exit, mint the decoder at the achieved-σ step and
+        // truncate the denoise to `keep` so PiD receives the partially-denoised latent — Lens is
+        // `vp_frame=false`, so the schedule σ *is* the degrade σ (flow-match identity). Resolve the plan
+        // against the SAME descending schedule `denoise_with_sampler` runs (via `resolve_sigmas`); Lens
+        // is pure T2I so `start_step = 0`. `None` capture → `(0.0, sigmas.len())` → full schedule,
+        // byte-identical.
+        let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
+        let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
+        let sigmas = self
+            .pipe
+            .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let keep = (keep < sigmas.len()).then_some(keep);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.defaults.id,
+            capture_sigma,
+        )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
         let mut images = Vec::with_capacity(req.count as usize);
@@ -234,21 +253,25 @@ impl LensGenerator {
             // Re-encode per image is cheap relative to denoise and keeps the RNG order matching the
             // struct API (one noise draw per image, no shared state). Progress is streamed via the
             // pipeline's per-step callback; cancellation is honored inside `denoise`.
-            let image =
-                self.pipe
-                    .generate_with_progress(&opts, pid_ref, &req.cancel, &mut |cur| {
-                        on_progress(Progress::Step {
-                            current: cur as u32,
-                            total,
-                        });
-                        // F-106: the pipeline decodes immediately after the final step returns (it only
-                        // exposes a step callback, not a Progress sink), so emit `Decoding` when the last
-                        // step lands — i.e. BEFORE the VAE/PiD decode, not after `generate_with_progress`
-                        // has already finished decoding.
-                        if cur as u32 >= total {
-                            on_progress(Progress::Decoding);
-                        }
-                    })?;
+            let image = self.pipe.generate_with_progress(
+                &opts,
+                pid_ref,
+                keep,
+                &req.cancel,
+                &mut |cur| {
+                    on_progress(Progress::Step {
+                        current: cur as u32,
+                        total,
+                    });
+                    // F-106: the pipeline decodes immediately after the final step returns (it only
+                    // exposes a step callback, not a Progress sink), so emit `Decoding` when the last
+                    // step lands — i.e. BEFORE the VAE/PiD decode, not after `generate_with_progress`
+                    // has already finished decoding.
+                    if cur as u32 >= total {
+                        on_progress(Progress::Decoding);
+                    }
+                },
+            )?;
             images.push(image);
         }
         Ok(GenerationOutput::Images(images))
