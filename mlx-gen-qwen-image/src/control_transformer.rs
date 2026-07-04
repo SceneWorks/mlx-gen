@@ -130,6 +130,17 @@ impl QwenFunControlBranch {
         self.blocks.len()
     }
 
+    /// The packed bit-width (4 or 8) if this branch loaded from a **pre-quantized** control tier
+    /// (sc-9517), else `None` (it loaded dense). Every control Linear packs at the same bits, so a
+    /// representative one (`before_proj`, always packed in a tier) reports for the whole branch. Lets
+    /// [`crate::model_control::load`] reject a requested-vs-packed tier mismatch (F-076): `quantize()`
+    /// no-ops on an already-packed branch, so without this a Q4-over-Q8 request would silently serve Q8.
+    pub fn packed_bits(&self) -> Option<i32> {
+        self.before_proj
+            .quantized_params()
+            .map(|(_, _, _, _, _, bits)| bits)
+    }
+
     /// The hint index injected at base block `idx`, or `None`. Mirrors the fork's
     /// `control_layers_mapping`.
     pub fn hint_index(&self, idx: usize) -> Option<usize> {

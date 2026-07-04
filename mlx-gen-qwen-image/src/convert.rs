@@ -13,12 +13,15 @@
 //! with no dense bf16 transient (sc-8670). This is the Group-B per-crate converter template
 //! (sc-8669); the dense-TE shape matches FLUX.2-klein (sc-8711).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_gen::quant::{
     copy_dir, copy_turnkey_assets, load_dir_map, quantize_map, save_map, write_quantized_config,
 };
+use mlx_gen::weights::Weights;
 use mlx_gen::Result;
+use mlx_rs::Array;
 
 use crate::quant::GROUP_SIZE;
 
@@ -81,12 +84,58 @@ pub fn prequantize_turnkey(src_root: &Path, dst_root: &Path, bits: i32) -> Resul
     copy_turnkey_assets(src_root, dst_root)
 }
 
+// ============================================================================================
+// 2512-Fun-Controlnet-Union control-branch converter (sc-9517 / epic 9083).
+// ============================================================================================
+
+/// Pre-quantize the alibaba-pai **2512-Fun-Controlnet-Union** control checkpoint — a single
+/// `Qwen-Image-2512-Fun-Controlnet-Union-2602.safetensors` overlay (the canonical MLX overlay), or a
+/// dir of shards — into a packed `model.safetensors` + a provenance `config.json` in `dst`. Mirrors
+/// [`QwenFunControlBranch::quantize`](crate::control_transformer::QwenFunControlBranch::quantize)'s
+/// scope exactly: every control-block joint-attention / gated-FFN / adaLN Linear plus each block's
+/// `after_proj` and block-0's `before_proj` pack group-64; the `control_img_in` patch embedder (132
+/// in-features → `% 64 != 0`) and the 1-D per-head attn RMSNorms stay **dense** — both shape-guarded
+/// by [`quantize_map`], so reusing the base [`is_transformer_target`] predicate (the control blocks
+/// share the base block key layout 1:1) is faithfulness + documentation, not the only net.
+///
+/// The packed keys keep their raw diffusers spelling; [`crate::loader::load_controlnet`] applies the
+/// same `remap_transformer_keys` to the packed tier as to the dense checkpoint and its projections
+/// packed-detect via `linear_from`, so the tier loads with no dense transient (and
+/// `QwenImageControl`'s load-time `.quantize()` no-ops on it — see [`crate::model_control`]). The
+/// candle lane consumes the SAME hosted tier via `candle_gen::quant` (epic 9083). `bits` = 4 or 8.
+pub fn quantize_qwen_control_branch(src: &Path, dst: &Path, bits: i32) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    // The overlay ships as a single `.safetensors` (canonical) or a dir of shards; read either into a
+    // key→Array map (the shared `load_dir_map` only handles dirs, so a file goes via `from_file`).
+    let w = if src.is_dir() {
+        Weights::from_dir(src)?
+    } else {
+        Weights::from_file(src)?
+    };
+    let map: HashMap<String, Array> = w
+        .keys()
+        .map(|k| (k.to_string(), w.get(k).expect("listed key").clone()))
+        .collect();
+    let packed = quantize_map(map, bits, GROUP_SIZE, is_transformer_target)?;
+    save_map(&dst.join("model.safetensors"), &packed)?;
+    // Provenance: a `{"quantization": {...}}` config.json (the loaders auto-detect packed weights via
+    // `{base}.scales` and ignore this block) + the source repo's README/LICENSE, so the hosted tier
+    // is self-describing + licensed (F-045). The overlay ships no config.json → the block starts from
+    // an empty object.
+    let src_root = if src.is_dir() {
+        src
+    } else {
+        src.parent().unwrap_or(src)
+    };
+    write_quantized_config(src_root, dst, bits, GROUP_SIZE)?;
+    copy_turnkey_assets(src_root, dst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_rs::ops::{eq, quantize};
-    use mlx_rs::{Array, Dtype};
-    use std::collections::HashMap;
+    use mlx_rs::Dtype;
 
     #[test]
     fn transformer_predicate_packs_every_linear_not_the_norms() {
