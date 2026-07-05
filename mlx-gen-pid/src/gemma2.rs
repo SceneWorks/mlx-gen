@@ -58,7 +58,13 @@ impl Gemma2Config {
 }
 
 fn lin(w: &Weights, key: &str) -> Result<AdaptableLinear> {
-    Ok(AdaptableLinear::dense(w.require(key)?.clone(), None))
+    // Packed-detect (Group-B, sc-8489): route through the shared `quant::lin` so a pre-quantized
+    // Gemma-2 (the SANA Q4/Q8 tier — `{base}.scales` present) loads its projections packed, while a
+    // dense Gemma-2 (every PiD decoder — no `.scales`) loads dense EXACTLY as before (bit-identical
+    // `AdaptableLinear::dense`). Callers pass the full `{base}.weight` key; Gemma-2 Linears are
+    // bias-free. `embed_tokens` is NOT routed here — it stays dense in every tier.
+    let base = key.strip_suffix(".weight").unwrap_or(key);
+    mlx_gen::quant::lin(w, base, false, mlx_gen::quant::DEFAULT_GROUP_SIZE)
 }
 
 /// Gemma RMSNorm with the precomputed `(1 + weight)`. The reference computes the normalization in

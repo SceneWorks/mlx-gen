@@ -43,6 +43,7 @@ use mlx_rs::ops::{
 };
 use mlx_rs::{Array, Dtype};
 
+use mlx_gen::adapters::AdaptableLinear;
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
 use mlx_gen::weights::Weights;
 use mlx_gen::{Error, Result};
@@ -63,40 +64,10 @@ fn relu(x: &Array) -> Result<Array> {
 // Linear / norm primitives (dtype-preserving; bf16/fp16 weights flow through unchanged).
 // ----------------------------------------------------------------------------------------------
 
-/// `nn.Linear`: stored weight is `[out, in]`; applies `x · Wᵀ (+ b)` over the last axis.
-struct Linear {
-    w_t: Array, // pre-transposed [in, out]
-    b: Option<Array>,
-}
-
-impl Linear {
-    fn load(w: &Weights, prefix: &str, bias: bool) -> Result<Self> {
-        let w_t = w
-            .require(&format!("{prefix}.weight"))?
-            .transpose_axes(&[1, 0])?;
-        let b = if bias {
-            Some(w.require(&format!("{prefix}.bias"))?.clone())
-        } else {
-            None
-        };
-        Ok(Self { w_t, b })
-    }
-
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let sh = x.shape();
-        let inn = sh[sh.len() - 1];
-        let out = self.w_t.shape()[1];
-        let n: i32 = sh[..sh.len() - 1].iter().product();
-        let y = matmul(&x.reshape(&[n, inn])?, &self.w_t)?;
-        let mut outsh: Vec<i32> = sh[..sh.len() - 1].to_vec();
-        outsh.push(out);
-        let y = y.reshape(&outsh)?;
-        match &self.b {
-            Some(b) => Ok(add(&y, b)?),
-            None => Ok(y),
-        }
-    }
-}
+// Every trunk `nn.Linear` loads through [`crate::quant::lin`] as an [`AdaptableLinear`] — packed
+// (Q4/Q8) when the on-disk `{base}.scales` is present, else dense (bf16), with identical numerics to
+// the former bespoke `Linear` (`x · Wᵀ (+ b)`). The `.base_shape()[0]` accessor recovers the output
+// (inner) dim the attention code needs, dense or packed alike (sc-8489, Group-B sc-8669).
 
 /// `RMSNorm(elementwise_affine=True, bias=False)` over the last axis, f32 reduction (diffusers
 /// `caption_norm`). `weight` is `[C]`.
@@ -176,10 +147,10 @@ impl Conv {
 
 /// `SanaLinearAttnProcessor2_0`: ReLU linear attention over the token axis. Input/output `[B, N, C]`.
 struct LinearSelfAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: AdaptableLinear,
+    to_k: AdaptableLinear,
+    to_v: AdaptableLinear,
+    to_out: AdaptableLinear,
     /// Sprint `qk_norm = "rms_norm_across_heads"` (sc-8490): RMSNorm over the full projected query /
     /// key (the whole `inner_dim`), applied BEFORE the head split and the ReLU. `None` for base SANA.
     norm_q: Option<Array>,
@@ -203,10 +174,10 @@ impl LinearSelfAttn {
         };
         Ok(Self {
             // attention_bias=false → q/k/v bias-free; to_out.0 carries a bias.
-            to_q: Linear::load(w, &format!("{prefix}.to_q"), false)?,
-            to_k: Linear::load(w, &format!("{prefix}.to_k"), false)?,
-            to_v: Linear::load(w, &format!("{prefix}.to_v"), false)?,
-            to_out: Linear::load(w, &format!("{prefix}.to_out.0"), true)?,
+            to_q: crate::quant::lin(w, &format!("{prefix}.to_q"), false)?,
+            to_k: crate::quant::lin(w, &format!("{prefix}.to_k"), false)?,
+            to_v: crate::quant::lin(w, &format!("{prefix}.to_v"), false)?,
+            to_out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), true)?,
             norm_q,
             norm_k,
             heads: cfg.num_attention_heads,
@@ -218,7 +189,7 @@ impl LinearSelfAttn {
     fn forward(&self, x: &Array) -> Result<Array> {
         let sh = x.shape();
         let (b, n) = (sh[0], sh[1]);
-        let inner = self.to_q.w_t.shape()[1];
+        let inner = self.to_q.base_shape()[0];
         let hd = inner / self.heads;
 
         // qk_norm = "rms_norm_across_heads": RMSNorm over the full `inner_dim`, BEFORE the head split
@@ -274,10 +245,10 @@ impl LinearSelfAttn {
 // ----------------------------------------------------------------------------------------------
 
 struct CrossAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: AdaptableLinear,
+    to_k: AdaptableLinear,
+    to_v: AdaptableLinear,
+    to_out: AdaptableLinear,
     /// Sprint `qk_norm = "rms_norm_across_heads"` (sc-8490): RMSNorm over the full projected query /
     /// key (the whole cross `inner_dim`), applied BEFORE the head split. `None` for base SANA.
     norm_q: Option<Array>,
@@ -299,10 +270,10 @@ impl CrossAttn {
             (None, None)
         };
         Ok(Self {
-            to_q: Linear::load(w, &format!("{prefix}.to_q"), true)?,
-            to_k: Linear::load(w, &format!("{prefix}.to_k"), true)?,
-            to_v: Linear::load(w, &format!("{prefix}.to_v"), true)?,
-            to_out: Linear::load(w, &format!("{prefix}.to_out.0"), true)?,
+            to_q: crate::quant::lin(w, &format!("{prefix}.to_q"), true)?,
+            to_k: crate::quant::lin(w, &format!("{prefix}.to_k"), true)?,
+            to_v: crate::quant::lin(w, &format!("{prefix}.to_v"), true)?,
+            to_out: crate::quant::lin(w, &format!("{prefix}.to_out.0"), true)?,
             norm_q,
             norm_k,
             heads: cfg.num_cross_attention_heads,
@@ -317,7 +288,7 @@ impl CrossAttn {
         let xsh = x.shape();
         let (b, n) = (xsh[0], xsh[1]);
         let m = kv.shape()[1];
-        let inner = self.to_q.w_t.shape()[1];
+        let inner = self.to_q.base_shape()[0];
         let hd = inner / self.heads;
         let scale = scalar(1.0 / (hd as f32).sqrt());
 
@@ -477,21 +448,21 @@ pub struct SanaTransformer {
     patch_embed: Conv, // proj: in → inner (kernel/stride = patch_size)
     // timestep path (AdaLayerNormSingle.emb + .linear, or — Sprint — the combined
     // timestep+guidance embedder, see `guidance_embedder`)
-    ts_embedder_1: Linear,
-    ts_embedder_2: Linear,
-    time_linear: Linear, // → 6·inner
+    ts_embedder_1: AdaptableLinear,
+    ts_embedder_2: AdaptableLinear,
+    time_linear: AdaptableLinear, // → 6·inner
     /// Sprint (sc-8490): the extra guidance embedder (`SanaCombinedTimestepGuidanceEmbeddings`). The
     /// embedded guidance scalar runs through the same `Timesteps(256)` sincos projection as the
     /// timestep, then this two-linear MLP, and is summed into the timestep conditioning. `None` for
     /// base SANA (`AdaLayerNormSingle`).
-    guidance_embedder: Option<(Linear, Linear)>,
+    guidance_embedder: Option<(AdaptableLinear, AdaptableLinear)>,
     // caption path
-    caption_proj_1: Linear,
-    caption_proj_2: Linear,
+    caption_proj_1: AdaptableLinear,
+    caption_proj_2: AdaptableLinear,
     caption_norm: Array, // RMSNorm weight [inner]
     blocks: Vec<SanaBlock>,
     scale_shift_table: Array, // [2, inner] (output modulated norm)
-    proj_out: Linear,
+    proj_out: AdaptableLinear,
 }
 
 impl SanaTransformer {
@@ -513,8 +484,8 @@ impl SanaTransformer {
                 "time_embed.timestep_embedder.linear_1",
                 "time_embed.timestep_embedder.linear_2",
                 Some((
-                    Linear::load(w, "time_embed.guidance_embedder.linear_1", true)?,
-                    Linear::load(w, "time_embed.guidance_embedder.linear_2", true)?,
+                    crate::quant::lin(w, "time_embed.guidance_embedder.linear_1", true)?,
+                    crate::quant::lin(w, "time_embed.guidance_embedder.linear_2", true)?,
                 )),
             )
         } else {
@@ -526,16 +497,16 @@ impl SanaTransformer {
         };
         Ok(Self {
             patch_embed,
-            ts_embedder_1: Linear::load(w, ts1_key, true)?,
-            ts_embedder_2: Linear::load(w, ts2_key, true)?,
-            time_linear: Linear::load(w, "time_embed.linear", true)?,
+            ts_embedder_1: crate::quant::lin(w, ts1_key, true)?,
+            ts_embedder_2: crate::quant::lin(w, ts2_key, true)?,
+            time_linear: crate::quant::lin(w, "time_embed.linear", true)?,
             guidance_embedder,
-            caption_proj_1: Linear::load(w, "caption_projection.linear_1", true)?,
-            caption_proj_2: Linear::load(w, "caption_projection.linear_2", true)?,
+            caption_proj_1: crate::quant::lin(w, "caption_projection.linear_1", true)?,
+            caption_proj_2: crate::quant::lin(w, "caption_projection.linear_2", true)?,
             caption_norm: w.require("caption_norm.weight")?.clone(),
             blocks,
             scale_shift_table: w.require("scale_shift_table")?.clone(),
-            proj_out: Linear::load(w, "proj_out", true)?,
+            proj_out: crate::quant::lin(w, "proj_out", true)?,
             cfg,
         })
     }

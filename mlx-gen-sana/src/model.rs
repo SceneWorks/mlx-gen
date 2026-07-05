@@ -165,9 +165,9 @@ pub struct Sana {
 }
 
 /// Construct a SANA generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
-/// pointing at a `Sana_1600M_1024px_diffusers`-shaped snapshot (`transformer/ vae/ text_encoder/`).
-/// A precision override, load-time quantization, or LoRA/LoKr adapters are rejected rather than
-/// silently ignored (none are wired for SANA yet).
+/// pointing at a `Sana_1600M_1024px_diffusers`-shaped snapshot (`transformer/ vae/ text_encoder/`), or
+/// a pre-quantized Q4/Q8 tier of the same shape (packed-detected on load, sc-8489). A precision
+/// override or LoRA/LoKr adapters are rejected rather than silently ignored (neither is wired yet).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     let descriptor = descriptor();
     let root = load_components(spec, descriptor.id)?;
@@ -192,8 +192,8 @@ pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 }
 
 /// Shared load preamble for [`load`] / [`load_sprint`] (F-090): reject the unsupported precision /
-/// quantization / adapter overrides (none are wired for SANA), then resolve the `LoadSpec` to the
-/// snapshot directory. Byte-identical to the guard+resolution block both entry points open-coded (the
+/// adapter overrides (neither is wired for SANA) — but ACCEPT a quant spec, since a pre-quantized tier
+/// is packed-detected from disk (sc-8489) — then resolve the `LoadSpec` to the snapshot directory. The
 /// `{id}` in each message comes from the descriptor, so the two paths' error text differs only by id).
 fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
     if spec.precision != Precision::Bf16 {
@@ -201,11 +201,12 @@ fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
             "{id}: only the default dense precision is wired (drop the precision override)"
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(Error::Msg(format!(
-            "{id}: load-time quantization is not supported (the 2-bit quant is not ported)"
-        )));
-    }
+    // Quantization is NOT load-time here (the 2-bit Clark-Labs quant is still not ported). Instead a
+    // pre-quantized Q4/Q8 tier is **packed-detected** from the on-disk `{base}.scales` by the shared
+    // `mlx_gen::quant::lin` inside `SanaTransformer`/`Gemma2` `from_weights` (Group-B, sc-8489), so a
+    // `spec.quantize` value is advisory: the resolved tier directory dictates the actual precision
+    // (dense bf16 when no `.scales`). We therefore accept any `spec.quantize` and never quantize dense
+    // weights at load — a request for a tier that is not on disk simply loads whichever tier is.
     if !spec.adapters.is_empty() {
         return Err(Error::Msg(format!(
             "{id}: LoRA/LoKr adapters are not supported"
@@ -430,11 +431,17 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_quantization() {
+    fn load_accepts_prequantized_tier() {
+        // Group-B (sc-8489): a Q4/Q8 tier is packed-detected from the on-disk `.scales`, so the
+        // loader no longer rejects a quant spec — it proceeds past the quant check and fails only on
+        // the missing snapshot directory, NOT with the old "quantization is not supported" message.
         let spec =
             LoadSpec::new(WeightsSource::Dir("/nonexistent-sana".into())).with_quant(Quant::Q8);
         let e = load(&spec).err().expect("error").to_string();
-        assert!(e.contains("quantization"), "got: {e}");
+        assert!(
+            !e.contains("quantization"),
+            "quant tier must be accepted, got: {e}"
+        );
     }
 
     #[test]
@@ -480,10 +487,14 @@ mod tests {
     }
 
     #[test]
-    fn sprint_load_rejects_quantization() {
+    fn sprint_load_accepts_prequantized_tier() {
+        // Sprint mirrors the base load path (sc-8489): a quant spec is packed-detected, not rejected.
         let spec =
             LoadSpec::new(WeightsSource::Dir("/nonexistent-sana".into())).with_quant(Quant::Q8);
         let e = load_sprint(&spec).err().expect("error").to_string();
-        assert!(e.contains("quantization"), "got: {e}");
+        assert!(
+            !e.contains("quantization"),
+            "quant tier must be accepted, got: {e}"
+        );
     }
 }

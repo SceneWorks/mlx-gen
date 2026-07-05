@@ -41,9 +41,11 @@
 //! `supported_guidance_methods`.
 
 pub mod config;
+pub mod convert;
 pub mod dc_ae;
 pub mod model;
 pub mod pipeline;
+pub(crate) mod quant;
 pub mod scm;
 pub mod text_encoder;
 pub mod transformer;
