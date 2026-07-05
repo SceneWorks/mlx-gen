@@ -38,7 +38,9 @@
 //! two is mirrored explicitly).
 
 use mlx_rs::fast::layer_norm;
-use mlx_rs::ops::{add, clip, divide, matmul, multiply, softmax_axis, split_sections, sum_axes};
+use mlx_rs::ops::{
+    add, clip, divide, matmul, multiply, softmax_axis, split_sections, subtract, sum_axes,
+};
 use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{gelu_tanh, silu, timestep_sincos};
@@ -308,8 +310,10 @@ impl CrossAttn {
         })
     }
 
-    /// `x` (query) `[B, N, C]`, `kv` (caption) `[B, M, C]`.
-    fn forward(&self, x: &Array, kv: &Array) -> Result<Array> {
+    /// `x` (query) `[B, N, C]`, `kv` (caption) `[B, M, C]`, `kv_mask` (optional `[B, M]`, `1.0` real /
+    /// `0.0` padding) — the caption padding mask diffusers passes as `encoder_attention_mask`. Applied
+    /// additively to the pre-softmax logits so PAD keys contribute nothing.
+    fn forward(&self, x: &Array, kv: &Array, kv_mask: Option<&Array>) -> Result<Array> {
         let xsh = x.shape();
         let (b, n) = (xsh[0], xsh[1]);
         let m = kv.shape()[1];
@@ -343,6 +347,17 @@ impl CrossAttn {
         let qf = q.as_dtype(F32)?;
         let kf = k.as_dtype(F32)?;
         let scores = multiply(&matmul(&qf, &kf.transpose_axes(&[0, 1, 3, 2])?)?, &scale)?; // [B,H,N,M]
+                                                                                           // Additive caption padding mask: PAD keys (mask==0) get a large negative bias → ~0 after
+                                                                                           // softmax. Broadcast [B,M] → [B,1,1,M] over heads and query positions. Without this, a short
+                                                                                           // prompt (300 slots dominated by PAD) lets padding embeddings swamp the real conditioning.
+        let scores = match kv_mask {
+            Some(mask) => {
+                let mask = mask.as_dtype(F32)?.reshape(&[b, 1, 1, m])?; // 1.0 real / 0.0 pad
+                let bias = multiply(&subtract(scalar(1.0), &mask)?, scalar(-1e9))?; // 0 / -1e9
+                add(&scores, &bias)?
+            }
+            None => scores,
+        };
         let probs = softmax_axis(&scores, -1, None)?;
         let ctx = matmul(&probs, &v.as_dtype(F32)?)?; // [B,H,N,hd]
 
@@ -417,6 +432,7 @@ impl SanaBlock {
         &self,
         hidden: &Array,
         caption: &Array,
+        caption_mask: Option<&Array>,
         temb: &Array,
         h: i32,
         w: i32,
@@ -438,7 +454,7 @@ impl SanaBlock {
         let hidden = add(hidden, &multiply(&gate_msa, &attn_out)?)?;
 
         // 3. Cross-attention (no pre-norm in SANA — attn2 reads `hidden` directly).
-        let cross = self.attn2.forward(&hidden, caption)?;
+        let cross = self.attn2.forward(&hidden, caption, caption_mask)?;
         let hidden = add(&cross, &hidden)?;
 
         // 4. Mix-FFN. norm2 → modulate → un-flatten to [B,H,W,dim] → GLUMBConv → flatten → gate.
@@ -534,7 +550,7 @@ impl SanaTransformer {
     /// `out_channels == 32` matches the DC-AE f32c32 latent so the output feeds
     /// [`crate::dc_ae::DcAeDecoder::decode`] directly (sc-8489 composition).
     pub fn forward(&self, latent_nchw: &Array, caption: &Array, timestep: &Array) -> Result<Array> {
-        self.forward_with_guidance(latent_nchw, caption, timestep, None)
+        self.forward_with_guidance(latent_nchw, caption, timestep, None, None)
     }
 
     /// [`Self::forward`] with an optional **embedded guidance scalar** (SANA-Sprint, sc-8490).
@@ -549,6 +565,7 @@ impl SanaTransformer {
         caption: &Array,
         timestep: &Array,
         guidance: Option<&Array>,
+        caption_mask: Option<&Array>,
     ) -> Result<Array> {
         let cfg = &self.cfg;
         let dim = cfg.inner_dim();
@@ -601,9 +618,10 @@ impl SanaTransformer {
         let cap = cap.reshape(&[b, -1, dim])?;
         let caption = rms_norm(&cap, &self.caption_norm, cfg.caption_norm_eps)?;
 
-        // 4. Transformer blocks.
+        // 4. Transformer blocks. The caption padding mask (if any) applies unchanged to every block's
+        // attn2 — the per-token caption projection above preserves the M (=300) axis it indexes.
         for block in &self.blocks {
-            hidden = block.forward(&hidden, &caption, &temb, ph, pw)?;
+            hidden = block.forward(&hidden, &caption, caption_mask, &temb, ph, pw)?;
         }
 
         // 5. Output: SanaModulatedNorm(embedded_timestep) → proj_out → unpatchify.

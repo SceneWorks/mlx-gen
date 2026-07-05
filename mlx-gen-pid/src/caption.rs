@@ -116,4 +116,27 @@ impl CaptionEncoder {
         let sel_arr = Array::from_slice(&sel, &[MODEL_MAX_LENGTH]);
         Ok(hidden.take_axis(&sel_arr, 1)?) // [1, 300, 2304]
     }
+
+    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. The mask marks
+    /// real (`1.0`) vs padding (`0.0`) tokens among the `select_index`-gathered positions. Consumers
+    /// whose trunk applies a cross-attention padding mask (diffusers SANA passes `prompt_attention_mask`
+    /// into the transformer) use it; PiD's inference net ignores the mask ([`Self::encode`]). Because a
+    /// short caption leaves the 300 slots dominated by PAD embeddings, dropping this mask lets the
+    /// padding swamp the real conditioning — so a masked consumer MUST use this variant.
+    pub fn encode_with_mask(&self, caption: &str) -> Result<(Array, Array)> {
+        let (ids, mask) = self.token_ids(caption)?;
+        let max_len = ids.len() as i32;
+        let ids_arr = Array::from_slice(&ids, &[1, max_len]);
+        let mask_arr = Array::from_slice(&mask, &[1, max_len]);
+        let hidden = self.gemma.forward(&ids_arr, Some(&mask_arr))?; // [1, max_len, 2304]
+
+        let mut sel = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
+        sel.push(0);
+        sel.extend((max_len - (MODEL_MAX_LENGTH - 1))..max_len);
+        // Gather the padding mask at the SAME select_index so it stays aligned with the embeddings.
+        let sel_mask: Vec<f32> = sel.iter().map(|&i| mask[i as usize] as f32).collect();
+        let sel_arr = Array::from_slice(&sel, &[MODEL_MAX_LENGTH]);
+        let sel_mask_arr = Array::from_slice(&sel_mask, &[1, MODEL_MAX_LENGTH]);
+        Ok((hidden.take_axis(&sel_arr, 1)?, sel_mask_arr)) // ([1,300,2304], [1,300])
+    }
 }

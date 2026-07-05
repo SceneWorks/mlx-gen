@@ -93,7 +93,9 @@ pub fn denoise_cfg(
     seed: u64,
     latents: Array,
     cond: &Array,
+    cond_mask: Option<&Array>,
     uncond: Option<&Array>,
+    uncond_mask: Option<&Array>,
     guidance_scale: f32,
     cancel: &CancelFlag,
     on_progress: &mut dyn FnMut(Progress),
@@ -101,10 +103,11 @@ pub fn denoise_cfg(
     let predict = |x: &Array, timestep: f32| -> Result<Array> {
         // The unified flow sampler hands `timestep = σ`; the SANA trunk embeds `σ·1000`.
         let t = Array::from_slice(&[timestep * NUM_TRAIN_TIMESTEPS], &[1]);
-        let pred_cond = transformer.forward(x, cond, &t)?;
+        let pred_cond = transformer.forward_with_guidance(x, cond, &t, None, cond_mask)?;
         match uncond {
             Some(uc) if guidance_scale > 1.0 => {
-                let pred_uncond = transformer.forward(x, uc, &t)?;
+                let pred_uncond =
+                    transformer.forward_with_guidance(x, uc, &t, None, uncond_mask)?;
                 // pred = uncond + scale·(cond − uncond).
                 let delta = subtract(&pred_cond, &pred_uncond)?;
                 Ok(add(
@@ -174,6 +177,7 @@ pub fn denoise_sprint(
     seed: u64,
     mut latents: Array,
     cond: &Array,
+    cond_mask: Option<&Array>,
     guidance_scale: f32,
     guidance_embeds_scale: f32,
     cancel: &CancelFlag,
@@ -219,7 +223,13 @@ pub fn denoise_sprint(
         // model input = (latents / sigma_data) * sqrt(scm_t² + (1-scm_t)²).
         let lat_in = multiply(&divide(&latents, arr1(sd))?, arr1(in_scale))?;
         let scm_t_arr = arr1(scm_t);
-        let raw = transformer.forward_with_guidance(&lat_in, cond, &scm_t_arr, Some(&guidance))?;
+        let raw = transformer.forward_with_guidance(
+            &lat_in,
+            cond,
+            &scm_t_arr,
+            Some(&guidance),
+            cond_mask,
+        )?;
 
         // diffusers trigflow recombination of the raw output (uses `latent_model_input` = the SCALED
         // `lat_in`, NOT the un-scaled latent):
@@ -401,13 +411,16 @@ impl SanaPipeline {
         // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
         // prompt (empty string when unset), used only when CFG is active. diffusers gates CFG on
         // `do_classifier_free_guidance = guidance_scale > 1.0`.
-        let cond = self.text_encoder.encode(req.prompt)?;
+        // Encode WITH the caption padding mask — SANA's attn2 cross-attention masks PAD keys (diffusers
+        // `encoder_attention_mask`); dropping it lets padding swamp short-prompt conditioning.
+        let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
         let cfg_on = guidance > 1.0;
-        let uncond = if cfg_on {
+        let (uncond, uncond_mask) = if cfg_on {
             let neg = req.negative_prompt.unwrap_or("");
-            Some(self.text_encoder.encode(neg)?)
+            let (u, um) = self.text_encoder.encode_with_mask(neg)?;
+            (Some(u), Some(um))
         } else {
-            None
+            (None, None)
         };
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build once. An
@@ -428,7 +441,9 @@ impl SanaPipeline {
             seed,
             latents,
             &cond,
+            Some(&cond_mask),
             uncond.as_ref(),
+            uncond_mask.as_ref(),
             guidance,
             cancel,
             on_progress,
@@ -451,7 +466,7 @@ impl SanaPipeline {
         let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
 
-        let cond = self.text_encoder.encode(req.prompt)?;
+        let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
         let scheduler = ScmScheduler::new(steps);
         let latents = create_noise(seed, req.width, req.height)?;
         let latents = denoise_sprint(
@@ -460,6 +475,7 @@ impl SanaPipeline {
             seed,
             latents,
             &cond,
+            Some(&cond_mask),
             guidance,
             self.guidance_embeds_scale,
             cancel,

@@ -144,7 +144,7 @@ fn sprint_trunk_matches_diffusers_tiny() {
     let model = SanaTransformer::from_weights(&weights, tiny_sprint_config())
         .expect("build Sprint trunk (guidance embedder + qk-norm keys)");
     let got = model
-        .forward_with_guidance(latent, caption, timestep, Some(guidance))
+        .forward_with_guidance(latent, caption, timestep, Some(guidance), None)
         .expect("forward_with_guidance");
 
     assert_eq!(got.shape(), want.shape(), "shape");

@@ -86,13 +86,50 @@ impl SanaTextEncoder {
     /// parity-checked against the reference without the gemma weights, and so the attention mask is
     /// available even though the trunk does not consume it.
     pub fn token_ids(&self, caption: &str) -> Result<(Vec<i32>, Vec<i32>)> {
-        self.inner.token_ids(caption)
+        self.inner.token_ids(&preprocess(caption))
     }
 
     /// Encode one caption to the SANA caption embedding `[1, 300, 2304]` (gemma last-hidden,
     /// `select_index`-gathered). Byte/shape-compatible with
     /// [`crate::transformer::SanaTransformer::forward`]'s `caption` argument.
     pub fn encode(&self, caption: &str) -> Result<Array> {
-        self.inner.encode(caption)
+        self.inner.encode(&preprocess(caption))
+    }
+
+    /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. SANA's trunk
+    /// applies the mask in `attn2` cross-attention (diffusers passes `prompt_attention_mask` into
+    /// `SanaTransformer2DModel`). Required for correctness: a short caption leaves the 300 slots mostly
+    /// PAD, so without the mask the padding embeddings swamp the real conditioning (colorful-noise /
+    /// cartoonish output that worsens as the prompt shortens).
+    pub fn encode_with_mask(&self, caption: &str) -> Result<(Array, Array)> {
+        self.inner.encode_with_mask(&preprocess(caption))
+    }
+}
+
+/// SANA prompt preprocessing — diffusers `SanaPipeline._text_preprocessing(clean_caption=False)` runs
+/// `text.lower().strip()` on the user prompt BEFORE prepending the CHI instruction (sc-9927). SANA is
+/// conditioned entirely on lowercased captions, so skipping this feeds the gemma out-of-distribution
+/// mixed-case tokens (e.g. `" Fox"` vs `" fox"`): the single differing token at the caption boundary
+/// propagates through the gemma's causal attention into a ~13% caption-embedding divergence and a
+/// visibly over-saturated / stylized result. The CHI prefix is applied downstream and is NOT lowered.
+fn preprocess(caption: &str) -> String {
+    caption.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preprocess;
+
+    #[test]
+    fn preprocess_lowercases_and_trims() {
+        // Matches diffusers `_text_preprocessing(clean_caption=False)` = `text.lower().strip()`
+        // (sc-9927). A mixed-case prompt must reach the gemma lowercased or SANA is conditioned OOD.
+        assert_eq!(
+            preprocess("  Fox Watching From The Edge  "),
+            "fox watching from the edge"
+        );
+        assert_eq!(preprocess("A FOX"), "a fox");
+        assert_eq!(preprocess("already lower"), "already lower");
+        assert_eq!(preprocess(""), "");
     }
 }

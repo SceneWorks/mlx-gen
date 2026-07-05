@@ -402,6 +402,7 @@ fn sprint_wires_guidance_trunk_scm_decode() {
         7, // seed
         latents,
         &cond,
+        None,                       // cond_mask (tiny golden: no padding)
         4.5,                        // guidance_scale (embedded, CFG-free)
         tcfg.guidance_embeds_scale, // 0.1
         &cancel,
@@ -462,6 +463,7 @@ fn sprint_single_step_runs_one_step() {
         1,
         latents,
         &cond,
+        None, // cond_mask (tiny golden: no padding)
         4.5,
         tcfg.guidance_embeds_scale,
         &cancel,
