@@ -158,10 +158,43 @@ impl FinalLayer {
     }
 }
 
+/// Reference per-axis pixel extent the 2kto4k SR students were trained within: the top of the
+/// `2048→3840` multi-resolution training bucket (`experiment_2kto4k/shared_config.py`). The additive
+/// pixel positional signal ([`sincos_2d_pos`]) uses **absolute** output-pixel coordinates, so a decode
+/// whose long side exceeds this extrapolates it out of distribution — a 4× SR of a tall image pushes
+/// the *height* coordinate past it (e.g. a 1280px-tall gen → 5120px decode > 3840) and the light
+/// 2-block pixel refiner biases toward a color cast in exactly those out-of-range (bottom) rows. See
+/// [`pixel_pos_scale`].
+const PIXEL_POS_TRAIN_MAX: f64 = 3840.0;
+
+/// Aspect-preserving positional-interpolation factor for the pixel pos table: shrink the coordinate
+/// grid so the long side never exceeds [`PIXEL_POS_TRAIN_MAX`], keeping every position inside the
+/// trained range (the standard PI fix for resolution extrapolation). An exact **no-op** (`1.0`) for
+/// any decode whose long side already fits — so the sc-7843 golden-parity fixtures and every
+/// in-distribution (≤3840) decode are byte-identical to the raw-absolute reference; the scaling only
+/// engages for the over-range tall/wide case the reference never handled.
+///
+/// `PID_PIXEL_POS_ABS=1` forces the raw-absolute reference behavior (the pre-fix path) for A/B.
+fn pixel_pos_scale(h: i32, w: i32) -> f64 {
+    if std::env::var("PID_PIXEL_POS_ABS").is_ok_and(|v| v == "1") {
+        return 1.0;
+    }
+    let long = h.max(w) as f64;
+    if long > PIXEL_POS_TRAIN_MAX {
+        PIXEL_POS_TRAIN_MAX / long
+    } else {
+        1.0
+    }
+}
+
 /// Host 2-D sin/cos pixel position table `[H·W, embed_dim]` (row-major over `(H, W)`, `W` fastest),
 /// matching `get_2d_sincos_pos_embed_from_grid`. The reference computes it in f64; we do too, then
 /// cast f32. First half encodes the **w** coordinate, second half the **h** coordinate (the
 /// reference's `emb_h`/`emb_w` naming is swapped relative to the axis it encodes — replicated here).
+///
+/// Coordinates are scaled by [`pixel_pos_scale`] first so a super-resolved decode whose long side
+/// exceeds the trained pixel extent stays in distribution (fixes the tall-image bottom color cast);
+/// this is a no-op for any decode that already fits, preserving reference/golden parity.
 pub fn sincos_2d_pos(embed_dim: i32, h: i32, w: i32) -> Array {
     let d = (embed_dim / 2) as usize; // per-axis dim
     let half = d / 2; // omega length
@@ -176,14 +209,17 @@ pub fn sincos_2d_pos(embed_dim: i32, h: i32, w: i32) -> Array {
             out[half + k] = a.cos() as f32;
         }
     };
+    let scale = pixel_pos_scale(h, w);
     let n = (h * w) as usize;
     let mut buf = vec![0f32; n * embed_dim as usize];
     for i in 0..h {
+        let yp = i as f64 * scale;
         for j in 0..w {
+            let xp = j as f64 * scale;
             let p = (i * w + j) as usize;
             let base = p * embed_dim as usize;
-            oned(j as f64, &mut buf[base..base + d]); // first half: w coordinate (j)
-            oned(i as f64, &mut buf[base + d..base + 2 * d]); // second half: h coordinate (i)
+            oned(xp, &mut buf[base..base + d]); // first half: w coordinate (j)
+            oned(yp, &mut buf[base + d..base + 2 * d]); // second half: h coordinate (i)
         }
     }
     Array::from_slice(&buf, &[n as i32, embed_dim])
