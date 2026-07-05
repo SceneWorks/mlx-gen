@@ -37,7 +37,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Result, WeightsSource,
+    Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
@@ -108,10 +108,15 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: true,
-            // SANA is the bf16/fp16 weight path; the 2-bit Clark Labs quant is intentionally NOT
-            // ported. No load-time quantization is wired for SANA yet — leave the set empty so the
-            // catalog never records a quant the engine cannot honor.
-            supported_quants: &[],
+            // SANA ships pre-quantized Q4/Q8 turnkey tiers (sc-8489, epic 8506): the Linear-DiT
+            // transformer + the Gemma-2 CHI TE are packed and PACKED-DETECTED on load (the DC-AE VAE
+            // stays dense in every tier). Advertise Q4/Q8 so the catalog routes SANA through the
+            // SAME quant-tier path as every other matrix model (tier selection + accurate recipe /
+            // downgrade telemetry) rather than a no-quant special case. This is NOT the (still
+            // unported) 2-bit Clark-Labs quant — it is the shared group-64 affine tier, packed
+            // offline by `crate::convert` and self-describing on load, so a `spec.quantize` is
+            // advisory (the resolved tier dir dictates the actual precision; see [`load`]).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
@@ -151,7 +156,10 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: true,
-            supported_quants: &[],
+            // Same Q4/Q8 packed turnkey tiers as base SANA (sc-8489): the Sprint Linear-DiT trunk +
+            // Gemma-2 TE are packed/packed-detected, DC-AE VAE dense. Advertise Q4/Q8 for standard
+            // quant-tier routing; `spec.quantize` is advisory (resolved tier dir dictates precision).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -359,7 +367,9 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(d.capabilities.supported_quants.is_empty());
+        // sc-8489/#653: SANA ships packed Q4/Q8 tiers (packed-detected on load), so the descriptor
+        // advertises them for first-class quant-tier routing — no longer an empty set.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.mac_only);
     }
 
@@ -483,6 +493,8 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supported_guidance_methods.is_empty());
         assert!(d.capabilities.conditioning.is_empty());
+        // Sprint advertises the same packed Q4/Q8 tiers as base SANA (sc-8489).
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.mac_only);
     }
 
