@@ -15,7 +15,7 @@ use mlx_gen::{
     Generator, LatentDecoder, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant,
     Result, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::Dtype;
 
 use crate::loader;
@@ -245,12 +245,30 @@ impl ZImageTurbo {
         // native schedule byte-exact (epic 7114 N1); a curated name re-shapes the σ schedule over the
         // same `shift=3.0` (`mu = ln(3)`).
         let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+        let resolved_sigmas = resolve_flow_schedule(
             req.scheduler.as_deref(),
             SCHEDULE_SHIFT.ln(),
             steps,
             &native.sigmas,
-        ))?;
+        );
+        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
+        // `use_pid` is set AND a PiD overlay was loaded, else `None` → the native VAE. Errors loudly if
+        // `use_pid` was requested without a loaded overlay (no silent VAE fallback). Z-Image is flow-match
+        // (`vp_frame=false`), so the schedule σ *is* the degrade σ: when `pid_capture_sigma` asks for an
+        // early exit, `flow_capture_for_request` folds the σ ceiling + schedule into `(capture_sigma,
+        // keep)` — mint the decoder at `capture_sigma` and build the scheduler over the *truncated*
+        // `resolved_sigmas[..keep]` so the denoise stops at the achieved-σ step (the img2img blend still
+        // reads `sigmas[start_step]`, valid since `keep > start_step`). The clean path yields `(0.0,
+        // len())` → full schedule, σ=0, byte-identical. `start_step` is the img2img noise-blend offset.
+        let (capture_sigma, keep) = flow_capture_for_request(req, &resolved_sigmas, start_step);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            MODEL_ID,
+            capture_sigma,
+        )?;
+        let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
         // VAE-encode the init image once: the clean latents depend only on the init image + target
         // dims, not the per-image seed, so they're constant across the count loop (F-034). Only the
@@ -267,10 +285,6 @@ impl ZImageTurbo {
         // Per-image batch render shared with the control variant (F-035); the base branch's only
         // difference is the plain `denoise_with_progress` step.
         let sampler_name = req.sampler.as_deref();
-        // PiD decode overlay (epic 7840, sc-7846): mint a σ=0 clean-latent decoder when `use_pid` is set
-        // AND a PiD overlay was loaded, else `None` → the native VAE. Errors loudly if `use_pid` was
-        // requested without a loaded overlay (no silent VAE fallback).
-        let pid_decoder = resolve_pid_decoder(self.pid.as_ref(), req, base_seed, MODEL_ID)?;
         let images = pipeline::render_batch(
             &self.vae,
             pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),

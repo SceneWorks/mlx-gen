@@ -29,7 +29,7 @@ use mlx_gen::image::{resize_lanczos_u8, resize_nearest_u8};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::tokenizer::TextTokenizer;
-use mlx_gen::{CancelFlag, Error, LatentDecoder, Progress, Result};
+use mlx_gen::{flow_capture_plan, CancelFlag, Error, LatentDecoder, Progress, Result};
 use mlx_gen_flux2::{patchify_latents, Flux2Vae};
 
 use crate::adapters::apply_ideogram_adapters;
@@ -373,6 +373,40 @@ impl Ideogram4Pipeline {
             guidance,
             seed,
             None,
+            0, // full denoise range (no PiD early-stop)
+            pid,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) T2I entry: as [`generate_with_progress`](Self::generate_with_progress)
+    /// but stops the denoise at `run_from` so PiD receives the partially-denoised latent at the capture
+    /// σ (resolve `run_from` via [`fromldm_capture`](Self::fromldm_capture)). `run_from == 0` is the full
+    /// schedule (byte-identical).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress_from(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        run_from: usize,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.run_denoise(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            None,
+            run_from,
             pid,
             cancel,
             on_progress,
@@ -406,15 +440,99 @@ impl Ideogram4Pipeline {
             guidance,
             seed,
             Some(edit),
+            0, // full denoise range (no PiD early-stop)
             pid,
             cancel,
             on_progress,
         )
     }
 
+    /// PiD `from_ldm` early-stop (sc-8048) edit entry: as
+    /// [`generate_edit_with_progress`](Self::generate_edit_with_progress) but stops the denoise at
+    /// `run_from` (resolve via [`fromldm_capture`](Self::fromldm_capture) with the edit strength).
+    /// `run_from == 0` is the full schedule (byte-identical).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress_from(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        edit: &EditInit,
+        run_from: usize,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.run_denoise(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            Some(edit),
+            run_from,
+            pid,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) capture plan for one Ideogram generation.
+    ///
+    /// **Frame conversion.** Ideogram's [`LogitNormalSchedule`] is *inverted* from the usual flow-match
+    /// σ (see [`add_noise_by_interpolation`]): `eval(si)` returns the **clean weight** (`eval(si[0])≈0.999`
+    /// clean, `eval(si[num_run])≈0.0001` pure noise). PiD's [`flow_capture_plan`] wants the standard
+    /// degrade σ (`0` = clean, `1` = noise) on a strictly *descending* schedule, so the executed-step
+    /// trajectory maps to `σ_std = 1 − eval(si)`. The denoise runs `i = num_run−1 … 0`; the latent at the
+    /// **start** of executed step `e` (`i = num_run−1−e`) sits at `σ_std = 1 − eval(si[num_run−e])`, so
+    /// the descending schedule handed to the plan is `[1 − eval(si[num_run]), …, 1 − eval(si[0])]`
+    /// (length `num_run + 1`, trailing ≈0). This is the exact σ trajectory [`run_denoise`] traverses.
+    ///
+    /// Returns `Some((capture_sigma, run_from))` when an early stop is warranted: `capture_sigma` is the
+    /// achieved standard-frame degrade σ to mint the PiD decoder at, and `run_from` is the loop's new
+    /// lower bound (`run_denoise` iterates `i = num_run−1 … run_from`, so it executes `keep − 1` of the
+    /// high-noise steps and stops with the latent at `capture_sigma`, skipping the clean polish tail).
+    /// `None` → the clean σ=0 full-denoise path (`req.pid_capture_sigma` unset / no benefit) — the loop
+    /// runs its full `0..num_run` range, byte-identical.
+    pub fn fromldm_capture(
+        &self,
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        strength: Option<f32>,
+        capture_sigma: Option<f32>,
+    ) -> Option<(f32, usize)> {
+        let num_run = match strength {
+            Some(s) => init_time_step(num_steps, s),
+            None => num_steps,
+        };
+        if num_run == 0 {
+            return None;
+        }
+        let (mu_eff, std_eff) = preset_mu_std(num_steps);
+        let schedule = LogitNormalSchedule::for_resolution(height, width, mu_eff, std_eff);
+        let si = make_step_intervals(num_steps);
+        // Descending standard-frame σ over the executed trajectory (high-noise first, trailing ≈0).
+        let sigmas: Vec<f32> = (0..=num_run)
+            .map(|e| 1.0 - schedule.eval(si[num_run - e]) as f32)
+            .collect();
+        let plan = flow_capture_plan(&sigmas, capture_sigma)?;
+        // `plan.keep` counts schedule entries to keep (`keep − 1` executed steps). The loop runs
+        // `i = num_run−1 … run_from`, i.e. `num_run − run_from` steps, so `run_from = num_run − (keep−1)`.
+        let run_from = num_run.saturating_sub(plan.keep - 1);
+        Some((plan.sigma, run_from))
+    }
+
     /// The shared flow-matching denoise behind [`generate_with_progress`] (edit `None`) and
     /// [`generate_edit_with_progress`] (edit `Some`). With `edit == None` the body is byte-identical
     /// to the original text-to-image render (pure-noise init, full step range, no mask blend).
+    /// `run_from` is the PiD `from_ldm` early-stop loop lower bound (sc-8048): `0` runs the full range
+    /// (byte-identical); a larger value stops the denoise early, leaving the latent at the capture σ
+    /// (see [`fromldm_capture`](Self::fromldm_capture)).
     #[allow(clippy::too_many_arguments)]
     fn run_denoise(
         &self,
@@ -425,6 +543,7 @@ impl Ideogram4Pipeline {
         guidance: f32,
         seed: u64,
         edit: Option<&EditInit>,
+        run_from: usize,
         pid: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -505,7 +624,12 @@ impl Ideogram4Pipeline {
         let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
 
         // ── Flow-matching Euler denoise (high → low noise) ──
-        for i in (0..num_run).rev() {
+        // PiD `from_ldm` early-stop (sc-8048): stop at `run_from` instead of `0`, so only the
+        // `num_run − run_from` high-noise steps run and the latent is left at the capture σ (the clean
+        // low-noise polish tail `i < run_from` is skipped). `run_from == 0` → the full range (byte-
+        // identical clean path). `total` counts the executed steps so progress still reaches 100%.
+        let total_run = num_run - run_from;
+        for i in (run_from..num_run).rev() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
@@ -560,7 +684,7 @@ impl Ideogram4Pipeline {
             eval([&z])?;
             on_progress(Progress::Step {
                 current: (num_run - i) as u32,
-                total: num_run as u32,
+                total: total_run as u32,
             });
         }
 

@@ -119,7 +119,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         if loader::needs_load_time_quant(root, bits, MODEL_ID)? {
             transformer.quantize(bits)?;
         }
-        controlnet.quantize(bits)?;
+        // F-076 parity for the control tier (sc-9517): a **published packed** control tier (built by
+        // `convert::quantize_qwen_control_branch`) loads packed — its projections packed-detect via
+        // `linear_from` — and `QwenFunControlBranch::quantize` no-ops on it (`AdaptableLinear::quantize`
+        // is a no-op once quantized), so it renders as-is. But a requested-vs-packed BIT mismatch would
+        // then silently serve the packed tier's bits — reject it, mirroring the base
+        // `loader::needs_load_time_quant`. A dense checkpoint reports no packed bits → the request stands.
+        match controlnet.packed_bits() {
+            Some(packed) if packed != bits => {
+                return Err(Error::Msg(format!(
+                    "{MODEL_ID}: control checkpoint is a pre-quantized Q{packed} tier but Q{bits} was \
+                     requested; quantize() is a no-op on packed weights so the request would silently \
+                     serve Q{packed}. Point at a Q{bits} control tier (or a dense checkpoint)."
+                )));
+            }
+            Some(_) => {}
+            None => controlnet.quantize(bits)?,
+        }
     }
     // Character-identity LoRA/LoKr targets the base transformer only (the control branch is never an
     // adapter target). No-op when `spec.adapters` is empty.

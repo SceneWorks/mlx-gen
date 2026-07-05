@@ -23,7 +23,8 @@ use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
 
 use mlx_gen::array::scalar;
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
+use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::config::DiffusionConfig;
 use crate::inpaint::{preprocess_mask, InpaintBlend};
@@ -512,15 +513,83 @@ impl Sdxl {
             _ => None,
         };
 
-        // PiD decode overlay (epic 7840, sc-7848): when `req.use_pid` is set and the model was loaded
-        // with `LoadSpec::pid`, mint a per-generation decoder (clean σ=0, seeded from `base_seed`)
-        // that super-resolves the final latent 4× in place of the VAE. `None` ⇒ the byte-exact VAE
-        // decode. Resolved once — the Gemma caption encode is shared across the count loop; each
-        // image's latent already differs by its own init-noise seed. (SDXL is the lone VP-frame
-        // student, but at σ=0 the VP/flow-match `add_noise` is identical, so the clean decode needs no
-        // VP-specific handling — the from_ldm/σ>0 path is the deferred sibling of sc-7993.)
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        // PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). SDXL is the lone
+        // **variance-preserving** PiD student. Its two denoise paths keep the latent in DIFFERENT frames,
+        // so the from_ldm capture is handled per-path:
+        //   • ancestral (the default; txt2img / img2img / control / IP via `denoise_core`) stores the
+        //     latent ALREADY renormalized to the VP frame `(x0+σε)/√(σ²+1)` = `√(1−σ_vp²)·x0 + σ_vp·ε`
+        //     at every node (see `EulerSampler::step`/`add_noise`), so a truncated x_k is handed to PiD
+        //     as-is (no rescale);
+        //   • curated (opt-in k-diffusion) stores RAW VE latents `x0+σ·ε`, so a truncated x_k is mapped
+        //     into the VP frame by the plan's rescale (`1/√(1+σ²)`) before decode.
+        // Both stay 0.13025-normalized throughout (the loop runs in the scaled latent space `vae.decode`
+        // consumes), so no extra normalization is applied. The plan is image-independent (the schedule is
+        // fixed by steps / scheduler / strength), so resolve it once here and mint the decoder at the
+        // achieved degrade σ. The clean σ=0 decode (`vp_plan = None`) is byte-identical to before. The
+        // few-step accel path (decode-bound → no from_ldm benefit, sc-7993) and the inpaint mask-blend
+        // (needs the full schedule to σ=0) keep the clean decode; a from_ldm request on either errors
+        // loudly rather than silently dropping the knob.
+        let vp_plan: Option<VpCapturePlan> = if req.use_pid && req.pid_capture_sigma.is_some() {
+            if is_accel || mask_latent.is_some() {
+                return Err(Error::Msg(format!(
+                    "{}: pid_capture_sigma (from_ldm early-stop) is not supported on the SDXL {} path \
+                     (it keeps the clean σ=0 decode); use the standard ancestral or curated denoise for \
+                     from_ldm (sc-8049)",
+                    self.descriptor.id,
+                    if is_accel {
+                        "few-step accel"
+                    } else {
+                        "inpaint mask-blend"
+                    }
+                )));
+            }
+            // Resolve the VP capture against the EXACT σ schedule this run will denoise, so `keep` and the
+            // achieved degrade σ agree with the truncated trajectory. (This mirrors the per-path schedule
+            // build in the count loop below — deterministic host math, no RNG, so it does not perturb the
+            // ancestral noise stream.)
+            let edm_sigmas = if use_curated {
+                let ms = DiscreteModelSampling::sdxl(&self.alpha_schedule);
+                let sched = req
+                    .scheduler
+                    .as_deref()
+                    .and_then(Scheduler::from_name)
+                    .unwrap_or(Scheduler::Normal);
+                let full_sigmas = schedule_sigmas(sched, &ms, steps);
+                if init_latents.is_some() {
+                    let strength = reference
+                        .and_then(|(_, s)| s)
+                        .unwrap_or(DEFAULT_STRENGTH)
+                        .clamp(0.0, 1.0);
+                    let eff = (steps as f32 * strength) as usize;
+                    let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
+                    full_sigmas[run_start..].to_vec()
+                } else {
+                    full_sigmas
+                }
+            } else {
+                let (eff, start_time) = if init_latents.is_some() {
+                    let strength = reference
+                        .and_then(|(_, s)| s)
+                        .unwrap_or(DEFAULT_STRENGTH)
+                        .clamp(0.0, 1.0);
+                    ((steps as f32 * strength) as usize, max_time * strength)
+                } else {
+                    (steps, max_time)
+                };
+                AncestralEuler::new(&self.sampler, eff, start_time)?.edm_sigmas()
+            };
+            vp_capture_plan(&edm_sigmas, req.pid_capture_sigma)
+        } else {
+            None
+        };
+        let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
         let mut images = Vec::with_capacity(req.count as usize);
@@ -562,6 +631,13 @@ impl Sdxl {
                     let init = multiply(&noise, scalar(full_sigmas[0]))?;
                     (full_sigmas, init)
                 };
+                // PiD from_ldm early-stop (sc-8049): truncate the curated k-diffusion schedule to the
+                // VP-capture `keep` nodes so the solver stops at the achieved degrade σ; the clean path
+                // (`vp_plan = None`) runs the full schedule byte-identically.
+                let keep_sigmas: &[f32] = match &vp_plan {
+                    Some(p) => &run_sigmas[..p.keep],
+                    None => &run_sigmas,
+                };
                 let ip = ip_tokens.as_ref().map(|t| (t, ip_scale));
                 // CFG++ (sc-8256): opt-in via `guidance_method == "cfg_pp"`, only with a CFG++-compatible
                 // base solver (euler/ddim/dpmpp_2m) and an active guidance gap (`cfg > 1`). Anything else
@@ -576,7 +652,7 @@ impl Sdxl {
                         &self.unet,
                         Some(sampler_name),
                         &ms,
-                        &run_sigmas,
+                        keep_sigmas,
                         init,
                         &conditioning,
                         &pooled,
@@ -593,7 +669,7 @@ impl Sdxl {
                         &self.unet,
                         Some(sampler_name),
                         &ms,
-                        &run_sigmas,
+                        keep_sigmas,
                         init,
                         &conditioning,
                         &pooled,
@@ -606,6 +682,13 @@ impl Sdxl {
                         ip,
                         None,
                     )?
+                };
+                // Curated latents live in RAW VE σ-space (`x0+σ·ε`); an early-stop leaves x_k at σ>0, so
+                // map it into the student's VP frame with the plan's rescale (`1/√(1+σ²)`) before decode.
+                // The clean path (`vp_plan = None`) leaves it byte-identical. (sc-8049)
+                let latents = match &vp_plan {
+                    Some(p) => multiply(&latents, scalar(p.rescale))?,
+                    None => latents,
                 };
                 on_progress(Progress::Decoding);
                 images.push(decode_image(&self.vae, &latents, pid_ref)?);
@@ -668,17 +751,30 @@ impl Sdxl {
                 let start_step = max_time * strength;
                 let x_t = self.sampler.add_noise(x_0, start_step)?;
                 let eff = (steps as f32 * strength) as usize;
+                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps; the stored
+                // ancestral latent is already the VP frame, so it is handed to PiD as-is. Clean path
+                // (`vp_plan = None`) keeps the full schedule.
+                let sampler = AncestralEuler::new(&self.sampler, eff, start_step)?;
                 (
                     x_t,
-                    Box::new(AncestralEuler::new(&self.sampler, eff, start_step)?),
+                    Box::new(match &vp_plan {
+                        Some(p) => sampler.truncate_to(p.keep - 1),
+                        None => sampler,
+                    }),
                     None,
                 )
             } else {
                 // txt2img (ancestral): seeded prior.
                 let prior = self.sampler.sample_prior(&latent_shape)?;
+                // PiD from_ldm early-stop (sc-8049): truncate to the VP-capture `keep` steps (see the
+                // img2img arm); clean path (`vp_plan = None`) keeps the full schedule.
+                let sampler = AncestralEuler::new(&self.sampler, steps, max_time)?;
                 (
                     prior,
-                    Box::new(AncestralEuler::new(&self.sampler, steps, max_time)?),
+                    Box::new(match &vp_plan {
+                        Some(p) => sampler.truncate_to(p.keep - 1),
+                        None => sampler,
+                    }),
                     None,
                 )
             };

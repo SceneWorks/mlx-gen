@@ -148,6 +148,7 @@ fn kolors_t2i_matches_diffusers() {
             cfg,
             h,
             w,
+            None,
             &mlx_gen::CancelFlag::new(),
             &mut |_p| {},
         )

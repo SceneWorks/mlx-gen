@@ -23,7 +23,7 @@ use mlx_gen::{
     LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
     WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
 use mlx_rs::Array;
 
@@ -726,12 +726,23 @@ impl Flux2 {
         // RAII guard (F-007): the process-global toggle is restored on drop, even on an early `?`.
         let _compile_glue = crate::transformer::CompileGlueGuard::enable();
 
-        // PiD decode overlay (epic 7840, sc-7847): when `req.use_pid` is set and the model was loaded
-        // with `LoadSpec::pid`, mint a per-generation decoder (clean σ=0, seeded from `base_seed`) that
+        // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): when `req.use_pid`
+        // is set and the model was loaded with `LoadSpec::pid`, mint a per-generation decoder that
         // super-resolves the packed latent 4× in place of the VAE. Errors if requested-but-not-loaded;
-        // `None` (the default) → the byte-exact VAE path. One decoder serves the whole count loop.
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        // `None` (the default) → the byte-exact VAE path. One decoder serves the whole count loop. When
+        // `pid_capture_sigma` asks for an early exit, stop the denoise at the achieved-σ step and hand
+        // PiD the partially-denoised packed latent (FLUX.2 is `vp_frame=false`, so the schedule σ *is*
+        // the degrade σ — flow-match identity); the packed-128ch BN seam below is unchanged. `start_step`
+        // is the img2img noise-blend offset (0 for txt2img), matching the schedule slice fed to the
+        // solver — so the capture keep-index is taken against the same full `sched.sigmas`.
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sched.sigmas, start_step);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
 
         // Image-guidance CFG on the reference condition (sc-8273/sc-8278): the identity-strength
         // lever, off by default so the shipped render is byte-identical. On the klein/dev EDIT path
@@ -824,7 +835,7 @@ impl Flux2 {
             let final_latents = run_flow_sampler(
                 sampler_name,
                 TimestepConvention::Sigma,
-                &sched.sigmas[start_step..],
+                &sched.sigmas[start_step..keep],
                 latents,
                 seed,
                 &req.cancel,

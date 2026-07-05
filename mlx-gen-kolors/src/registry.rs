@@ -15,20 +15,22 @@
 
 use mlx_rs::{random, Array, Dtype};
 
+use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
 use mlx_gen::{
-    curated_scheduler_names, default_seed, Capabilities, Conditioning, ConditioningKind,
-    ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, Scheduler, Solver, WeightsSource,
+    curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
+    Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
+    GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
+    Progress, Quant, Result, Scheduler, Solver, WeightsSource,
 };
 
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_sdxl::{
     decode_image, encode_init_latents, load_controlnet, ControlNet, IpImageEncoder, PID_BACKBONE,
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
 use crate::model::{DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
-use crate::sampler::NUM_TRAIN_TIMESTEPS;
+use crate::sampler::{KolorsEulerSampler, BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
 use crate::Kolors;
 
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
@@ -400,13 +402,84 @@ impl KolorsGenerator {
                 _ => None,
             };
 
-        // PiD decode overlay (epic 7840, sc-7848): mint a per-generation decoder (clean σ=0, seeded
-        // from `base_seed`) when `req.use_pid` is set and the model was loaded with `LoadSpec::pid`;
-        // it super-resolves the final latent 4× in place of the SDXL VAE. `None` ⇒ byte-exact VAE.
-        // Resolved once — the Gemma caption encode is shared across the count loop.
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
+        // PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). Kolors is a
+        // **variance-preserving** PiD student on the shared SDXL backbone, but — unlike SDXL's ancestral
+        // path — EVERY Kolors path stores RAW variance-exploding latents `x0 + σ·ε` (the leading-Euler
+        // `step` is plain k-diffusion `x + eps·dt`; `add_noise` returns raw `x0 + noise·σ`; the curated
+        // path integrates the same VE k-diffusion `run_sigmas`). So `from_ldm` is uniform here: truncate
+        // the schedule to the VP-capture `keep` nodes and map the captured VE latent into the student's
+        // VP frame with the plan's `rescale` (`1/√(1+σ_edm²)`) before decode — at BOTH the curated and
+        // bespoke decode sites. Everything stays 0.13025-scaled, so no extra normalization.
+        //
+        // The plan is image-independent (the σ schedule is fixed by steps / scheduler / strength), so
+        // resolve it once here, against the EXACT schedule the active mode denoises, and mint the decoder
+        // at the achieved degrade σ. This deterministic host math runs BEFORE the per-image
+        // `random::seed`/noise draws below, so it does not perturb the noise stream. `pid_capture_sigma`
+        // unset ⇒ `vp_plan = None` ⇒ full schedule + no rescale ⇒ byte-identical to the clean σ=0 decode.
+        // Kolors has no few-step accel or inpaint/mask mode (Mask is not an accepted conditioning), so —
+        // unlike SDXL — every dispatch path supports from_ldm and no guard is needed.
+        let vp_plan: Option<VpCapturePlan> = if req.use_pid && req.pid_capture_sigma.is_some() {
+            // Build the σ schedule of the ACTIVE path. The curated path denoises the k-diffusion
+            // `schedule_sigmas` (Normal/Karras/…), NOT the native leading-Euler schedule, so its plan is
+            // resolved against that exact `run_sigmas` (mirroring the SDXL curated anchor); the bespoke
+            // paths use the native `KolorsEulerSampler` schedule via `edm_sigmas()`. The strength each
+            // mode passes to its denoise method is matched here so `keep` agrees with the truncated run.
+            let edm_sigmas: Vec<f32> = if use_curated {
+                let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
+                let ms = DiscreteModelSampling::sdxl(&sched);
+                let scheduler = req
+                    .scheduler
+                    .as_deref()
+                    .and_then(Scheduler::from_name)
+                    .unwrap_or(Scheduler::Normal);
+                let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
+                // Curated init mirrors `curated_init` above: combined-pose + img2img are strength-sliced;
+                // txt2img runs the full schedule.
+                let strength = if control.is_some() && ip_mode {
+                    Some(req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH))
+                } else {
+                    img2img.map(|(_, s)| s)
+                };
+                match strength {
+                    Some(strength) => {
+                        let strength = strength.clamp(0.0, 1.0);
+                        let eff = (steps as f32 * strength) as usize;
+                        let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
+                        full_sigmas[run_start..].to_vec()
+                    }
+                    None => full_sigmas,
+                }
+            } else if control.is_some() && ip_mode {
+                // Combined strict-pose tier: img2img at POSE_IMG2IMG_STRENGTH (or `req.strength`).
+                let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
+                KolorsEulerSampler::kolors_img2img(steps, strength, self.kolors.dtype())?
+                    .edm_sigmas()
+                    .to_vec()
+            } else if let Some((_, strength)) = img2img {
+                KolorsEulerSampler::kolors_img2img(steps, strength, self.kolors.dtype())?
+                    .edm_sigmas()
+                    .to_vec()
+            } else {
+                // txt2img / controlnet-only / ip-only: the full native leading-Euler schedule.
+                KolorsEulerSampler::kolors(steps, self.kolors.dtype())?
+                    .edm_sigmas()
+                    .to_vec()
+            };
+            vp_capture_plan(&edm_sigmas, req.pid_capture_sigma)
+        } else {
+            None
+        };
+        let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
         let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        // The run-step truncation each denoise method applies (keep nodes ⇒ keep-1 denoise steps).
+        let run_steps = vp_plan.map(|p| p.keep - 1);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
@@ -457,9 +530,16 @@ impl KolorsGenerator {
                     w,
                     control_arg,
                     ip_arg,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?;
+                // PiD from_ldm (sc-8049): map the raw VE latent into the VP frame before decode. `None`
+                // ⇒ byte-identical. Kolors is uniformly VE, so this applies on the curated path too.
+                let latents = match &vp_plan {
+                    Some(p) => mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?,
+                    None => latents,
+                };
                 on_progress(Progress::Decoding);
                 images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
                 continue;
@@ -491,6 +571,7 @@ impl KolorsGenerator {
                     *ip_scale,
                     h,
                     w,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?
@@ -506,6 +587,7 @@ impl KolorsGenerator {
                     scale,
                     h,
                     w,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?
@@ -520,6 +602,7 @@ impl KolorsGenerator {
                     *scale,
                     h,
                     w,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?
@@ -538,6 +621,7 @@ impl KolorsGenerator {
                     cfg,
                     h,
                     w,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?
@@ -550,11 +634,19 @@ impl KolorsGenerator {
                     cfg,
                     h,
                     w,
+                    run_steps,
                     &req.cancel,
                     on_progress,
                 )?
             };
 
+            // PiD from_ldm (sc-8049): map the raw VE latent into the VP frame before decode. `None` ⇒
+            // byte-identical. Every bespoke Kolors path stores raw VE, so this rescale is unconditional
+            // across the branches above.
+            let latents = match &vp_plan {
+                Some(p) => mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?,
+                None => latents,
+            };
             on_progress(Progress::Decoding);
             images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
         }

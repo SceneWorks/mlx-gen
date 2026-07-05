@@ -9,7 +9,7 @@ use mlx_gen::{
     Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
     TimestepConvention, WeightsSource,
 };
-use mlx_gen_pid::{resolve_pid_decoder, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
@@ -380,17 +380,6 @@ impl Flux1 {
         self.validate(req)?;
         let vae = self.vae()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        // PiD decode overlay (epic 7840, sc-7846): when `use_pid` is set AND a PiD overlay was loaded,
-        // decode (and 4× super-resolve) the final latent through PiD instead of the native VAE; errors
-        // loudly if `use_pid` was requested without a loaded overlay (no silent VAE fallback). `None` →
-        // the native VAE, the byte-exact default. One decoder is shared across the `count` loop (same
-        // prompt → same caption embeddings); per-image variation comes from the per-seed denoised latent.
-        let pid_decoder =
-            resolve_pid_decoder(self.pid.as_ref(), req, base_seed, self.descriptor.id)?;
-        let decoder: &dyn LatentDecoder = match &pid_decoder {
-            Some(d) => d,
-            None => vae,
-        };
         // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
         // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
         // changes the default step count + guidance (the acceleration is a distilled LoRA the caller
@@ -417,6 +406,29 @@ impl Flux1 {
             self.variant.requires_sigma_shift(),
             req.scheduler.as_deref(),
         )?;
+        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): when `use_pid` is
+        // set AND a PiD overlay was loaded, decode (and 4× super-resolve) the latent through PiD instead
+        // of the native VAE; errors loudly if `use_pid` was requested without a loaded overlay (no
+        // silent VAE fallback). `None` → the native VAE, the byte-exact default. When `pid_capture_sigma`
+        // additionally asks for an early exit on this flow-match schedule (flux is `vp_frame=false`, so
+        // the schedule σ *is* the degrade σ), stop the denoise at the achieved-σ step and hand PiD the
+        // partially-denoised x_k; otherwise the clean σ=0 full-denoise path (`capture_sigma = 0`, full
+        // schedule). One decoder is shared across the `count` loop (same prompt → same caption embeds);
+        // per-image variation comes from the per-seed denoised latent. (flux is txt2img here — no
+        // img2img blend in this path — so `start_step = 0`.)
+        let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+        let pid_decoder = resolve_pid_decoder_at_sigma(
+            self.pid.as_ref(),
+            req,
+            base_seed,
+            self.descriptor.id,
+            capture_sigma,
+        )?;
+        let decoder: &dyn LatentDecoder = match &pid_decoder {
+            Some(d) => d,
+            None => vae,
+        };
+        let denoise_sigmas = &sigmas[..keep];
         // Route the flow-match denoise through the unified curated-sampler framework (epic 7114 P3):
         // the default `flow_match` / `hyper` profile maps to Euler (the legacy `x + v·Δσ` step, within
         // the N1 parity tolerance), and the curated menu (heun / dpmpp_2m / uni_pc / …) becomes
@@ -435,7 +447,7 @@ impl Flux1 {
             let final_latents = run_flow_sampler(
                 Some(sampler_name),
                 TimestepConvention::Sigma,
-                &sigmas,
+                denoise_sigmas,
                 latents,
                 seed,
                 &req.cancel,

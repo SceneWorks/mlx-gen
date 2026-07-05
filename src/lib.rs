@@ -77,8 +77,9 @@ pub use control::{require_base_dir, require_control, AcceptedControlKinds, Contr
 pub use decoder::LatentDecoder;
 pub use error::{Error, Result};
 pub use gen_core::sampling::{
-    flow_capture_plan, schedule_sigmas, CapturePlan, DiscreteModelSampling, EdmModelSampling,
-    ModelSampling, PredictionType, Scheduler, Solver, TimestepConvention,
+    flow_capture_plan, schedule_sigmas, vp_capture_plan, vp_sigma_from_edm, CapturePlan,
+    DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType, Scheduler, Solver,
+    TimestepConvention, VpCapturePlan,
 };
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,

@@ -270,6 +270,13 @@ impl Kolors {
         &self.vae
     }
 
+    /// Crate-internal compute-dtype accessor for the registry wrapper. Used by the PiD `from_ldm`
+    /// early-stop (sc-8049) to build the throwaway [`KolorsEulerSampler`] whose `edm_sigmas()` the
+    /// VP-capture plan resolves against — the same dtype the active denoise method passes.
+    pub(crate) fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+
     /// Run the CFG denoise loop from a (raw, unit-normal) initial-noise tensor `init_noise`
     /// `[1, h, w, 4]`. The single denoise assembly for plain T2I: the parity gate feeds diffusers'
     /// exact noise with a no-op `cancel`/`on_progress`, and the registry's production count loop
@@ -286,10 +293,17 @@ impl Kolors {
         cfg: f32,
         height: i32,
         width: i32,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): `run_steps = Some(keep-1)` truncates the schedule so the
+        // solver stops at the VP-capture σ; `None` runs the full schedule byte-identically.
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
@@ -342,6 +356,7 @@ impl Kolors {
             cfg,
             height,
             width,
+            None,
             &CancelFlag::new(),
             &mut |_p| {},
         )?;
@@ -366,10 +381,18 @@ impl Kolors {
         cfg: f32,
         height: i32,
         width: i32,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): truncate the (already strength-sliced) schedule to `keep-1`
+        // steps when `run_steps = Some`; `None` runs the full sliced schedule byte-identically. The
+        // init seed uses `start_sigma` (schedule slice start), unaffected by the trailing truncation.
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         // Seed the init: raw `x₀ + noise·σ_start` (diffusers EulerDiscrete add_noise at begin_index).
         let latents = sampler.add_noise(init_latents, noise)?;
@@ -425,6 +448,7 @@ impl Kolors {
         width: i32,
         control: Option<(&ControlNet, &Image, f32)>,
         ip_tokens: Option<(&Array, f32)>,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
@@ -454,6 +478,19 @@ impl Kolors {
                 full_sigmas.clone(),
                 multiply(&noise, scalar(full_sigmas[0]))?,
             )
+        };
+        // PiD from_ldm early-stop (sc-8049): truncate the curated k-diffusion schedule to the VP-capture
+        // `keep = run_steps + 1` nodes so the solver stops at the achieved degrade σ; `None` runs the full
+        // schedule byte-identically. (The curated `run_sigmas` — not a `KolorsEulerSampler` — is what this
+        // path integrates over, so it is truncated in place, mirroring the SDXL curated anchor's
+        // `run_sigmas[..keep]`.) `truncate` clamps, so a `keep` past the end is a no-op.
+        let run_sigmas = match run_steps {
+            Some(rs) => {
+                let mut s = run_sigmas;
+                s.truncate(rs + 1);
+                s
+            }
+            None => run_sigmas,
         };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
 
@@ -542,6 +579,7 @@ impl Kolors {
             cfg,
             height,
             width,
+            None,
             &CancelFlag::new(),
             &mut |_p| {},
         )?;
@@ -568,10 +606,17 @@ impl Kolors {
         control_scale: f32,
         height: i32,
         width: i32,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
+        // runs the full schedule byte-identically.
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
@@ -643,6 +688,7 @@ impl Kolors {
             control_scale,
             height,
             width,
+            None,
             &CancelFlag::new(),
             &mut |_p| {},
         )?;
@@ -674,10 +720,17 @@ impl Kolors {
         ip_scale: f32,
         height: i32,
         width: i32,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): truncate to `keep-1` steps when `run_steps = Some`; `None`
+        // runs the full schedule byte-identically.
         let sampler = KolorsEulerSampler::kolors(num_steps, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         let latents = sampler.scale_initial_noise(init_noise)?;
 
@@ -739,10 +792,17 @@ impl Kolors {
         ip_scale: f32,
         height: i32,
         width: i32,
+        run_steps: Option<usize>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
+        // PiD from_ldm early-stop (sc-8049): truncate the (strength-sliced) schedule to `keep-1` steps
+        // when `run_steps = Some`; `None` runs the full sliced schedule byte-identically.
         let sampler = KolorsEulerSampler::kolors_img2img(num_steps, strength, self.dtype)?;
+        let sampler = match run_steps {
+            Some(rs) => sampler.truncate_to(rs),
+            None => sampler,
+        };
         let (conditioning, pooled, time_ids) = cfg_conditioning(pos, neg, cfg, height, width)?;
         // Seed the img2img init (raw `x₀ + noise·σ_start`), as in `denoise_img2img_latents`.
         let latents = sampler.add_noise(init_latents, noise)?;
@@ -837,6 +897,7 @@ impl Kolors {
             ip_scale,
             height,
             width,
+            None,
             &CancelFlag::new(),
             &mut |_p| {},
         )?;
@@ -881,6 +942,7 @@ impl Kolors {
             ip_scale,
             height,
             width,
+            None,
             &CancelFlag::new(),
             &mut |_p| {},
         )?;

@@ -312,6 +312,34 @@ impl<'a> AncestralEuler<'a> {
             schedule: inner.timesteps(num_steps, start_time)?,
         })
     }
+
+    /// The per-node EDM/k-diffusion σ schedule of this baked run — `[σ(t₀), σ(t₁), …, σ(t_{n-1}), σ(0)]`
+    /// (length `num_steps + 1`, strictly descending to the terminal `0`). Used by the PiD `from_ldm`
+    /// early-stop (epic 7840, sc-8049) to resolve the variance-preserving capture plan
+    /// ([`mlx_gen::gen_core::sampling::vp_capture_plan`]) against the *exact* schedule this run denoises,
+    /// so the `keep` index and the achieved degrade σ agree with the truncated trajectory.
+    pub fn edm_sigmas(&self) -> Vec<f32> {
+        let mut v: Vec<f32> = self
+            .schedule
+            .iter()
+            .map(|&(t, _)| self.inner.sigma(t))
+            .collect();
+        if let Some(&(_, last_prev)) = self.schedule.last() {
+            v.push(self.inner.sigma(last_prev));
+        }
+        v
+    }
+
+    /// Truncate the baked schedule to its first `run_steps` steps — the PiD `from_ldm` early-stop
+    /// (epic 7840, sc-8049). This keeps the FULL schedule's spacing and stops after `run_steps` denoise
+    /// steps, leaving `x_k` at node `run_steps` (EDM σ = `edm_sigmas()[run_steps]`) — unlike rebuilding
+    /// with fewer steps, which would re-space the whole `[start_time → 0]` linspace. `run_steps ≥
+    /// schedule.len()` is a no-op (the clean full-denoise path). The stored ancestral latent is already
+    /// renormalized to the VP frame `(x0+σε)/√(σ²+1)`, so the truncated latent is handed to PiD as-is.
+    pub fn truncate_to(mut self, run_steps: usize) -> Self {
+        self.schedule.truncate(run_steps);
+        self
+    }
 }
 
 impl DiffusionSampler for AncestralEuler<'_> {
@@ -371,6 +399,87 @@ mod tests {
         let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
         assert!(s.timesteps(0, 0.0).unwrap().is_empty());
         assert!(s.timesteps(0, 1000.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ancestral_stored_latent_is_the_vp_frame() {
+        // PiD from_ldm (sc-8049): the early-stop hands the ancestral sampler's stored latent to the
+        // variance-preserving PiD student WITHOUT a rescale, on the claim that the leading-Euler sampler
+        // already keeps the latent renormalized to the VP frame `(x0+σε)/√(σ²+1) = √(1−σ_vp²)·x0 + σ_vp·ε`
+        // at every node. `add_noise_with` IS that renormalized frame convention (`EulerSampler::step`
+        // maintains it across the reverse loop — `x_{prev} = renorm·(√(σ²+1)·x_t + eps·Δσ)`), so proving
+        // the identity here validates the no-rescale decision WITHOUT the PiD weights. `σ_vp =
+        // σ/√(1+σ²)` and the VP `x0` coefficient `√(1−σ_vp²) = 1/√(1+σ²)`.
+        use mlx_gen::gen_core::sampling::vp_sigma_from_edm;
+        use mlx_rs::ops::{add, multiply};
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let x0 = Array::from_slice(&[1.0f32, -2.0, 0.5, 3.0], &[4]);
+        let noise = Array::from_slice(&[0.3f32, 0.7, -1.1, 0.2], &[4]);
+        for &t in &[900.0f32, 500.0, 200.0, 50.0] {
+            let sigma = s.sigma(t);
+            let sigma_vp = vp_sigma_from_edm(sigma);
+            let alpha = (1.0 - sigma_vp * sigma_vp).sqrt(); // = 1/√(1+σ²)
+            let expected = add(
+                multiply(&x0, scalar(alpha)).unwrap(),
+                multiply(&noise, scalar(sigma_vp)).unwrap(),
+            )
+            .unwrap();
+            let got = s.add_noise_with(&x0, &noise, t).unwrap();
+            let (e, g) = (expected.as_slice::<f32>(), got.as_slice::<f32>());
+            for (a, b) in e.iter().zip(g) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "t={t} σ={sigma}: ancestral latent ≠ VP frame ({a} vs {b})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn edm_sigmas_descend_to_zero_with_node_count() {
+        // The from_ldm VP capture (sc-8049) resolves `vp_capture_plan` against this per-node σ schedule.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let sampler = AncestralEuler::new(&s, 8, s.max_time()).unwrap();
+        let edm = sampler.edm_sigmas();
+        assert_eq!(
+            edm.len(),
+            sampler.num_steps() + 1,
+            "one σ per node incl. terminal 0"
+        );
+        assert_eq!(edm.len(), 9);
+        assert_eq!(*edm.last().unwrap(), 0.0, "terminal node σ=0");
+        assert!(edm.windows(2).all(|w| w[0] >= w[1]), "descending");
+        assert!(edm[0] > 0.0, "starts at a positive σ");
+    }
+
+    #[test]
+    fn truncate_to_preserves_full_schedule_spacing() {
+        // The from_ldm early-stop truncates the FULL schedule (keeping its spacing) rather than
+        // rebuilding with fewer steps (which would re-space the `[start → 0]` linspace) — sc-8049.
+        let s = EulerSampler::new(&DiffusionConfig::sdxl_base(), true).unwrap();
+        let full_edm = AncestralEuler::new(&s, 8, s.max_time())
+            .unwrap()
+            .edm_sigmas();
+        let trunc = AncestralEuler::new(&s, 8, s.max_time())
+            .unwrap()
+            .truncate_to(3);
+        assert_eq!(trunc.num_steps(), 3, "3 steps kept");
+        let trunc_edm = trunc.edm_sigmas();
+        assert_eq!(trunc_edm.len(), 4, "3 steps → 4 nodes");
+        for i in 0..4 {
+            assert!(
+                (trunc_edm[i] - full_edm[i]).abs() < 1e-6,
+                "node {i}: truncation must keep the full schedule's leading nodes"
+            );
+        }
+        // A natively-built 3-step schedule re-spaces, so its interior node differs from the truncation.
+        let native3 = AncestralEuler::new(&s, 3, s.max_time())
+            .unwrap()
+            .edm_sigmas();
+        assert!(
+            (trunc_edm[1] - native3[1]).abs() > 1e-4,
+            "truncation must NOT equal a re-spaced 3-step schedule"
+        );
     }
 
     #[test]

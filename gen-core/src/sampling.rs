@@ -289,6 +289,85 @@ pub fn flow_capture_plan(sigmas: &[f32], capture_sigma: Option<f32>) -> Option<C
     None
 }
 
+/// A PiD `from_ldm` early-stop capture plan for a **variance-preserving** (VP-frame) student (epic 7840,
+/// sc-8049) — the sibling of [`CapturePlan`] for SDXL / RealVisXL / Kolors, the one VP student in the
+/// catalog. Its sampler runs in the EDM/discrete σ space (variance-*exploding* latent `x0 + σ_edm·ε`),
+/// **not** the flow-match `[1→0]` schedule, so an early stop needs both a frame map (EDM σ → the
+/// student's degrade σ) and a rescale of the captured latent into the VP frame the student trained on.
+/// Resolved by [`vp_capture_plan`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VpCapturePlan {
+    /// Leading EDM-schedule entries to keep — run the denoise over `&edm_sigmas[..keep]` so it stops at
+    /// step `keep − 1`, leaving `x_k` at EDM σ = `edm_sigmas[keep-1]`.
+    pub keep: usize,
+    /// The achieved **degrade σ** to hand PiD, in the student's variance-preserving frame
+    /// `x_t = √(1−σ²)·x0 + σ·ε`. Equals `σ_edm/√(1+σ_edm²)` at the capture step — always in `(0,1)`.
+    pub sigma: f32,
+    /// The VP-frame rescale to apply to the captured EDM latent before handing it to PiD:
+    /// `x_vp = rescale · x_k`, where `rescale = 1/√(1+σ_edm²) = √(1−σ²)`. This turns the
+    /// variance-exploding EDM latent `x0 + σ_edm·ε` into the variance-preserving `√(1−σ²)·x0 + σ·ε`
+    /// (the student's `from_ldm` frame). Downstream, the caller still applies the space's latent
+    /// normalization (SDXL's `0.13025` affine) exactly as the clean σ=0 decode does.
+    pub rescale: f32,
+}
+
+/// Map an EDM/discrete sampler σ to the variance-preserving student's degrade σ (epic 7840, sc-8049):
+/// `σ_vp = σ_edm / √(1 + σ_edm²)`. Monotonic increasing, `0 → 0`, and `σ_edm → 1` as `σ_edm → ∞`, so the
+/// VP degrade σ lives in `[0,1)` — the same frame-agnostic "fraction of noise remaining" the flow-match
+/// schedule σ already is. That shared `[0,1)` degrade frame is why one
+/// [`pid_capture_sigma`](crate::GenerationRequest::pid_capture_sigma) ceiling resolves correctly in
+/// *either* frame (flow-match via [`flow_capture_plan`], VP via [`vp_capture_plan`]). A non-finite or
+/// non-positive input maps to `0.0` (the clean frame).
+pub fn vp_sigma_from_edm(edm_sigma: f32) -> f32 {
+    if !edm_sigma.is_finite() || edm_sigma <= 0.0 {
+        return 0.0;
+    }
+    edm_sigma / (1.0 + edm_sigma * edm_sigma).sqrt()
+}
+
+/// Resolve a PiD `from_ldm` early-stop capture plan for a **variance-preserving** (SDXL) sampler
+/// (epic 7840, sc-8049) — the VP-frame sibling of [`flow_capture_plan`]. `edm_sigmas` is the sampler's
+/// own σ schedule (strictly descending from σ_max, positive entries, optionally with a trailing `0.0`);
+/// `capture_sigma` is the request's noise *ceiling*
+/// ([`pid_capture_sigma`](crate::GenerationRequest::pid_capture_sigma)), interpreted in the **VP
+/// degrade-σ** frame `[0,1)` so the same knob means the same cleanliness it does on a flow-match schedule.
+///
+/// Returns `Some` at the first step `k ≥ 1` whose VP degrade σ (`σ_vp = σ_edm/√(1+σ_edm²)`) has dropped
+/// to `≤ capture_sigma`, keeping `&edm_sigmas[..=k]`, reporting the achieved VP σ, and the
+/// [`rescale`](VpCapturePlan::rescale) to convert the captured EDM latent into the student's VP frame.
+///
+/// Returns `None` (the clean σ=0 full-denoise path) on the same conditions as [`flow_capture_plan`]:
+/// `capture_sigma` is `None`/`≤ 0`/non-finite; the schedule is degenerate (`< 2` entries); or the ceiling
+/// is below the smallest positive VP σ (only the terminal `0` would qualify → no benefit over a clean
+/// decode).
+///
+/// **Frame:** unlike [`flow_capture_plan`]'s identity map, this converts EDM → VP and carries the rescale;
+/// a flow-match space must **not** use this helper (and vice-versa).
+pub fn vp_capture_plan(edm_sigmas: &[f32], capture_sigma: Option<f32>) -> Option<VpCapturePlan> {
+    let target = capture_sigma?;
+    if !target.is_finite() || target <= 0.0 || edm_sigmas.len() < 2 {
+        return None;
+    }
+    // The EDM schedule descends, so σ_vp descends too (the map is monotonic): the first index at/below
+    // the ceiling is the earliest step that reaches the requested cleanliness. k starts at 1 so at least
+    // one denoise step always runs.
+    for (k, &edm) in edm_sigmas.iter().enumerate().skip(1) {
+        let vp = vp_sigma_from_edm(edm);
+        if vp <= target {
+            // vp == 0 (a terminal 0.0 in the schedule) means the ceiling is below every positive σ_vp →
+            // no early stop (the clean σ=0 decode is already best).
+            return (vp > 0.0).then_some(VpCapturePlan {
+                keep: k + 1,
+                sigma: vp,
+                // rescale = 1/√(1+σ_edm²) = √(1−σ_vp²) (α²+σ_vp²=1); compute from σ_vp so it stays exact
+                // with the reported σ.
+                rescale: (1.0 - vp * vp).max(0.0).sqrt(),
+            });
+        }
+    }
+    None
+}
+
 // =================================================================================================
 // Concrete policies
 // =================================================================================================
@@ -696,6 +775,92 @@ mod tests {
         let plan = flow_capture_plan(&sigmas, Some(0.999)).expect("an early capture");
         assert_eq!(plan.keep, 2);
         assert_eq!(plan.sigma, sigmas[1]);
+    }
+
+    // --- VP-frame (SDXL) from_ldm capture (sc-8049) ---------------------------------------------
+
+    /// A real SDXL EDM σ schedule (variance-exploding, descending from ~14.6, trailing 0.0) — the
+    /// trailing-spaced Euler sigmas the VP-frame capture policy consumes.
+    fn sdxl_edm_sigmas(num_steps: usize) -> Vec<f32> {
+        LightningPolicy::new(&sdxl_sched(), 1000, num_steps).sigmas
+    }
+
+    #[test]
+    fn vp_sigma_from_edm_maps_into_unit_interval_monotonically() {
+        // 0 → 0; clamp non-finite / non-positive to the clean frame.
+        assert_eq!(vp_sigma_from_edm(0.0), 0.0);
+        assert_eq!(vp_sigma_from_edm(-3.0), 0.0);
+        assert_eq!(vp_sigma_from_edm(f32::NAN), 0.0);
+        // σ_edm = 1 → 1/√2 (the exact midpoint identity σ_vp = σ_edm/√(1+σ_edm²)).
+        assert!((vp_sigma_from_edm(1.0) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        // Monotonic increasing and strictly inside [0,1): a big σ_edm approaches (but never reaches) 1.
+        let big = vp_sigma_from_edm(14.6);
+        assert!(big > 0.99 && big < 1.0);
+        assert!(vp_sigma_from_edm(0.5) < vp_sigma_from_edm(2.0));
+        // The whole real SDXL schedule maps to a descending [0,1) VP-σ sequence.
+        let vp: Vec<f32> = sdxl_edm_sigmas(50)
+            .iter()
+            .map(|&s| vp_sigma_from_edm(s))
+            .collect();
+        assert!(vp[0] > 0.99 && *vp.last().unwrap() == 0.0);
+        assert!(vp.windows(2).all(|w| w[0] >= w[1]));
+    }
+
+    #[test]
+    fn vp_capture_plan_none_paths_are_clean() {
+        let sigmas = sdxl_edm_sigmas(50); // descending EDM σ, trailing 0.0
+        assert!(vp_capture_plan(&sigmas, None).is_none());
+        assert!(vp_capture_plan(&sigmas, Some(0.0)).is_none());
+        assert!(vp_capture_plan(&sigmas, Some(-0.3)).is_none());
+        assert!(vp_capture_plan(&sigmas, Some(f32::NAN)).is_none());
+        // A ceiling below the smallest positive VP σ → only the terminal 0.0 qualifies → clean.
+        let smallest_positive_vp = vp_sigma_from_edm(sigmas[sigmas.len() - 2]);
+        assert!(vp_capture_plan(&sigmas, Some(smallest_positive_vp * 0.5)).is_none());
+        // Degenerate schedules never panic.
+        assert!(vp_capture_plan(&[], Some(0.5)).is_none());
+        assert!(vp_capture_plan(&[0.0], Some(0.5)).is_none());
+    }
+
+    #[test]
+    fn vp_capture_plan_truncates_and_carries_the_vp_rescale() {
+        let sigmas = sdxl_edm_sigmas(50);
+        let plan = vp_capture_plan(&sigmas, Some(0.2)).expect("a VP capture below 0.2");
+        // Achieved VP σ is at/below the ceiling, positive, and is the map of the kept EDM σ.
+        assert!(plan.sigma <= 0.2 && plan.sigma > 0.0);
+        assert!((plan.sigma - vp_sigma_from_edm(sigmas[plan.keep - 1])).abs() < 1e-6);
+        // The step before was still above the ceiling (first crossing).
+        assert!(vp_sigma_from_edm(sigmas[plan.keep - 2]) > 0.2);
+        // A genuine early stop: ≥1 step run, strictly fewer than the full schedule.
+        assert!(plan.keep >= 2 && plan.keep < sigmas.len());
+        // The rescale is the VP frame factor: α = √(1−σ²) = 1/√(1+σ_edm²), so α² + σ² = 1, and applying
+        // it to the kept EDM σ recovers exactly the VP σ (α·σ_edm == σ_vp).
+        assert!((plan.rescale * plan.rescale + plan.sigma * plan.sigma - 1.0).abs() < 1e-5);
+        let edm = sigmas[plan.keep - 1];
+        assert!((plan.rescale - 1.0 / (1.0 + edm * edm).sqrt()).abs() < 1e-6);
+        assert!((plan.rescale * edm - plan.sigma).abs() < 1e-5);
+    }
+
+    #[test]
+    fn vp_capture_plan_is_schedule_agnostic_in_sigma() {
+        // One VP-σ ceiling resolves to comparable cleanliness on a coarse and a fine EDM schedule. Use a
+        // ceiling above the coarse 8-step schedule's smallest positive VP σ (its last pre-terminal node
+        // is still ~0.32 = 32% noise before the terminal 0), so both schedules cross it positively — a
+        // ceiling below that floor legitimately yields the clean path on the coarse schedule (no benefit).
+        let s50 = sdxl_edm_sigmas(50);
+        let s8 = sdxl_edm_sigmas(8);
+        let p50 = vp_capture_plan(&s50, Some(0.5)).unwrap();
+        let p8 = vp_capture_plan(&s8, Some(0.5)).unwrap();
+        assert!(p50.sigma <= 0.5 && p8.sigma <= 0.5);
+        assert!(p50.keep < s50.len() && p8.keep < s8.len());
+    }
+
+    #[test]
+    fn vp_capture_plan_high_ceiling_keeps_at_least_one_step() {
+        let sigmas = sdxl_edm_sigmas(50);
+        // A ceiling at/above σ_vp[1] captures after a single step (never zero steps).
+        let plan = vp_capture_plan(&sigmas, Some(0.999)).expect("an early capture");
+        assert_eq!(plan.keep, 2);
+        assert!((plan.sigma - vp_sigma_from_edm(sigmas[1])).abs() < 1e-6);
     }
 
     #[test]

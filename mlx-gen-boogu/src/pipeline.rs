@@ -179,7 +179,8 @@ impl BooguPipeline {
     /// Generate one RGB image from a text prompt. Convenience wrapper over
     /// [`Self::generate_with_progress`] with no cancellation and a no-op progress sink.
     pub fn generate(&self, prompt: &str, opts: &GenerateOptions) -> Result<Image> {
-        self.generate_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
+        let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
+        self.generate_with_progress(prompt, opts, &sigmas, None, &CancelFlag::new(), &mut |_| {})
     }
 
     /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
@@ -194,6 +195,7 @@ impl BooguPipeline {
         &self,
         prompt: &str,
         opts: &GenerateOptions,
+        sigmas: &[f32],
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -220,19 +222,14 @@ impl BooguPipeline {
         // timestep `t = 1 − σ` to the DiT (OneMinusSigma) and its DiT predicts the velocity in
         // clean-fraction time (`dz/dt`), so `predict` negates it into `run_flow_sampler`'s noise-fraction
         // FLOW convention (`dz/dσ = −dz/dt`) and casts to f32 (the native step's dtype). Cancellation,
-        // the per-step `eval`, and progress all live in `run_flow_sampler`.
-        let native = base_native_sigmas(opts.steps);
-        let sigmas = resolve_flow_schedule(
-            opts.scheduler.as_deref(),
-            base_shift_mu(),
-            opts.steps,
-            &native,
-        );
+        // the per-step `eval`, and progress all live in `run_flow_sampler`. The `sigmas` schedule is
+        // built + resolved by the model layer ([`base_flow_schedule`]) so the PiD `from_ldm` early-stop
+        // (sc-8048) can hand a *truncated* slice here; the full schedule is byte-identical to before.
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
-            &sigmas,
+            sigmas,
             lat,
             opts.seed,
             cancel,
@@ -390,10 +387,12 @@ impl BooguPipeline {
         instruction: &str,
         opts: &EditOptions,
     ) -> Result<Image> {
+        let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
         self.generate_edit_multi_with_progress(
             references,
             instruction,
             opts,
+            &sigmas,
             None,
             &CancelFlag::new(),
             &mut |_| {},
@@ -406,11 +405,13 @@ impl BooguPipeline {
     /// the DiT image sequence (`forward_edit_multi`, `[ref₀; …; ref_{N-1}; noise]`). The reference
     /// latents are shared by both CFG passes; only the instruction differs. `N = 1` matches
     /// [`Self::generate_edit_with_progress`].
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_edit_multi_with_progress(
         &self,
         references: &[Image],
         instruction: &str,
         opts: &EditOptions,
+        sigmas: &[f32],
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
@@ -459,19 +460,14 @@ impl BooguPipeline {
         // threaded through `forward_edit_multi`. Native static-shift schedule is the byte-exact default;
         // velocity is negated into the noise-fraction FLOW convention. The output resolution starts from
         // pure noise (the reference shapes the DiT sequence, not the init latent), so there is no
-        // start-step slicing.
-        let native = base_native_sigmas(opts.steps);
-        let sigmas = resolve_flow_schedule(
-            opts.scheduler.as_deref(),
-            base_shift_mu(),
-            opts.steps,
-            &native,
-        );
+        // start-step slicing. The `sigmas` schedule is built + resolved by the model layer
+        // ([`base_flow_schedule`], shared with the Base path) so the PiD `from_ldm` early-stop (sc-8048)
+        // can hand a *truncated* slice here; the full schedule is byte-identical to before.
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::OneMinusSigma,
-            &sigmas,
+            sigmas,
             lat,
             opts.seed,
             cancel,
@@ -655,6 +651,16 @@ fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
 /// `normal` / `sgm_uniform` / … schedule re-shapes σ over the SAME shift the native schedule uses.
 fn base_shift_mu() -> f32 {
     lin_mu(SEQ_LEN) as f32
+}
+
+/// The resolved Base/Edit flow-match σ schedule (native static-shift + optional curated re-shape),
+/// exposed so the model-layer PiD `from_ldm` early-stop (sc-8048) can mint the decoder at the achieved
+/// capture σ and truncate the denoise — the schedule must be known where the decoder is resolved. This
+/// is the exact `sigmas` the Base/Edit `run_flow_sampler` runs over (noise-fraction, `vp_frame=false`,
+/// so the schedule σ *is* the degrade σ).
+pub fn base_flow_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
+    let native = base_native_sigmas(steps);
+    resolve_flow_schedule(scheduler, base_shift_mu(), steps, &native)
 }
 
 /// The Base/Edit native sigma schedule (noise-fraction, descending to a trailing `0.0`) — the
