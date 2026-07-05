@@ -128,17 +128,30 @@ pub fn load_trainer(spec: &LoadSpec) -> Result<Box<dyn Trainer>> {
                 .into(),
         )),
     };
-    Ok(Box::new(load_trainer_from_dir(root)?))
+    Ok(Box::new(load_trainer_from_dir(
+        root,
+        spec.text_encoder.as_ref(),
+    )?))
 }
 
 /// The concrete-typed loader behind [`load_trainer`] (sc-4942 — the first-step memory harness needs
 /// the concrete [`LtxTrainer`] to reach `.transformer` / `.vae`, which a `Box<dyn Trainer>` hides).
-fn load_trainer_from_dir(root: &Path) -> Result<LtxTrainer> {
+///
+/// `te_override` is `LoadSpec::text_encoder` — the bundled Gemma-3 dir the self-contained LTX install
+/// ships beside the tier weights (sc-8827/sc-9989). Threaded into [`resolve_gemma_dir`] exactly as the
+/// inference path does (`model.rs`): spec-override > `$LTX_GEMMA_DIR` > HF-cache snapshot. `None` keeps
+/// the legacy env/HF-cache fallback (the concrete-loader tests pass `None`).
+fn load_trainer_from_dir(root: &Path, te_override: Option<&WeightsSource>) -> Result<LtxTrainer> {
+    // Resolve (and validate) the Gemma-3 TE location up front — a bad `LoadSpec::text_encoder`
+    // override fails fast here, ahead of the split-weight load, and keeps the wiring unit-testable
+    // without the ~24 GB base snapshot (sc-9989). Only the path is resolved here; the heavy
+    // `Weights::from_dir` load stays below with the rest of the component loads.
+    let gemma_dir = crate::model::resolve_gemma_dir(te_override)?;
+
     let split = SplitModel::from_model_dir(root)?;
     let cfg = LtxConfig::from_model_dir(root)?;
     let vae_config = LtxVaeConfig::from_model_dir(root)?;
 
-    let gemma_dir = crate::model::resolve_gemma_dir(None)?;
     let gemma_w = Weights::from_dir(&gemma_dir)?;
     let gemma_quant = crate::model::resolve_gemma_quant(&gemma_dir)?;
     let connector_w = Weights::from_file(root.join("connector.safetensors"))?;
@@ -918,7 +931,7 @@ mod first_step_repro {
         Array,
         Vec<Vec<BlockLoraRef>>,
     ) {
-        let mut trainer = load_trainer_from_dir(&snapshot())
+        let mut trainer = load_trainer_from_dir(&snapshot(), None)
             .expect("LTX-2.3 base snapshot (SceneWorks cache or $LTX_BASE_DIR) + Gemma TE");
         let suffixes: Vec<String> = DEFAULT_TARGET_SUFFIXES
             .iter()
@@ -1455,5 +1468,31 @@ mod validate_request_tests {
         let mut r = request(1);
         r.config.optimizer = "sgd".into();
         assert!(validate_request(&r).is_err()); // unsupported optimizer
+    }
+}
+
+#[cfg(test)]
+mod load_trainer_tests {
+    use super::*;
+
+    /// sc-9989: the trainer must honor `LoadSpec::text_encoder` (the bundled Gemma-3 dir a
+    /// self-contained LTX install ships beside the tier weights) exactly like inference does. A
+    /// nonexistent override is rejected up front with the spec-side message — proving the override is
+    /// threaded through `load_trainer` → `load_trainer_from_dir` → `resolve_gemma_dir` rather than
+    /// silently falling back to `$LTX_GEMMA_DIR` / the HF-cache scan. Path-only resolution runs before
+    /// the split-weight load, so this needs no base snapshot and is deterministic (env-independent).
+    #[test]
+    fn load_trainer_forwards_text_encoder_override() {
+        let spec = LoadSpec {
+            text_encoder: Some(WeightsSource::Dir("/nonexistent/ltx_gemma".into())),
+            ..LoadSpec::new(WeightsSource::Dir("/nonexistent/ltx_root".into()))
+        };
+        // `Box<dyn Trainer>` isn't `Debug`, so match rather than `unwrap_err`.
+        let err = match load_trainer(&spec) {
+            Ok(_) => panic!("expected a LoadSpec::text_encoder override error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
+        assert!(err.contains("does not exist"), "got: {err}");
     }
 }
