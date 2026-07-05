@@ -15,9 +15,11 @@
 //! mu. The `clamp(-1,1)` + denormalize the reference applies after decode lives in `decoded_to_image`
 //! (`clip(x·0.5 + 0.5, 0, 1)`, the algebraic equal).
 
+use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::adapters::loader::apply_adapters_strict;
+use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
@@ -29,7 +31,7 @@ use mlx_gen::{
 use std::path::Path;
 
 use crate::loader::{load_text_encoder, load_transformer};
-use crate::schedule::{turbo_sigmas, TURBO_MU};
+use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU};
 use crate::text_encoder::{KreaTextEncoder, KreaTokenizer};
 use crate::transformer::Krea2Transformer;
 use crate::vae::{load_vae, QwenVae};
@@ -164,6 +166,115 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
+    /// Generate one RGB image through the **Raw** classifier-free-guidance path with no cancellation, a
+    /// no-op progress sink, and the native VAE decode (no PiD). Convenience wrapper over
+    /// [`Self::generate_base_with_progress`].
+    pub fn generate_base(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_base_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            opts,
+            None,
+            usize::MAX,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// Generate one RGB image through the **Raw** classifier-free-guidance path (`krea_2_raw`): the
+    /// undistilled 12B DiT with a real guidance scale + optional user negative prompt (reference
+    /// `sampling.py::sample` with `guidance > 0`). Two DiT forwards per step — the conditional (positive
+    /// prompt) and the unconditional (the negative prompt, or `""` when none) — combined by the
+    /// **reference** formula `v = cond + guidance·(cond − uncond)` (NOT the standard
+    /// `uncond + g·(cond − uncond)`: Krea's guidance is offset by one). `guidance ≤ 0` collapses to a
+    /// single conditional forward (the uncond context is never encoded), matching the reference
+    /// `cfg = guidance > 0` short-circuit.
+    ///
+    /// The Raw schedule is resolution-**dynamic** ([`base_schedule`] / [`dynamic_mu`]), unlike the
+    /// distilled Turbo's fixed `mu = 1.15`. `decoder` / `keep` are the same PiD decode + `from_ldm`
+    /// early-stop seam as [`Self::generate_turbo_with_progress`] (Krea reuses the Qwen-Image latent
+    /// space); the caller resolves them from [`base_schedule`] so the truncation and the decoder's σ
+    /// agree. Both the positive and unconditional contexts are prepared ONCE (the F-079 hoist), so each
+    /// step reuses the two `JointPrep`s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        keep: usize,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+
+        // Positive (conditional) condition encoding → step-invariant prep (the Turbo F-079 hoist).
+        let (ids, attn) = self.tok.encode_prompt(prompt)?;
+        let context = self.te.forward(&ids, &attn)?;
+
+        // Initial latent noise [1, 16, H/8, W/8] — shared by both prep branches (same geometry).
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+        let prep_pos = self.dit.prepare(&context, None, &noise)?;
+
+        // Unconditional branch, encoded + prepared ONLY when CFG is active (reference
+        // `cfg = guidance > 0`). The negative prompt defaults to `""` at the caller (reference
+        // `negative_prompts = [""] * n`).
+        let prep_neg = if guidance > 0.0 {
+            let (nids, nattn) = self.tok.encode_prompt(negative_prompt)?;
+            let ncontext = self.te.forward(&nids, &nattn)?;
+            Some(self.dit.prepare(&ncontext, None, &noise)?)
+        } else {
+            None
+        };
+
+        // Resolution-dynamic Raw schedule (mu from image-token count), truncated to `keep` for a PiD
+        // `from_ldm` early-stop (σ=0 clean path runs them all).
+        let full = base_schedule(
+            opts.steps,
+            opts.width,
+            opts.height,
+            opts.scheduler.as_deref(),
+        );
+        let sigmas = &full[..keep.min(full.len())];
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            sigmas,
+            noise,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond = self.dit.forward_prepared(x, &t, &prep_pos)?;
+                let v = match &prep_neg {
+                    // Reference `sampling.py`: v = cond + guidance·(cond − uncond).
+                    Some(neg) => {
+                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                        add(
+                            &cond,
+                            &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
+                        )?
+                    }
+                    None => cond,
+                };
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
     /// Decode a latent to an RGB image through the seam. `decoded_to_image` applies
     /// `clip(x·0.5 + 0.5, 0, 1)` — the algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` —
     /// and drops the singleton temporal axis when present (`QwenVae::decode` is NCTHW with T=1; PiD
@@ -183,6 +294,19 @@ impl KreaPipeline {
 pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
     let native = turbo_sigmas(steps);
     resolve_flow_schedule(scheduler, TURBO_MU as f32, steps, &native)
+}
+
+/// The **Raw** flow-match sigma schedule for `steps` at a given resolution: the exponential-mu shift
+/// with a resolution-**dynamic** `mu` interpolated in image-token count ([`dynamic_mu`]), unlike the
+/// Turbo fixed `mu = 1.15`. Length `steps + 1`, descending with a trailing `0.0`; a curated scheduler
+/// (epic 7114) reshapes over the same dynamic mu. Exposed so the caller can resolve a PiD `from_ldm`
+/// early-stop capture from the same schedule [`KreaPipeline::generate_base_with_progress`] runs.
+pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&str>) -> Vec<f32> {
+    // Image token count = (W/16)·(H/16) (latent /8 then patch /2) — the reference `x.shape[1]`.
+    let seq_len = (width as f64 / 16.0) * (height as f64 / 16.0);
+    let mu = dynamic_mu(seq_len);
+    let native = krea_sigmas(steps, mu);
+    resolve_flow_schedule(scheduler, mu as f32, steps, &native)
 }
 
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).

@@ -4,8 +4,10 @@
 //! foundation image model (released 2026-06-22). Two surfaces share **one architecture**:
 //! - **Krea 2 Turbo** (`krea_2_turbo`) — the user-facing text-to-image model (TDM-distilled few-step,
 //!   CFG-free, 8 steps, up to 2048²),
-//! - **Krea 2 Raw** — the undistilled base used as a LoRA-training base (MLX/macOS-only; LoRAs train on
-//!   Raw and apply at Turbo inference, the Lens / Z-Image precedent — epic 7565 P3).
+//! - **Krea 2 Raw** (`krea_2_raw`) — the undistilled base. Both a **generation model** (full-CFG
+//!   text-to-image: real guidance + a user negative prompt, 52 steps, resolution-dynamic mu — epic
+//!   9992) AND the **LoRA-training base** (LoRAs train on Raw and apply at Turbo inference, the Lens /
+//!   Z-Image precedent — epic 7565 P3). One id, both roles (generator + trainer registries).
 //!
 //! ## Architecture (verified against the real `krea/Krea-2-Turbo` configs + safetensors index)
 //! - **DiT** — `Krea2Transformer2DModel`, a **dense single-stream** rectified-flow / v-param
@@ -47,7 +49,7 @@ pub mod vae;
 
 pub use config::Krea2Config;
 pub use loader::{load_text_encoder, load_transformer};
-pub use model::{descriptor, load, Krea, KREA_2_TURBO_ID};
+pub use model::{descriptor, load, load_raw, raw_descriptor, Krea, KREA_2_RAW_ID, KREA_2_TURBO_ID};
 pub use pipeline::{KreaPipeline, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};

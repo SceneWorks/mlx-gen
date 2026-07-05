@@ -20,7 +20,7 @@ use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 
 use std::path::Path;
 
-use crate::pipeline::{turbo_schedule, KreaPipeline, TurboOptions};
+use crate::pipeline::{base_schedule, turbo_schedule, KreaPipeline, TurboOptions};
 
 /// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
 /// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
@@ -49,6 +49,19 @@ const RES_MULTIPLE: u32 = 16;
 /// `is_distilled` + `guidance_scale 0`). Consumed by `generate` (`req.steps.unwrap_or(DEFAULT_STEPS)`);
 /// the manifest `default_steps` mirrors this (sc-7572).
 const DEFAULT_STEPS: u32 = 8;
+
+/// Registry id for the undistilled **Raw** text-to-image variant (epic 9992). The SAME string as the
+/// Krea LoRA *trainer* base ([`crate::training::KREA_2_RAW_TRAINER_ID`]) — Path 1 makes one id both the
+/// training base and a first-class generator; the trainer + generator live in separate registries so
+/// the shared id never collides. Matches the SceneWorks worker's `payload.model` + manifest `engine_id`.
+pub const KREA_2_RAW_ID: &str = "krea_2_raw";
+
+/// Raw defaults (the reference `sampling.py` Raw preset per the sc-7566 spike): full-CFG at 52 steps,
+/// guidance 3.5, resolution-dynamic mu. Consumed by `generate_impl`
+/// (`req.steps.unwrap_or(DEFAULT_RAW_STEPS)` / `req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE)`); the
+/// manifest `default_steps` / `defaults.guidanceScale` mirror these (sc-9999 / sc-10003).
+const DEFAULT_RAW_STEPS: u32 = 52;
+const DEFAULT_RAW_GUIDANCE: f32 = 3.5;
 
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
@@ -92,8 +105,27 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded Krea 2 Turbo generator: the cached descriptor + the assembled Turbo pipeline (tokenizer +
-/// Qwen3-VL-4B condition encoder + single-stream DiT + Qwen-Image VAE).
+/// Krea 2 **Raw** identity + capabilities — the undistilled 12B DiT run with **true classifier-free
+/// guidance** (two DiT forwards/step: cond vs uncond) at 52 steps, unlike the CFG-free distilled Turbo.
+/// Same architecture / snapshot layout as Turbo (only the DiT weights differ, distilled vs base), so it
+/// shares [`load_variant`] + the whole [`KreaPipeline`]. Exposes a real guidance scale AND a user
+/// negative prompt — the reference `sample()` accepts `negative_prompts` (richer than Boogu's base,
+/// which fixes the uncond to the empty prompt). NOT guidance-distilled, so `supports_true_cfg` stays
+/// false: there is no separate embedded-guidance axis to layer a `true_cfg_scale` over — the two-forward
+/// CFG IS the guidance (the Boogu-base precedent). Derived from [`descriptor`] so the shared surface
+/// (family/backend/samplers/quants/size/LoRA) stays in lockstep.
+pub fn raw_descriptor() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = KREA_2_RAW_ID;
+    d.capabilities.supports_negative_prompt = true;
+    d.capabilities.supports_guidance = true;
+    d.capabilities.supports_true_cfg = false;
+    d
+}
+
+/// A loaded Krea 2 generator (Turbo or Raw): the cached descriptor + the assembled pipeline (tokenizer +
+/// Qwen3-VL-4B condition encoder + single-stream DiT + Qwen-Image VAE). The variant is read back off
+/// `descriptor.id` at generate time (Turbo = CFG-free distilled; Raw = full-CFG undistilled).
 pub struct Krea {
     descriptor: ModelDescriptor,
     pipeline: KreaPipeline,
@@ -109,7 +141,22 @@ pub struct Krea {
 /// override is rejected rather than silently ignored. Raw-trained LoRA/LoKr adapters in `spec.adapters`
 /// are installed onto the DiT (sc-7911).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let id = KREA_2_TURBO_ID;
+    load_variant(spec, descriptor())
+}
+
+/// Load the undistilled **Raw** generator (`krea_2_raw`, epic 9992). Identical snapshot assembly to
+/// [`load`] — the Raw + Turbo turnkeys share the exact architecture / weight layout (only distilled-vs-
+/// base DiT weights differ), so one loader serves both — but stores the CFG-capable [`raw_descriptor`]
+/// so `generate` runs the full-CFG path.
+pub fn load_raw(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, raw_descriptor())
+}
+
+/// Shared loader behind [`load`] / [`load_raw`]: assemble the pipeline from a snapshot dir, install any
+/// Raw-trained LoRA/LoKr adapters, apply the optional (F-076-guarded) quantize, and overlay a PiD
+/// decoder. `descriptor` selects the variant (Turbo vs Raw) the returned [`Krea`] renders.
+fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
+    let id = descriptor.id;
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{id}: only the default dense precision is wired (drop the precision override)"
@@ -142,7 +189,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         if let Some(packed) = packed_quant_bits(root) {
             if packed != q.bits() {
                 return Err(Error::Msg(format!(
-                    "krea_2_turbo: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
+                    "{id}: snapshot is a pre-quantized Q{packed} turnkey but Q{} was \
                      requested; quantize() is a no-op on packed weights so the request would \
                      silently serve Q{packed}. Point at a Q{} snapshot (or a dense one).",
                     q.bits(),
@@ -161,7 +208,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
         .transpose()?;
     Ok(Box::new(Krea {
-        descriptor: descriptor(),
+        descriptor,
         pipeline,
         pid,
     }))
@@ -184,23 +231,39 @@ impl Krea {
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        // Variant read back off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu);
+        // Turbo = CFG-free distilled (8-step, fixed mu). One `Krea` struct, two render paths.
+        let is_raw = self.descriptor.id == KREA_2_RAW_ID;
+        let steps = req.steps.unwrap_or(if is_raw {
+            DEFAULT_RAW_STEPS
+        } else {
+            DEFAULT_STEPS
+        }) as usize;
         // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): when `req.use_pid`, build one PiD
         // decoder from the prompt and reuse it across the batch — same prompt → same caption; per-image
         // variation comes from the per-seed latent. `None` → the native VAE. Errors if PiD was requested
         // but not loaded. With `req.pid_capture_sigma`, resolve the achieved degrade σ + the truncation
-        // `keep` from the (seed-independent) Turbo schedule and decode the partially-denoised x_k; else
-        // the clean σ=0 full-denoise path (`capture_sigma = 0`, `keep = MAX`).
-        let sigmas = turbo_schedule(steps, req.scheduler.as_deref());
+        // `keep` from the (seed-independent) schedule and decode the partially-denoised x_k; else the
+        // clean σ=0 full-denoise path (`capture_sigma = 0`, `keep = MAX`). Raw uses the resolution-
+        // dynamic schedule; both share the Qwen-Image latent space the PiD student decodes.
+        let sigmas = if is_raw {
+            base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
+        } else {
+            turbo_schedule(steps, req.scheduler.as_deref())
+        };
         let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
         let pid_decoder = resolve_pid_decoder_at_sigma(
             self.pid.as_ref(),
             req,
             base_seed,
-            KREA_2_TURBO_ID,
+            self.descriptor.id,
             capture_sigma,
         )?;
         let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
+        // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) path.
+        let guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
+        let negative = req.negative_prompt.clone().unwrap_or_default();
         let mut images = Vec::with_capacity(req.count as usize);
         for n in 0..req.count {
             let opts = TurboOptions {
@@ -211,14 +274,27 @@ impl Krea {
                 sampler: req.sampler.clone(),
                 scheduler: req.scheduler.clone(),
             };
-            let img = self.pipeline.generate_turbo_with_progress(
-                &req.prompt,
-                &opts,
-                decoder,
-                keep,
-                &req.cancel,
-                on_progress,
-            )?;
+            let img = if is_raw {
+                self.pipeline.generate_base_with_progress(
+                    &req.prompt,
+                    &negative,
+                    guidance,
+                    &opts,
+                    decoder,
+                    keep,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else {
+                self.pipeline.generate_turbo_with_progress(
+                    &req.prompt,
+                    &opts,
+                    decoder,
+                    keep,
+                    &req.cancel,
+                    on_progress,
+                )?
+            };
             images.push(img);
         }
         Ok(GenerationOutput::Images(images))
@@ -248,8 +324,12 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 }
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both variants register
+// here — `krea_2_turbo` (distilled, CFG-free) and `krea_2_raw` (undistilled, full-CFG; epic 9992).
+mlx_gen::register_generators! {
+    descriptor => load,
+    raw_descriptor => load_raw,
+}
 
 #[cfg(test)]
 mod tests {
@@ -389,5 +469,56 @@ mod tests {
             !e.contains("no generator registered"),
             "id not resolved: {e}"
         );
+    }
+
+    // --- Raw (undistilled, full-CFG) variant — epic 9992 ---
+
+    #[test]
+    fn raw_descriptor_is_krea_2_raw_and_cfg_capable() {
+        let d = raw_descriptor();
+        assert_eq!(d.id, "krea_2_raw");
+        // The generator id MUST equal the LoRA-trainer base id (Path 1: one id, both roles).
+        assert_eq!(KREA_2_RAW_ID, crate::training::KREA_2_RAW_TRAINER_ID);
+        assert_eq!(d.family, "krea_2");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        // Undistilled base: real CFG guidance + a user negative prompt (unlike Turbo / Boogu base).
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        // Not guidance-distilled: no separate embedded-guidance axis, so no true_cfg toggle.
+        assert!(!d.capabilities.supports_true_cfg);
+        // Shared surface stays in lockstep with Turbo (derived from `descriptor()`).
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(d.capabilities.samplers, descriptor().capabilities.samplers);
+        assert!(d.capabilities.mac_only);
+        assert_eq!(DEFAULT_RAW_STEPS, 52);
+        assert_eq!(DEFAULT_RAW_GUIDANCE, 3.5);
+    }
+
+    #[test]
+    fn raw_validate_accepts_guidance_and_negative_prompt() {
+        // The CFG floor that rejects these on Turbo must ACCEPT them on Raw.
+        assert!(validate_request(
+            &raw_descriptor(),
+            &GenerationRequest {
+                guidance: Some(3.5),
+                negative_prompt: Some("blurry, lowres".into()),
+                ..req(1024, 1024)
+            }
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn raw_reachable_via_registry_by_id() {
+        assert!(
+            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_RAW_ID),
+            "id {KREA_2_RAW_ID} not registered"
+        );
+        // Same snapshot loader as Turbo — a single-file weights source is rejected the same way.
+        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let e = load_raw(&file).err().expect("error").to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
     }
 }
