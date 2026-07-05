@@ -51,7 +51,6 @@
 use std::path::Path;
 
 use mlx_gen::adapters::AdaptableHost;
-use mlx_gen::array::scalar;
 use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
@@ -76,6 +75,7 @@ use mlx_rs::transforms::{eval, keyed_value_and_grad};
 use mlx_rs::{random, Array, Dtype};
 
 use crate::loader::{load_text_encoder, load_transformer};
+use crate::pipeline::krea_cfg_combine;
 use crate::schedule::{dynamic_mu, krea_sigmas};
 use crate::text_encoder::{KreaTextEncoder, KreaTokenizer};
 use crate::transformer::Krea2Transformer;
@@ -915,13 +915,14 @@ fn render_sample(
         |x, timestep| {
             let tt = Array::from_slice(&[timestep], &[1]);
             let v_cond = dit.forward(x, &tt, ctx_pos, None)?;
-            // CFG: v = v_uncond + guidance · (v_cond − v_uncond). guidance == 0 collapses to v_cond.
+            // CFG via the shared [`krea_cfg_combine`] (reference `sampling.py:129`
+            // `v_cond + g·(v_cond − v_uncond)`, one source of truth with the Raw inference path). Prior
+            // to sc-10009 this used the standard `v_uncond + g·Δ`, which at the shared default
+            // `sample_guidance_scale = 1.0` collapsed to exactly `v_cond` — zero effective CFG, the
+            // washed-out previews. `guidance == 0` still collapses to the bare conditional velocity.
             let v = if guidance > 0.0 {
                 let v_uncond = dit.forward(x, &tt, ctx_neg, None)?;
-                add(
-                    &v_uncond,
-                    &multiply(&subtract(&v_cond, &v_uncond)?, scalar(guidance))?,
-                )?
+                krea_cfg_combine(&v_cond, &v_uncond, guidance)?
             } else {
                 v_cond
             };

@@ -257,13 +257,9 @@ impl KreaPipeline {
                 let t = Array::from_slice(&[timestep], &[1]);
                 let cond = self.dit.forward_prepared(x, &t, &prep_pos)?;
                 let v = match &prep_neg {
-                    // Reference `sampling.py`: v = cond + guidance·(cond − uncond).
                     Some(neg) => {
                         let uncond = self.dit.forward_prepared(x, &t, neg)?;
-                        add(
-                            &cond,
-                            &multiply(&subtract(&cond, &uncond)?, scalar(guidance))?,
-                        )?
+                        krea_cfg_combine(&cond, &uncond, guidance)?
                     }
                     None => cond,
                 };
@@ -309,6 +305,19 @@ pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&s
     resolve_flow_schedule(scheduler, mu as f32, steps, &native)
 }
 
+/// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
+/// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
+/// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
+/// collapses to exactly `v_cond` (zero effective CFG). Single source of truth so the Raw inference path
+/// and the trainer preview (`training::render_sample`) can never drift again (sc-10009). The caller runs
+/// this only for `guidance > 0` (a single conditional forward otherwise, matching `cfg = guidance > 0`).
+pub(crate) fn krea_cfg_combine(v_cond: &Array, v_uncond: &Array, guidance: f32) -> Result<Array> {
+    Ok(add(
+        v_cond,
+        &multiply(&subtract(v_cond, v_uncond)?, scalar(guidance))?,
+    )?)
+}
+
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).
 /// The model layer offsets `seed` per image in a batch, mirroring the reference `seed + i`.
 fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
@@ -320,4 +329,27 @@ fn init_noise(height: u32, width: u32, seed: u64) -> Result<Array> {
         None,
         Some(&key),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Krea CFG combine is the reference `cond + g·(cond − uncond)`, not the standard
+    /// `uncond + g·Δ`. With cond = 2, uncond = 1 (Δ = 1): g = 1 → 3 (the standard form would give 2 —
+    /// exactly `cond` — which is why the default `sample_guidance_scale = 1.0` washed previews out); a
+    /// larger g pushes further from cond, away from uncond.
+    #[test]
+    fn cfg_combine_is_reference_offset_by_one() {
+        let cond = Array::from_slice(&[2.0f32], &[1]);
+        let uncond = Array::from_slice(&[1.0f32], &[1]);
+        for (g, want) in [(1.0f32, 3.0f32), (3.5, 5.5), (0.0, 2.0)] {
+            let v = krea_cfg_combine(&cond, &uncond, g).unwrap();
+            assert!(
+                (v.item::<f32>() - want).abs() < 1e-5,
+                "g={g}: got {}, want {want}",
+                v.item::<f32>()
+            );
+        }
+    }
 }
