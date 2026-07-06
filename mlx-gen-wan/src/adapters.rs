@@ -44,6 +44,7 @@ use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
     resolve_lokr_path,
 };
+use mlx_gen::adapters::{AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
@@ -540,6 +541,306 @@ fn merge_adapters_into(
     Ok(report)
 }
 
+// ============================================================================================
+// Additive (UNMERGED) LoRA/LoKr/LoHa install (sc-10044)
+// ============================================================================================
+//
+// The [`merge_wan_adapters`] path above FOLDS every adapter delta into a dense `Weights` map
+// (`W += δ`) before [`WanTransformer::from_weights`] builds the model — which is why a *pre-quantized*
+// (packed Q4/Q8) snapshot has nowhere to write the delta and the loader hard-errors (`model.rs:614`).
+//
+// The additive path below is the runtime alternative: it installs each adapter as a **forward-time
+// residual** onto an already-built [`WanTransformer`] (any [`AdaptableHost`]) via
+// [`Adapter`]-stacking, so the base weight `W` is used AS-IS — dense bf16 **or** packed Q4/Q8, never
+// dequantized or mutated. Each linear then computes `base(x) + Σ scale·(x·A)·B` (LoRA) /
+// `base(x) + Σ scale·x·ΔWᵀ` (LoKr/LoHa) — two small matmuls in compute precision, deferred (no out×in
+// delta materialized, no per-gen dense reload). This makes LoRA usable on a packed snapshot with zero
+// change to the base's quant.
+//
+// The math is byte-parity with the fold path: for LoRA the fold computes `ΔW = (B·A)·(alpha/rank·s)`
+// and forwards `x·(W+ΔW)ᵀ = x·Wᵀ + (alpha/rank·s)·x·(B·A)ᵀ`; the residual computes
+// `s·(x·Aᵀ)·(Bᵀ·(alpha/rank)) = (alpha/rank·s)·x·Aᵀ·Bᵀ` — identical (`(B·A)ᵀ = Aᵀ·Bᵀ`). This mirrors
+// the core `install_lora_groups` factor convention exactly (`a = downᵀ`, `b = upᵀ`, `alpha/rank`
+// folded into `b`, `scale = strength`) so a fold and an additive install of the same file agree
+// within Metal matmul tolerance. LoKr/LoHa reconstruct the same `[out,in]` delta the fold uses and
+// stack it as an [`Adapter::Lokr`] residual (`scale = strength`, `alpha/rank` already baked into the
+// delta), with the base shape recovered from the host (works for a packed base too — see
+// [`mlx_gen::adapters::AdaptableLinear::base_shape`]).
+//
+// Format coverage mirrors [`merge_one`]: PEFT/kohya LoRA, peft LoKr, third-party LyCORIS LoKr/LoHa.
+// A target absent from (or outside the adaptable surface of) the host is surfaced (skipped), never
+// fatal — matching the fold path's `skipped` reporting.
+
+/// Install every adapter in `specs` that targets `expert` onto the native-Wan [`AdaptableHost`]
+/// `host` (a [`WanTransformer`](crate::transformer)) as **forward-time residuals** — the unmerged,
+/// quant-agnostic sibling of [`merge_wan_adapters`] (sc-10044). The base weights are used AS-IS
+/// (dense bf16 or packed Q4/Q8, never dequantized). Shared (`moe_expert == None`) specs install
+/// first, then this `expert`'s specific ones, mirroring the reference `(loras)+(loras_*)` order.
+/// Returns the same [`WanLoraReport`] the fold path returns; the caller enforces the
+/// "matched nothing across both experts" error.
+pub fn apply_wan_adapters_additive(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    expert: MoeExpert,
+) -> Result<WanLoraReport> {
+    apply_additive_into(host, specs, expert, normalize_wan_key)
+}
+
+/// Shared additive-install core (the forward-time-residual analog of [`merge_adapters_into`]) — Pass 1
+/// shared (untagged) files, Pass 2 this `expert`'s specific files. `normalize` maps a file's raw key
+/// to the host's module path ([`normalize_wan_key`] for the native Wan DiT).
+fn apply_additive_into(
+    host: &mut impl AdaptableHost,
+    specs: &[AdapterSpec],
+    expert: MoeExpert,
+    normalize: fn(&str) -> String,
+) -> Result<WanLoraReport> {
+    let mut report = WanLoraReport::default();
+    for spec in specs.iter().filter(|s| s.moe_expert.is_none()) {
+        report.applicable += 1;
+        install_one_additive(host, spec, normalize, &mut report)?;
+    }
+    for spec in specs.iter().filter(|s| s.moe_expert == Some(expert)) {
+        report.applicable += 1;
+        install_one_additive(host, spec, normalize, &mut report)?;
+    }
+    Ok(report)
+}
+
+/// Install one adapter file onto `host` as residuals at `spec.scale` (the additive analog of
+/// [`merge_one`]) — same per-file format dispatch (peft/kohya LoRA, peft LoKr, third-party LyCORIS
+/// LoKr/LoHa), same normalized module paths, but pushing an [`Adapter`] rather than folding `W += δ`.
+fn install_one_additive(
+    host: &mut impl AdaptableHost,
+    spec: &AdapterSpec,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let lw = Weights::from_file(&spec.path)?;
+    if spec.kind == AdapterKind::Lokr || is_lokr(&lw) {
+        return install_one_lokr_additive(host, &lw, spec.scale, normalize, report);
+    }
+    if is_lokr_keys(&lw) {
+        return install_one_lokr_thirdparty_additive(host, &lw, spec.scale, normalize, report);
+    }
+    if is_loha_keys(&lw) {
+        return install_one_loha_thirdparty_additive(host, &lw, spec.scale, normalize, report);
+    }
+    install_one_lora_additive(host, &lw, spec.scale, normalize, report)
+}
+
+/// Push `adapter` onto the host module at the (already-normalized) native path `path`. A path outside
+/// the host's adaptable surface (e.g. a non-block target, or a block index beyond this checkpoint) is
+/// surfaced in `report.skipped`, never fatal — mirroring the fold path's per-target skip.
+fn push_at(
+    host: &mut impl AdaptableHost,
+    path: String,
+    adapter: Adapter,
+    report: &mut WanLoraReport,
+) {
+    let parts: Vec<&str> = path.split('.').collect();
+    match host.adaptable_mut(&parts) {
+        Some(lin) => {
+            lin.push(adapter);
+            report.applied += 1;
+        }
+        None => report.skipped.push(path),
+    }
+}
+
+/// Install a PEFT/kohya LoRA file as residuals. Mirrors [`merge_one`]'s grouping + the core
+/// `install_lora_groups` factor convention: `a = downᵀ [in,rank]`, `b = upᵀ [rank,out]` with
+/// `alpha/rank` folded into `b`, and `scale = strength` — so `scale·(x·A)·B` reproduces the fold's
+/// `(alpha/rank·strength)·x·(B·A)ᵀ` within tolerance, with `W` untouched (dense OR packed).
+fn install_one_lora_additive(
+    host: &mut impl AdaptableHost,
+    lw: &Weights,
+    strength: f32,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let mut groups: BTreeMap<String, LoraParts> = BTreeMap::new();
+    for key in lw.keys().map(str::to_string).collect::<Vec<_>>() {
+        let Some((stem, role)) = SUFFIXES
+            .iter()
+            .find_map(|(suf, role)| key.strip_suffix(suf).map(|s| (s, *role)))
+        else {
+            continue;
+        };
+        let parts = groups.entry(normalize(stem)).or_default();
+        match role {
+            Role::Down => parts.down = Some(lw.require(&key)?.clone()),
+            Role::Up => parts.up = Some(lw.require(&key)?.clone()),
+            Role::Alpha => parts.alpha = Some(read_alpha(lw.require(&key)?)?),
+        }
+    }
+
+    let cfg = LoraAdapterMeta::from_metadata(lw.metadata(LORA_ADAPTER_METADATA_KEY));
+    for (path, parts) in groups {
+        let (Some(down), Some(up)) = (parts.down, parts.up) else {
+            report.skipped.push(path);
+            continue;
+        };
+        // `down` is [rank, in], `up` is [out, rank]. The residual form is `(x·A)·B` with A = downᵀ
+        // [in, rank] and B = upᵀ [rank, out]; the `alpha/rank` scale is folded into B (matching the
+        // core `install_lora_groups`), and the user strength stays as the `Adapter::Lora` scale.
+        let a = down.t();
+        let mut b = up.t();
+        if a.shape().len() != 2 || b.shape().len() != 2 {
+            return Err(format!(
+                "wan additive LoRA at '{path}' has non-2-D factors (down {:?}, up {:?})",
+                down.shape(),
+                up.shape()
+            )
+            .into());
+        }
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
+        let factor_rank = a.shape()[1] as f64; // r
+        if factor_rank == 0.0 {
+            return Err(format!("wan additive LoRA at '{path}' has zero rank").into());
+        }
+        // Fold `alpha/rank` into B when an alpha is present (per-target `.alpha` → blob), matching the
+        // fold path's `eff = alpha/rank·strength` split (the strength stays the residual scale).
+        if let Some(alpha) = parts.alpha.or(cfg_alpha) {
+            let rank = cfg_rank.map(|r| r as f64).unwrap_or(factor_rank);
+            let ratio = (alpha as f64 / rank) as f32;
+            b = multiply(&b, &scalar(ratio).as_dtype(b.dtype())?)?;
+        }
+        push_at(
+            host,
+            path,
+            Adapter::Lora {
+                a,
+                b,
+                scale: strength,
+            },
+            report,
+        );
+    }
+    Ok(())
+}
+
+/// Install a peft LoKr file as residuals (sc-2393/sc-10044). Each module's `[out,in]` delta is
+/// reconstructed (bf16, `alpha/rank` folded in — the fork-parity residual dtype) at the target's base
+/// shape (recovered from the host, packed or dense) and stacked as an [`Adapter::Lokr`] at the user
+/// strength — `scale·x·ΔWᵀ`, base untouched. A target outside the adaptable surface is skipped.
+fn install_one_lokr_additive(
+    host: &mut impl AdaptableHost,
+    lw: &Weights,
+    strength: f32,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let file = parse_lokr(lw)?;
+    for (raw_path, factors) in &file.groups {
+        let path = normalize(raw_path);
+        let parts: Vec<&str> = path.split('.').collect();
+        let Some(base_shape) = host.adaptable_mut(&parts).map(|lin| lin.base_shape()) else {
+            report.skipped.push(path);
+            continue;
+        };
+        // Fork-parity residual keeps the delta at bf16 (PARITY-BF16, sc-2609); `alpha/rank` is baked in.
+        let delta = file.delta(factors, &base_shape, Dtype::Bfloat16)?;
+        push_at(
+            host,
+            path,
+            Adapter::Lokr {
+                delta,
+                scale: strength,
+            },
+            report,
+        );
+    }
+    Ok(())
+}
+
+/// Install a third-party LyCORIS **LoKr** file as residuals (sc-3671/sc-10044). As
+/// [`install_one_lokr_additive`] but with per-module lycoris factors + key resolution (kohya-flattened
+/// stem table, else the dotted `normalize`). The reconstructed delta bakes in the lycoris per-module
+/// scale; the user strength stays the residual scale.
+fn install_one_lokr_thirdparty_additive(
+    host: &mut impl AdaptableHost,
+    lw: &Weights,
+    strength: f32,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let table = host_module_table(host);
+    for (raw, g) in &parse_lokr_thirdparty(lw)? {
+        let path = resolve_wan_thirdparty(raw, &table, normalize);
+        install_thirdparty_delta(
+            host,
+            path,
+            |bs| g.delta(bs, Dtype::Bfloat16),
+            strength,
+            report,
+        )?;
+    }
+    Ok(())
+}
+
+/// Install a third-party LyCORIS **LoHa** file as residuals (sc-3671/sc-10044) — as
+/// [`install_one_lokr_thirdparty_additive`] with the Hadamard reconstruction.
+fn install_one_loha_thirdparty_additive(
+    host: &mut impl AdaptableHost,
+    lw: &Weights,
+    strength: f32,
+    normalize: fn(&str) -> String,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let table = host_module_table(host);
+    for (raw, g) in &parse_loha_thirdparty(lw)? {
+        let path = resolve_wan_thirdparty(raw, &table, normalize);
+        install_thirdparty_delta(
+            host,
+            path,
+            |bs| g.delta(bs, Dtype::Bfloat16),
+            strength,
+            report,
+        )?;
+    }
+    Ok(())
+}
+
+/// Reconstruct a third-party `[out,in]` delta at the host target's base shape and stack it as an
+/// [`Adapter::Lokr`] residual at `strength` — the additive analog of [`merge_wan_thirdparty_delta`].
+/// A path outside the adaptable surface is surfaced (skipped), never fatal.
+fn install_thirdparty_delta(
+    host: &mut impl AdaptableHost,
+    path: String,
+    delta_at: impl FnOnce(&[i32]) -> Result<Array>,
+    strength: f32,
+    report: &mut WanLoraReport,
+) -> Result<()> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let Some(base_shape) = host.adaptable_mut(&parts).map(|lin| lin.base_shape()) else {
+        report.skipped.push(path);
+        return Ok(());
+    };
+    let delta = delta_at(&base_shape)?;
+    push_at(
+        host,
+        path,
+        Adapter::Lokr {
+            delta,
+            scale: strength,
+        },
+        report,
+    );
+    Ok(())
+}
+
+/// Build the `flattened-stem → native-module-path` table from the host's adaptable surface (every
+/// [`AdaptableHost::adaptable_paths`] entry, dots→underscores), so a third-party LyCORIS file's
+/// kohya-flattened key resolves to a native Wan module (the additive analog of [`wan_module_table`],
+/// which reads the weight map — here we read the host, which is already built).
+fn host_module_table(host: &impl AdaptableHost) -> BTreeMap<String, String> {
+    host.adaptable_paths()
+        .into_iter()
+        .map(|p| (p.replace('.', "_"), p))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +1178,48 @@ mod tests {
             kind: AdapterKind::Lora,
             pass_scales: None,
             moe_expert: expert,
+        }
+    }
+
+    /// Write a peft LoKr file for `blocks.0.self_attn.q` ([16,8] = kron(w1[4,2], w2[4,4])) with the
+    /// given `alpha`/`rank` in metadata (sc-10044 additive tests). Deterministic factor values.
+    fn write_lokr(name: &str, alpha: f32, rank: f32) -> PathBuf {
+        use std::collections::HashMap;
+        let w1 = Array::from_slice(
+            &(0..8)
+                .map(|i| (i as f32 * 0.03).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 2],
+        );
+        let w2 = Array::from_slice(
+            &(0..16)
+                .map(|i| (i as f32 * 0.05).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[4, 4],
+        );
+        let meta = HashMap::from([
+            ("networkType".to_string(), "lokr".to_string()),
+            ("alpha".to_string(), alpha.to_string()),
+            ("rank".to_string(), rank.to_string()),
+        ]);
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.self_attn.q.lokr_w1", &w1),
+                ("blocks.0.self_attn.q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    /// A LoKr-kind [`AdapterSpec`] (the [`spec`] helper defaults to `AdapterKind::Lora`).
+    fn lokr_spec(path: PathBuf, scale: f32) -> AdapterSpec {
+        AdapterSpec {
+            kind: AdapterKind::Lokr,
+            ..spec(path, scale, None)
         }
     }
 
@@ -1465,5 +1808,346 @@ mod tests {
         let report = merge_vace_adapters(&mut w, &[spec(lora, 1.0, None)]).unwrap();
         assert_eq!(report.applied, 1);
         assert_eq!(report.skipped, vec!["blocks.99.attn1.to_q".to_string()]);
+    }
+
+    // ---- Additive (unmerged) install (sc-10044) --------------------------------------------------
+
+    use mlx_gen::adapters::AdaptableLinear;
+
+    /// A minimal [`AdaptableHost`] mirroring the native Wan DiT's adaptable surface for one block:
+    /// `blocks.0.self_attn.{q,k,v,o}`, `blocks.0.cross_attn.{q,k,v,o}`, `blocks.0.ffn.{fc1,fc2}`. It
+    /// carries the two linears the test LoRA files target (`self_attn.q` and `ffn.fc1`) as real
+    /// [`AdaptableLinear`]s, so [`apply_wan_adapters_additive`] exercises the genuine install path
+    /// (normalize + factor convention + residual stacking) without the full ~7GB `WanTransformer`.
+    struct TinyWanHost {
+        q: AdaptableLinear,
+        fc1: AdaptableLinear,
+    }
+
+    impl AdaptableHost for TinyWanHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            match path {
+                ["blocks", "0", "self_attn", "q"] => Some(&mut self.q),
+                ["blocks", "0", "ffn", "fc1"] => Some(&mut self.fc1),
+                _ => None,
+            }
+        }
+
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec![
+                "blocks.0.self_attn.q".to_string(),
+                "blocks.0.ffn.fc1".to_string(),
+            ]
+        }
+    }
+
+    impl TinyWanHost {
+        /// Build from the shared `synthetic_weights()` map (same `[16,8]` q + `[24,8]` fc1 the fold
+        /// tests use), so an additive install and a folded merge start from the identical base.
+        fn from_synthetic() -> Self {
+            let w = synthetic_weights();
+            Self {
+                q: AdaptableLinear::dense(
+                    w.require("blocks.0.self_attn.q.weight").unwrap().clone(),
+                    None,
+                ),
+                fc1: AdaptableLinear::dense(
+                    w.require("blocks.0.ffn.fc1.weight").unwrap().clone(),
+                    None,
+                ),
+            }
+        }
+    }
+
+    /// f32 activations `[n, 8]` for the parity forwards (f32 in makes `addmm == matmul+add` bit-exact,
+    /// so the only tolerance is the low-rank residual matmul).
+    fn acts(n: i32) -> Array {
+        Array::from_slice(
+            &(0..n * 8)
+                .map(|i| (i as f32 * 0.017).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[n, 8],
+        )
+    }
+
+    #[test]
+    fn additive_lora_matches_folded_merge_dense() {
+        // ACCEPTANCE: the additive residual on a DENSE base == the folded merge, same output within
+        // Metal matmul tolerance. Fold into a `Weights` map via `merge_wan_adapters`, build a dense
+        // linear from the merged weight, and compare its forward to the additive-installed host's.
+        let lora = write_lora(
+            "additive_parity.safetensors",
+            &[("blocks.0.self_attn.q", 16, 8), ("blocks.0.ffn.0", 24, 8)],
+            4,
+            0.13,
+        );
+        let x = acts(3);
+
+        // Folded reference.
+        let mut w = synthetic_weights();
+        let fold_report =
+            merge_wan_adapters(&mut w, &[spec(lora.clone(), 0.75, None)], MoeExpert::High).unwrap();
+        assert_eq!(fold_report.applied, 2);
+        let folded_q = AdaptableLinear::dense(
+            w.require("blocks.0.self_attn.q.weight").unwrap().clone(),
+            None,
+        );
+        let folded_fc1 =
+            AdaptableLinear::dense(w.require("blocks.0.ffn.fc1.weight").unwrap().clone(), None);
+
+        // Additive.
+        let mut host = TinyWanHost::from_synthetic();
+        let add_report =
+            apply_wan_adapters_additive(&mut host, &[spec(lora, 0.75, None)], MoeExpert::High)
+                .unwrap();
+        assert_eq!(add_report.applied, 2, "both q and fc1 installed additively");
+        assert!(add_report.skipped.is_empty());
+
+        for (folded, additive, name) in [
+            (&folded_q, &host.q, "self_attn.q"),
+            (&folded_fc1, &host.fc1, "ffn.fc1"),
+        ] {
+            let want = folded.forward(&x).unwrap();
+            let got = additive.forward(&x).unwrap();
+            assert!(
+                all_close(&got, &want, 2e-2, 2e-2, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "additive residual must match the folded merge on {name} (dense)"
+            );
+            // Non-degenerate: the adapter actually changed the output vs the bare base.
+            let bare = AdaptableLinear::dense(
+                synthetic_weights()
+                    .require(&format!(
+                        "blocks.0.{}.weight",
+                        if name == "self_attn.q" {
+                            "self_attn.q"
+                        } else {
+                            "ffn.fc1"
+                        }
+                    ))
+                    .unwrap()
+                    .clone(),
+                None,
+            )
+            .forward(&x)
+            .unwrap();
+            assert!(
+                !array_eq(&got, &bare, false).unwrap().item::<bool>(),
+                "additive adapter must change {name}'s output (non-degenerate)"
+            );
+        }
+    }
+
+    /// A quant-sized host: `blocks.0.self_attn.q` is `[128, 64]` so its `in = 64` is a multiple of the
+    /// group size (64) and the base can be packed to Q4/Q8. Only the `q` target is populated.
+    struct QuantWanHost {
+        q: AdaptableLinear,
+    }
+    impl AdaptableHost for QuantWanHost {
+        fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+            match path {
+                ["blocks", "0", "self_attn", "q"] => Some(&mut self.q),
+                _ => None,
+            }
+        }
+        fn adaptable_paths(&self) -> Vec<String> {
+            vec!["blocks.0.self_attn.q".to_string()]
+        }
+    }
+    impl QuantWanHost {
+        fn new() -> Self {
+            let w = Array::from_slice(
+                &(0..128 * 64)
+                    .map(|i| (i as f32 * 0.0007).sin() * 0.05)
+                    .collect::<Vec<_>>(),
+                &[128, 64],
+            )
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+            Self {
+                q: AdaptableLinear::dense(w, None),
+            }
+        }
+    }
+
+    #[test]
+    fn additive_lora_on_quantized_base_no_error_and_nondegenerate() {
+        // ACCEPTANCE: a LoRA applies on a Q4/Q8 PACKED base with NO error (the old model.rs:614
+        // rejection) and produces finite, non-zero output that differs from the no-adapter forward.
+        // The base stays packed (never dequantized). The target is [128,64] so it is quantizable.
+        let lora = write_lora(
+            "additive_quant.safetensors",
+            &[("blocks.0.self_attn.q", 128, 64)],
+            8,
+            0.21,
+        );
+        let x = Array::from_slice(
+            &(0..3 * 64)
+                .map(|i| (i as f32 * 0.017).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[3, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        for bits in [8, 4] {
+            let mut host = QuantWanHost::new();
+            // Pack the base to Q{bits} FIRST — so the additive install writes onto a packed snapshot.
+            host.q.quantize(bits, None).unwrap();
+            assert!(host.q.is_quantized(), "base must be packed before install");
+            let baseline = host.q.forward(&x).unwrap();
+
+            let report = apply_wan_adapters_additive(
+                &mut host,
+                &[spec(lora.clone(), 0.9, None)],
+                MoeExpert::High,
+            )
+            .unwrap();
+            assert_eq!(
+                report.applied, 1,
+                "q installed additively on the packed base (Q{bits})"
+            );
+            assert!(
+                host.q.is_quantized(),
+                "base must STAY packed after install (Q{bits}) — no dequant of W"
+            );
+
+            let got = host.q.forward(&x).unwrap();
+            // Finite + non-zero.
+            let g = got.as_dtype(Dtype::Float32).unwrap();
+            let vals = g.as_slice::<f32>();
+            assert!(
+                vals.iter().all(|v| v.is_finite()),
+                "Q{bits} additive output must be finite"
+            );
+            assert!(
+                vals.iter().any(|v| v.abs() > 1e-6),
+                "Q{bits} additive output must be non-zero"
+            );
+            // Differs from the no-adapter forward (the residual actually fired).
+            assert!(
+                !array_eq(&got, &baseline, false).unwrap().item::<bool>(),
+                "Q{bits} additive adapter must change the packed base's output"
+            );
+        }
+    }
+
+    #[test]
+    fn additive_no_adapter_is_byte_identical() {
+        // ACCEPTANCE: with NO adapters installed the forward is byte-identical to the bare base — the
+        // additive path adds nothing when empty (no regression to the no-adapter path).
+        let x = acts(3);
+        let host = TinyWanHost::from_synthetic();
+        let bare_q = AdaptableLinear::dense(
+            synthetic_weights()
+                .require("blocks.0.self_attn.q.weight")
+                .unwrap()
+                .clone(),
+            None,
+        );
+        let bare_out = bare_q.forward(&x).unwrap();
+        let host_out = host.q.forward(&x).unwrap();
+        assert!(
+            array_eq(host_out, &bare_out, false).unwrap().item::<bool>(),
+            "an un-adapted additive host must be byte-identical to the bare base"
+        );
+
+        // And an EMPTY spec list is a no-op install (applied 0, output unchanged).
+        let mut host2 = TinyWanHost::from_synthetic();
+        let report = apply_wan_adapters_additive(&mut host2, &[], MoeExpert::High).unwrap();
+        assert_eq!(report.applied, 0);
+        let host2_out = host2.q.forward(&x).unwrap();
+        assert!(
+            array_eq(host2_out, &bare_out, false)
+                .unwrap()
+                .item::<bool>(),
+            "empty additive install must leave the forward byte-identical"
+        );
+    }
+
+    #[test]
+    fn additive_scale_zero_is_bit_exact_noop() {
+        // A strength-0 additive LoRA is a bit-exact no-op (the residual is `0·…`), mirroring the
+        // fold path's `scale_zero_is_bit_exact_noop`.
+        let lora = write_lora(
+            "additive_zero.safetensors",
+            &[("blocks.0.self_attn.q", 16, 8)],
+            4,
+            0.3,
+        );
+        let x = acts(3);
+        let bare = TinyWanHost::from_synthetic();
+        let want = bare.q.forward(&x).unwrap();
+
+        let mut host = TinyWanHost::from_synthetic();
+        let report =
+            apply_wan_adapters_additive(&mut host, &[spec(lora, 0.0, None)], MoeExpert::High)
+                .unwrap();
+        assert_eq!(report.applied, 1);
+        let got = host.q.forward(&x).unwrap();
+        assert!(
+            array_eq(got, &want, false).unwrap().item::<bool>(),
+            "strength 0 must leave the additive forward bit-identical"
+        );
+    }
+
+    #[test]
+    fn additive_lokr_matches_folded_merge_dense() {
+        // The LoKr additive residual on a dense base matches the folded LoKr merge (same reconstructed
+        // ΔW, one as `W+=δ`, the other as `x·δᵀ`). Reuses the fold tests' `write_lokr` helper.
+        let lokr = write_lokr("additive_lokr.safetensors", 8.0, 4.0);
+        let x = acts(3);
+
+        // Folded reference: merge onto the q weight, forward the merged dense linear.
+        let mut w = synthetic_weights();
+        let fold =
+            merge_wan_adapters(&mut w, &[lokr_spec(lokr.clone(), 0.6)], MoeExpert::High).unwrap();
+        assert_eq!(fold.applied, 1);
+        let folded_q = AdaptableLinear::dense(
+            w.require("blocks.0.self_attn.q.weight").unwrap().clone(),
+            None,
+        );
+
+        // Additive.
+        let mut host = TinyWanHost::from_synthetic();
+        let add_report =
+            apply_wan_adapters_additive(&mut host, &[lokr_spec(lokr, 0.6)], MoeExpert::High)
+                .unwrap();
+        assert_eq!(add_report.applied, 1);
+
+        let want = folded_q.forward(&x).unwrap();
+        let got = host.q.forward(&x).unwrap();
+        assert!(
+            all_close(&got, &want, 2e-2, 2e-2, false)
+                .unwrap()
+                .item::<bool>(),
+            "additive LoKr residual must match the folded LoKr merge (dense)"
+        );
+    }
+
+    #[test]
+    fn additive_skips_target_absent_from_host() {
+        // A LoRA target outside the host's adaptable surface (a non-block / far-block module) is
+        // surfaced (skipped), never fatal — mirroring the fold path's skip reporting.
+        let lora = write_lora(
+            "additive_skip.safetensors",
+            &[
+                ("blocks.0.self_attn.q", 16, 8),
+                ("blocks.99.self_attn.q", 16, 8),
+            ],
+            4,
+            0.1,
+        );
+        let mut host = TinyWanHost::from_synthetic();
+        let report =
+            apply_wan_adapters_additive(&mut host, &[spec(lora, 1.0, None)], MoeExpert::High)
+                .unwrap();
+        assert_eq!(report.applied, 1, "the present target installs");
+        assert_eq!(
+            report.skipped,
+            vec!["blocks.99.self_attn.q".to_string()],
+            "the absent target is surfaced, not fatal"
+        );
     }
 }

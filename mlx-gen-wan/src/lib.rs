@@ -69,7 +69,8 @@ pub mod vae22;
 mod vae_common;
 
 pub use adapters::{
-    merge_vace_adapters, merge_vace_adapters_expert, merge_wan_adapters, WanLoraReport,
+    apply_wan_adapters_additive, merge_vace_adapters, merge_vace_adapters_expert,
+    merge_wan_adapters, WanLoraReport,
 };
 pub use chunk::{map_seq_chunks, slice_axis0, DitMemoryConfig};
 pub use config::{GuideScale, WanModelConfig, WanQuant, WanVaceConfig, SAMPLE_NEG_PROMPT};
