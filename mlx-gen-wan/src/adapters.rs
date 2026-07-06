@@ -571,6 +571,57 @@ fn merge_adapters_into(
 // A target absent from (or outside the adaptable surface of) the host is surfaced (skipped), never
 // fatal — matching the fold path's `skipped` reporting.
 
+/// The adapter family a file resolves to, for the packed-snapshot routing (sc-10045). `classify` reads
+/// the file's keys/metadata exactly as [`install_one_additive`] does, so a spec routes the same way it
+/// will install: plain LoRA is the additive-path family this epic (v1) ships; LoKr/LoHa on a packed
+/// tier is not (their real additive handling lands in sc-10050/sc-10051), so the loader rejects it up
+/// front with an actionable error rather than dequantizing the base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WanAdapterFamily {
+    /// PEFT / kohya LoRA (`lora_A/B` or `lora_down/up`) — the additive-path family (this epic v1).
+    Lora,
+    /// LoKr / LoHa (peft `networkType=lokr`, or third-party `lokr_*` / `hada_*` keys) — deferred on a
+    /// packed tier to sc-10050 (LoKr) / sc-10051 (LoHa); allowed only on a dense bf16 tier.
+    LokrLoha,
+}
+
+/// Classify one adapter file into a [`WanAdapterFamily`] using the SAME precedence
+/// [`install_one_additive`]/[`merge_one`] dispatch on: an explicit `AdapterKind::Lokr` spec kind, a
+/// peft LoKr metadata stamp ([`is_lokr`]), third-party LoKr keys ([`is_lokr_keys`]), or LoHa keys
+/// ([`is_loha_keys`]) — anything else is plain LoRA. Reads the file once (the caller reuses the load).
+fn classify_family(lw: &Weights, kind: AdapterKind) -> WanAdapterFamily {
+    if kind == AdapterKind::Lokr || is_lokr(lw) || is_lokr_keys(lw) || is_loha_keys(lw) {
+        WanAdapterFamily::LokrLoha
+    } else {
+        WanAdapterFamily::Lora
+    }
+}
+
+/// Reject a LoKr/LoHa adapter on a **pre-quantized (packed Q4/Q8)** Wan snapshot with an explicit,
+/// actionable error (sc-10045). Plain LoRA installs additively onto a packed base with no dequant
+/// (this epic v1); LoKr/LoHa on a packed tier is deferred to sc-10050 (LoKr) / sc-10051 (LoHa), so —
+/// rather than the old generic "not yet wired" message (which also rejected LoRA) or a silent wrong
+/// result — the loader surfaces the bf16 tier as the supported route. `model_id` is the registry id
+/// for the message. Scans every non-empty spec (each file loaded once) and errors on the first
+/// LoKr/LoHa; a pure-LoRA set passes through untouched. No-op on a dense base (the caller only calls
+/// this when the snapshot is packed).
+pub fn reject_lokr_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Result<()> {
+    for spec in specs {
+        let lw = Weights::from_file(&spec.path)?;
+        if classify_family(&lw, spec.kind) == WanAdapterFamily::LokrLoha {
+            return Err(format!(
+                "{model_id}: LoKr/LoHa adapters on a quantized (packed Q4/Q8) Wan tier are not \
+                 supported yet — use the bf16 tier (where they merge into the dense weight), or a \
+                 plain LoRA (which applies additively on any tier). Tracked in sc-10050 (LoKr) / \
+                 sc-10051 (LoHa). Offending file: {}",
+                spec.path.display()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Install every adapter in `specs` that targets `expert` onto the native-Wan [`AdaptableHost`]
 /// `host` (a [`WanTransformer`](crate::transformer)) as **forward-time residuals** — the unmerged,
 /// quant-agnostic sibling of [`merge_wan_adapters`] (sc-10044). The base weights are used AS-IS
@@ -578,6 +629,11 @@ fn merge_adapters_into(
 /// first, then this `expert`'s specific ones, mirroring the reference `(loras)+(loras_*)` order.
 /// Returns the same [`WanLoraReport`] the fold path returns; the caller enforces the
 /// "matched nothing across both experts" error.
+///
+/// **Packed-snapshot routing (sc-10045):** on a pre-quantized base the caller first calls
+/// [`reject_lokr_loha_on_packed`] so only plain LoRA reaches here (LoKr/LoHa on a packed tier is
+/// deferred to sc-10050/sc-10051); on a dense base the fold path ([`merge_wan_adapters`]) is used
+/// instead, so LoKr/LoHa keep working there unchanged.
 pub fn apply_wan_adapters_additive(
     host: &mut impl AdaptableHost,
     specs: &[AdapterSpec],
@@ -2124,6 +2180,85 @@ mod tests {
                 .item::<bool>(),
             "additive LoKr residual must match the folded LoKr merge (dense)"
         );
+    }
+
+    // ---- Packed-snapshot routing guard (sc-10045) -----------------------------------------------
+
+    #[test]
+    fn reject_lokr_loha_on_packed_passes_plain_lora() {
+        // A pure plain-LoRA spec list is allowed on a packed tier (it installs additively with the
+        // base staying packed) — the guard is a no-op. Two LoRA files, both pass.
+        let l1 = write_lora(
+            "packroute_lora1.safetensors",
+            &[("blocks.0.self_attn.q", 16, 8)],
+            4,
+            0.1,
+        );
+        let l2 = write_lora(
+            "packroute_lora2.safetensors",
+            &[("blocks.0.ffn.0", 24, 8)],
+            4,
+            0.4,
+        );
+        reject_lokr_loha_on_packed(
+            "wan2_2_t2v_14b",
+            &[spec(l1, 1.0, None), spec(l2, 1.0, Some(MoeExpert::High))],
+        )
+        .expect("plain LoRA files must pass the packed guard");
+    }
+
+    #[test]
+    fn reject_lokr_loha_on_packed_errors_on_peft_lokr() {
+        // A peft LoKr file (networkType=lokr stamp) on a packed tier is rejected with the NEW explicit,
+        // actionable error — NOT the old generic "not yet wired", NOT a panic, NOT success. The message
+        // must point at the bf16 tier and the deferral stories (sc-10050/sc-10051).
+        let lokr = write_lokr("packroute_lokr.safetensors", 8.0, 4.0);
+        let err = reject_lokr_loha_on_packed("wan2_2_t2v_14b", &[lokr_spec(lokr, 0.6)])
+            .expect_err("LoKr on a packed tier must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bf16"),
+            "error must point at the bf16 tier, got: {msg}"
+        );
+        assert!(
+            msg.contains("sc-10050") && msg.contains("sc-10051"),
+            "error must cite the deferral stories sc-10050/sc-10051, got: {msg}"
+        );
+        assert!(
+            msg.contains("LoKr") || msg.contains("LoHa"),
+            "error must name LoKr/LoHa, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not yet wired"),
+            "must NOT be the old generic 'not yet wired' message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_lokr_loha_on_packed_errors_on_thirdparty_lokr_and_loha() {
+        // The committed third-party LyCORIS LoKr + LoHa fixtures (no networkType stamp — detected by
+        // keys) are also rejected on a packed tier via the key-based classification, same actionable
+        // message. Uses the fold tests' fixtures. Declared as LoRA kind so the guard MUST catch it by
+        // KEYS (spec.kind is not lokr), mirroring `merge_one`/`install_one_additive`'s key dispatch.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for (dir, stem) in [
+            ("sc3642_lokr", "linear_w1full_w2lr"),
+            ("sc3643_loha", "linear"),
+        ] {
+            let path = root
+                .join("tests/fixtures")
+                .join(dir)
+                .join(format!("{stem}.safetensors"));
+            let err = reject_lokr_loha_on_packed("wan2_2_i2v_14b", &[spec(path, 1.0, None)])
+                .expect_err(&format!(
+                    "{dir}: third-party {stem} must be rejected on a packed tier"
+                ));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("bf16") && msg.contains("sc-10050"),
+                "{dir}: error must point at bf16 + the deferral stories, got: {msg}"
+            );
+        }
     }
 
     #[test]

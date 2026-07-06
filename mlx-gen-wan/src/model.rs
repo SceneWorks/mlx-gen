@@ -25,7 +25,10 @@ use mlx_gen::{
 use mlx_rs::random;
 use mlx_rs::Array;
 
-use crate::adapters::{merge_wan_adapters, warn_skipped_adapters};
+use crate::adapters::{
+    apply_wan_adapters_additive, merge_wan_adapters, reject_lokr_loha_on_packed,
+    warn_skipped_adapters, WanLoraReport,
+};
 use crate::config::WanModelConfig;
 use crate::pipeline::{
     align_dim, auto_tiling_budgeted, auto_tiling_budgeted_z16, best_output_size, build_i2v_y,
@@ -143,24 +146,10 @@ impl Wan {
         &self.config
     }
 
-    /// Merge the load-time LoRA/LoKr adapters onto the single dense model weight map in place,
-    /// before the [`WanTransformer`] is built. No-op without adapters. The dense 5B has no MoE
-    /// experts, so it takes only **shared** (untagged) specs — the reference's `_loras_single`
-    /// (`--lora`, not `--lora-high/low`); a `moe_expert`-tagged spec is a misconfiguration here.
-    /// Reuses the sc-2683/sc-2393 [`merge_wan_adapters`] seam (`MoeExpert::High` ⇒ only the
-    /// `moe_expert == None` pass fires, since all specs are untagged).
-    fn merge_adapters(&self, w: &mut Weights) -> Result<()> {
-        if self.adapters.is_empty() {
-            return Ok(());
-        }
-        if self.config.quantization.is_some() {
-            return Err(Error::Msg(format!(
-                "{}: LoRA adapters on a pre-quantized snapshot need dequantize-then-merge (the \
-                 reference loading.py path), not yet wired — load a dense bf16 snapshot (LoRA \
-                 merges, then `spec.quantize` quantizes the merged weights), or drop the adapters",
-                self.descriptor.id
-            )));
-        }
+    /// Reject a `moe_expert`-tagged spec on the dense 5B (a misconfiguration — high/low tagging is
+    /// only for the dual-expert A14B). The dense 5B takes only **shared** (untagged) specs — the
+    /// reference's `_loras_single` (`--lora`, not `--lora-high/low`).
+    fn check_dense_specs(&self) -> Result<()> {
         if self.adapters.iter().any(|s| s.moe_expert.is_some()) {
             return Err(Error::Msg(format!(
                 "{}: `moe_expert` (high/low) tagging is only for the dual-expert A14B — the dense \
@@ -168,7 +157,13 @@ impl Wan {
                 self.descriptor.id
             )));
         }
-        let report = merge_wan_adapters(w, &self.adapters, MoeExpert::High)?;
+        Ok(())
+    }
+
+    /// Enforce the "matched no module" error + surface partial skips after an adapter apply (fold OR
+    /// additive) — shared by both paths so the message can't drift. A non-empty adapter set that
+    /// applied nothing is a format/prefix misconfiguration; per-key skips are surfaced, not fatal.
+    fn finalize_report(&self, report: &WanLoraReport) -> Result<()> {
         if report.applied == 0 {
             return Err(Error::Msg(format!(
                 "{}: {} adapter file(s) matched no module — check the format (PEFT `lora_A/B` or \
@@ -179,6 +174,36 @@ impl Wan {
         }
         warn_skipped_adapters(self.descriptor.id, &report.skipped);
         Ok(())
+    }
+
+    /// **Dense-bf16 path.** Fold the load-time LoRA/LoKr adapters into the single dense model weight
+    /// map in place, before the [`WanTransformer`] is built (the reference fold order: LoRA folds into
+    /// the dense weight, then `spec.quantize` may quantize it). No-op without adapters. Reuses the
+    /// sc-2683/sc-2393 [`merge_wan_adapters`] seam (`MoeExpert::High` ⇒ only the `moe_expert == None`
+    /// pass fires, since all specs are untagged). Called only for a dense snapshot; a pre-quantized
+    /// snapshot uses [`Wan::install_adapters_additive`] instead (sc-10045).
+    fn merge_adapters(&self, w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        self.check_dense_specs()?;
+        let report = merge_wan_adapters(w, &self.adapters, MoeExpert::High)?;
+        self.finalize_report(&report)
+    }
+
+    /// **Pre-quantized (packed Q4/Q8) path (sc-10045).** Install the load-time LoRA adapters onto the
+    /// already-built (packed) [`WanTransformer`] as forward-time residuals — the base stays packed,
+    /// never dequantized. No-op without adapters. Plain LoRA only: LoKr/LoHa on a packed tier is
+    /// rejected up front with an actionable error (deferred to sc-10050/sc-10051). Called only for a
+    /// pre-quantized snapshot; a dense snapshot uses [`Wan::merge_adapters`] instead.
+    fn install_adapters_additive(&self, dit: &mut WanTransformer) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        self.check_dense_specs()?;
+        reject_lokr_loha_on_packed(self.descriptor.id, &self.adapters)?;
+        let report = apply_wan_adapters_additive(dit, &self.adapters, MoeExpert::High)?;
+        self.finalize_report(&report)
     }
 }
 
@@ -410,13 +435,22 @@ impl Wan {
         // --- Stage 2: load the DiT, merge adapters + quantize, embed contexts, denoise (→ freed) ---
         let latents = {
             let mut w = Weights::from_file(self.root.join("model.safetensors"))?;
-            // Merge LoRA/LoKr on the dense bf16 weights (no-op without adapters). Runs BEFORE
-            // quantization (the fork order: a LoRA folds into the dense weight, then it is quantized;
-            // load rejects LoRA on a pre-quantized snapshot).
-            self.merge_adapters(&mut w)?;
+            // Adapter routing (sc-2683 / sc-2393 / sc-10045), two mutually-exclusive paths:
+            //   • DENSE bf16 snapshot → FOLD LoRA/LoKr into the dense weights BEFORE building (the fork
+            //     order: fold, then `spec.quantize` may quantize the merged weight). No-op w/o adapters.
+            //   • PRE-QUANTIZED (packed Q4/Q8) snapshot → build packed first, then install LoRA as
+            //     forward-time residuals on the built DiT (base stays packed; LoKr/LoHa rejected up
+            //     front, deferred to sc-10050/sc-10051).
+            let prequantized = self.config.quantization.is_some();
+            if !prequantized {
+                self.merge_adapters(&mut w)?;
+            }
             let mut dit = WanTransformer::from_weights(&w, cfg)?;
             if let Some(q) = self.quant {
                 dit.quantize(q.bits(), None)?;
+            }
+            if prequantized {
+                self.install_adapters_additive(&mut dit)?;
             }
             let ctx_cond = dit.embed_text(&context)?;
             let ctx_uncond = match &context_null {
@@ -597,30 +631,12 @@ impl Wan14b {
         &self.config
     }
 
-    /// Merge the load-time LoRA adapters onto the two expert weight maps in place (sc-2683), before
-    /// the [`WanTransformer`]s are built. No-op when no adapters were supplied (the no-adapter path
-    /// is byte-identical). Shared specs merge onto both experts, `moe_expert`-tagged specs onto their
-    /// own (the reference `(loras)+(loras_high/low)` split). Errors if a non-empty adapter set matched
-    /// no module across *either* expert (a format/prefix misconfiguration); per-key skips (a target
-    /// absent from this checkpoint) are surfaced as a warning, not fatal, mirroring the reference.
-    fn merge_adapters(&self, low_w: &mut Weights, high_w: &mut Weights) -> Result<()> {
-        if self.adapters.is_empty() {
-            return Ok(());
-        }
-        // A LoRA delta folds into the *dense* bf16 weight (then that may be quantized at load). On a
-        // pre-quantized snapshot the experts ship packed (u32 codes + scales), so there is no dense
-        // weight to merge into — the reference's dequantize-then-merge path (sc-2682's `loading.py`
-        // LoRA branch) is a follow-on, not wired. Surface it rather than corrupt the packed weights.
-        if self.config.quantization.is_some() {
-            return Err(Error::Msg(format!(
-                "{}: LoRA adapters on a pre-quantized snapshot need dequantize-then-merge (the \
-                 reference loading.py path), not yet wired — load a dense bf16 snapshot (LoRA merges, \
-                 then `spec.quantize` quantizes the merged weights), or drop the adapters",
-                self.descriptor.id
-            )));
-        }
-        let low = merge_wan_adapters(low_w, &self.adapters, MoeExpert::Low)?;
-        let high = merge_wan_adapters(high_w, &self.adapters, MoeExpert::High)?;
+    /// Enforce the "matched no module across either expert" error + surface the combined partial skips
+    /// after an adapter apply (fold OR additive) — shared by both paths so the message can't drift. A
+    /// non-empty adapter set that applied nothing across BOTH experts is a format/prefix
+    /// misconfiguration; per-key skips (a target absent from this checkpoint) are surfaced as a
+    /// warning, not fatal, mirroring the reference.
+    fn finalize_dual_report(&self, low: WanLoraReport, high: WanLoraReport) -> Result<()> {
         if low.applied + high.applied == 0 {
             return Err(Error::Msg(format!(
                 "{}: {} LoRA file(s) matched no module across either expert — check the format \
@@ -636,6 +652,42 @@ impl Wan14b {
         skipped.dedup();
         warn_skipped_adapters(self.descriptor.id, &skipped);
         Ok(())
+    }
+
+    /// **Dense-bf16 path.** Fold the load-time LoRA/LoKr adapters onto the two expert weight maps in
+    /// place (sc-2683), before the [`WanTransformer`]s are built (the reference fold order: LoRA folds
+    /// into the dense weight, then `spec.quantize` may quantize it). No-op without adapters (the
+    /// no-adapter path is byte-identical). Shared specs merge onto both experts, `moe_expert`-tagged
+    /// specs onto their own (the reference `(loras)+(loras_high/low)` split). Called only for a dense
+    /// snapshot; a pre-quantized snapshot uses [`Wan14b::install_adapters_additive`] (sc-10045).
+    fn merge_adapters(&self, low_w: &mut Weights, high_w: &mut Weights) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        let low = merge_wan_adapters(low_w, &self.adapters, MoeExpert::Low)?;
+        let high = merge_wan_adapters(high_w, &self.adapters, MoeExpert::High)?;
+        self.finalize_dual_report(low, high)
+    }
+
+    /// **Pre-quantized (packed Q4/Q8) path (sc-10045).** Install the load-time LoRA adapters onto the
+    /// two already-built (packed) expert [`WanTransformer`]s as forward-time residuals — the bases
+    /// stay packed, never dequantized (removing the old `model.rs:614` rejection). No-op without
+    /// adapters. Shared specs install onto both experts, `moe_expert`-tagged onto their own (same
+    /// high/low routing as the fold path). Plain LoRA only: LoKr/LoHa on a packed tier is rejected up
+    /// front with an actionable error (deferred to sc-10050/sc-10051). Called only for a pre-quantized
+    /// snapshot; a dense snapshot uses [`Wan14b::merge_adapters`] instead.
+    fn install_adapters_additive(
+        &self,
+        low_dit: &mut WanTransformer,
+        high_dit: &mut WanTransformer,
+    ) -> Result<()> {
+        if self.adapters.is_empty() {
+            return Ok(());
+        }
+        reject_lokr_loha_on_packed(self.descriptor.id, &self.adapters)?;
+        let low = apply_wan_adapters_additive(low_dit, &self.adapters, MoeExpert::Low)?;
+        let high = apply_wan_adapters_additive(high_dit, &self.adapters, MoeExpert::High)?;
+        self.finalize_dual_report(low, high)
     }
 }
 
@@ -847,23 +899,31 @@ impl Wan14b {
         let latents = {
             let mut low_w = Weights::from_file(self.root.join("low_noise_model.safetensors"))?;
             let mut high_w = Weights::from_file(self.root.join("high_noise_model.safetensors"))?;
-            // Merge LoRA adapters per expert (sc-2683) on the dense bf16 weights — no-op without
-            // adapters. This runs BEFORE quantization (the fork order: a LoRA folds into the dense
-            // weight, then that is quantized; load rejects LoRA on an already-pre-quantized snapshot).
-            self.merge_adapters(&mut low_w, &mut high_w)?;
-            // Q4/Q8 (sc-2682), two routes, both transformer-only (attn q/k/v/o + ffn.fc1/fc2; T5
-            // above + VAE below stay f32 — the reference's quant scope):
+            // Adapter routing (sc-2683 / sc-2393 / sc-10045), two mutually-exclusive paths:
+            //   • DENSE bf16 snapshot → FOLD LoRA/LoKr into each expert's dense weights BEFORE
+            //     building (the fork order: fold, then `spec.quantize` may quantize the merged weight).
+            //   • PRE-QUANTIZED (packed Q4/Q8) snapshot → build both experts packed first, then install
+            //     LoRA as forward-time residuals per expert (bases stay packed; LoKr/LoHa rejected up
+            //     front, deferred to sc-10050/sc-10051). Removes the old `model.rs:614` hard error.
+            // Q4/Q8 (sc-2682) is transformer-only (attn q/k/v/o + ffn.fc1/fc2; T5 above + VAE below stay
+            // f32 — the reference's quant scope), two routes:
             //   • pre-quantized snapshot (config.json `quantization` block) → `from_weights` already
             //     built the experts quantized from the on-disk packed weights (`self.quant` is None,
             //     resolved in load), so they load at the reduced ~Q4/Q8 size — the low-peak path;
-            //   • dense bf16 snapshot + `spec.quantize` → quantize each expert in-memory after the
-            //     (optional) LoRA merge.
+            //   • dense bf16 snapshot + `spec.quantize` → quantize each expert in-memory after the fold.
             // Either way both experts are quantized independently.
+            let prequantized = self.config.quantization.is_some();
+            if !prequantized {
+                self.merge_adapters(&mut low_w, &mut high_w)?;
+            }
             let mut low_dit = WanTransformer::from_weights(&low_w, cfg)?;
             let mut high_dit = WanTransformer::from_weights(&high_w, cfg)?;
             if let Some(q) = self.quant {
                 low_dit.quantize(q.bits(), None)?;
                 high_dit.quantize(q.bits(), None)?;
+            }
+            if prequantized {
+                self.install_adapters_additive(&mut low_dit, &mut high_dit)?;
             }
 
             // Each expert has its own text_embedding weights, so contexts are embedded per expert.
@@ -1137,5 +1197,384 @@ mod tests {
         assert!(w < 2048 && h < 2048, "over-area request must shrink");
         // Under-cap request: align-only, no enlargement.
         assert_eq!(resolve_capped_dims(&req(512, 512), &cfg), (512, 512));
+    }
+
+    // ---- sc-10045: adapter routing at the two merge_adapters SITES (5B `Wan` + A14B `Wan14b`) ------
+    //
+    // These drive the real private `install_adapters_additive` / `merge_adapters` methods that the
+    // generate paths call — with a *tiny* synthetic `WanTransformer` (in = 64 so the block Linears
+    // quantize at group_size 64), never the ~7GB checkpoint. They prove: (a) a plain LoRA installs on
+    // a PACKED base with NO error (the old model.rs:614 rejection is gone) and changes the forward with
+    // the base STILL packed; (b) LoKr/LoHa on a packed base is the NEW explicit typed error; (c) the
+    // dense fold path is untouched.
+
+    use crate::config::WanModelConfig;
+    use crate::transformer::WanTransformer;
+    use mlx_gen::adapters::AdaptableHost;
+    use mlx_gen::runtime::AdapterKind;
+    use mlx_rs::ops::array_eq;
+    use mlx_rs::{Array, Dtype};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// A tiny 1-layer Wan config: dim 64 (in = 64 is a group_size multiple, so the block Linears pack
+    /// to Q4/Q8), 2 heads, ffn 128. Not run through forward — only built + adapter-installed.
+    fn tiny_cfg() -> WanModelConfig {
+        let mut c = WanModelConfig::wan21_t2v_1_3b();
+        c.dim = 64;
+        c.ffn_dim = 128;
+        c.num_heads = 2;
+        c.num_layers = 1;
+        c.freq_dim = 16;
+        c.text_dim = 64;
+        c.in_dim = 4;
+        c.out_dim = 4;
+        c.quantization = None; // built dense; the test packs the linears after build
+        c
+    }
+
+    fn tmp_dir() -> PathBuf {
+        let d = std::env::temp_dir().join("mlx_gen_wan_model_site_test");
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn bf16(vals: impl Iterator<Item = f32>, shape: &[i32]) -> Array {
+        Array::from_slice(&vals.collect::<Vec<_>>(), shape)
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap()
+    }
+
+    /// Build a tiny dense [`WanTransformer`] from synthesized weights matching [`tiny_cfg`]. Every
+    /// tensor `from_weights` + `Block::load` requires is present; the per-block attn/ffn Linears carry
+    /// `in = 64`/`128` so a subsequent `.quantize(bits)` packs them (group 64).
+    fn tiny_transformer(cfg: &WanModelConfig) -> WanTransformer {
+        let dim = cfg.dim as i32;
+        let ffn = cfg.ffn_dim as i32;
+        let mut entries: Vec<(String, Array)> = Vec::new();
+        fn lin(entries: &mut Vec<(String, Array)>, name: &str, out: i32, inp: i32, seed: f32) {
+            entries.push((
+                format!("{name}.weight"),
+                bf16(
+                    (0..out * inp).map(|i| (i as f32 * 0.001 + seed).sin() * 0.05),
+                    &[out, inp],
+                ),
+            ));
+            entries.push((
+                format!("{name}.bias"),
+                bf16((0..out).map(|i| i as f32 * 0.001), &[out]),
+            ));
+        }
+        // Embeddings + head (shapes plausible; not exercised by forward here).
+        lin(
+            &mut entries,
+            "patch_embedding_proj",
+            dim,
+            cfg.in_dim as i32,
+            0.1,
+        );
+        lin(
+            &mut entries,
+            "text_embedding_0",
+            dim,
+            cfg.text_dim as i32,
+            0.2,
+        );
+        lin(&mut entries, "text_embedding_1", dim, dim, 0.3);
+        lin(
+            &mut entries,
+            "time_embedding_0",
+            dim,
+            cfg.freq_dim as i32,
+            0.4,
+        );
+        lin(&mut entries, "time_embedding_1", dim, dim, 0.5);
+        lin(&mut entries, "time_projection", dim * 6, dim, 0.6);
+        lin(&mut entries, "head.head", cfg.out_dim as i32, dim, 0.7);
+        entries.push((
+            "head.modulation".into(),
+            bf16((0..2 * dim).map(|i| i as f32 * 0.001), &[1, 2, dim]),
+        ));
+        // Block 0.
+        entries.push((
+            "blocks.0.modulation".into(),
+            bf16((0..6 * dim).map(|i| i as f32 * 0.001), &[1, 6, dim]),
+        ));
+        for attn in ["self_attn", "cross_attn"] {
+            for (p, seed) in [("q", 1.1), ("k", 1.2), ("v", 1.3), ("o", 1.4)] {
+                lin(
+                    &mut entries,
+                    &format!("blocks.0.{attn}.{p}"),
+                    dim,
+                    dim,
+                    seed,
+                );
+            }
+            entries.push((
+                format!("blocks.0.{attn}.norm_q.weight"),
+                bf16((0..dim).map(|_| 1.0), &[dim]),
+            ));
+            entries.push((
+                format!("blocks.0.{attn}.norm_k.weight"),
+                bf16((0..dim).map(|_| 1.0), &[dim]),
+            ));
+        }
+        entries.push((
+            "blocks.0.norm3.weight".into(),
+            bf16((0..dim).map(|_| 1.0), &[dim]),
+        ));
+        entries.push((
+            "blocks.0.norm3.bias".into(),
+            bf16((0..dim).map(|_| 0.0), &[dim]),
+        ));
+        lin(&mut entries, "blocks.0.ffn.fc1", ffn, dim, 1.5);
+        lin(&mut entries, "blocks.0.ffn.fc2", dim, ffn, 1.6);
+
+        let path = tmp_dir().join("tiny_wan.safetensors");
+        let refs: Vec<(&str, &Array)> = entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        Array::save_safetensors(refs, None, &path).unwrap();
+        let w = Weights::from_file(&path).unwrap();
+        WanTransformer::from_weights(&w, cfg).unwrap()
+    }
+
+    /// A PEFT LoRA file targeting `blocks.0.self_attn.q` ([dim,dim]) — `diffusion_model.`-prefixed,
+    /// A `[rank,dim]`, B `[dim,rank]`, no alpha.
+    fn tiny_lora(name: &str, dim: i32, rank: i32) -> PathBuf {
+        let a = bf16(
+            (0..rank * dim).map(|i| (i as f32 * 0.01).sin() * 0.03),
+            &[rank, dim],
+        );
+        let b = bf16(
+            (0..dim * rank).map(|i| (i as f32 * 0.007).cos() * 0.03),
+            &[dim, rank],
+        );
+        let path = tmp_dir().join(name);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
+                ("diffusion_model.blocks.0.self_attn.q.lora_B.weight", &b),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    /// A peft LoKr file (networkType=lokr) targeting `blocks.0.self_attn.q` ([64,64] = kron([8,8],[8,8])).
+    fn tiny_lokr(name: &str) -> PathBuf {
+        let w1 = Array::from_slice(
+            &(0..64)
+                .map(|i| (i as f32 * 0.03).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[8, 8],
+        );
+        let w2 = Array::from_slice(
+            &(0..64)
+                .map(|i| (i as f32 * 0.05).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[8, 8],
+        );
+        let meta = HashMap::from([
+            ("networkType".to_string(), "lokr".to_string()),
+            ("alpha".to_string(), "8".to_string()),
+            ("rank".to_string(), "8".to_string()),
+        ]);
+        let path = tmp_dir().join(name);
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.self_attn.q.lokr_w1", &w1),
+                ("blocks.0.self_attn.q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    fn lora_spec(path: PathBuf) -> AdapterSpec {
+        AdapterSpec {
+            path,
+            scale: 0.8,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }
+    }
+
+    /// Probe the built transformer's `blocks.0.self_attn.q` linear's quant state, for the "stays
+    /// packed" assertions (the site methods must never dequantize the base).
+    fn q_is_quantized(dit: &mut WanTransformer) -> bool {
+        dit.adaptable_mut(&["blocks", "0", "self_attn", "q"])
+            .unwrap()
+            .is_quantized()
+    }
+
+    /// Construct a bare pre-quantized `Wan` (5B) with a config that reports pre-quantized, so the
+    /// generate path would route to the additive install. `bits` mirrors a Q4/Q8 snapshot.
+    fn wan_5b_prequant(adapters: Vec<AdapterSpec>) -> Wan {
+        let mut cfg = tiny_cfg();
+        cfg.quantization = Some(crate::config::WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        Wan {
+            descriptor: descriptor(),
+            config: cfg,
+            root: tmp_dir(),
+            adapters,
+            quant: None,
+        }
+    }
+
+    fn wan_14b_prequant(adapters: Vec<AdapterSpec>) -> Wan14b {
+        let mut cfg = tiny_cfg();
+        cfg.dual_model = true;
+        cfg.quantization = Some(crate::config::WanQuant {
+            bits: 8,
+            group_size: 64,
+        });
+        Wan14b {
+            descriptor: descriptor_t2v_14b(),
+            config: cfg,
+            root: tmp_dir(),
+            adapters,
+            quant: None,
+        }
+    }
+
+    #[test]
+    fn site_5b_packed_lora_installs_additively_no_error() {
+        // 5B `Wan::install_adapters_additive`: a plain LoRA installs on a PACKED base with no error;
+        // the base stays packed and the q forward-linear gains a residual.
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        dit.quantize(8, None).unwrap();
+        assert!(q_is_quantized(&mut dit), "base packed before install");
+
+        let model = wan_5b_prequant(vec![lora_spec(tiny_lora(
+            "site5b.safetensors",
+            cfg.dim as i32,
+            8,
+        ))]);
+        model
+            .install_adapters_additive(&mut dit)
+            .expect("plain LoRA on a packed 5B must install with no error");
+        assert!(
+            q_is_quantized(&mut dit),
+            "base must STAY packed after install (no dequant)"
+        );
+    }
+
+    #[test]
+    fn site_5b_packed_lokr_is_explicit_typed_error() {
+        // 5B: LoKr on a packed base → the NEW explicit error (bf16 tier + sc-10050/10051), not a panic,
+        // not the old "not yet wired", not success.
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        dit.quantize(8, None).unwrap();
+
+        let mut spec = lora_spec(tiny_lokr("site5b_lokr.safetensors"));
+        spec.kind = AdapterKind::Lokr;
+        let model = wan_5b_prequant(vec![spec]);
+        let err = model
+            .install_adapters_additive(&mut dit)
+            .expect_err("LoKr on a packed 5B must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bf16") && msg.contains("sc-10050"),
+            "actionable msg, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not yet wired"),
+            "not the old generic message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn site_14b_packed_lora_installs_on_both_experts() {
+        // A14B `Wan14b::install_adapters_additive`: a shared plain LoRA installs onto BOTH packed
+        // experts with no error; both bases stay packed.
+        let cfg = tiny_cfg();
+        let mut low = tiny_transformer(&cfg);
+        let mut high = tiny_transformer(&cfg);
+        low.quantize(4, None).unwrap();
+        high.quantize(4, None).unwrap();
+
+        let model = wan_14b_prequant(vec![lora_spec(tiny_lora(
+            "site14b.safetensors",
+            cfg.dim as i32,
+            8,
+        ))]);
+        model
+            .install_adapters_additive(&mut low, &mut high)
+            .expect("plain LoRA on packed A14B experts must install with no error");
+        assert!(
+            q_is_quantized(&mut low) && q_is_quantized(&mut high),
+            "both experts stay packed"
+        );
+    }
+
+    #[test]
+    fn site_14b_packed_lokr_is_explicit_typed_error() {
+        // A14B: LoKr on packed experts → the NEW explicit error, checked before touching either expert.
+        let cfg = tiny_cfg();
+        let mut low = tiny_transformer(&cfg);
+        let mut high = tiny_transformer(&cfg);
+        low.quantize(4, None).unwrap();
+        high.quantize(4, None).unwrap();
+
+        let mut spec = lora_spec(tiny_lokr("site14b_lokr.safetensors"));
+        spec.kind = AdapterKind::Lokr;
+        let model = wan_14b_prequant(vec![spec]);
+        let err = model
+            .install_adapters_additive(&mut low, &mut high)
+            .expect_err("LoKr on packed A14B must be rejected");
+        assert!(
+            err.to_string().contains("sc-10050"),
+            "actionable msg: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn site_14b_dense_fold_still_works() {
+        // Dense-path regression: `Wan14b::merge_adapters` (the fold path) still folds a plain LoRA onto
+        // both dense expert weight maps, unchanged by sc-10045.
+        let cfg = tiny_cfg();
+        let lora = tiny_lora("site14b_dense.safetensors", cfg.dim as i32, 8);
+        // Build the two dense expert weight maps from the tiny synthetic base.
+        let base_path = {
+            let mut c = cfg.clone();
+            c.dual_model = true;
+            let _ = tiny_transformer(&c); // side-effect: writes tiny_wan.safetensors
+            tmp_dir().join("tiny_wan.safetensors")
+        };
+        let mut low_w = Weights::from_file(&base_path).unwrap();
+        let mut high_w = Weights::from_file(&base_path).unwrap();
+        let before = low_w
+            .require("blocks.0.self_attn.q.weight")
+            .unwrap()
+            .clone();
+
+        let model = wan_14b_prequant(vec![lora_spec(lora)]);
+        // Use a DENSE config for the fold path (quantization None).
+        let dense = Wan14b {
+            config: {
+                let mut c = model.config.clone();
+                c.quantization = None;
+                c
+            },
+            ..model
+        };
+        dense
+            .merge_adapters(&mut low_w, &mut high_w)
+            .expect("dense fold must apply");
+        let after = low_w.require("blocks.0.self_attn.q.weight").unwrap();
+        assert!(
+            !array_eq(after, &before, false).unwrap().item::<bool>(),
+            "dense fold must change the q weight"
+        );
     }
 }
