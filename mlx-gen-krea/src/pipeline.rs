@@ -21,6 +21,7 @@ use mlx_rs::{random, Array, Dtype};
 use mlx_gen::adapters::loader::apply_adapters_strict;
 use mlx_gen::array::scalar;
 use mlx_gen::image::{decoded_to_image, validate_multiple_of_16};
+use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::media::Image;
 use mlx_gen::runtime::AdapterSpec;
 use mlx_gen::{
@@ -152,6 +153,96 @@ impl KreaPipeline {
             TimestepConvention::Sigma,
             sigmas,
             noise,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let v = self.dit.forward_prepared(x, &t, &prep)?;
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
+    /// Generate one RGB image seeded from a reference `init` image at the given `strength` (img2img,
+    /// slice A / sc-8590). Convenience wrapper over [`Self::generate_turbo_img2img_with_progress`] with
+    /// no cancellation, a no-op progress sink, and the native VAE decode (no PiD).
+    pub fn generate_turbo_img2img(
+        &self,
+        prompt: &str,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_turbo_img2img_with_progress(
+            prompt,
+            init,
+            strength,
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **img2img latent-init on Turbo** (epic 8588 slice A; sc-8589 validated the strength window,
+    /// sc-8590 productionized this). Generate one RGB image seeded from a reference `init` at the given
+    /// `strength` — reference fidelity in the fork's [`init_time_step`] convention: higher strength →
+    /// later start step → fewer denoise steps → the output stays closer to the reference; `strength ≤ 0`
+    /// degenerates to a full txt2img (start step 0, identical to [`Self::generate_turbo_with_progress`]).
+    ///
+    /// Reuses the proven shared [`mlx_gen::img2img`] leaves (the Qwen-Image / Z-Image img2img path) with
+    /// Krea's **unpacked** `[1, 16, H/8, W/8]` latent (the DiT patchifies internally, so — unlike Qwen —
+    /// the clean latent is NOT pre-packed): VAE-encode the reference into the same normalized latent
+    /// space as [`init_noise`] (`QwenVae::encode` returns `(e − mean)/std`), blend
+    /// `(1 − σ_k)·clean + σ_k·noise` at the start sigma `σ_k = sigmas[k]`, and run the rectified-flow
+    /// Euler sampler over `sigmas[k..]`. Distilled Turbo is CFG-free → one DiT forward per step (no
+    /// guidance branch), and the step-invariant text-fusion + joint RoPE are prepared ONCE (the F-079
+    /// hoist), exactly like [`Self::generate_turbo_with_progress`].
+    ///
+    /// `decoder` is the same latent→pixel seam as the t2i path (`None` = native [`QwenVae`], `Some` = a
+    /// PiD super-resolving decoder over the final clean latent). The PiD `from_ldm` early-stop (`keep`)
+    /// is intentionally NOT plumbed here: combining a partial-denoise capture with the img2img start
+    /// step needs the caller to resolve the capture against the *sliced* schedule — tracked separately
+    /// so it is not silently dropped. Cancellation + progress stream through [`run_flow_sampler`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_turbo_img2img_with_progress(
+        &self,
+        prompt: &str,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "krea_2_turbo")?;
+
+        let (ids, attn) = self.tok.encode_prompt(prompt)?;
+        let context = self.te.forward(&ids, &attn)?;
+
+        // Reference → clean latent [1, 16, H/8, W/8]. `QwenVae::encode` already returns the normalized
+        // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
+        let image_nchw = preprocess_init_image(init, opts.width, opts.height)?;
+        let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
+
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+
+        // Start step from strength; blend the clean latent with noise at σ_k, then denoise sigmas[k..].
+        let full = turbo_schedule(opts.steps, opts.scheduler.as_deref());
+        let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
+        let sigmas = &full[start..];
+        let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
+
+        let prep = self.dit.prepare(&context, None, &x_start)?;
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            sigmas,
+            x_start,
             opts.seed,
             cancel,
             on_progress,
