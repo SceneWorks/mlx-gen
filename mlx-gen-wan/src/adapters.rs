@@ -49,7 +49,7 @@ use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{Error, Result};
 
 /// LoRA key namespace prefixes stripped (longest-first), matching the reference
 /// `_normalize_wan_lora_key`. SceneWorks' trained Wan LoRAs use `diffusion_model.`.
@@ -603,26 +603,39 @@ fn classify_family(lw: &Weights, kind: AdapterKind) -> WanAdapterFamily {
     }
 }
 
-/// Reject a **LoHa** adapter on a **pre-quantized (packed Q4/Q8)** Wan snapshot with an explicit,
-/// actionable error (sc-10045, narrowed by sc-10050). Plain LoRA AND LoKr now install additively onto
-/// a packed base with no dequant — LoRA via its low-rank factors, LoKr via the structured
-/// deferred-Kronecker vec-trick ([`install_one_lokr_additive`], sc-10050) — so only LoHa remains
-/// deferred (sc-10051). Rather than a silent wrong result, the loader surfaces the bf16 tier as the
-/// supported route for LoHa. `model_id` is the registry id for the message. Scans every non-empty spec
-/// (each file loaded once) and errors on the first LoHa; a LoRA/LoKr set passes through untouched.
-/// No-op on a dense base (the caller only calls this when the snapshot is packed).
+/// Reject a **LoHa** (LyCORIS Hadamard) adapter on a **pre-quantized (packed Q4/Q8)** Wan snapshot
+/// with an explicit, actionable **typed** error (sc-10045; narrowed by sc-10050; finalized by
+/// sc-10051, Option A). Plain LoRA AND LoKr now install additively onto a packed base with no dequant
+/// — LoRA via its low-rank factors, LoKr via the structured deferred-Kronecker vec-trick
+/// ([`install_one_lokr_additive`], sc-10050). LoHa is the **only** family that cannot: its delta is
+/// `ΔW = (B₁A₁) ⊙ (B₂A₂)`, and the element-wise (Hadamard) product entangles the two low-rank
+/// branches so there is **no allocation-free deferred form** — evaluating it requires materializing
+/// the full `[out,in]` bf16 delta (~dense-weight-sized, ~28 GB/expert on a 14B Wan tier). On a packed
+/// tier that means holding packed-W (~7 GB/expert) **plus** that dense delta, negating the whole
+/// low-memory point of the quantized tier. So rather than silently OOM or silently dequantize, the
+/// loader **steers the user to the bf16 tier** (where LoHa folds into the dense weight in place) via a
+/// typed [`Error::Unsupported`] — which bridges 1:1 to [`gen_core::Error::Unsupported`] so the worker
+/// can surface actionable guidance instead of an opaque failure (epic 3720, F-008).
+///
+/// `model_id` is the registry id for the message. Scans every non-empty spec (each file loaded once)
+/// and errors on the first LoHa; a LoRA/LoKr set passes through untouched. No-op on a dense base (the
+/// caller only calls this when the snapshot is packed).
 pub fn reject_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Result<()> {
     for spec in specs {
         let lw = Weights::from_file(&spec.path)?;
         if classify_family(&lw, spec.kind) == WanAdapterFamily::Loha {
-            return Err(format!(
-                "{model_id}: LoHa adapters on a quantized (packed Q4/Q8) Wan tier are not supported \
-                 yet — use the bf16 tier (where they merge into the dense weight), or a plain LoRA / \
-                 LoKr (which apply additively on any tier, sc-10050). Tracked in sc-10051 (LoHa). \
-                 Offending file: {}",
+            return Err(Error::Unsupported(format!(
+                "{model_id}: this is a LoHa (LyCORIS Hadamard) adapter, which cannot run on a \
+                 quantized (packed Q4/Q8) Wan tier. LoHa's delta is a Hadamard product of two \
+                 low-rank branches, ΔW = (B₁A₁) ⊙ (B₂A₂); the element-wise product entangles the \
+                 factors so there is no deferred/additive form — applying it would have to \
+                 materialize the full dense weight-sized delta (~28 GB/expert on a 14B tier) on top \
+                 of the packed weights, defeating the quantized tier's memory savings. Use the bf16 \
+                 tier for this adapter (where LoHa merges into the dense weight in place), or pick a \
+                 plain LoRA / LoKr adapter (which apply additively on any tier, sc-10050). Tracked in \
+                 sc-10051 (epic 10043). Offending file: {}",
                 spec.path.display()
-            )
-            .into());
+            )));
         }
     }
     Ok(())
@@ -2451,24 +2464,62 @@ mod tests {
 
     #[test]
     fn reject_loha_on_packed_errors_on_thirdparty_loha() {
-        // The committed third-party LyCORIS LoHa fixture (no networkType stamp — detected by keys) is
-        // still rejected on a packed tier (LoHa is sc-10051, out of scope here), with the actionable
-        // message pointing at the bf16 tier. Declared as LoRA kind so the guard catches it by KEYS.
+        // sc-10051 (Option A): the committed third-party LyCORIS LoHa fixture (no networkType stamp —
+        // detected by keys) is rejected on a packed tier with a CLEAR, ACTIONABLE, TYPED error. It
+        // must NOT panic, NOT succeed, and NOT silently materialize the dense delta. Declared as LoRA
+        // kind so the guard catches it by KEYS.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("tests/fixtures/sc3643_loha/linear.safetensors");
         let err = reject_loha_on_packed("wan2_2_i2v_14b", &[spec(path, 1.0, None)])
             .expect_err("third-party LoHa must be rejected on a packed tier");
+        // Distinct typed variant the worker matches on (bridges 1:1 to gen_core::Error::Unsupported),
+        // NOT a generic Msg — so the worker can surface steer-to-bf16 guidance, not an opaque failure.
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "LoHa-on-packed must be a typed Unsupported error, got: {err:?}"
+        );
         let msg = err.to_string();
+        // Actionable: names the family, the mechanism (Hadamard), and the fix (bf16 tier), + story.
         assert!(
             msg.contains("bf16") && msg.contains("sc-10051"),
             "error must point at bf16 + the LoHa deferral story (sc-10051), got: {msg}"
         );
         assert!(msg.contains("LoHa"), "error must name LoHa, got: {msg}");
         assert!(
+            msg.contains("Hadamard"),
+            "error must explain the Hadamard mechanism, got: {msg}"
+        );
+        assert!(
+            msg.contains("bf16 tier"),
+            "error must steer the user to the bf16 tier, got: {msg}"
+        );
+        assert!(
             !msg.contains("not yet wired"),
             "must NOT be the old generic 'not yet wired' message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn reject_loha_on_packed_unsupported_bridges_to_gen_core() {
+        // The typed Unsupported must survive the mlx-gen → gen-core seam 1:1 (epic 3720, F-008) so the
+        // worker's Unsupported classification (not a generic backend failure) fires with the full
+        // steer-to-bf16 text intact.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/sc3643_loha/linear.safetensors");
+        let err = reject_loha_on_packed("wan2_2_t2v_14b", &[spec(path, 1.0, None)])
+            .expect_err("LoHa on a packed tier must error");
+        let bridged: mlx_gen::gen_core::Error = err.into();
+        match bridged {
+            mlx_gen::gen_core::Error::Unsupported(s) => {
+                assert!(
+                    s.contains("bf16 tier") && s.contains("LoHa"),
+                    "bridged gen-core Unsupported lost the actionable text: {s}"
+                );
+            }
+            other => panic!("LoHa-on-packed degraded across the seam to {other:?}"),
+        }
     }
 
     #[test]
