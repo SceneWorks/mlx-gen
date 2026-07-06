@@ -10,10 +10,11 @@
 //! end-to-end Turbo t2i [`crate::pipeline`] in sc-7571. [`Krea::generate`] now renders real images
 //! (CFG-free, few-step) through the assembled tokenizer → TE → DiT → VAE pipeline.
 
+use mlx_gen::media::Image;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -78,8 +79,11 @@ pub fn descriptor() -> ModelDescriptor {
             // CFG-free distilled student (like Ideogram Turbo / Boogu Turbo / SDXL-Lightning).
             supports_guidance: false,
             supports_true_cfg: false,
-            // Turbo is text-to-image only.
-            conditioning: Vec::new(),
+            // Reference-image conditioning = img2img latent-init (epic 8588 slice A, sc-10135): a single
+            // `Conditioning::Reference { image, strength }` seeds the denoise from the VAE-encoded
+            // reference (see [`generate_impl`] → `generate_turbo_img2img_with_progress`). Turbo only; the
+            // Raw descriptor clears this (no Raw img2img entrypoint yet).
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr trained on the undistilled Raw DiT (sc-7577) apply at Turbo inference via the
             // shared `apply_adapters_strict` seam onto the `Krea2Transformer` adapter host (sc-7911).
             // Family-match cross-apply, no base-model gating (the Lens / Z-Image precedent).
@@ -120,6 +124,9 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
+    // img2img (Reference conditioning) is Turbo-only for now — `generate_turbo_img2img_with_progress`
+    // is the distilled-Turbo entrypoint; there is no Raw img2img path yet, so Raw stays pure t2i.
+    d.capabilities.conditioning = Vec::new();
     d
 }
 
@@ -260,6 +267,21 @@ impl Krea {
             capture_sigma,
         )?;
         let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        // img2img (epic 8588 slice A, sc-10135): a single `Conditioning::Reference` seeds the Turbo
+        // denoise from the VAE-encoded reference at `strength` (the reference's own strength, else the
+        // request-level `strength`, else 0.5). Turbo only — the Raw descriptor never advertises
+        // `Reference`, so `reference` is always `None` on the Raw path. The PiD `from_ldm` early-stop
+        // (`keep != MAX`) is not wired for img2img yet (sc-10121): reject the combo rather than silently
+        // desync the decoder's σ from a full-denoise latent (the PiD super-res decoder, `keep == MAX`,
+        // is fine — it decodes the clean final latent).
+        let reference = single_reference(req)?;
+        if reference.is_some() && keep != usize::MAX {
+            return Err(Error::Msg(format!(
+                "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
+                 (tracked in sc-10121)",
+                self.descriptor.id
+            )));
+        }
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
         // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) path.
         let guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
@@ -274,7 +296,20 @@ impl Krea {
                 sampler: req.sampler.clone(),
                 scheduler: req.scheduler.clone(),
             };
-            let img = if is_raw {
+            let img = if let Some((init, ref_strength)) = reference {
+                // Reference fidelity: the Reference's own strength wins, else the request-level img2img
+                // strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
+                let strength = ref_strength.or(req.strength).unwrap_or(0.5);
+                self.pipeline.generate_turbo_img2img_with_progress(
+                    &req.prompt,
+                    init,
+                    strength,
+                    &opts,
+                    decoder,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else if is_raw {
                 self.pipeline.generate_base_with_progress(
                     &req.prompt,
                     &negative,
@@ -323,6 +358,21 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
+/// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A), or
+/// `None` for plain txt2img. Krea conditions on exactly one reference image; `MultiReference` or more
+/// than one `Reference` errors. The descriptor only advertises `Reference` on Turbo, so this returns
+/// `None` on the Raw path (validation rejects a Reference on Raw before we get here). Mirrors the FLUX
+/// single-reference idiom.
+fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    match req.conditioning.as_slice() {
+        [] => Ok(None),
+        [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
+        _ => Err(Error::Msg(
+            "krea_2_turbo: img2img supports exactly one Reference image".into(),
+        )),
+    }
+}
+
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both variants register
 // here — `krea_2_turbo` (distilled, CFG-free) and `krea_2_raw` (undistilled, full-CFG; epic 9992).
@@ -346,6 +396,58 @@ mod tests {
         }
     }
 
+    fn tiny_image() -> Image {
+        Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 16 * 16 * 3],
+        }
+    }
+
+    /// A 1024² request carrying `refs` `Reference` conditionings (each with `strength`).
+    fn ref_req(refs: usize, strength: Option<f32>) -> GenerationRequest {
+        let mut r = req(1024, 1024);
+        r.conditioning = (0..refs)
+            .map(|_| Conditioning::Reference {
+                image: tiny_image(),
+                strength,
+            })
+            .collect();
+        r
+    }
+
+    #[test]
+    fn turbo_advertises_reference_conditioning_raw_does_not() {
+        // img2img (sc-10135) is Turbo-only; Raw stays pure t2i (no img2img entrypoint yet).
+        assert_eq!(
+            descriptor().capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
+        assert!(raw_descriptor().capabilities.conditioning.is_empty());
+    }
+
+    #[test]
+    fn validate_reference_accepted_on_turbo_rejected_on_raw() {
+        assert!(validate_request(&descriptor(), &ref_req(1, Some(0.5))).is_ok());
+        let e = validate_request(&raw_descriptor(), &ref_req(1, Some(0.5))).unwrap_err();
+        assert!(
+            format!("{e}").contains("conditioning"),
+            "Raw must reject Reference conditioning: {e}"
+        );
+    }
+
+    #[test]
+    fn single_reference_extracts_one_or_errors() {
+        // No conditioning → plain txt2img.
+        assert!(single_reference(&req(1024, 1024)).unwrap().is_none());
+        // Exactly one → the image + its strength.
+        let r1 = ref_req(1, Some(0.4));
+        let one = single_reference(&r1).unwrap();
+        assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
+        // More than one → error (Krea conditions on a single reference).
+        assert!(single_reference(&ref_req(2, None)).is_err());
+    }
+
     #[test]
     fn descriptor_is_krea_2_turbo() {
         let d = descriptor();
@@ -353,10 +455,14 @@ mod tests {
         assert_eq!(d.family, "krea_2");
         assert_eq!(d.backend, "mlx");
         assert_eq!(d.modality, Modality::Image);
-        // CFG-free distilled Turbo: no guidance, no negative prompt, no conditioning surface.
+        // CFG-free distilled Turbo: no guidance, no negative prompt. img2img reference conditioning
+        // (sc-10135) IS advertised (the only conditioning surface).
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
-        assert!(d.capabilities.conditioning.is_empty());
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // Raw-trained LoRA/LoKr apply at Turbo inference (sc-7911).
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
