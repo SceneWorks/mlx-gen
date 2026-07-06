@@ -23,6 +23,7 @@ use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{SampleType, SamplerConfig};
 use crate::lq::PidNet;
+use crate::tiling::forward_tiled;
 
 /// The distilled few-step sampler.
 pub struct Sampler {
@@ -78,6 +79,45 @@ impl Sampler {
         sigma: &Array,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
+        self.run_inner(noise, eps, cancel, |x, t_scaled| {
+            net.forward(x, t_scaled, caption, lq_latent, sigma)
+        })
+    }
+
+    /// Like [`Self::run`] but the per-step **velocity** forward is spatially tiled (sc-10087):
+    /// [`crate::tiling::forward_tiled`] runs the net on overlapping `tile`-px pixel windows and
+    /// feather-blends them, so the whole-image `PidNet::forward` peak (and its single long Metal command
+    /// buffer) never materializes. The 4-step SDE loop stays whole-image — `noise`/`eps` are the same
+    /// full-res seeded draws, so the sampler math + RNG sequence are unchanged and only the forward is
+    /// approximated. `overlap` is the feather width (px).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tiled(
+        &self,
+        net: &PidNet,
+        noise: &Array,
+        eps: &[Array],
+        caption: &Array,
+        lq_latent: &Array,
+        sigma: &Array,
+        tile: i32,
+        overlap: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        self.run_inner(noise, eps, cancel, |x, t_scaled| {
+            forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
+        })
+    }
+
+    /// Shared SDE step loop. `forward(x, t_scaled) -> v` is the per-step velocity predictor — either the
+    /// whole-image `PidNet::forward` ([`Self::run`]) or the tiled forward ([`Self::run_tiled`]). The step
+    /// math, ε injection, cancel handling, and per-step `eval` are identical between the two paths.
+    fn run_inner(
+        &self,
+        noise: &Array,
+        eps: &[Array],
+        cancel: Option<&CancelFlag>,
+        forward: impl Fn(&Array, &Array) -> Result<Array>,
+    ) -> Result<Array> {
         // F-100: the SDE loop consumes one `eps[ei]` per interior step; a caller that supplies fewer
         // than `num_eps()` draws would panic OOB mid-loop. Validate the contract up front.
         if eps.len() < self.num_eps() {
@@ -97,7 +137,7 @@ impl Sampler {
             let t_cur = self.t_list[i];
             let t_next = self.t_list[i + 1];
             let t_scaled = Array::from_slice(&vec![t_cur * self.timescale; b as usize], &[b]);
-            let v = net.forward(&x, &t_scaled, caption, lq_latent, sigma)?;
+            let v = forward(&x, &t_scaled)?;
             if t_next > 0.0 {
                 if self.sde {
                     let x0 = Self::velocity_to_x0(&x, &v, t_cur)?;
@@ -150,5 +190,43 @@ impl Sampler {
             k_rest = k_n;
         }
         self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)
+    }
+
+    /// Tiled production entry (sc-10087): identical seeded noise/ε draw as [`Self::sample`] (full-res, so
+    /// the RNG sequence is byte-for-byte the same), then [`Self::run_tiled`] with the spatial `tile` /
+    /// `overlap`. Use for large outputs where the whole-image forward overflows the memory /
+    /// command-buffer envelope. `tile`/`overlap` are output-pixel units (rounded to the pixel→latent
+    /// factor internally).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_tiled(
+        &self,
+        net: &PidNet,
+        caption: &Array,
+        lq_latent: &Array,
+        sigma: &Array,
+        b: i32,
+        h: i32,
+        w: i32,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Array> {
+        let (k_noise, mut k_rest) = random::split(&random::key(seed)?, 2)?;
+        let noise = random::normal::<f32>(&[b, 3, h, w], None, None, Some(&k_noise))?;
+        let mut eps = Vec::with_capacity(self.num_eps());
+        for _ in 0..self.num_eps() {
+            let (k_e, k_n) = random::split(&k_rest, 2)?;
+            eps.push(random::normal::<f32>(
+                &[b, 3, h, w],
+                None,
+                None,
+                Some(&k_e),
+            )?);
+            k_rest = k_n;
+        }
+        self.run_tiled(
+            net, &noise, &eps, caption, lq_latent, sigma, tile, overlap, cancel,
+        )
     }
 }

@@ -33,6 +33,7 @@ pub mod gemma2;
 pub mod lq;
 pub mod registry;
 pub mod sampler;
+pub mod tiling;
 
 pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;

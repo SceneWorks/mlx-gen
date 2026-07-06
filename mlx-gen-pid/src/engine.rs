@@ -185,13 +185,14 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    // Memory budget guard (F-013, sc-9095). PiD super-resolves in pixel space by `engine.scale()`, so a
-    // `max_size`-legal `req.width × req.height` decodes at `(width·scale) × (height·scale)` — a 2048²
-    // request → 8192², tens of GB of concurrent pixel-space + patch-stream tensors. Estimate that peak
-    // against this machine's `safe_budget_gib()` (min(MLX_limit × 0.85, maxBufferLength) — the same
-    // shared budget wan/seedvr2 use) and refuse *here*, before the caption encode + `PidNet` build,
-    // rather than letting the OS SIGKILL the worker mid-decode. There is no clean spatial-tiling seam
-    // for a single global-attention PixDiT super-res forward, so the typed refusal is the minimum.
+    // Memory + command-buffer budget (F-013 sc-9095, tiling sc-10087). PiD super-resolves in pixel space
+    // by `engine.scale()`, so a `max_size`-legal `req.width × req.height` decodes at `(width·scale) ×
+    // (height·scale)` — a 1536² request → 6144², which a single whole-image forward can't hold: on Metal
+    // it trips the IOGPU watchdog, on CUDA it exhausts VRAM. We now **tile** the pixel-space forward
+    // rather than refuse (sc-10087): size the tile against this machine's `safe_budget_gib()` (the shared
+    // wan/seedvr2 budget) and the Metal watchdog-safe forward edge, and only refuse when even a minimum
+    // tile plus the resident output-resolution buffers won't fit.
+    let safe_gib = mlx_gen::memory::safe_budget_gib();
     crate::budget::guard(
         model_id,
         req.count,
@@ -199,16 +200,32 @@ pub fn resolve_pid_decoder_at_sigma(
         req.height,
         engine.scale(),
         engine.config(),
-        mlx_gen::memory::safe_budget_gib(),
+        safe_gib,
     )?;
+    let scale = engine.scale();
+    let (th, tw) = (
+        (req.height * scale as u32) as i32,
+        (req.width * scale as u32) as i32,
+    );
+    let cfg = engine.config();
+    let plan = crate::budget::plan_tile_edge(
+        req.count.max(1) as i32,
+        th,
+        tw,
+        cfg.patch_size,
+        cfg.hidden_size,
+        safe_gib,
+    );
     // Thread the request's cancel flag into the minted decoder so the ~100 s 4-step decode honors a
     // cancel per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag,
     // so we bind it here where the request is in scope.
-    Ok(Some(
-        engine
-            .decoder(&req.prompt, capture_sigma, base_seed)?
-            .with_cancel(req.cancel.clone()),
-    ))
+    let mut decoder = engine
+        .decoder(&req.prompt, capture_sigma, base_seed)?
+        .with_cancel(req.cancel.clone());
+    if !plan.whole_fits {
+        decoder = decoder.with_tiling(plan.edge, plan.overlap);
+    }
+    Ok(Some(decoder))
 }
 
 /// Resolve the `from_ldm` early-stop for one **flow-match** generation (sc-7993): fold `req.use_pid` +
