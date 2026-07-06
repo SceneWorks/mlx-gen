@@ -26,8 +26,8 @@ use mlx_rs::random;
 use mlx_rs::Array;
 
 use crate::adapters::{
-    apply_wan_adapters_additive, merge_wan_adapters, reject_lokr_loha_on_packed,
-    warn_skipped_adapters, WanLoraReport,
+    apply_wan_adapters_additive, merge_wan_adapters, reject_loha_on_packed, warn_skipped_adapters,
+    WanLoraReport,
 };
 use crate::config::WanModelConfig;
 use crate::pipeline::{
@@ -191,17 +191,18 @@ impl Wan {
         self.finalize_report(&report)
     }
 
-    /// **Pre-quantized (packed Q4/Q8) path (sc-10045).** Install the load-time LoRA adapters onto the
-    /// already-built (packed) [`WanTransformer`] as forward-time residuals — the base stays packed,
-    /// never dequantized. No-op without adapters. Plain LoRA only: LoKr/LoHa on a packed tier is
-    /// rejected up front with an actionable error (deferred to sc-10050/sc-10051). Called only for a
-    /// pre-quantized snapshot; a dense snapshot uses [`Wan::merge_adapters`] instead.
+    /// **Pre-quantized (packed Q4/Q8) path (sc-10045 / sc-10050).** Install the load-time adapters onto
+    /// the already-built (packed) [`WanTransformer`] as forward-time residuals — the base stays packed,
+    /// never dequantized. No-op without adapters. Plain LoRA and **LoKr** both apply here (LoKr via the
+    /// structured deferred-Kronecker vec-trick, sc-10050 — no full delta materialized); only LoHa on a
+    /// packed tier is rejected up front with an actionable error (deferred to sc-10051). Called only for
+    /// a pre-quantized snapshot; a dense snapshot uses [`Wan::merge_adapters`] instead.
     fn install_adapters_additive(&self, dit: &mut WanTransformer) -> Result<()> {
         if self.adapters.is_empty() {
             return Ok(());
         }
         self.check_dense_specs()?;
-        reject_lokr_loha_on_packed(self.descriptor.id, &self.adapters)?;
+        reject_loha_on_packed(self.descriptor.id, &self.adapters)?;
         let report = apply_wan_adapters_additive(dit, &self.adapters, MoeExpert::High)?;
         self.finalize_report(&report)
     }
@@ -673,9 +674,10 @@ impl Wan14b {
     /// two already-built (packed) expert [`WanTransformer`]s as forward-time residuals — the bases
     /// stay packed, never dequantized (removing the old `model.rs:614` rejection). No-op without
     /// adapters. Shared specs install onto both experts, `moe_expert`-tagged onto their own (same
-    /// high/low routing as the fold path). Plain LoRA only: LoKr/LoHa on a packed tier is rejected up
-    /// front with an actionable error (deferred to sc-10050/sc-10051). Called only for a pre-quantized
-    /// snapshot; a dense snapshot uses [`Wan14b::merge_adapters`] instead.
+    /// high/low routing as the fold path). Plain LoRA and **LoKr** both apply (LoKr via the structured
+    /// deferred-Kronecker vec-trick, sc-10050); only LoHa on a packed tier is rejected up front with an
+    /// actionable error (deferred to sc-10051). Called only for a pre-quantized snapshot; a dense
+    /// snapshot uses [`Wan14b::merge_adapters`] instead.
     fn install_adapters_additive(
         &self,
         low_dit: &mut WanTransformer,
@@ -684,7 +686,7 @@ impl Wan14b {
         if self.adapters.is_empty() {
             return Ok(());
         }
-        reject_lokr_loha_on_packed(self.descriptor.id, &self.adapters)?;
+        reject_loha_on_packed(self.descriptor.id, &self.adapters)?;
         let low = apply_wan_adapters_additive(low_dit, &self.adapters, MoeExpert::Low)?;
         let high = apply_wan_adapters_additive(high_dit, &self.adapters, MoeExpert::High)?;
         self.finalize_dual_report(low, high)
@@ -1203,10 +1205,10 @@ mod tests {
     //
     // These drive the real private `install_adapters_additive` / `merge_adapters` methods that the
     // generate paths call — with a *tiny* synthetic `WanTransformer` (in = 64 so the block Linears
-    // quantize at group_size 64), never the ~7GB checkpoint. They prove: (a) a plain LoRA installs on
-    // a PACKED base with NO error (the old model.rs:614 rejection is gone) and changes the forward with
-    // the base STILL packed; (b) LoKr/LoHa on a packed base is the NEW explicit typed error; (c) the
-    // dense fold path is untouched.
+    // quantize at group_size 64), never the ~7GB checkpoint. They prove: (a) a plain LoRA AND a LoKr
+    // install on a PACKED base with NO error (the old model.rs:614 rejection is gone; LoKr via the
+    // structured deferred-Kronecker path, sc-10050) with the base STILL packed; (b) LoHa on a packed
+    // base is the explicit typed error (deferred to sc-10051); (c) the dense fold path is untouched.
 
     use crate::config::WanModelConfig;
     use crate::transformer::WanTransformer;
@@ -1468,27 +1470,23 @@ mod tests {
     }
 
     #[test]
-    fn site_5b_packed_lokr_is_explicit_typed_error() {
-        // 5B: LoKr on a packed base → the NEW explicit error (bf16 tier + sc-10050/10051), not a panic,
-        // not the old "not yet wired", not success.
+    fn site_5b_packed_lokr_installs_structurally_no_error() {
+        // 5B (sc-10050): LoKr on a packed base now installs via the structured deferred-Kronecker path
+        // with NO error (the sc-10045 interim rejection is gone), and the base STAYS packed.
         let cfg = tiny_cfg();
         let mut dit = tiny_transformer(&cfg);
         dit.quantize(8, None).unwrap();
+        assert!(q_is_quantized(&mut dit), "base packed before install");
 
         let mut spec = lora_spec(tiny_lokr("site5b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
         let model = wan_5b_prequant(vec![spec]);
-        let err = model
+        model
             .install_adapters_additive(&mut dit)
-            .expect_err("LoKr on a packed 5B must be rejected");
-        let msg = err.to_string();
+            .expect("LoKr on a packed 5B must install structurally with no error (sc-10050)");
         assert!(
-            msg.contains("bf16") && msg.contains("sc-10050"),
-            "actionable msg, got: {msg}"
-        );
-        assert!(
-            !msg.contains("not yet wired"),
-            "not the old generic message, got: {msg}"
+            q_is_quantized(&mut dit),
+            "base must STAY packed after structured LoKr install (no dequant)"
         );
     }
 
@@ -1517,8 +1515,9 @@ mod tests {
     }
 
     #[test]
-    fn site_14b_packed_lokr_is_explicit_typed_error() {
-        // A14B: LoKr on packed experts → the NEW explicit error, checked before touching either expert.
+    fn site_14b_packed_lokr_installs_structurally_no_error() {
+        // A14B (sc-10050): a shared LoKr installs onto BOTH packed experts via the structured
+        // deferred-Kronecker path with NO error; both bases stay packed.
         let cfg = tiny_cfg();
         let mut low = tiny_transformer(&cfg);
         let mut high = tiny_transformer(&cfg);
@@ -1528,13 +1527,39 @@ mod tests {
         let mut spec = lora_spec(tiny_lokr("site14b_lokr.safetensors"));
         spec.kind = AdapterKind::Lokr;
         let model = wan_14b_prequant(vec![spec]);
-        let err = model
-            .install_adapters_additive(&mut low, &mut high)
-            .expect_err("LoKr on packed A14B must be rejected");
+        model.install_adapters_additive(&mut low, &mut high).expect(
+            "LoKr on packed A14B experts must install structurally with no error (sc-10050)",
+        );
         assert!(
-            err.to_string().contains("sc-10050"),
-            "actionable msg: {}",
-            err
+            q_is_quantized(&mut low) && q_is_quantized(&mut high),
+            "both experts stay packed after structured LoKr install"
+        );
+    }
+
+    #[test]
+    fn site_5b_packed_loha_is_explicit_typed_error() {
+        // 5B: LoHa on a packed base is still rejected (LoHa is sc-10051, out of scope) — the actionable
+        // error points at the bf16 tier + sc-10051, not a panic, not the old "not yet wired".
+        let cfg = tiny_cfg();
+        let mut dit = tiny_transformer(&cfg);
+        dit.quantize(8, None).unwrap();
+
+        // A committed third-party LoHa fixture (detected by `hada_*` keys).
+        let loha = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/sc3643_loha/linear.safetensors");
+        let model = wan_5b_prequant(vec![lora_spec(loha)]);
+        let err = model
+            .install_adapters_additive(&mut dit)
+            .expect_err("LoHa on a packed 5B must be rejected (sc-10051)");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bf16") && msg.contains("sc-10051") && msg.contains("LoHa"),
+            "actionable LoHa-deferral msg, got: {msg}"
+        );
+        assert!(
+            !msg.contains("not yet wired"),
+            "not the old generic message, got: {msg}"
         );
     }
 
