@@ -29,8 +29,8 @@ use mlx_rs::ops::indexing::TryIndexOp;
 use mlx_rs::{Array, Dtype};
 
 use super::{
-    reconstruct_loha_delta, reconstruct_lokr_delta, reconstruct_lokr_delta_scaled, AdaptableHost,
-    Adapter,
+    build_lokr_factors, reconstruct_loha_delta, reconstruct_lokr_delta,
+    reconstruct_lokr_delta_scaled, AdaptableHost, Adapter, LokrFactors,
 };
 use crate::runtime::{AdapterKind, AdapterSpec};
 use crate::weights::Weights;
@@ -305,6 +305,34 @@ impl ThirdPartyLokr {
     pub fn delta(&self, base_shape: &[i32], out_dtype: Dtype) -> Result<Array> {
         reconstruct_lokr_delta_scaled(
             self.scale()?,
+            base_shape,
+            self.w1.as_ref(),
+            self.w1_a.as_ref(),
+            self.w1_b.as_ref(),
+            self.w2.as_ref(),
+            self.t2.as_ref(),
+            self.w2_a.as_ref(),
+            self.w2_b.as_ref(),
+            out_dtype,
+        )
+    }
+
+    /// The **structured** (deferred, allocation-free) counterpart to [`delta`](Self::delta) for a
+    /// packed base (sc-10050): build the small `[a,c]`/`[b,d]` Kronecker factors (the FULL scale
+    /// `lycoris_per_module_scale · strength` baked into `w2`) via [`build_lokr_factors`], so the residual
+    /// applies the vec-trick without ever materializing the `[out,in]` delta. The user `strength` is
+    /// baked in here (the structured residual carries no separate scale). Returns `Ok(None)` for a
+    /// **tucker/CP** `w2` (`lokr_t2`, conv-only) that has no 2-D matrix form — the caller then falls back
+    /// (materialize on dense, or a clear error on packed). `pub` so the video providers (Wan/LTX) reuse
+    /// the exact derivation.
+    pub fn factors(
+        &self,
+        strength: f32,
+        base_shape: &[i32],
+        out_dtype: Dtype,
+    ) -> Result<Option<LokrFactors>> {
+        build_lokr_factors(
+            self.scale()? * strength,
             base_shape,
             self.w1.as_ref(),
             self.w1_a.as_ref(),

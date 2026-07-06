@@ -44,7 +44,7 @@ use mlx_gen::adapters::loader::{
     is_loha_keys, is_lokr, is_lokr_keys, parse_loha_thirdparty, parse_lokr, parse_lokr_thirdparty,
     resolve_lokr_path,
 };
-use mlx_gen::adapters::{AdaptableHost, Adapter};
+use mlx_gen::adapters::{build_lokr_factors, AdaptableHost, Adapter};
 use mlx_gen::array::scalar;
 use mlx_gen::gen_core::weightsmeta::{LoraAdapterMeta, LORA_ADAPTER_METADATA_KEY};
 use mlx_gen::runtime::{AdapterKind, AdapterSpec, MoeExpert};
@@ -571,49 +571,55 @@ fn merge_adapters_into(
 // A target absent from (or outside the adaptable surface of) the host is surfaced (skipped), never
 // fatal — matching the fold path's `skipped` reporting.
 
-/// The adapter family a file resolves to, for the packed-snapshot routing (sc-10045). `classify` reads
-/// the file's keys/metadata exactly as [`install_one_additive`] does, so a spec routes the same way it
-/// will install: plain LoRA is the additive-path family this epic (v1) ships; LoKr/LoHa on a packed
-/// tier is not (their real additive handling lands in sc-10050/sc-10051), so the loader rejects it up
-/// front with an actionable error rather than dequantizing the base.
+/// The adapter family a file resolves to, for the packed-snapshot routing (sc-10045/sc-10050).
+/// `classify` reads the file's keys/metadata exactly as [`install_one_additive`] does, so a spec
+/// routes the same way it will install: plain LoRA and **LoKr** both apply additively on a packed tier
+/// (LoRA via low-rank factors, LoKr via the structured vec-trick, sc-10050); **LoHa** on a packed tier
+/// is still deferred (sc-10051), so the loader rejects only LoHa up front rather than dequantizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WanAdapterFamily {
-    /// PEFT / kohya LoRA (`lora_A/B` or `lora_down/up`) — the additive-path family (this epic v1).
+    /// PEFT / kohya LoRA (`lora_A/B` or `lora_down/up`) — additive on any tier.
     Lora,
-    /// LoKr / LoHa (peft `networkType=lokr`, or third-party `lokr_*` / `hada_*` keys) — deferred on a
-    /// packed tier to sc-10050 (LoKr) / sc-10051 (LoHa); allowed only on a dense bf16 tier.
-    LokrLoha,
+    /// LoKr (peft `networkType=lokr`, or third-party `lokr_*` keys) — additive on any tier: the
+    /// **structured deferred** Kronecker install on a packed base (sc-10050), the materialized-delta
+    /// residual / fold on a dense base.
+    Lokr,
+    /// LoHa (third-party `hada_*` keys) — deferred on a packed tier to sc-10051; dense-only for now.
+    Loha,
 }
 
 /// Classify one adapter file into a [`WanAdapterFamily`] using the SAME precedence
 /// [`install_one_additive`]/[`merge_one`] dispatch on: an explicit `AdapterKind::Lokr` spec kind, a
 /// peft LoKr metadata stamp ([`is_lokr`]), third-party LoKr keys ([`is_lokr_keys`]), or LoHa keys
-/// ([`is_loha_keys`]) — anything else is plain LoRA. Reads the file once (the caller reuses the load).
+/// ([`is_loha_keys`]) — anything else is plain LoRA. LoKr precedes LoHa (a file is never both). Reads
+/// the file once (the caller reuses the load).
 fn classify_family(lw: &Weights, kind: AdapterKind) -> WanAdapterFamily {
-    if kind == AdapterKind::Lokr || is_lokr(lw) || is_lokr_keys(lw) || is_loha_keys(lw) {
-        WanAdapterFamily::LokrLoha
+    if kind == AdapterKind::Lokr || is_lokr(lw) || is_lokr_keys(lw) {
+        WanAdapterFamily::Lokr
+    } else if is_loha_keys(lw) {
+        WanAdapterFamily::Loha
     } else {
         WanAdapterFamily::Lora
     }
 }
 
-/// Reject a LoKr/LoHa adapter on a **pre-quantized (packed Q4/Q8)** Wan snapshot with an explicit,
-/// actionable error (sc-10045). Plain LoRA installs additively onto a packed base with no dequant
-/// (this epic v1); LoKr/LoHa on a packed tier is deferred to sc-10050 (LoKr) / sc-10051 (LoHa), so —
-/// rather than the old generic "not yet wired" message (which also rejected LoRA) or a silent wrong
-/// result — the loader surfaces the bf16 tier as the supported route. `model_id` is the registry id
-/// for the message. Scans every non-empty spec (each file loaded once) and errors on the first
-/// LoKr/LoHa; a pure-LoRA set passes through untouched. No-op on a dense base (the caller only calls
-/// this when the snapshot is packed).
-pub fn reject_lokr_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Result<()> {
+/// Reject a **LoHa** adapter on a **pre-quantized (packed Q4/Q8)** Wan snapshot with an explicit,
+/// actionable error (sc-10045, narrowed by sc-10050). Plain LoRA AND LoKr now install additively onto
+/// a packed base with no dequant — LoRA via its low-rank factors, LoKr via the structured
+/// deferred-Kronecker vec-trick ([`install_one_lokr_additive`], sc-10050) — so only LoHa remains
+/// deferred (sc-10051). Rather than a silent wrong result, the loader surfaces the bf16 tier as the
+/// supported route for LoHa. `model_id` is the registry id for the message. Scans every non-empty spec
+/// (each file loaded once) and errors on the first LoHa; a LoRA/LoKr set passes through untouched.
+/// No-op on a dense base (the caller only calls this when the snapshot is packed).
+pub fn reject_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Result<()> {
     for spec in specs {
         let lw = Weights::from_file(&spec.path)?;
-        if classify_family(&lw, spec.kind) == WanAdapterFamily::LokrLoha {
+        if classify_family(&lw, spec.kind) == WanAdapterFamily::Loha {
             return Err(format!(
-                "{model_id}: LoKr/LoHa adapters on a quantized (packed Q4/Q8) Wan tier are not \
-                 supported yet — use the bf16 tier (where they merge into the dense weight), or a \
-                 plain LoRA (which applies additively on any tier). Tracked in sc-10050 (LoKr) / \
-                 sc-10051 (LoHa). Offending file: {}",
+                "{model_id}: LoHa adapters on a quantized (packed Q4/Q8) Wan tier are not supported \
+                 yet — use the bf16 tier (where they merge into the dense weight), or a plain LoRA / \
+                 LoKr (which apply additively on any tier, sc-10050). Tracked in sc-10051 (LoHa). \
+                 Offending file: {}",
                 spec.path.display()
             )
             .into());
@@ -630,9 +636,11 @@ pub fn reject_lokr_loha_on_packed(model_id: &str, specs: &[AdapterSpec]) -> Resu
 /// Returns the same [`WanLoraReport`] the fold path returns; the caller enforces the
 /// "matched nothing across both experts" error.
 ///
-/// **Packed-snapshot routing (sc-10045):** on a pre-quantized base the caller first calls
-/// [`reject_lokr_loha_on_packed`] so only plain LoRA reaches here (LoKr/LoHa on a packed tier is
-/// deferred to sc-10050/sc-10051); on a dense base the fold path ([`merge_wan_adapters`]) is used
+/// **Packed-snapshot routing (sc-10045 / sc-10050):** on a pre-quantized base the caller first calls
+/// [`reject_loha_on_packed`] so only plain LoRA and LoKr reach here; LoRA installs via its low-rank
+/// factors and LoKr via the **structured deferred-Kronecker** vec-trick ([`install_one_lokr_additive`],
+/// sc-10050) — both with the base staying packed, no `[out,in]` delta materialized. LoHa on a packed
+/// tier stays deferred (sc-10051). On a dense base the fold path ([`merge_wan_adapters`]) is used
 /// instead, so LoKr/LoHa keep working there unchanged.
 pub fn apply_wan_adapters_additive(
     host: &mut impl AdaptableHost,
@@ -776,10 +784,20 @@ fn install_one_lora_additive(
     Ok(())
 }
 
-/// Install a peft LoKr file as residuals (sc-2393/sc-10044). Each module's `[out,in]` delta is
-/// reconstructed (bf16, `alpha/rank` folded in — the fork-parity residual dtype) at the target's base
-/// shape (recovered from the host, packed or dense) and stacked as an [`Adapter::Lokr`] at the user
-/// strength — `scale·x·ΔWᵀ`, base untouched. A target outside the adaptable surface is skipped.
+/// Install a peft LoKr file as residuals (sc-2393/sc-10044/sc-10050). Per target, choose the install
+/// by the base's quantization:
+/// - **Packed (Q4/Q8)** base (sc-10050 / epic 10043): a **structured, deferred** Kronecker residual
+///   ([`Adapter::LokrStructured`]) via the vec-trick — `scale·vec(w1·reshape(x)·w2ᵀ)` — so the full
+///   `[out,in]` delta is NEVER materialized and the base stays packed at plain-LoRA memory cost. The
+///   `alpha/rank` factor is baked into the structured `w2` (the user strength stays the residual scale).
+/// - **Dense** base (unchanged, sc-2393/sc-10044): the fork-parity materialized `[out,in]` delta
+///   (bf16, `alpha/rank` folded) stacked as an [`Adapter::Lokr`] — plenty of memory on dense, and the
+///   established byte-parity path.
+///
+/// A non-deferrable LoKr variant (a **tucker/CP** `w2`, i.e. conv-only — the Wan DiT adapter surface
+/// is all Linear, so this never fires) falls back to materialization on a **dense** base, or an
+/// explicit typed error on a **packed** base (never a silent OOM / wrong result). A target outside the
+/// adaptable surface is skipped.
 fn install_one_lokr_additive(
     host: &mut impl AdaptableHost,
     lw: &Weights,
@@ -791,23 +809,62 @@ fn install_one_lokr_additive(
     for (raw_path, factors) in &file.groups {
         let path = normalize(raw_path);
         let parts: Vec<&str> = path.split('.').collect();
-        let Some(base_shape) = host.adaptable_mut(&parts).map(|lin| lin.base_shape()) else {
+        let Some(lin) = host.adaptable_mut(&parts) else {
             report.skipped.push(path);
             continue;
         };
-        // Fork-parity residual keeps the delta at bf16 (PARITY-BF16, sc-2609); `alpha/rank` is baked in.
-        let delta = file.delta(factors, &base_shape, Dtype::Bfloat16)?;
-        push_at(
-            host,
-            path,
-            Adapter::Lokr {
+        let base_shape = lin.base_shape();
+        if lin.is_quantized() {
+            // Structured deferred path (packed base). The FULL scale `(alpha/rank)·strength` is baked
+            // into `w2` — the structured residual carries no separate scale, so both the `alpha/rank`
+            // fold (as in the dense delta) and the user strength must live in the factors here.
+            match build_lokr_factors(
+                (file.alpha / file.rank) * strength,
+                &base_shape,
+                factors.get("lokr_w1"),
+                factors.get("lokr_w1_a"),
+                factors.get("lokr_w1_b"),
+                factors.get("lokr_w2"),
+                None, // peft LoKr never carries a tucker factor (conv-only)
+                factors.get("lokr_w2_a"),
+                factors.get("lokr_w2_b"),
+                Dtype::Bfloat16,
+            )? {
+                Some(structured) => {
+                    lin.push(Adapter::LokrStructured {
+                        factors: structured,
+                    });
+                    report.applied += 1;
+                }
+                None => {
+                    return Err(non_deferrable_lokr_error(&path));
+                }
+            }
+        } else {
+            // Dense: the established materialized-delta residual (bf16, `alpha/rank` folded in).
+            let delta = file.delta(factors, &base_shape, Dtype::Bfloat16)?;
+            lin.push(Adapter::Lokr {
                 delta,
                 scale: strength,
-            },
-            report,
-        );
+            });
+            report.applied += 1;
+        }
     }
     Ok(())
+}
+
+/// The clear, actionable error for a LoKr variant that is genuinely NOT deferrable via the vec-trick
+/// on a **packed** base (only the conv-only tucker/CP `w2` form — which the all-Linear Wan DiT adapter
+/// surface never produces). Rather than a silent OOM or a wrong result, point the user at the bf16
+/// tier (where it materializes into the dense weight). Dense bases fall back to materialization instead.
+fn non_deferrable_lokr_error(path: &str) -> mlx_gen::Error {
+    format!(
+        "LoKr at '{path}' uses a tucker/CP (conv) factorization that cannot be applied on a \
+         quantized (packed Q4/Q8) Wan tier without materializing the full delta — use the bf16 tier \
+         (where it merges into the dense weight). This form does not occur for the Wan DiT's Linear \
+         adapter targets (sc-10050 / epic 10043)."
+    )
+    .into()
 }
 
 /// Install a third-party LyCORIS **LoKr** file as residuals (sc-3671/sc-10044). As
@@ -824,13 +881,35 @@ fn install_one_lokr_thirdparty_additive(
     let table = host_module_table(host);
     for (raw, g) in &parse_lokr_thirdparty(lw)? {
         let path = resolve_wan_thirdparty(raw, &table, normalize);
-        install_thirdparty_delta(
-            host,
-            path,
-            |bs| g.delta(bs, Dtype::Bfloat16),
-            strength,
-            report,
-        )?;
+        let parts: Vec<&str> = path.split('.').collect();
+        let Some(lin) = host.adaptable_mut(&parts) else {
+            report.skipped.push(path);
+            continue;
+        };
+        let base_shape = lin.base_shape();
+        if lin.is_quantized() {
+            // Structured deferred path on a packed base (sc-10050): the lycoris per-module scale is
+            // baked into the small `w2` factor; no `[out,in]` delta is materialized. A tucker/CP `w2`
+            // (`lokr_t2`) has no 2-D form (`Ok(None)`) — the all-Linear Wan surface never hits it, but
+            // guard it with the same clear error rather than a silent materialize.
+            match g.factors(strength, &base_shape, Dtype::Bfloat16)? {
+                Some(structured) => {
+                    lin.push(Adapter::LokrStructured {
+                        factors: structured,
+                    });
+                    report.applied += 1;
+                }
+                None => return Err(non_deferrable_lokr_error(&path)),
+            }
+        } else {
+            // Dense: the established materialized-delta residual (lycoris scale baked in).
+            let delta = g.delta(&base_shape, Dtype::Bfloat16)?;
+            lin.push(Adapter::Lokr {
+                delta,
+                scale: strength,
+            });
+            report.applied += 1;
+        }
     }
     Ok(())
 }
@@ -2182,12 +2261,164 @@ mod tests {
         );
     }
 
-    // ---- Packed-snapshot routing guard (sc-10045) -----------------------------------------------
+    // ---- Structured (deferred) LoKr on a PACKED base (sc-10050) ----------------------------------
+
+    /// Write a peft LoKr for `blocks.0.self_attn.q` sized to a **quantizable** `[128,64]` base
+    /// (`in = 64` is a multiple of the group size): `[128,64] = kron(w1[16,8], w2[8,8])`. `alpha`/`rank`
+    /// in metadata. Deterministic factor values.
+    fn write_lokr_quant(name: &str, alpha: f32, rank: f32) -> PathBuf {
+        use std::collections::HashMap;
+        let w1 = Array::from_slice(
+            &(0..16 * 8)
+                .map(|i| (i as f32 * 0.013).sin() * 0.08)
+                .collect::<Vec<_>>(),
+            &[16, 8],
+        );
+        let w2 = Array::from_slice(
+            &(0..8 * 8)
+                .map(|i| (i as f32 * 0.021).cos() * 0.08)
+                .collect::<Vec<_>>(),
+            &[8, 8],
+        );
+        let meta = HashMap::from([
+            ("networkType".to_string(), "lokr".to_string()),
+            ("alpha".to_string(), alpha.to_string()),
+            ("rank".to_string(), rank.to_string()),
+        ]);
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.self_attn.q.lokr_w1", &w1),
+                ("blocks.0.self_attn.q.lokr_w2", &w2),
+            ],
+            Some(&meta),
+            &path,
+        )
+        .unwrap();
+        path
+    }
 
     #[test]
-    fn reject_lokr_loha_on_packed_passes_plain_lora() {
-        // A pure plain-LoRA spec list is allowed on a packed tier (it installs additively with the
-        // base staying packed) — the guard is a no-op. Two LoRA files, both pass.
+    fn structured_lokr_on_quantized_matches_dense_and_stays_packed() {
+        // ACCEPTANCE (sc-10050): a peft LoKr applies on a Q4/Q8 PACKED base with NO error, NO full
+        // out×in delta materialized, the base STAYS packed, and its LoKr CONTRIBUTION (packed-with-LoKr
+        // minus packed-baseline) matches the dense LoKr residual within tolerance. Comparing the
+        // residual contribution — not the full output — isolates the adapter from the (much larger)
+        // base-quantization error, which is what the vec-trick vs the materialized delta must agree on.
+        // `[128,64]` target so `in` is a group-size multiple.
+        let lokr = write_lokr_quant("structured_quant_lokr.safetensors", 8.0, 4.0);
+        let x = Array::from_slice(
+            &(0..3 * 64)
+                .map(|i| (i as f32 * 0.017).sin() * 0.5)
+                .collect::<Vec<_>>(),
+            &[3, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        let dense_w = Array::from_slice(
+            &(0..128 * 64)
+                .map(|i| (i as f32 * 0.0007).sin() * 0.05)
+                .collect::<Vec<_>>(),
+            &[128, 64],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+
+        // Dense reference LoKr residual = (dense base + materialized LoKr) − (dense base). This is the
+        // established materialized-delta path (the `install_one_lokr_additive` dense branch).
+        let dense_base = AdaptableLinear::dense(dense_w.clone(), None);
+        let dense_baseline = dense_base.forward(&x).unwrap();
+        let mut dense_host = QuantWanHost {
+            q: AdaptableLinear::dense(dense_w.clone(), None),
+        };
+        apply_wan_adapters_additive(
+            &mut dense_host,
+            &[lokr_spec(lokr.clone(), 0.6)],
+            MoeExpert::High,
+        )
+        .unwrap();
+        let dense_with_lokr = dense_host.q.forward(&x).unwrap();
+        let dense_residual = mlx_rs::ops::subtract(&dense_with_lokr, &dense_baseline).unwrap();
+
+        for bits in [8, 4] {
+            let mut host = QuantWanHost {
+                q: AdaptableLinear::dense(dense_w.clone(), None),
+            };
+            host.q.quantize(bits, None).unwrap();
+            assert!(host.q.is_quantized(), "base must be packed before install");
+            let baseline = host.q.forward(&x).unwrap();
+
+            let report = apply_wan_adapters_additive(
+                &mut host,
+                &[lokr_spec(lokr.clone(), 0.6)],
+                MoeExpert::High,
+            )
+            .unwrap();
+            assert_eq!(report.applied, 1, "LoKr installed structurally on Q{bits}");
+            assert!(report.skipped.is_empty());
+            assert!(
+                host.q.is_quantized(),
+                "base must STAY packed after structured LoKr install (Q{bits})"
+            );
+
+            // The installed adapter is the STRUCTURED variant whose factors are the SMALL Kronecker
+            // matrices — never an [out=128, in=64] delta. Assert the memory/no-materialization property
+            // structurally: the only stored tensors are [16,8] (w1) and [8,8] (w2).
+            match host.q.adapters() {
+                [Adapter::LokrStructured { factors }] => {
+                    assert_eq!(
+                        factors.w1.shape(),
+                        &[16, 8],
+                        "w1 must be the small [a,c] factor, not [out,in]"
+                    );
+                    assert_eq!(
+                        factors.w2.shape(),
+                        &[8, 8],
+                        "w2 must be the small [b,d] factor, not [out,in]"
+                    );
+                    // Neither factor is the [out,in]=[128,64] delta.
+                    assert_ne!(factors.w1.shape(), &[128, 64]);
+                    assert_ne!(factors.w2.shape(), &[128, 64]);
+                }
+                other => panic!(
+                    "expected a single structured LoKr on the packed base, got {} adapter(s)",
+                    other.len()
+                ),
+            }
+
+            let got = host.q.forward(&x).unwrap();
+            // Finite + non-degenerate (differs from the no-adapter forward).
+            let g = got.as_dtype(Dtype::Float32).unwrap();
+            assert!(
+                g.as_slice::<f32>().iter().all(|v| v.is_finite()),
+                "Q{bits} structured LoKr output must be finite"
+            );
+            assert!(
+                !array_eq(&got, &baseline, false).unwrap().item::<bool>(),
+                "Q{bits} structured LoKr must change the packed base's output"
+            );
+            // The structured LoKr CONTRIBUTION matches the dense materialized-delta residual. The
+            // residual runs over the packed base's bf16 activation stream (same as the dense path here),
+            // so the only difference is the vec-trick vs the materialized delta — Metal matmul tolerance.
+            let quant_residual = mlx_rs::ops::subtract(&got, &baseline).unwrap();
+            // The vec-trick (two small bf16 matmuls) vs the materialized delta (one bf16 matmul) round
+            // differently; the residual itself is bf16, so allow the bf16-residual reduced-precision band.
+            assert!(
+                all_close(&quant_residual, &dense_residual, 5e-2, 8e-3, false)
+                    .unwrap()
+                    .item::<bool>(),
+                "Q{bits} structured LoKr contribution must match the dense materialized-delta residual"
+            );
+        }
+    }
+
+    // ---- Packed-snapshot routing guard (sc-10045 / narrowed by sc-10050) ------------------------
+
+    #[test]
+    fn reject_loha_on_packed_passes_plain_lora_and_lokr() {
+        // Plain-LoRA AND LoKr spec lists are allowed on a packed tier (sc-10050): LoRA installs
+        // additively, LoKr via the structured deferred-Kronecker path — the guard is a no-op for both.
         let l1 = write_lora(
             "packroute_lora1.safetensors",
             &[("blocks.0.self_attn.q", 16, 8)],
@@ -2200,65 +2431,44 @@ mod tests {
             4,
             0.4,
         );
-        reject_lokr_loha_on_packed(
+        reject_loha_on_packed(
             "wan2_2_t2v_14b",
             &[spec(l1, 1.0, None), spec(l2, 1.0, Some(MoeExpert::High))],
         )
         .expect("plain LoRA files must pass the packed guard");
+        // A peft LoKr file (networkType=lokr stamp) now ALSO passes — it installs via the structured
+        // vec-trick (sc-10050), no longer rejected.
+        let lokr = write_lokr("packroute_lokr.safetensors", 8.0, 4.0);
+        reject_loha_on_packed("wan2_2_t2v_14b", &[lokr_spec(lokr, 0.6)])
+            .expect("LoKr must pass the packed guard now that sc-10050 applies it structurally");
+        // Third-party LoKr (no networkType stamp — detected by keys) likewise passes.
+        let tp_lokr = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/sc3642_lokr/linear_w1full_w2lr.safetensors");
+        reject_loha_on_packed("wan2_2_i2v_14b", &[spec(tp_lokr, 1.0, None)])
+            .expect("third-party LoKr must pass the packed guard (structural apply, sc-10050)");
     }
 
     #[test]
-    fn reject_lokr_loha_on_packed_errors_on_peft_lokr() {
-        // A peft LoKr file (networkType=lokr stamp) on a packed tier is rejected with the NEW explicit,
-        // actionable error — NOT the old generic "not yet wired", NOT a panic, NOT success. The message
-        // must point at the bf16 tier and the deferral stories (sc-10050/sc-10051).
-        let lokr = write_lokr("packroute_lokr.safetensors", 8.0, 4.0);
-        let err = reject_lokr_loha_on_packed("wan2_2_t2v_14b", &[lokr_spec(lokr, 0.6)])
-            .expect_err("LoKr on a packed tier must be rejected");
+    fn reject_loha_on_packed_errors_on_thirdparty_loha() {
+        // The committed third-party LyCORIS LoHa fixture (no networkType stamp — detected by keys) is
+        // still rejected on a packed tier (LoHa is sc-10051, out of scope here), with the actionable
+        // message pointing at the bf16 tier. Declared as LoRA kind so the guard catches it by KEYS.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("tests/fixtures/sc3643_loha/linear.safetensors");
+        let err = reject_loha_on_packed("wan2_2_i2v_14b", &[spec(path, 1.0, None)])
+            .expect_err("third-party LoHa must be rejected on a packed tier");
         let msg = err.to_string();
         assert!(
-            msg.contains("bf16"),
-            "error must point at the bf16 tier, got: {msg}"
+            msg.contains("bf16") && msg.contains("sc-10051"),
+            "error must point at bf16 + the LoHa deferral story (sc-10051), got: {msg}"
         );
-        assert!(
-            msg.contains("sc-10050") && msg.contains("sc-10051"),
-            "error must cite the deferral stories sc-10050/sc-10051, got: {msg}"
-        );
-        assert!(
-            msg.contains("LoKr") || msg.contains("LoHa"),
-            "error must name LoKr/LoHa, got: {msg}"
-        );
+        assert!(msg.contains("LoHa"), "error must name LoHa, got: {msg}");
         assert!(
             !msg.contains("not yet wired"),
             "must NOT be the old generic 'not yet wired' message, got: {msg}"
         );
-    }
-
-    #[test]
-    fn reject_lokr_loha_on_packed_errors_on_thirdparty_lokr_and_loha() {
-        // The committed third-party LyCORIS LoKr + LoHa fixtures (no networkType stamp — detected by
-        // keys) are also rejected on a packed tier via the key-based classification, same actionable
-        // message. Uses the fold tests' fixtures. Declared as LoRA kind so the guard MUST catch it by
-        // KEYS (spec.kind is not lokr), mirroring `merge_one`/`install_one_additive`'s key dispatch.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        for (dir, stem) in [
-            ("sc3642_lokr", "linear_w1full_w2lr"),
-            ("sc3643_loha", "linear"),
-        ] {
-            let path = root
-                .join("tests/fixtures")
-                .join(dir)
-                .join(format!("{stem}.safetensors"));
-            let err = reject_lokr_loha_on_packed("wan2_2_i2v_14b", &[spec(path, 1.0, None)])
-                .expect_err(&format!(
-                    "{dir}: third-party {stem} must be rejected on a packed tier"
-                ));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("bf16") && msg.contains("sc-10050"),
-                "{dir}: error must point at bf16 + the deferral stories, got: {msg}"
-            );
-        }
     }
 
     #[test]

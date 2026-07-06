@@ -125,6 +125,95 @@ fn rebuild_tucker(t2: &Array, wa: &Array, wb: &Array) -> Result<Array> {
     Ok(einsum("ijhw,ip,jr->prhw", [t2, wa, wb])?)
 }
 
+/// The two small Kronecker factors of a LoKr delta, kept UNMATERIALIZED for a deferred
+/// structured forward (sc-10050). `ΔW = scale · kron(w1, w2)` reshapes to the base's `[out, in]`,
+/// but the Kronecker–vector identity lets us apply it WITHOUT ever forming that `[out, in]` tensor:
+/// with `w1` `[a, c]` (LyCORIS `shape[0][0] × shape[1][0]`) and `w2` `[b, d]`
+/// (`shape[0][1] × shape[1][1]`), so `out = a·b` and `in = c·d`, the residual `y = x · ΔWᵀ` is
+///   `Y = w1 · X · w2ᵀ`  (then flatten row-major `[.., a, b] → [.., out]`),
+/// where `X = reshape(x, [.., c, d])`. Two small matmuls (`[a,c]·[..,c,d]` then `·[d,b]`) touch only
+/// the factor shapes — never `[out, in]` — so a LoKr applies on a packed Q4/Q8 base at the same
+/// memory profile as a plain LoRA (sc-10050 / epic 10043). `w1`/`w2` are the *small* Kronecker
+/// factors, materialized from their low-rank `w_a·w_b` inner products if decomposed (that product is
+/// bounded by the factor dims, NOT `out×in`), so every linear LoKr variant is deferrable this way.
+#[derive(Clone)]
+pub struct LokrFactors {
+    /// `[a, c]` — the left Kronecker factor (`out = a·b`, `in = c·d`).
+    pub w1: Array,
+    /// `[b, d]` — the right Kronecker factor.
+    pub w2: Array,
+    /// `a` — leading (row) count of `w1`, so the flattened output index is `p·b + q`.
+    pub a: i32,
+    /// `b` — leading (row) count of `w2`.
+    pub b: i32,
+    /// `c` — trailing (col) count of `w1`, so the flattened input index is `r·d + s`.
+    pub c: i32,
+    /// `d` — trailing (col) count of `w2`.
+    pub d: i32,
+}
+
+/// Build the small [`LokrFactors`] from a LoKr module's factors (full `w1`/`w2` or low-rank
+/// `w_a·w_b`), baking `scale` into `w2` and casting to `out_dtype` — the deferred, allocation-free
+/// counterpart to [`reconstruct_lokr_delta_scaled`] (which materializes the full `[out, in]` delta).
+/// Only the **linear** (2-D-factor) LoKr forms are deferrable via the vec-trick; a **tucker/CP** `w2`
+/// (`w2_t2`, conv-only in LyCORIS) has no 2-D matrix form, so this returns `Ok(None)` and the caller
+/// falls back to materialization (dense) or a clear error (packed). `base_shape` is the target's
+/// logical `[out, in]`, used to confirm `a·b == out` and `c·d == in`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_lokr_factors(
+    scale: f32,
+    base_shape: &[i32],
+    w1: Option<&Array>,
+    w1_a: Option<&Array>,
+    w1_b: Option<&Array>,
+    w2: Option<&Array>,
+    w2_t2: Option<&Array>,
+    w2_a: Option<&Array>,
+    w2_b: Option<&Array>,
+    out_dtype: Dtype,
+) -> Result<Option<LokrFactors>> {
+    // Tucker/CP `w2` is a 4-D conv factor with no 2-D matrix form — not deferrable via the vec-trick.
+    // (LyCORIS only emits `lokr_t2` for conv layers; the Wan DiT adapter surface is all Linear, so
+    // this never fires there, but guard it so a conv LoKr falls back rather than silently mis-applies.)
+    if w2_t2.is_some() {
+        return Ok(None);
+    }
+    // The two small Kronecker factors — full, or the low-rank product (bounded by the factor dims,
+    // NEVER `out×in`). Building `w1_a @ w1_b` yields the small `[a, c]`, not the packed delta.
+    let factor1 = match (w1, w1_a, w1_b) {
+        (Some(w), _, _) => w.clone(),
+        (_, Some(a), Some(b)) => matmul(a, b)?,
+        _ => return Err("LoKr: w1 missing (need full w1 or w1_a@w1_b)".into()),
+    };
+    let factor2 = match (w2, w2_a, w2_b) {
+        (Some(w), _, _) => w.clone(),
+        (_, Some(a), Some(b)) => matmul(a, b)?,
+        _ => return Err("LoKr: w2 missing (need full w2 or w2_a@w2_b)".into()),
+    };
+    // A conv-shaped factor (>2-D) is likewise not a plain matrix — defer to materialization.
+    if factor1.shape().len() != 2 || factor2.shape().len() != 2 {
+        return Ok(None);
+    }
+    let (a, c) = (factor1.shape()[0], factor1.shape()[1]);
+    let (b, d) = (factor2.shape()[0], factor2.shape()[1]);
+    // The base must factor as `out = a·b`, `in = c·d` (a 2-element logical shape). Anything else
+    // (a conv weight with kernel dims, or a factor/base mismatch) is not this linear vec-trick.
+    if base_shape.len() != 2 || a * b != base_shape[0] || c * d != base_shape[1] {
+        return Ok(None);
+    }
+    // Bake `scale` into `w2` (either factor works; `w2` keeps `w1` a clean copy) and match dtype.
+    let factor2 = multiply(&factor2, scalar(scale))?.as_dtype(out_dtype)?;
+    let factor1 = factor1.as_dtype(out_dtype)?;
+    Ok(Some(LokrFactors {
+        w1: factor1,
+        w2: factor2,
+        a,
+        b,
+        c,
+        d,
+    }))
+}
+
 /// Reconstruct a **LoHa** (Hadamard-product) weight delta `ΔW = scale · ((w1_a·w1_b) ⊙ (w2_a·w2_b))`,
 /// reshaped to `base_shape` and cast to `out_dtype` (sc-3643). Third-party LyCORIS LoHa decomposes a
 /// delta as the elementwise product of TWO low-rank products (vs LoKr's Kronecker). With tucker
@@ -233,6 +322,12 @@ pub enum Adapter {
     Lora { a: Array, b: Array, scale: f32 },
     /// LoKr: `residual = scale · x·ΔWᵀ`; `delta` stored bf16 (see [`reconstruct_lokr_delta`]).
     Lokr { delta: Array, scale: f32 },
+    /// LoKr applied as a **structured, deferred Kronecker** residual (sc-10050 / epic 10043) — the
+    /// full `[out, in]` delta is NEVER materialized. `scale` is baked into `factors.w2`, so the
+    /// residual is `vec(w1 · reshape(x) · w2ᵀ)` (see [`LokrFactors`]) — two small matmuls in compute
+    /// precision over the packed (or dense) base, matching the folded delta within tolerance. This is
+    /// the packed-tier path so a LoKr works on q4/q8 at plain-LoRA memory cost.
+    LokrStructured { factors: LokrFactors },
 }
 
 impl Adapter {
@@ -264,9 +359,42 @@ impl Adapter {
                 let d = delta.as_dtype(x.dtype())?;
                 (matmul(x, d.t())?, *scale)
             }
+            // Structured LoKr (sc-10050): the vec-trick, `scale` already baked into `factors.w2`, so
+            // there is nothing left to multiply — return directly. `y = w1 · X · w2ᵀ` reshaped back,
+            // with `X = reshape(x, [.., c, d])` and no `[out, in]` delta ever formed.
+            Adapter::LokrStructured { factors } => return factors.residual(x),
         };
         // Dtype-matched scalar → preserves the residual's dtype (the fork's weak-float `scale * …`).
         Ok(multiply(&r, &scalar(scale).as_dtype(r.dtype())?)?)
+    }
+}
+
+impl LokrFactors {
+    /// The deferred, allocation-free LoKr residual `scale · x·ΔWᵀ` via the Kronecker–vector identity
+    /// (`scale` is baked into [`w2`](Self::w2)). For an activation `x` of shape `[.., in]` (`in = c·d`):
+    /// reshape to `[.., c, d]`, compute `Y = w1 · X · w2ᵀ` (`[.., a, b]`), and flatten row-major to
+    /// `[.., out]` (`out = a·b`). The two matmuls (`w1 · X` then `· w2ᵀ`) touch only the small factor
+    /// shapes `[a,c]`/`[b,d]` — the full `[out, in]` delta is NEVER materialized, so this holds the
+    /// same memory profile on a packed Q4/Q8 base as a plain LoRA. Factors are cast to the activation
+    /// dtype (mirroring [`Adapter::Lokr`]'s `delta.astype(x.dtype)`) so a bf16 stream runs bf16.
+    pub fn residual(&self, x: &Array) -> Result<Array> {
+        let w1 = self.w1.as_dtype(x.dtype())?;
+        let w2t = self.w2.as_dtype(x.dtype())?.t();
+        let lead: Vec<i32> = x.shape()[..x.shape().len() - 1].to_vec();
+        let n: i32 = lead.iter().product::<i32>().max(1);
+        // Collapse every leading dim into ONE batch axis, then reshape `[N, in] → [N, c, d]`. Doing the
+        // batched matmul against an explicit `[N, …]` batch (rather than broadcasting a bare 2-D `w1`
+        // over `[.., c, d]`) avoids the numpy/MLX matmul ambiguity when a leading batch dim happens to
+        // equal `a`/`b`. `w1`/`w2ᵀ` are prepended a length-1 batch so they broadcast cleanly over `N`.
+        let xr = x.reshape(&[n, self.c, self.d])?;
+        let w1b = w1.reshape(&[1, self.a, self.c])?;
+        let w2tb = w2t.reshape(&[1, self.d, self.b])?;
+        // Y = w1 · X · w2ᵀ  → [N, a, b].
+        let y = matmul(&matmul(&w1b, &xr)?, &w2tb)?;
+        // [N, a, b] → [.., out] (out = a·b), restoring the original leading dims.
+        let mut ys = lead;
+        ys.push(self.a * self.b);
+        Ok(y.reshape(&ys)?)
     }
 }
 
@@ -1110,6 +1238,230 @@ mod tests {
             all_close(lin.forward(&x).unwrap(), &expected, 1e-4, 1e-2, false)
                 .unwrap()
                 .item::<bool>()
+        );
+    }
+
+    // ---- Structured (deferred) LoKr — the vec-trick (sc-10050) ------------------------------------
+
+    /// The vec-trick `residual` must equal the materialized-delta `residual` for a **full** `w1⊗w2`
+    /// LoKr, proving `vec(w1·X·w2ᵀ) == x·(w1⊗w2)ᵀ` under row-major kron ordering — the core identity
+    /// this story rests on. `out = a·b = 2·3 = 6`, `in = c·d = 4·5 = 20`.
+    #[test]
+    fn structured_lokr_full_matches_materialized_delta() {
+        let (a, b, c, d) = (2i32, 3, 4, 5);
+        let (out, inp) = (a * b, c * d);
+        let w1 = Array::from_slice(
+            &(0..a * c)
+                .map(|i| (i as f32 * 0.11).sin())
+                .collect::<Vec<_>>(),
+            &[a, c],
+        );
+        let w2 = Array::from_slice(
+            &(0..b * d)
+                .map(|i| (i as f32 * 0.07).cos())
+                .collect::<Vec<_>>(),
+            &[b, d],
+        );
+        let scale = 0.9f32;
+        // Materialized reference delta and its residual `x·ΔWᵀ`.
+        let delta = reconstruct_lokr_delta_scaled(
+            scale,
+            &[out, inp],
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap();
+        // Structured factors — no [out,in] tensor built.
+        let factors = build_lokr_factors(
+            scale,
+            &[out, inp],
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+            Dtype::Float32,
+        )
+        .unwrap()
+        .expect("a plain linear LoKr is deferrable");
+        // The built factors are the SMALL Kronecker factors, never the [out,in] delta.
+        assert_eq!(factors.w1.shape(), &[a, c]);
+        assert_eq!(factors.w2.shape(), &[b, d]);
+
+        let x = Array::from_slice(
+            &(0..2 * inp)
+                .map(|i| (i as f32 * 0.013 - 0.5).sin())
+                .collect::<Vec<_>>(),
+            &[2, inp],
+        );
+        let want = Adapter::Lokr { delta, scale: 1.0 }.residual(&x).unwrap();
+        let got = factors.residual(&x).unwrap();
+        assert_eq!(got.shape(), &[2, out]);
+        // Metal reduced-precision matmul (~1e-3 relative) — the vec-trick and the materialized delta
+        // take different matmul shapes, so compare at the Metal tolerance, not bit-exact.
+        assert!(
+            all_close(&got, &want, 2e-2, 2e-3, false)
+                .unwrap()
+                .item::<bool>(),
+            "structured LoKr residual must match the materialized-delta residual"
+        );
+    }
+
+    /// Same identity for a **decomposed** LoKr (`w1_a·w1_b`, `w2_a·w2_b`) — the low-rank inner factors
+    /// are materialized only as the SMALL `[a,c]`/`[b,d]` Kronecker factors, never the `[out,in]` delta.
+    #[test]
+    fn structured_lokr_decomposed_matches_materialized_delta() {
+        let (a, b, c, d, r) = (3i32, 2, 5, 4, 2);
+        let (out, inp) = (a * b, c * d);
+        let mk = |rows: i32, cols: i32, seed: f32| {
+            Array::from_slice(
+                &(0..rows * cols)
+                    .map(|i| (i as f32 * 0.09 + seed).sin() * 0.3)
+                    .collect::<Vec<_>>(),
+                &[rows, cols],
+            )
+        };
+        let (w1a, w1b) = (mk(a, r, 0.1), mk(r, c, 0.2)); // w1 = [a,c]
+        let (w2a, w2b) = (mk(b, r, 0.3), mk(r, d, 0.4)); // w2 = [b,d]
+        let scale = 1.3f32;
+        let delta = reconstruct_lokr_delta_scaled(
+            scale,
+            &[out, inp],
+            None,
+            Some(&w1a),
+            Some(&w1b),
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b),
+            Dtype::Float32,
+        )
+        .unwrap();
+        let factors = build_lokr_factors(
+            scale,
+            &[out, inp],
+            None,
+            Some(&w1a),
+            Some(&w1b),
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b),
+            Dtype::Float32,
+        )
+        .unwrap()
+        .expect("a decomposed linear LoKr is deferrable");
+        assert_eq!(factors.w1.shape(), &[a, c]);
+        assert_eq!(factors.w2.shape(), &[b, d]);
+
+        let x = Array::from_slice(
+            &(0..inp)
+                .map(|i| (i as f32 * 0.02).cos())
+                .collect::<Vec<_>>(),
+            &[1, inp],
+        );
+        let want = Adapter::Lokr { delta, scale: 1.0 }.residual(&x).unwrap();
+        let got = factors.residual(&x).unwrap();
+        assert!(
+            all_close(&got, &want, 2e-2, 2e-3, false)
+                .unwrap()
+                .item::<bool>(),
+            "decomposed structured LoKr must match the materialized delta"
+        );
+    }
+
+    /// A **tucker/CP** `w2` (`w2_t2`, conv-only) is NOT deferrable via the 2-D vec-trick → `Ok(None)`,
+    /// so the caller can fall back to materialization (dense) or a clear error (packed). Never a panic.
+    #[test]
+    fn structured_lokr_tucker_is_not_deferrable() {
+        let t2 = Array::from_slice(&[0.1f32; 2 * 2 * 3 * 3], &[2, 2, 3, 3]);
+        let w2a = Array::from_slice(&[0.2f32; 2 * 4], &[2, 4]);
+        let w2b = Array::from_slice(&[0.3f32; 2 * 5], &[2, 5]);
+        let w1 = Array::from_slice(&[0.4f32; 3 * 4], &[3, 4]);
+        let got = build_lokr_factors(
+            1.0,
+            &[24, 180], // conv-ish; the tucker guard fires before any shape check
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&t2),
+            Some(&w2a),
+            Some(&w2b),
+            Dtype::Float32,
+        )
+        .unwrap();
+        assert!(
+            got.is_none(),
+            "tucker/CP LoKr must be reported non-deferrable"
+        );
+    }
+
+    /// End-to-end on a **quantized (Q8)** base: a structured LoKr applies with a non-degenerate,
+    /// finite output and the base stays packed — the memory-safe packed-tier path (sc-10050). The
+    /// residual is computed only from the small factors (asserted above), so no `[out,in]` is built.
+    #[test]
+    fn structured_lokr_applies_on_quantized_base() {
+        let (a, b, c, d) = (4i32, 8, 8, 8); // out=32, in=64 (in % group_size(64)==0)
+        let (out, inp) = (a * b, c * d);
+        let wv: Vec<f32> = (0..out * inp).map(|i| (i as f32 * 0.001).sin()).collect();
+        let mut lin = AdaptableLinear::dense(Array::from_slice(&wv, &[out, inp]), None);
+        lin.quantize(8, Some(64)).unwrap();
+        assert!(lin.is_quantized());
+
+        let w1 = Array::from_slice(
+            &(0..a * c)
+                .map(|i| (i as f32 * 0.05).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[a, c],
+        );
+        let w2 = Array::from_slice(
+            &(0..b * d)
+                .map(|i| (i as f32 * 0.03).cos() * 0.1)
+                .collect::<Vec<_>>(),
+            &[b, d],
+        );
+        let factors = build_lokr_factors(
+            0.8,
+            &lin.base_shape(),
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .unwrap()
+        .unwrap();
+        lin.push(Adapter::LokrStructured { factors });
+
+        let x = Array::from_slice(
+            &(0..inp)
+                .map(|i| (i as f32 * 0.01).sin())
+                .collect::<Vec<_>>(),
+            &[1, inp],
+        )
+        .as_dtype(Dtype::Bfloat16)
+        .unwrap();
+        let y = lin.forward(&x).unwrap();
+        assert_eq!(y.shape(), &[1, out]);
+        assert!(lin.is_quantized(), "base must stay packed after LoKr apply");
+        // Non-degenerate + finite.
+        let ys = y.as_dtype(Dtype::Float32).unwrap();
+        let sum_abs = ys.abs().unwrap().sum(None).unwrap().item::<f32>();
+        assert!(
+            sum_abs.is_finite() && sum_abs > 0.0,
+            "output must be finite and non-zero"
         );
     }
 }
