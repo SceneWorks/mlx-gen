@@ -11,6 +11,7 @@
 //! so pointing at a pre-quantized snapshot skips the dense transient. A precision override and LoRA
 //! adapters are rejected rather than silently ignored.
 
+use mlx_gen::img2img::init_time_step;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
@@ -19,7 +20,8 @@ use mlx_gen::{
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::pipeline::{
-    base_flow_schedule, BooguPipeline, EditOptions, GenerateOptions, TurboOptions,
+    base_flow_schedule, resolve_reference, BooguPipeline, EditOptions, GenerateOptions,
+    TurboOptions,
 };
 
 /// Registry id for the Base text-to-image variant (true-CFG). Matches the SceneWorks worker's
@@ -57,8 +59,8 @@ const DEFAULT_TURBO_SIGMA: f32 = 0.001;
 
 /// Boogu Base's identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). True-CFG text-to-image: `guidance` is offered, the
-/// CFG-negative is the model's own fixed empty/drop instruction (not a user negative prompt), and
-/// there is no img2img/control conditioning on the Base checkpoint.
+/// CFG-negative is the model's own fixed empty/drop instruction (not a user negative prompt), and a
+/// single `Reference` opts into img2img latent-init (sc-10191, shared with Turbo via clone).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: BOOGU_IMAGE_ID,
@@ -70,9 +72,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            // Base/Turbo are text-to-image only; the instruction-edit reference path is a capability
-            // of the Edit checkpoint (`descriptor_edit`).
-            conditioning: Vec::new(),
+            // Base/Turbo are text-to-image, and a single `Reference` opts them into img2img
+            // latent-init (epic 8588 A4.3, sc-10191): VAE-encode the reference + noise-blend at a
+            // strength-derived start step. The instruction-edit MultiReference path (Qwen3-VL semantic
+            // edit) is the Edit checkpoint's alone (`descriptor_edit`); Turbo inherits this via clone.
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             // Base/Edit are rectified-flow Euler over a static-shift (`mu = 1.15`) schedule, routed
@@ -267,6 +271,13 @@ impl Boogu {
                 self.descriptor.id,
                 0.0,
             )?;
+            // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise
+            // from the VAE-encoded reference at a strength-derived start step; no reference (or a
+            // strength that resolves to start 0) → pure t2i.
+            let reference = resolve_reference(req, self.descriptor.id)?;
+            let start_step = reference
+                .map(|(_, strength)| init_time_step(steps, strength))
+                .unwrap_or(0);
             for n in 0..req.count {
                 let opts = TurboOptions {
                     height: req.height,
@@ -277,13 +288,27 @@ impl Boogu {
                     sampler: req.sampler.clone(),
                     scheduler: req.scheduler.clone(),
                 };
-                let img = self.pipeline.generate_turbo_with_progress(
-                    &req.prompt,
-                    &opts,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                    &req.cancel,
-                    on_progress,
-                )?;
+                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                let img = match reference {
+                    Some((image, _)) if start_step > 0 => {
+                        self.pipeline.generate_turbo_img2img_with_progress(
+                            &req.prompt,
+                            image,
+                            start_step,
+                            &opts,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?
+                    }
+                    _ => self.pipeline.generate_turbo_with_progress(
+                        &req.prompt,
+                        &opts,
+                        decoder,
+                        &req.cancel,
+                        on_progress,
+                    )?,
+                };
                 images.push(img);
             }
         } else if self.descriptor.id == BOOGU_IMAGE_EDIT_ID {
@@ -330,8 +355,17 @@ impl Boogu {
         } else {
             let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
             let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+            // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from
+            // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
+            let reference = resolve_reference(req, self.descriptor.id)?;
+            let start_step = reference
+                .map(|(_, strength)| init_time_step(steps, strength))
+                .unwrap_or(0);
             let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
-            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+            // The img2img start offsets the schedule; `flow_capture_for_request` folds any PiD `from_ldm`
+            // σ ceiling against the *start-offset* schedule so the two compose (`keep > start_step`,
+            // mirroring Z-Image). No reference → `start_step = 0`, byte-identical to before.
+            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
             let pid_decoder = resolve_pid_decoder_at_sigma(
                 self.pid.as_ref(),
                 req,
@@ -350,14 +384,29 @@ impl Boogu {
                     sampler: req.sampler.clone(),
                     scheduler: req.scheduler.clone(),
                 };
-                let img = self.pipeline.generate_with_progress(
-                    &req.prompt,
-                    &opts,
-                    denoise_sigmas,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                    &req.cancel,
-                    on_progress,
-                )?;
+                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                let img = match reference {
+                    Some((image, _)) if start_step > 0 => {
+                        self.pipeline.generate_base_img2img_with_progress(
+                            &req.prompt,
+                            image,
+                            start_step,
+                            &opts,
+                            denoise_sigmas,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?
+                    }
+                    _ => self.pipeline.generate_with_progress(
+                        &req.prompt,
+                        &opts,
+                        denoise_sigmas,
+                        decoder,
+                        &req.cancel,
+                        on_progress,
+                    )?,
+                };
                 images.push(img);
             }
         }
@@ -480,8 +529,12 @@ mod tests {
         assert_eq!(d.modality, Modality::Image);
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
-        // Base is text-to-image only — no conditioning surface.
-        assert!(d.capabilities.conditioning.is_empty());
+        // Base is text-to-image with a single-`Reference` img2img surface (sc-10191); no
+        // MultiReference (that is the Edit checkpoint's).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.mac_only);
     }
@@ -494,7 +547,12 @@ mod tests {
         assert_eq!(t.modality, b.modality);
         assert!(b.capabilities.supports_guidance);
         assert!(!t.capabilities.supports_guidance);
-        assert!(t.capabilities.conditioning.is_empty());
+        // Turbo inherits the Base img2img `Reference` surface via clone.
+        assert_eq!(t.capabilities.conditioning, b.capabilities.conditioning);
+        assert_eq!(
+            t.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         assert_eq!(
             t.capabilities.supported_quants,
             b.capabilities.supported_quants
@@ -615,16 +673,57 @@ mod tests {
     }
 
     #[test]
-    fn base_rejects_reference_conditioning() {
-        // Base has no conditioning surface, so the capability floor rejects a Reference.
-        let r = GenerationRequest {
+    fn base_and_turbo_accept_a_single_img2img_reference() {
+        // sc-10191: Base/Turbo now advertise a single-`Reference` img2img surface, so the capability
+        // floor accepts one reference (with or without a strength) but rejects a second.
+        let one = GenerationRequest {
+            conditioning: vec![Conditioning::Reference {
+                image: img(512, 512),
+                strength: Some(0.6),
+            }],
+            ..req(512, 512)
+        };
+        assert!(validate_request(&descriptor(), &one).is_ok());
+        assert!(validate_request(&descriptor_turbo(), &one).is_ok());
+        // resolve_reference returns the image + strength (falling back to req.strength when unset).
+        let (_, strength) = resolve_reference(&one, "boogu_image").unwrap().unwrap();
+        assert_eq!(strength, Some(0.6));
+
+        // Two references on the t2i path → error (single img2img init only; multi is the Edit path).
+        let two = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(512, 512),
+                    strength: None,
+                },
+            ],
+            ..req(512, 512)
+        };
+        assert!(resolve_reference(&two, "boogu_image").is_err());
+
+        // No reference → None (pure t2i), and a per-reference strength falls back to req.strength.
+        assert!(resolve_reference(&req(512, 512), "boogu_image")
+            .unwrap()
+            .is_none());
+        let fallback = GenerationRequest {
+            strength: Some(0.4),
             conditioning: vec![Conditioning::Reference {
                 image: img(512, 512),
                 strength: None,
             }],
             ..req(512, 512)
         };
-        assert!(validate_request(&descriptor(), &r).is_err());
+        assert_eq!(
+            resolve_reference(&fallback, "boogu_image")
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(0.4)
+        );
     }
 
     #[test]
