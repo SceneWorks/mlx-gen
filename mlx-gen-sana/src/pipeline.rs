@@ -41,6 +41,7 @@
 //! to NCHW before the `clip(x·0.5 + 0.5)` → RGB8 conversion.
 
 use mlx_gen::image::decoded_to_image;
+use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, Error, FlowMatchEuler, Image, Progress, Result,
     TimestepConvention,
@@ -49,7 +50,7 @@ use mlx_rs::ops::{add, divide, multiply, subtract};
 use mlx_rs::{random, Array};
 
 use crate::config::DcAeConfig;
-use crate::dc_ae::DcAeDecoder;
+use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::scm::ScmScheduler;
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
@@ -90,6 +91,7 @@ pub fn denoise_cfg(
     transformer: &SanaTransformer,
     scheduler: &FlowMatchEuler,
     sampler_name: Option<&str>,
+    start_step: usize,
     seed: u64,
     latents: Array,
     cond: &Array,
@@ -118,10 +120,13 @@ pub fn denoise_cfg(
             _ => Ok(pred_cond),
         }
     };
+    // img2img runs the tail of the schedule (`sigmas[start_step..]`); txt2img passes `start_step = 0`
+    // → the full schedule, byte-identical to the pre-img2img path. The pre-noised init latent (blended
+    // at `sigmas[start_step]` by the caller) is the loop's starting point.
     run_flow_sampler(
         sampler_name,
         TimestepConvention::Sigma,
-        &scheduler.sigmas,
+        &scheduler.sigmas[start_step.min(scheduler.sigmas.len().saturating_sub(1))..],
         latents,
         seed,
         cancel,
@@ -175,7 +180,43 @@ pub fn denoise_sprint(
     transformer: &SanaTransformer,
     scheduler: &ScmScheduler,
     seed: u64,
-    mut latents: Array,
+    latents: Array,
+    cond: &Array,
+    cond_mask: Option<&Array>,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    // txt2img: seed the SCM prior (`latents * sigma_data`) and run the whole angle schedule (start 0).
+    let latents = multiply(&latents, arr1(scheduler.sigma_data))?;
+    denoise_sprint_from(
+        transformer,
+        scheduler,
+        0,
+        seed,
+        latents,
+        cond,
+        cond_mask,
+        guidance_scale,
+        guidance_embeds_scale,
+        cancel,
+        on_progress,
+    )
+}
+
+/// The SCM (TrigFlow) few-step denoise loop starting at angle index `start_step`, over an **already
+/// `sigma_data`-scaled** `latents` (the caller seeds it: txt2img = `noise · σ_data`; img2img =
+/// `cos(t)·x0 + sin(t)·noise·σ_data` renoised to `t = timesteps[start_step]`). `start_step = 0` runs
+/// the full schedule (the txt2img path, via [`denoise_sprint`]). Progress is reported over the steps
+/// actually run (`n - start_step`).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint_from(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    start_step: usize,
+    seed: u64,
+    latents: Array,
     cond: &Array,
     cond_mask: Option<&Array>,
     guidance_scale: f32,
@@ -186,15 +227,15 @@ pub fn denoise_sprint(
     use mlx_rs::transforms::eval;
 
     let sd = scheduler.sigma_data;
-    // diffusers: latents = latents * sigma_data (the SCM prior std-dev).
-    latents = multiply(&latents, arr1(sd))?;
+    let mut latents = latents;
 
     // The embedded guidance scalar (CFG-free): guidance_scale * guidance_embeds_scale, a [1] tensor
     // fed to the trunk's guidance embedder. Constant across steps.
     let guidance = arr1(guidance_scale * guidance_embeds_scale);
 
     let n = scheduler.num_steps();
-    let total = n.max(1) as u32;
+    let start = start_step.min(n);
+    let total = (n - start).max(1) as u32;
     let mut denoised = latents.clone();
     // Per-step renoise key — a distinct subkey per step so the between-step noise is decorrelated and
     // deterministic for a given request seed (mirrors the unified sampler's `StepRng` derivation).
@@ -203,7 +244,7 @@ pub fn denoise_sprint(
         Ok(random::key(sub)?)
     };
 
-    for i in 0..n {
+    for i in start..n {
         if cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
@@ -211,7 +252,7 @@ pub fn denoise_sprint(
         // responsive rather than deferred to decode.
         eval([&latents])?;
         on_progress(Progress::Step {
-            current: (i as u32 + 1).min(total),
+            current: (i - start) as u32 + 1,
             total,
         });
 
@@ -288,6 +329,9 @@ pub fn denoise_sprint(
 pub struct SanaPipeline {
     text_encoder: SanaTextEncoder,
     transformer: SanaTransformer,
+    /// DC-AE **encoder** — the img2img reference→latent path (sc-10190). Loaded from the SAME
+    /// `vae/` snapshot as the decoder (the checkpoint ships both `encoder.*` and `decoder.*` keys).
+    encoder: DcAeEncoder,
     decoder: DcAeDecoder,
     dc_ae_cfg: DcAeConfig,
     sprint: bool,
@@ -309,6 +353,12 @@ pub struct SanaGenerateRequest<'a> {
     pub sampler: Option<&'a str>,
     /// Optional curated epic-7114 scheduler name re-shaping σ over the same `mu = ln(shift)`.
     pub scheduler: Option<&'a str>,
+    /// **img2img** reference image (sc-10190): when present with a positive [`Self::strength`], the
+    /// DC-AE-encoded init latent seeds the denoise instead of pure noise. `None` = plain txt2img.
+    pub init_image: Option<&'a Image>,
+    /// img2img strength ∈ `(0, 1]` (the fork's `init_time_step` convention: higher → start later →
+    /// output stays closer to the init image). `None` (or with no `init_image`) = txt2img.
+    pub strength: Option<f32>,
 }
 
 impl<'a> SanaGenerateRequest<'a> {
@@ -324,8 +374,26 @@ impl<'a> SanaGenerateRequest<'a> {
             seed: None,
             sampler: None,
             scheduler: None,
+            init_image: None,
+            strength: None,
         }
     }
+}
+
+/// VAE-encode an img2img reference image into a **denoise-space** DC-AE latent
+/// `[1, latent_channels, H/32, W/32]` (sc-10190): LANCZOS-resize + `[-1,1]` NCHW preprocess →
+/// [`DcAeEncoder::encode`] → multiply by the DC-AE `scaling_factor`. The `scaling_factor` places the
+/// latent in the same space the denoise loop + [`decode_to_image`] (which divides it back) operate in.
+pub fn encode_init_latents(
+    encoder: &DcAeEncoder,
+    cfg: &DcAeConfig,
+    image: &Image,
+    width: u32,
+    height: u32,
+) -> Result<Array> {
+    let image_nchw = preprocess_init_image(image, width, height)?;
+    let raw = encoder.encode(&image_nchw)?; // [1, 32, H/32, W/32], raw (pre-scale)
+    Ok(multiply(&raw, arr1(cfg.scaling_factor))?)
 }
 
 impl SanaPipeline {
@@ -334,12 +402,14 @@ impl SanaPipeline {
     pub fn new(
         text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
+        encoder: DcAeEncoder,
         decoder: DcAeDecoder,
         dc_ae_cfg: DcAeConfig,
     ) -> Self {
         Self {
             text_encoder,
             transformer,
+            encoder,
             decoder,
             dc_ae_cfg,
             sprint: false,
@@ -355,6 +425,7 @@ impl SanaPipeline {
     pub fn new_sprint(
         text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
+        encoder: DcAeEncoder,
         decoder: DcAeDecoder,
         dc_ae_cfg: DcAeConfig,
         guidance_embeds_scale: f32,
@@ -362,6 +433,7 @@ impl SanaPipeline {
         Self {
             text_encoder,
             transformer,
+            encoder,
             decoder,
             dc_ae_cfg,
             sprint: true,
@@ -433,11 +505,47 @@ impl SanaPipeline {
             &native.sigmas,
         ))?;
 
-        let latents = create_noise(seed, req.width, req.height)?;
+        // img2img (sc-10190): a reference image + positive strength starts the denoise at
+        // `sigmas[start_step]` over the DC-AE-encoded init latent blended with noise; else start 0
+        // (pure-noise txt2img). `init_time_step` returns 0 when strength is None/≤0 (→ txt2img).
+        let start_step = match req.init_image {
+            Some(_) => init_time_step(steps, req.strength),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            let image = req
+                .init_image
+                .expect("start_step > 0 implies an init image");
+            Some(encode_init_latents(
+                &self.encoder,
+                &self.dc_ae_cfg,
+                image,
+                req.width,
+                req.height,
+            )?)
+        } else {
+            None
+        };
+
+        let noise = create_noise(seed, req.width, req.height)?;
+        let latents = match &clean {
+            // Blend the pre-encoded clean latents with the noise at `sigma = sigmas[start_step]`.
+            Some(clean) => {
+                let sigma = *scheduler.sigmas.get(start_step).ok_or_else(|| {
+                    Error::Msg(format!(
+                        "sana img2img: start step {start_step} out of range for {}-element schedule",
+                        scheduler.sigmas.len()
+                    ))
+                })?;
+                add_noise_by_interpolation(clean, &noise, sigma)?
+            }
+            None => noise,
+        };
         let latents = denoise_cfg(
             &self.transformer,
             &scheduler,
             req.sampler,
+            start_step,
             seed,
             latents,
             &cond,
@@ -453,9 +561,15 @@ impl SanaPipeline {
     }
 
     /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) generate path (sc-8490). Encodes the
-    /// prompt ONCE (no uncond — Sprint is CFG-free), seeds the latent, runs [`denoise_sprint`] over an
+    /// prompt ONCE (no uncond — Sprint is CFG-free), seeds the latent, runs the SCM loop over an
     /// [`ScmScheduler`] (default 2 steps, embedded guidance 4.5), then DC-AE-decodes. The negative
     /// prompt / curated sampler+scheduler knobs are inapplicable to the SCM loop and ignored.
+    ///
+    /// **img2img (sc-10190):** a reference image + positive strength starts the SCM loop at angle
+    /// index `start = init_time_step(n, strength)`, seeding `latents` by TrigFlow-renoising the
+    /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
+    /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
+    /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
     fn generate_sprint(
         &self,
         req: &SanaGenerateRequest<'_>,
@@ -468,10 +582,37 @@ impl SanaPipeline {
 
         let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
         let scheduler = ScmScheduler::new(steps);
-        let latents = create_noise(seed, req.width, req.height)?;
-        let latents = denoise_sprint(
+        let n = scheduler.num_steps();
+        let sd = scheduler.sigma_data;
+
+        let start_step = match req.init_image {
+            Some(_) => init_time_step(n, req.strength),
+            None => 0,
+        };
+        let noise = create_noise(seed, req.width, req.height)?;
+        let latents = if start_step > 0 {
+            // img2img: renoise the encoded init to the start angle `timesteps[start_step]`.
+            let image = req
+                .init_image
+                .expect("start_step > 0 implies an init image");
+            let clean =
+                encode_init_latents(&self.encoder, &self.dc_ae_cfg, image, req.width, req.height)?;
+            // x0 in the SCM prior space (σ_data-scaled); noise likewise. TrigFlow renoise to angle t.
+            let x0 = multiply(&clean, arr1(sd))?;
+            let noise_sd = multiply(&noise, arr1(sd))?;
+            let t = scheduler.timesteps[start_step];
+            add(
+                &multiply(&x0, arr1(t.cos()))?,
+                &multiply(&noise_sd, arr1(t.sin()))?,
+            )?
+        } else {
+            // txt2img: the SCM prior is `noise · σ_data`.
+            multiply(&noise, arr1(sd))?
+        };
+        let latents = denoise_sprint_from(
             &self.transformer,
             &scheduler,
+            start_step,
             seed,
             latents,
             &cond,

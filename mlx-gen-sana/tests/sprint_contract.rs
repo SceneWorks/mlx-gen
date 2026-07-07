@@ -26,8 +26,8 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{CancelFlag, Progress};
 
 use mlx_gen_sana::{
-    denoise_sprint, BlockType, DcAeConfig, DcAeDecoder, SanaTransformer, SanaTransformerConfig,
-    ScmScheduler,
+    denoise_sprint, BlockType, DcAeConfig, DcAeDecoder, DcAeEncoder, SanaTransformer,
+    SanaTransformerConfig, ScmScheduler,
 };
 
 fn rand(shape: &[i32], seed: u64) -> Array {
@@ -287,6 +287,7 @@ fn tiny_dcae_config() -> DcAeConfig {
         attention_head_dim: 4,
         block_out_channels: vec![6, 8],
         layers_per_block: vec![1, 1],
+        encoder_layers_per_block: vec![1, 1], // unused by the decode-only Sprint contract test
         block_types: vec![BlockType::Res, BlockType::Res],
         qkv_multiscales: vec![5],
         upsample_interpolate: true,
@@ -681,10 +682,11 @@ fn real_weight_sprint_1024_e2e() {
         .unwrap();
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_file(root.join("vae/diffusion_pytorch_model.safetensors")).unwrap();
+    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone()).unwrap();
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone()).unwrap();
     let te = SanaTextEncoder::from_snapshot(root.join("text_encoder")).unwrap();
 
-    let pipe = SanaPipeline::new_sprint(te, trunk, decoder, dcfg, 0.1);
+    let pipe = SanaPipeline::new_sprint(te, trunk, encoder, decoder, dcfg, 0.1);
     assert!(pipe.is_sprint());
     let mut req = SanaGenerateRequest::new("a photorealistic red panda on a mossy log");
     req.steps = Some(2);

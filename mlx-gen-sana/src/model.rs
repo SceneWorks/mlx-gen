@@ -35,13 +35,13 @@ use std::path::Path;
 
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
-    GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
+    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
-use crate::dc_ae::DcAeDecoder;
+use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
 use crate::pipeline::{SanaGenerateRequest, SanaPipeline};
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
@@ -73,8 +73,9 @@ const MAX_COUNT: u32 = 8;
 
 /// SANA-1.6B's identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). True-CFG text-to-image: negative prompt + guidance
-/// scale, flow-match Euler over the unified curated sampler/scheduler menu (epic 7114). No img2img /
-/// control conditioning is wired yet (plain txt2img — the Sprint CFG-free distill is a later story).
+/// scale, flow-match Euler over the unified curated sampler/scheduler menu (epic 7114). Advertises
+/// `Reference` img2img (sc-10190): a single reference image seeds the denoise from the DC-AE-encoded
+/// init latent. ControlNet conditioning is a separate, later variant.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -85,8 +86,9 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // Plain txt2img — no img2img/control conditioning on the base SANA checkpoint.
-            conditioning: Vec::new(),
+            // img2img (sc-10190): a single `Reference` image seeds the denoise from the DC-AE-encoded
+            // init latent (`ui.img2img` in the catalog). ControlNet is a separate, later variant.
+            conditioning: vec![ConditioningKind::Reference],
             // No SANA LoRA wiring yet (reserved for a later story).
             supports_lora: false,
             supports_lokr: false,
@@ -143,7 +145,9 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supports_negative_prompt: false,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: Vec::new(),
+            // img2img (sc-10190): reference-seeded, via the SCM/TrigFlow renoise at the start angle.
+            // Distilled/few-step → the strength window is narrow (validate on-device).
+            conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
             // The SCM/TrigFlow consistency loop is a dedicated few-step sampler, not a curated
@@ -239,11 +243,13 @@ fn build_pipeline(root: &Path) -> Result<SanaPipeline> {
 
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
+    // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
+    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
 
     let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
 
-    Ok(SanaPipeline::new(te, trunk, decoder, dcfg))
+    Ok(SanaPipeline::new(te, trunk, encoder, decoder, dcfg))
 }
 
 /// Assemble the **SANA-Sprint** [`SanaPipeline`] from the snapshot tree (sc-8490). Same layout as
@@ -257,6 +263,7 @@ fn build_sprint_pipeline(root: &Path) -> Result<SanaPipeline> {
 
     let dcfg = DcAeConfig::sana_f32c32();
     let vae_w = Weights::from_dir(root.join("vae"))?;
+    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
     let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
 
     let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
@@ -264,10 +271,32 @@ fn build_sprint_pipeline(root: &Path) -> Result<SanaPipeline> {
     Ok(SanaPipeline::new_sprint(
         te,
         trunk,
+        encoder,
         decoder,
         dcfg,
         guidance_embeds_scale,
     ))
+}
+
+/// Resolve the optional img2img reference from the request conditioning (sc-10190): at most one
+/// `Conditioning::Reference` (multiple → error), returning its image and the effective strength
+/// (`per-reference strength.or(req.strength)`). Mirrors the sibling img2img families (Z-Image).
+fn resolve_reference<'a>(
+    req: &'a GenerationRequest,
+    id: &str,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(Error::Msg(format!(
+                    "{id}: multiple reference images are not supported (single img2img init only)"
+                )));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
 }
 
 /// Capability-driven request validation, factored out so it can be unit-tested without loaded
@@ -309,6 +338,15 @@ impl Sana {
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
 
+        // img2img (sc-10190): a single `Reference` conditioning, with a per-reference strength
+        // overriding `req.strength`. Both `SanaPipeline` paths (base flow-match + Sprint SCM) seed the
+        // denoise from the encoded init when an image + positive strength is present.
+        let reference = resolve_reference(req, self.descriptor.id)?;
+        let (init_image, strength) = match reference {
+            Some((image, strength)) => (Some(image), strength),
+            None => (None, None),
+        };
+
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.map(|s| s as usize);
         let mut images = Vec::with_capacity(req.count as usize);
@@ -324,6 +362,8 @@ impl Sana {
                 seed: Some(seed),
                 sampler: req.sampler.as_deref(),
                 scheduler: req.scheduler.as_deref(),
+                init_image,
+                strength,
             };
             let img = self
                 .pipeline
@@ -366,7 +406,11 @@ mod tests {
         assert!(d.capabilities.supports_true_cfg);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supports_negative_prompt);
-        assert!(d.capabilities.conditioning.is_empty());
+        // sc-10190: img2img reference conditioning is now advertised.
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // sc-8489/#653: SANA ships packed Q4/Q8 tiers (packed-detected on load), so the descriptor
         // advertises them for first-class quant-tier routing — no longer an empty set.
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
@@ -385,6 +429,61 @@ mod tests {
     fn validate_accepts_1024_square() {
         let d = descriptor();
         assert!(validate_request(&d, &req(1024, 1024)).is_ok());
+    }
+
+    fn ref_image() -> Image {
+        Image {
+            width: 32,
+            height: 32,
+            pixels: vec![128u8; 32 * 32 * 3],
+        }
+    }
+
+    #[test]
+    fn resolve_reference_extracts_single_img2img_init() {
+        // sc-10190: a single Reference resolves to (image, strength); an img2img Reference is now an
+        // ACCEPTED conditioning kind (advertised on the descriptor), so validate_request passes it.
+        let mut r = req(1024, 1024);
+        r.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: Some(0.6),
+        }];
+        let (_, strength) = resolve_reference(&r, MODEL_ID)
+            .unwrap()
+            .expect("a reference");
+        assert_eq!(strength, Some(0.6));
+        assert!(validate_request(&descriptor(), &r).is_ok());
+    }
+
+    #[test]
+    fn reference_strength_falls_back_to_request_strength() {
+        // A per-reference `None` strength inherits `req.strength` (matches the sibling families).
+        let mut r = req(1024, 1024);
+        r.strength = Some(0.4);
+        r.conditioning = vec![Conditioning::Reference {
+            image: ref_image(),
+            strength: None,
+        }];
+        let (_, strength) = resolve_reference(&r, MODEL_ID)
+            .unwrap()
+            .expect("a reference");
+        assert_eq!(strength, Some(0.4));
+    }
+
+    #[test]
+    fn resolve_reference_rejects_multiple_images() {
+        let mut r = req(1024, 1024);
+        r.conditioning = vec![
+            Conditioning::Reference {
+                image: ref_image(),
+                strength: None,
+            },
+            Conditioning::Reference {
+                image: ref_image(),
+                strength: None,
+            },
+        ];
+        assert!(resolve_reference(&r, MODEL_ID).is_err());
     }
 
     #[test]
@@ -492,7 +591,11 @@ mod tests {
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.supports_guidance);
         assert!(d.capabilities.supported_guidance_methods.is_empty());
-        assert!(d.capabilities.conditioning.is_empty());
+        // sc-10190: Sprint also advertises img2img reference conditioning.
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
         // Sprint advertises the same packed Q4/Q8 tiers as base SANA (sc-8489).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(d.capabilities.mac_only);

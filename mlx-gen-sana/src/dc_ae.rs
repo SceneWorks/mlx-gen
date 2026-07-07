@@ -463,3 +463,193 @@ impl DcAeDecoder {
         self.conv_out.forward(&h)
     }
 }
+
+// =================================================================================================
+// DC-AE ENCODER (sc-10190, img2img) — the mirror of `DcAeDecoder`. Faithful port of the diffusers
+// `AutoencoderDC.Encoder` for `dc-ae-f32c32-sana-1.0`. Reuses the decoder's ResBlock / LinearAttn /
+// GluMbConv primitives; the net-new pieces are `pixel_unshuffle_2d` + the `DownBlock` (DCDownBlock2d
+// in the checkpoint's `downsample_block_type = "Conv"` mode: a stride-2 conv, plus a pixel-unshuffle
+// + grouped-channel-mean shortcut). Stages run shallow→deep (128→1024 ch, image→image/32).
+// =================================================================================================
+
+/// `PixelUnshuffle2D(r)` over NHWC — the exact inverse of [`pixel_shuffle_2d`]:
+/// `(N, H, W, C) → (N, H/r, W/r, C·r²)`. The channel packing (`c·r² + rh·r + rw`) matches PyTorch
+/// `F.pixel_unshuffle`, so the DCDownBlock2d shortcut lines up with diffusers bit-for-bit.
+fn pixel_unshuffle_2d(x: &Array, r: i32) -> Result<Array> {
+    let sh = x.shape();
+    let (n, big_h, big_w, c) = (sh[0], sh[1], sh[2], sh[3]);
+    let (h, w) = (big_h / r, big_w / r);
+    let x = x.reshape(&[n, h, r, w, r, c])?; // split H→(h,rh), W→(w,rw)
+    let x = x.transpose_axes(&[0, 1, 3, 5, 2, 4])?; // → [n, h, w, c, rh, rw]
+    Ok(x.reshape(&[n, h, w, c * r * r])?) // merge → c·r² + rh·r + rw
+}
+
+/// Channel-grouped mean over NHWC: split the last axis into `out_channels` contiguous groups and
+/// average each (the diffusers `unflatten(1, (-1, group_size)).mean(dim=2)`, channel-last here).
+/// `C` must be divisible by `out_channels`.
+fn avg_group(x: &Array, out_channels: i32) -> Result<Array> {
+    let sh = x.shape();
+    let (n, h, w, c) = (sh[0], sh[1], sh[2], sh[3]);
+    let group_size = c / out_channels;
+    let g = x.reshape(&[n, h, w, out_channels, group_size])?;
+    Ok(mean_axes(&g, &[4], false)?)
+}
+
+/// `DCDownBlock2d` in **`downsample_block_type = "Conv"`** mode (the real SANA config): a stride-2
+/// conv does the 2× spatial downsample AND the channel change, plus a residual shortcut = the
+/// pixel-unshuffled input averaged down to `out_channels`. (This is NOT the pixel-unshuffle-conv
+/// variant — `downsample=False` in diffusers, so no unshuffle on the conv branch and the conv keeps
+/// full `out_channels`.)
+struct DownBlock {
+    conv: Conv, // in→out, stride 2, pad 1, bias
+    out_channels: i32,
+}
+
+impl DownBlock {
+    fn load(w: &Weights, prefix: &str, out_channels: i32) -> Result<Self> {
+        Ok(Self {
+            conv: Conv::load(w, &format!("{prefix}.conv"), 2, 1, 1, true)?,
+            out_channels,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let down = self.conv.forward(x)?; // [n, H/2, W/2, out]
+        let shortcut = avg_group(&pixel_unshuffle_2d(x, 2)?, self.out_channels)?;
+        Ok(add(&down, &shortcut)?)
+    }
+}
+
+/// One encoder stage: `encoder_layers_per_block` blocks then an optional trailing downsample (all
+/// stages but the deepest carry one). Storage order matches `encoder.down_blocks.{i}.{slot}` — blocks
+/// at slots `0..num_layers`, the downsample at slot `num_layers`.
+struct EncStage {
+    blocks: Vec<Block>,
+    downsample: Option<DownBlock>,
+}
+
+/// The full DC-AE **encoder**: `conv_in → [stage]×6 → conv_out (+ out_shortcut)`. The mirror of
+/// [`DcAeDecoder`]. Runs in f32 (the checkpoint is f32).
+pub struct DcAeEncoder {
+    conv_in: Conv,
+    stages: Vec<EncStage>, // shallow(0) → deep(n-1)
+    conv_out: Conv,
+    /// The out-shortcut averages `block_out_channels[-1]` down to this many groups (`latent_channels`).
+    out_shortcut_groups: i32,
+}
+
+impl DcAeEncoder {
+    pub fn from_weights(w: &Weights, cfg: DcAeConfig) -> Result<Self> {
+        let n = cfg.num_stages();
+        // conv_in: 3 → block_out_channels[0], regular 3×3 conv (layers_per_block[0] > 0).
+        let conv_in = Conv::load(w, "encoder.conv_in", 1, 1, 1, true)?;
+
+        let mut stages = Vec::with_capacity(n);
+        for i in 0..n {
+            let ch = cfg.block_out_channels[i];
+            let num_layers = cfg.encoder_layers_per_block[i];
+            let mut blocks = Vec::new();
+            for j in 0..num_layers {
+                let prefix = format!("encoder.down_blocks.{i}.{j}");
+                let block = match cfg.block_types[i] {
+                    BlockType::Res => Block::Res(ResBlock::load(w, &prefix, cfg.norm_eps)?),
+                    BlockType::EfficientVit => Block::Evit {
+                        attn: LinearAttn::load(w, &format!("{prefix}.attn"), &cfg, ch)?,
+                        conv_out: GluMbConv::load(
+                            w,
+                            &format!("{prefix}.conv_out"),
+                            ch,
+                            cfg.norm_eps,
+                        )?,
+                    },
+                };
+                blocks.push(block);
+            }
+            // Stages 0..n-1 carry a trailing DCDownBlock2d (slot == num_layers), out_channels =
+            // block_out_channels[i+1]; the deepest stage has none.
+            let downsample = if i + 1 < n {
+                Some(DownBlock::load(
+                    w,
+                    &format!("encoder.down_blocks.{i}.{num_layers}"),
+                    cfg.block_out_channels[i + 1],
+                )?)
+            } else {
+                None
+            };
+            stages.push(EncStage { blocks, downsample });
+        }
+
+        let conv_out = Conv::load(w, "encoder.conv_out", 1, 1, 1, true)?;
+
+        Ok(Self {
+            out_shortcut_groups: cfg.latent_channels,
+            conv_in,
+            stages,
+            conv_out,
+        })
+    }
+
+    /// Encode a preprocessed image `[B, 3, H, W]` (channels-first, `[-1, 1]`, the
+    /// [`mlx_gen::img2img::preprocess_init_image`] output) into a **raw** DC-AE latent
+    /// `[B, latent_channels, H/32, W/32]` (channels-first) — the diffusers `AutoencoderDC.encode`
+    /// output, BEFORE the `scaling_factor` multiply (the caller applies it, mirroring the decode
+    /// path's `latents / scaling_factor`).
+    pub fn encode(&self, image_nchw: &Array) -> Result<Array> {
+        let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
+        let mut h = self.conv_in.forward(&x)?;
+        for stage in &self.stages {
+            for block in &stage.blocks {
+                h = block.forward(&h)?;
+            }
+            if let Some(down) = &stage.downsample {
+                h = down.forward(&h)?;
+            }
+        }
+        // out_shortcut: conv_out(h) + mean_group(h → latent_channels).
+        let shortcut = avg_group(&h, self.out_shortcut_groups)?;
+        let latent_nhwc = add(&self.conv_out.forward(&h)?, &shortcut)?; // [n, H/32, W/32, latent]
+        Ok(latent_nhwc.transpose_axes(&[0, 3, 1, 2])?) // → NCHW
+    }
+}
+
+#[cfg(test)]
+mod encoder_tests {
+    use super::*;
+    use mlx_rs::random::{key, normal};
+    use mlx_rs::transforms::eval;
+
+    #[test]
+    fn pixel_unshuffle_inverts_pixel_shuffle() {
+        // Both ops are exact index permutations, so unshuffle→shuffle must return the original
+        // bit-for-bit. This pins the channel packing to PyTorch's `pixel_(un)shuffle` convention —
+        // the one guarantee the DCDownBlock2d shortcut relies on to match diffusers.
+        let x = normal::<f32>(&[2, 6, 8, 12], None, None, Some(&key(11).unwrap())).unwrap();
+        let round = pixel_shuffle_2d(&pixel_unshuffle_2d(&x, 2).unwrap(), 2).unwrap();
+        eval([&x, &round]).unwrap();
+        assert_eq!(x.shape(), round.shape());
+        assert_eq!(x.as_slice::<f32>(), round.as_slice::<f32>());
+    }
+
+    #[test]
+    fn pixel_unshuffle_shape() {
+        // (N,H,W,C) → (N,H/2,W/2,C·4).
+        let x = normal::<f32>(&[1, 4, 4, 3], None, None, Some(&key(1).unwrap())).unwrap();
+        let y = pixel_unshuffle_2d(&x, 2).unwrap();
+        eval([&y]).unwrap();
+        assert_eq!(y.shape(), &[1, 2, 2, 12]);
+    }
+
+    #[test]
+    fn avg_group_averages_contiguous_groups() {
+        // 8 channels → 2 groups of 4; group g = mean of channels [4g, 4g+4) (the out-shortcut op).
+        let x = normal::<f32>(&[1, 1, 1, 8], None, None, Some(&key(3).unwrap())).unwrap();
+        let g = avg_group(&x, 2).unwrap();
+        eval([&g]).unwrap();
+        let xs = x.as_slice::<f32>();
+        let gs = g.as_slice::<f32>();
+        let m0 = (xs[0] + xs[1] + xs[2] + xs[3]) / 4.0;
+        let m1 = (xs[4] + xs[5] + xs[6] + xs[7]) / 4.0;
+        assert!((gs[0] - m0).abs() < 1e-5, "group 0: {} vs {m0}", gs[0]);
+        assert!((gs[1] - m1).abs() < 1e-5, "group 1: {} vs {m1}", gs[1]);
+    }
+}

@@ -51,7 +51,7 @@ pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
-pub use dc_ae::DcAeDecoder;
+pub use dc_ae::{DcAeDecoder, DcAeEncoder};
 pub use model::{
     descriptor as sana_descriptor, load as load_sana, sprint_descriptor, Sana, MODEL_ID,
     SPRINT_MODEL_ID,

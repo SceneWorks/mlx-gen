@@ -22,6 +22,11 @@ pub struct DcAeConfig {
     pub attention_head_dim: i32,
     pub block_out_channels: Vec<i32>,
     pub layers_per_block: Vec<i32>,
+    /// Encoder layers per stage (`encoder_layers_per_block`). **Differs from the decoder's
+    /// `layers_per_block`**: the real `dc-ae-f32c32-sana-1.0` config ships `[2, 2, 2, 3, 3, 3]` for the
+    /// encoder vs `[3, 3, 3, 3, 3, 3]` for the decoder (sc-10190, img2img). Consumed by
+    /// [`crate::dc_ae::DcAeEncoder`]; unused by the decode path.
+    pub encoder_layers_per_block: Vec<i32>,
     pub block_types: Vec<BlockType>,
     /// One `kernel_size` per multiscale QKV projection in the EfficientViT stages (`[5]` for SANA-1.0).
     pub qkv_multiscales: Vec<i32>,
@@ -46,6 +51,8 @@ impl DcAeConfig {
             attention_head_dim: 32,
             block_out_channels: vec![128, 256, 512, 512, 1024, 1024],
             layers_per_block: vec![3, 3, 3, 3, 3, 3],
+            // Encoder is shallower in the three ResBlock stages (2 vs 3) per the real config.
+            encoder_layers_per_block: vec![2, 2, 2, 3, 3, 3],
             block_types: vec![R, R, R, E, E, E],
             qkv_multiscales: vec![5],
             upsample_interpolate: true,
