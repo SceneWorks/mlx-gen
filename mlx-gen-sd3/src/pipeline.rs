@@ -16,6 +16,7 @@
 //!   combines `pred = uncond + scale·(cond − uncond)`. The uncond branch conditions on the
 //!   (empty/negative) prompt's triple-TE embedding. `guidance_scale` defaults to 3.5.
 
+use mlx_gen::img2img::{add_noise_by_interpolation, init_time_step, preprocess_init_image};
 use mlx_gen::{
     run_flow_sampler, CancelFlag, FlowMatchEuler, Image, Progress, Result, TimestepConvention,
 };
@@ -98,13 +99,15 @@ pub fn encode_prompt(
     encoders.encode(&clip_l_row, &clip_g_row, &t5_ids, None)
 }
 
-/// One flow-match Euler denoise with **true CFG** + progress + cooperative cancellation. Each step
-/// runs the MMDiT twice (cond + uncond) and combines `uncond + scale·(cond − uncond)`; the Euler
-/// step then advances the latents in σ-space. The MMDiT timestep is `σ·1000`.
+/// The shared flow-match Euler denoise core over an explicit `sigmas` slice — the true-CFG predict
+/// closure + the unified sampler. Runs the MMDiT once (cond) or twice (cond + uncond → `uncond +
+/// scale·(cond − uncond)`) per step; the Euler step advances the latents in σ-space; the MMDiT
+/// timestep is `σ·1000`. txt2img passes the full schedule ([`denoise_cfg`]); img2img passes the tail
+/// `sigmas[start..]` from a noised init latent ([`denoise_img2img_cfg`]).
 #[allow(clippy::too_many_arguments)]
-pub fn denoise_cfg(
+fn denoise_over_sigmas(
     transformer: &Sd3Transformer,
-    scheduler: &FlowMatchEuler,
+    sigmas: &[f32],
     sampler_name: Option<&str>,
     seed: u64,
     latents: Array,
@@ -134,12 +137,96 @@ pub fn denoise_cfg(
     run_flow_sampler(
         sampler_name,
         TimestepConvention::Sigma,
-        &scheduler.sigmas,
+        sigmas,
         latents,
         seed,
         cancel,
         on_progress,
         predict,
+    )
+}
+
+/// One flow-match Euler denoise with **true CFG** + progress + cooperative cancellation. Each step
+/// runs the MMDiT twice (cond + uncond) and combines `uncond + scale·(cond − uncond)`; the Euler
+/// step then advances the latents in σ-space. The MMDiT timestep is `σ·1000`.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cfg(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    latents: Array,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    denoise_over_sigmas(
+        transformer,
+        &scheduler.sigmas,
+        sampler_name,
+        seed,
+        latents,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
+    )
+}
+
+/// **img2img latent-init** (epic 8588 slice A4, sc-10189) — reference-guided generation on SD3.5.
+/// VAE-encode `init` into the same normalized 16-ch latent space as [`create_noise`] (SD3.5's VAE
+/// `encode` returns `(mean − shift)·scale`, matching diffusers' `StableDiffusion3Img2ImgPipeline`),
+/// blend `(1 − σ_k)·clean + σ_k·noise` at the start sigma `σ_k = sigmas[k]`, and run the true-CFG
+/// flow-match Euler sampler over the tail `sigmas[k..]`. `strength` is reference fidelity in the fork's
+/// [`init_time_step`] convention (`k = max(1, ⌊num_steps·strength⌋)`): higher strength → later start →
+/// fewer denoise steps → the output stays closer to the reference; `strength ≤ 0` degenerates to a full
+/// txt2img (`k = 0`, identical to [`denoise_cfg`]). Unlike the packed Qwen-Image / Z-Image path, the
+/// SD3.5 MMDiT patchifies internally, so the clean latent is used **unpacked** `[1, 16, H/8, W/8]`
+/// (matching `create_noise`) — no pre-pack. Shares the true-CFG predict core with [`denoise_cfg`], so
+/// Large/Medium run two forwards/step and the distilled Large-Turbo runs one (`guidance == 1.0`).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_img2img_cfg(
+    transformer: &Sd3Transformer,
+    scheduler: &FlowMatchEuler,
+    sampler_name: Option<&str>,
+    seed: u64,
+    vae: &Vae,
+    init: &Image,
+    strength: f32,
+    width: u32,
+    height: u32,
+    steps: usize,
+    cond: &Sd3Conditioning,
+    uncond: Option<&Sd3Conditioning>,
+    guidance_scale: f32,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    // Reference → clean latent [1, 16, H/8, W/8]. `Vae::encode` returns the normalized `(mean−shift)·
+    // scale` latent (the same space as `create_noise`); SD3.5's MMDiT patchifies internally, so keep it
+    // unpacked.
+    let image_nchw = preprocess_init_image(init, width, height)?;
+    let clean = vae.encode(&image_nchw)?;
+    let noise = create_noise(seed, width, height)?;
+
+    // Start step from strength; blend clean⊕noise at σ_k, then denoise sigmas[k..]. The schedule has
+    // `steps + 1` sigmas, so clamp the start index inside it (strength ≥ 1 → the last usable step).
+    let start = init_time_step(steps, Some(strength)).min(scheduler.sigmas.len().saturating_sub(1));
+    let x_start = add_noise_by_interpolation(&clean, &noise, scheduler.sigmas[start])?;
+    denoise_over_sigmas(
+        transformer,
+        &scheduler.sigmas[start..],
+        sampler_name,
+        seed,
+        x_start,
+        cond,
+        uncond,
+        guidance_scale,
+        cancel,
+        on_progress,
     )
 }
 

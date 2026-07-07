@@ -15,7 +15,8 @@
 //! real 8.1B Large model and a tiny parity fixture, so the converter / validator run against both.
 
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, Capabilities, Modality, ModelDescriptor, Quant,
+    curated_sampler_names, curated_scheduler_names, Capabilities, ConditioningKind, Modality,
+    ModelDescriptor, Quant,
 };
 
 pub const SD3_5_LARGE_ID: &str = "sd3_5_large";
@@ -197,9 +198,13 @@ impl Sd3Variant {
                 supports_negative_prompt: self.supports_true_cfg(),
                 supports_guidance: self.supports_true_cfg(),
                 supports_true_cfg: self.supports_true_cfg(),
-                // E1 is the converter/config slice; image-conditioning modes (img2img / inpaint)
-                // are later epic stories and are not advertised yet (plain txt2img only).
-                conditioning: vec![],
+                // Reference-image conditioning = img2img latent-init (epic 8588 slice A4, sc-10189):
+                // a single `Conditioning::Reference { image, strength }` seeds the flow-match denoise
+                // from the VAE-encoded reference (see model.rs `generate_impl` → pipeline
+                // `denoise_img2img_cfg`). All three variants share the 16-ch VAE (encoder loaded) +
+                // sliceable static-shift schedule, so Large (true-CFG), Medium (true-CFG), and the
+                // distilled Large-Turbo all support it; inpaint/mask remains a later story.
+                conditioning: vec![ConditioningKind::Reference],
                 supported_quants: &[Quant::Q4, Quant::Q8],
                 supports_lora: true,
                 supports_lokr: true,

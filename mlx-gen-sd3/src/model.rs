@@ -36,8 +36,8 @@
 
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, resolve_flow_schedule, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    default_seed, resolve_flow_schedule, Conditioning, Error, FlowMatchEuler, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result,
     WeightsSource,
 };
 
@@ -228,23 +228,53 @@ impl Sd3Large {
             &native.sigmas,
         ))?;
 
+        // img2img (epic 8588 slice A4, sc-10189): a single `Conditioning::Reference` seeds the denoise
+        // from the VAE-encoded reference at `strength` (the reference's own strength, else the
+        // request-level `strength`, else the 0.5 mid default — the full-range slider default the worker
+        // sends). Plain txt2img otherwise. All three variants advertise `Reference` (16-ch VAE encoder
+        // is loaded), so this routes for Large/Medium (true-CFG) and the distilled Large-Turbo alike.
+        let reference = single_reference(req)?;
+        let strength = reference
+            .and_then(|(_, s)| s.or(req.strength))
+            .unwrap_or(0.5);
+
         let sampler_name = req.sampler.as_deref();
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);
-            let latents = pipeline::create_noise(seed, req.width, req.height)?;
-            let latents = pipeline::denoise_cfg(
-                &self.transformer,
-                &scheduler,
-                sampler_name,
-                seed,
-                latents,
-                &cond,
-                uncond.as_ref(),
-                guidance,
-                &req.cancel,
-                on_progress,
-            )?;
+            let latents = if let Some((init, _)) = reference {
+                pipeline::denoise_img2img_cfg(
+                    &self.transformer,
+                    &scheduler,
+                    sampler_name,
+                    seed,
+                    &self.vae,
+                    init,
+                    strength,
+                    req.width,
+                    req.height,
+                    steps,
+                    &cond,
+                    uncond.as_ref(),
+                    guidance,
+                    &req.cancel,
+                    on_progress,
+                )?
+            } else {
+                let latents = pipeline::create_noise(seed, req.width, req.height)?;
+                pipeline::denoise_cfg(
+                    &self.transformer,
+                    &scheduler,
+                    sampler_name,
+                    seed,
+                    latents,
+                    &cond,
+                    uncond.as_ref(),
+                    guidance,
+                    &req.cancel,
+                    on_progress,
+                )?
+            };
             on_progress(Progress::Decoding);
             images.push(pipeline::decode_to_image(&self.vae, &latents)?);
         }
@@ -320,6 +350,20 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
     Ok(())
 }
 
+/// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A4), or
+/// `None` for plain txt2img. SD3.5 conditions on exactly one reference image; more than one `Reference`
+/// (or a `MultiReference`) errors. Mirrors the Krea / FLUX single-reference idiom; the descriptor now
+/// advertises `Reference` on all three variants, so `validate_request` admits it before we get here.
+fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    match req.conditioning.as_slice() {
+        [] => Ok(None),
+        [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
+        _ => Err(Error::Msg(
+            "sd3: img2img supports exactly one Reference image".into(),
+        )),
+    }
+}
+
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both the true-CFG
 // Large (E5) and the distilled CFG-off Large-Turbo (E6) register here on the shared backbone.
@@ -332,7 +376,68 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::Modality;
+    use mlx_gen::{ConditioningKind, Modality};
+
+    fn tiny_image() -> Image {
+        Image {
+            width: 16,
+            height: 16,
+            pixels: vec![0u8; 16 * 16 * 3],
+        }
+    }
+
+    /// A valid request carrying `refs` `Reference` conditionings (each with `strength`).
+    fn ref_req(refs: usize, strength: Option<f32>) -> GenerationRequest {
+        GenerationRequest {
+            prompt: "a red apple on a wooden table".into(),
+            conditioning: (0..refs)
+                .map(|_| Conditioning::Reference {
+                    image: tiny_image(),
+                    strength,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn all_variants_advertise_reference_img2img() {
+        // A4 (sc-10189): every SD3.5 variant advertises `Reference` (16-ch VAE encoder is loaded on all
+        // three; the flow-match schedule is sliceable) — Large + Medium (true-CFG) + Large-Turbo (distilled).
+        for d in [descriptor(), turbo_descriptor(), medium_descriptor()] {
+            assert_eq!(
+                d.capabilities.conditioning,
+                vec![ConditioningKind::Reference],
+                "{} must advertise Reference img2img",
+                d.id
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_single_reference() {
+        // The descriptor advertises Reference, so validation admits one reference conditioning (the
+        // img2img path). This holds on the distilled Turbo too (img2img needs no guidance/CFG).
+        assert!(validate_request(&descriptor(), &ref_req(1, Some(0.5))).is_ok());
+        assert!(validate_request(&turbo_descriptor(), &ref_req(1, Some(0.4))).is_ok());
+        assert!(validate_request(&medium_descriptor(), &ref_req(1, None)).is_ok());
+    }
+
+    #[test]
+    fn single_reference_extracts_one_or_errors() {
+        // No conditioning → plain txt2img.
+        let plain = GenerationRequest {
+            prompt: "a fox".into(),
+            ..Default::default()
+        };
+        assert!(single_reference(&plain).unwrap().is_none());
+        // Exactly one → the image + its strength.
+        let r1 = ref_req(1, Some(0.4));
+        let one = single_reference(&r1).unwrap();
+        assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
+        // More than one → error (SD3.5 conditions on a single reference).
+        assert!(single_reference(&ref_req(2, None)).is_err());
+    }
 
     #[test]
     fn descriptor_is_sd3_5_large() {
