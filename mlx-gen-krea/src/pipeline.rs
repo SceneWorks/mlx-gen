@@ -362,6 +362,122 @@ impl KreaPipeline {
         self.decode_latents(&lat, decoder)
     }
 
+    /// Generate one RGB image seeded from a reference `init` at `strength` through the **Raw**
+    /// true-CFG path, with no cancellation, a no-op progress sink, and the native VAE decode (no PiD).
+    /// Convenience wrapper over [`Self::generate_base_img2img_with_progress`] (mirrors
+    /// [`Self::generate_turbo_img2img`] / [`Self::generate_base`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_img2img(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+    ) -> Result<Image> {
+        self.generate_base_img2img_with_progress(
+            prompt,
+            negative_prompt,
+            guidance,
+            init,
+            strength,
+            opts,
+            None,
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// **img2img latent-init on the Raw (true-CFG) path** (`krea_2_raw`, epic 8588 slice A / sc-10224).
+    /// The CFG counterpart of [`Self::generate_turbo_img2img_with_progress`]: seed the denoise from a
+    /// VAE-encoded `init` reference instead of pure noise, then run the full-CFG Raw sampler (two DiT
+    /// forwards/step combined by [`krea_cfg_combine`]) over the tail of the resolution-dynamic
+    /// [`base_schedule`]. Merges the Turbo-img2img front matter (VAE-encode → strength-derived start step
+    /// → noise-blend) with the Raw CFG loop from [`Self::generate_base_with_progress`] — so unlike Turbo
+    /// img2img (CFG-free), this honors `guidance` + the `negative_prompt`, which is the whole point of
+    /// Raw.
+    ///
+    /// `strength` follows the fork's [`init_time_step`] convention (higher → later start step → fewer
+    /// denoise steps → closer to the reference; `strength ≤ 0` degenerates to full txt2img). Both the
+    /// positive and (CFG-active) unconditional contexts are prepared ONCE against the blended `x_start`
+    /// (the F-079 hoist). The PiD `from_ldm` early-stop (`keep`) is intentionally NOT plumbed here — same
+    /// as Turbo img2img: combining a partial-denoise capture with the img2img start step needs the caller
+    /// to resolve the capture against the *sliced* schedule (tracked in sc-10121); the model layer rejects
+    /// that combo. `decoder` is the same latent→pixel seam (native [`QwenVae`] or a PiD decoder).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_img2img_with_progress(
+        &self,
+        prompt: &str,
+        negative_prompt: &str,
+        guidance: f32,
+        init: &Image,
+        strength: f32,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "krea_2_raw")?;
+
+        // Reference → clean latent [1, 16, H/8, W/8]. `QwenVae::encode` already returns the normalized
+        // `(e − mean)/std` latent (the same space as `init_noise`); drop the singleton temporal axis.
+        let image_nchw = preprocess_init_image(init, opts.width, opts.height)?;
+        let clean = self.vae.encode(&image_nchw)?.squeeze_axes(&[2])?;
+
+        let noise = init_noise(opts.height, opts.width, opts.seed)?;
+
+        // Start step from strength on the resolution-dynamic Raw schedule; blend the clean latent with
+        // noise at σ_k, then denoise sigmas[k..]. (Turbo uses `turbo_schedule`; Raw's mu is dynamic.)
+        let full = base_schedule(
+            opts.steps,
+            opts.width,
+            opts.height,
+            opts.scheduler.as_deref(),
+        );
+        let start = init_time_step(opts.steps, Some(strength)).min(full.len().saturating_sub(1));
+        let sigmas = &full[start..];
+        let x_start = add_noise_by_interpolation(&clean, &noise, full[start])?;
+
+        // Positive + (CFG-active) unconditional preps, hoisted once against the blended start latent
+        // (mirrors `generate_base_with_progress`; the negative prompt defaults to `""` at the caller).
+        let (ids, attn) = self.tok.encode_prompt(prompt)?;
+        let context = self.te.forward(&ids, &attn)?;
+        let prep_pos = self.dit.prepare(&context, None, &x_start)?;
+        let prep_neg = if guidance > 0.0 {
+            let (nids, nattn) = self.tok.encode_prompt(negative_prompt)?;
+            let ncontext = self.te.forward(&nids, &nattn)?;
+            Some(self.dit.prepare(&ncontext, None, &x_start)?)
+        } else {
+            None
+        };
+
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            sigmas,
+            x_start,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| {
+                let t = Array::from_slice(&[timestep], &[1]);
+                let cond = self.dit.forward_prepared(x, &t, &prep_pos)?;
+                let v = match &prep_neg {
+                    Some(neg) => {
+                        let uncond = self.dit.forward_prepared(x, &t, neg)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    }
+                    None => cond,
+                };
+                Ok(v.as_dtype(Dtype::Float32)?)
+            },
+        )?;
+
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
     /// Decode a latent to an RGB image through the seam. `decoded_to_image` applies
     /// `clip(x·0.5 + 0.5, 0, 1)` — the algebraic equal of the reference `img.clamp(-1,1)·0.5 + 0.5` —
     /// and drops the singleton temporal axis when present (`QwenVae::decode` is NCTHW with T=1; PiD

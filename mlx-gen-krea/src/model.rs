@@ -124,9 +124,11 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_negative_prompt = true;
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
-    // img2img (Reference conditioning) is Turbo-only for now — `generate_turbo_img2img_with_progress`
-    // is the distilled-Turbo entrypoint; there is no Raw img2img path yet, so Raw stays pure t2i.
-    d.capabilities.conditioning = Vec::new();
+    // img2img reference latent-init (epic 8588 slice A, sc-10224): Raw advertises `Reference` just like
+    // Turbo, but routes to the CFG entrypoint `generate_base_img2img_with_progress` (honoring guidance +
+    // negative prompt), NOT the CFG-free Turbo one. Inherited from `descriptor()` — same single-Reference
+    // surface — so this is a no-op re-affirmation kept explicit for the reader.
+    d.capabilities.conditioning = vec![ConditioningKind::Reference];
     d
 }
 
@@ -304,15 +306,31 @@ impl Krea {
                 // Reference fidelity: the Reference's own strength wins, else the request-level img2img
                 // strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
                 let strength = ref_strength.or(req.strength).unwrap_or(0.5);
-                self.pipeline.generate_turbo_img2img_with_progress(
-                    &req.prompt,
-                    init,
-                    strength,
-                    &opts,
-                    decoder,
-                    &req.cancel,
-                    on_progress,
-                )?
+                // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
+                // negative prompt honored, sc-10224); Turbo takes the CFG-free distilled one (sc-10135).
+                if is_raw {
+                    self.pipeline.generate_base_img2img_with_progress(
+                        &req.prompt,
+                        &negative,
+                        guidance,
+                        init,
+                        strength,
+                        &opts,
+                        decoder,
+                        &req.cancel,
+                        on_progress,
+                    )?
+                } else {
+                    self.pipeline.generate_turbo_img2img_with_progress(
+                        &req.prompt,
+                        init,
+                        strength,
+                        &opts,
+                        decoder,
+                        &req.cancel,
+                        on_progress,
+                    )?
+                }
             } else if is_raw {
                 self.pipeline.generate_base_with_progress(
                     &req.prompt,
@@ -364,9 +382,9 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 
 /// Extract the single reference image + its optional `strength` for img2img (epic 8588 slice A), or
 /// `None` for plain txt2img. Krea conditions on exactly one reference image; `MultiReference` or more
-/// than one `Reference` errors. The descriptor only advertises `Reference` on Turbo, so this returns
-/// `None` on the Raw path (validation rejects a Reference on Raw before we get here). Mirrors the FLUX
-/// single-reference idiom.
+/// than one `Reference` errors. Both variants advertise `Reference` (Turbo → CFG-free img2img sc-10135,
+/// Raw → CFG img2img sc-10224), so this is reached on either path; the `generate_impl` dispatch then
+/// picks the matching entrypoint by `is_raw`. Mirrors the FLUX single-reference idiom.
 fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
     match req.conditioning.as_slice() {
         [] => Ok(None),
@@ -432,23 +450,25 @@ mod tests {
     }
 
     #[test]
-    fn turbo_advertises_reference_conditioning_raw_does_not() {
-        // img2img (sc-10135) is Turbo-only; Raw stays pure t2i (no img2img entrypoint yet).
+    fn both_variants_advertise_reference_conditioning() {
+        // img2img is now on BOTH variants: Turbo → CFG-free (sc-10135), Raw → CFG (sc-10224).
         assert_eq!(
             descriptor().capabilities.conditioning,
             vec![ConditioningKind::Reference]
         );
-        assert!(raw_descriptor().capabilities.conditioning.is_empty());
+        assert_eq!(
+            raw_descriptor().capabilities.conditioning,
+            vec![ConditioningKind::Reference]
+        );
     }
 
     #[test]
-    fn validate_reference_accepted_on_turbo_rejected_on_raw() {
+    fn validate_reference_accepted_on_both_variants() {
+        // A single Reference (img2img) validates on Turbo AND Raw (sc-10224). The conditioning-floor
+        // checks the KIND is allowed; the exactly-one-Reference count is enforced later by
+        // `single_reference` (see `single_reference_extracts_one_or_errors`).
         assert!(validate_request(&descriptor(), &ref_req(1, Some(0.5))).is_ok());
-        let e = validate_request(&raw_descriptor(), &ref_req(1, Some(0.5))).unwrap_err();
-        assert!(
-            format!("{e}").contains("conditioning"),
-            "Raw must reject Reference conditioning: {e}"
-        );
+        assert!(validate_request(&raw_descriptor(), &ref_req(1, Some(0.5))).is_ok());
     }
 
     #[test]
