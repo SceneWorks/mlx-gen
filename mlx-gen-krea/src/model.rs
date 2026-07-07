@@ -270,12 +270,16 @@ impl Krea {
         // img2img (epic 8588 slice A, sc-10135): a single `Conditioning::Reference` seeds the Turbo
         // denoise from the VAE-encoded reference at `strength` (the reference's own strength, else the
         // request-level `strength`, else 0.5). Turbo only — the Raw descriptor never advertises
-        // `Reference`, so `reference` is always `None` on the Raw path. The PiD `from_ldm` early-stop
-        // (`keep != MAX`) is not wired for img2img yet (sc-10121): reject the combo rather than silently
-        // desync the decoder's σ from a full-denoise latent (the PiD super-res decoder, `keep == MAX`,
-        // is fine — it decodes the clean final latent).
+        // `Reference`, so `reference` is always `None` on the Raw path. A PiD `from_ldm` early-stop
+        // CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo rather than silently desync
+        // the decoder's σ from the img2img-sliced schedule. A capture is active only when the truncation
+        // `keep` lands BEFORE the end of the schedule; the no-capture path (full denoise → the PiD
+        // super-res decoder or the native VAE decodes the clean final latent) reports `keep ==
+        // sigmas.len()` and is perfectly fine with img2img. NB `flow_capture_for_request` returns
+        // `sigmas.len()` (NOT `usize::MAX`) for the no-capture case, so the earlier `keep != usize::MAX`
+        // guard was always true and rejected EVERY img2img gen, PiD or not (the on-device break).
         let reference = single_reference(req)?;
-        if reference.is_some() && keep != usize::MAX {
+        if img2img_conflicts_with_capture(reference.is_some(), keep, sigmas.len()) {
             return Err(Error::Msg(format!(
                 "{}: PiD from_ldm early-stop is not supported with img2img reference conditioning \
                  (tracked in sc-10121)",
@@ -373,6 +377,17 @@ fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f3
     }
 }
 
+/// Whether an img2img reference conflicts with an ACTIVE PiD `from_ldm` early-stop capture — the combo
+/// deferred to sc-10121. A capture is active ONLY when [`flow_capture_for_request`]'s truncation `keep`
+/// lands strictly before the end of the schedule (`keep < num_sigmas`); the no-capture full-denoise path
+/// reports `keep == num_sigmas` (the PiD super-res decoder / native VAE then decodes the clean final
+/// latent — fine with img2img). Extracted + tested because the original inline guard compared `keep`
+/// against `usize::MAX`, a sentinel `flow_capture_for_request` never returns, so it rejected EVERY
+/// img2img generation (the on-device break this fixes).
+fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: usize) -> bool {
+    has_reference && keep < num_sigmas
+}
+
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Both variants register
 // here — `krea_2_turbo` (distilled, CFG-free) and `krea_2_raw` (undistilled, full-CFG; epic 9992).
@@ -434,6 +449,34 @@ mod tests {
             format!("{e}").contains("conditioning"),
             "Raw must reject Reference conditioning: {e}"
         );
+    }
+
+    #[test]
+    fn img2img_conflicts_only_with_an_active_capture() {
+        // sc-10121 sentinel regression: the no-capture full-denoise path reports `keep == num_sigmas`
+        // (NOT usize::MAX). Plain img2img (no PiD capture) must be ACCEPTED; only a real from_ldm capture
+        // (`keep < num_sigmas`) conflicts.
+        let num_sigmas = 9; // an 8-step Turbo schedule has 9 sigmas.
+                            // No reference → never a conflict (plain txt2img, any keep).
+        assert!(!img2img_conflicts_with_capture(false, 5, num_sigmas));
+        assert!(!img2img_conflicts_with_capture(
+            false, num_sigmas, num_sigmas
+        ));
+        // Reference + NO capture (keep == num_sigmas) → allowed (the on-device break; must NOT conflict).
+        assert!(!img2img_conflicts_with_capture(
+            true, num_sigmas, num_sigmas
+        ));
+        // Reference + an ACTIVE from_ldm capture (keep truncates early) → the sc-10121 conflict.
+        assert!(img2img_conflicts_with_capture(true, 5, num_sigmas));
+        assert!(img2img_conflicts_with_capture(true, 0, num_sigmas));
+        // The old bug: `keep == usize::MAX` was the (wrong) allowed sentinel; the real allowed sentinel
+        // is `num_sigmas`. A capture value of usize::MAX (never produced) would be treated as no-conflict
+        // here only because it is not < num_sigmas — but the point is num_sigmas itself is now allowed.
+        assert!(!img2img_conflicts_with_capture(
+            true,
+            usize::MAX,
+            num_sigmas
+        ));
     }
 
     #[test]
