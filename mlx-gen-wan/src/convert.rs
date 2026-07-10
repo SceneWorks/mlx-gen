@@ -522,6 +522,7 @@ pub fn assemble_wan_vace_snapshot(
     }
     let has_shard = std::fs::read_dir(tf_src)?
         .filter_map(|e| e.ok())
+        .filter(|e| !mlx_gen::gen_core::weightsmeta::is_hidden_file(&e.path()))
         .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"));
     if !has_shard {
         return Err(Error::Msg(format!(
@@ -591,6 +592,7 @@ pub fn assemble_wan_vace_fun_snapshot(
         }
         let has_shard = std::fs::read_dir(src)?
             .filter_map(|e| e.ok())
+            .filter(|e| !mlx_gen::gen_core::weightsmeta::is_hidden_file(&e.path()))
             .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("safetensors"));
         if !has_shard {
             return Err(Error::Msg(format!(
@@ -650,6 +652,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        // Test the entry's own name, not the canonicalized target: an HF-cache entry resolves to a
+        // `blobs/<sha>` path whose name says nothing about whether the entry is a hidden sidecar
+        // (SceneWorks#1333).
+        if mlx_gen::gen_core::weightsmeta::is_hidden_file(&entry.path()) {
+            continue;
+        }
         let from = entry.path().canonicalize()?;
         let to = dst.join(entry.file_name());
         if from.is_dir() {
@@ -764,6 +772,7 @@ fn extract_bernini_expert(bernini_dir: &Path, prefix: &str) -> Result<HashMap<St
     let mut shards: Vec<PathBuf> = std::fs::read_dir(bernini_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !mlx_gen::gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     shards.sort();
     if shards.is_empty() {

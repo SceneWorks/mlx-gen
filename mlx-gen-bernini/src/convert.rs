@@ -111,6 +111,7 @@ fn extract_planner_groups(
     let mut shards: Vec<PathBuf> = std::fs::read_dir(bernini_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !mlx_gen::gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     shards.sort();
     if shards.is_empty() {
@@ -252,6 +253,11 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let from = entry.path();
+        // Hidden entries (macOS AppleDouble sidecars) must not reach the assembled tier — they would
+        // ship with the upload and break `Weights::from_dir` on download (SceneWorks#1333).
+        if mlx_gen::gen_core::weightsmeta::is_hidden_file(&from) {
+            continue;
+        }
         let to = dst.join(entry.file_name());
         // Use `symlink_metadata` (the entry's OWN type) so only a REAL subdirectory is recursed into;
         // a symlink — even one pointing at a directory — falls to `fs::copy` (which follows it to the

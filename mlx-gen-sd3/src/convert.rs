@@ -472,6 +472,7 @@ pub fn validate_transformer_dir(arch: &Sd3Arch, transformer_dir: &Path) -> Resul
     let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(transformer_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !mlx_gen::gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     shards.sort();
     if shards.is_empty() {

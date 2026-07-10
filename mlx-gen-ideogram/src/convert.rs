@@ -48,6 +48,11 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
+        // Hidden entries (macOS AppleDouble sidecars) must not reach the assembled tier — they would
+        // ship with the upload and break `Weights::from_dir` on download (SceneWorks#1333).
+        if mlx_gen::gen_core::weightsmeta::is_hidden_file(&path) {
+            continue;
+        }
         let target = dst.join(entry.file_name());
         if path.is_dir() {
             copy_dir(&path, &target)?;

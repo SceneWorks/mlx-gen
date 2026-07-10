@@ -469,7 +469,9 @@ fn copy_dir_flat(src_dir: &Path, dst_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dst_dir)?;
     for entry in std::fs::read_dir(src_dir)? {
         let path = entry?.path();
-        if path.is_file() {
+        // Hidden entries (macOS AppleDouble sidecars) must not reach the assembled tier — they would
+        // ship with the upload and break `Weights::from_dir` on download (SceneWorks#1333).
+        if path.is_file() && !mlx_gen::gen_core::weightsmeta::is_hidden_file(&path) {
             let name = path.file_name().expect("dir entry has a name");
             copy_file(&path, &dst_dir.join(name))?;
         }

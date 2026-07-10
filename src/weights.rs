@@ -34,11 +34,16 @@ impl Weights {
     /// Load and merge every `.safetensors` file under `dir` (sharded checkpoints). Keys
     /// across shards are disjoint, so a plain merge reconstructs the full tensor set
     /// without parsing the index — no torch, no shard map needed.
+    ///
+    /// Hidden entries are skipped: macOS AppleDouble sidecars (`._model.safetensors`) carry the
+    /// `.safetensors` extension but are not shards, and sort ahead of the real file — see
+    /// [`gen_core::weightsmeta::is_hidden_file`].
     pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         let mut files: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .filter(|p| !gen_core::weightsmeta::is_hidden_file(p))
             .collect();
         files.sort();
         if files.is_empty() {
@@ -47,7 +52,10 @@ impl Weights {
         let mut tensors = HashMap::new();
         let mut metadata = HashMap::new();
         for f in files {
-            let (t, m) = Array::load_safetensors_with_metadata(&f)?;
+            // Name the offending file: the underlying mlx-c error carries only its own C++ source
+            // location, so a corrupt/foreign file in a shard dir was previously undiagnosable.
+            let (t, m) = Array::load_safetensors_with_metadata(&f)
+                .map_err(|e| Error::from(format!("loading shard {}: {e}", f.display())))?;
             // Shards are expected to be disjoint; a key collision means the shard set is wrong (e.g.
             // a stray extra file in the dir) and a plain `extend` would silently let the later shard
             // win, loading a partially-wrong tensor set. Surface it instead (F-032). Metadata is
@@ -179,5 +187,52 @@ mod tests {
             to_dtype(&a, Dtype::Bfloat16).unwrap().dtype(),
             Dtype::Bfloat16
         );
+    }
+
+    /// SceneWorks#1333 regression: `boogu_image` failed to load because its `mllm/` dir held a macOS
+    /// AppleDouble sidecar next to the real shard. `._model.safetensors` has extension `safetensors`
+    /// and sorts first, so `from_dir` opened it and mlx-c rejected its magic bytes with
+    /// `[load_safetensors] Invalid json header length`. The sidecar must be skipped.
+    #[test]
+    fn from_dir_skips_appledouble_sidecar() {
+        let dir = std::env::temp_dir().join(format!("mlx_gen_appledouble_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
+        Array::save_safetensors(
+            vec![("blk.weight", &a)],
+            None,
+            dir.join("model.safetensors"),
+        )
+        .unwrap();
+        // Real AppleDouble header (magic 0x00051607, version 0x00020000).
+        std::fs::write(
+            dir.join("._model.safetensors"),
+            [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+
+        let w = Weights::from_dir(&dir).expect("sidecar must be skipped, not loaded");
+        assert_eq!(w.len(), 1);
+        assert!(w.get("blk.weight").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A genuinely corrupt *shard* still errors — and the message now names the file, which the bare
+    /// mlx-c error (a C++ source location) did not.
+    #[test]
+    fn from_dir_error_names_the_offending_shard() {
+        let dir = std::env::temp_dir().join(format!("mlx_gen_bad_shard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
+
+        let err = match Weights::from_dir(&dir) {
+            Ok(_) => panic!("a corrupt shard must not load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("model.safetensors"), "unexpected: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

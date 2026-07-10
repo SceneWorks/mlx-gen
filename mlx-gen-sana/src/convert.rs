@@ -131,7 +131,9 @@ fn copy_sidecars(src: &Path, dst: &Path) -> Result<()> {
         if !path.is_file() {
             continue;
         }
-        if path.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+        if path.extension().and_then(|e| e.to_str()) == Some("safetensors")
+            || mlx_gen::gen_core::weightsmeta::is_hidden_file(&path)
+        {
             continue;
         }
         if let Some(name) = path.file_name() {

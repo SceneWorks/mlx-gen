@@ -24,6 +24,22 @@ use safetensors::SafeTensors;
 
 use crate::{Error, Result};
 
+/// True when `path`'s file name begins with `.` — a hidden entry that is never a weight shard.
+///
+/// The case that motivates this: macOS writes an **AppleDouble sidecar** (`._<name>`) alongside a
+/// file whenever it must persist extended attributes on a volume with no native xattr support
+/// (exFAT/FAT external drives, SMB/NFS shares, cloud-sync folders), and those sidecars also survive
+/// a Finder copy or a zip round-trip. `._model.safetensors` has extension `safetensors`, so an
+/// extension-only filter admits it; it sorts *before* `model.safetensors`, so it is the first file a
+/// sharded loader opens. Its 4-byte magic (`00 05 16 07`) then decodes as a ~2.2 TB safetensors
+/// header length and the load dies with `[load_safetensors] Invalid json header length`
+/// (SceneWorks#1333). No legitimate shard name starts with `.`, so skipping hidden entries is exact.
+pub fn is_hidden_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
+}
+
 // =================================================================================================
 // CheckpointMeta — neutral safetensors header / byte-view reader.
 // =================================================================================================
@@ -75,6 +91,7 @@ impl CheckpointMeta {
         let mut files: Vec<_> = std::fs::read_dir(dir)?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+            .filter(|p| !is_hidden_file(p))
             .collect();
         files.sort();
         if files.is_empty() {
@@ -776,5 +793,71 @@ mod tests {
         assert!(meta.tensor("missing").is_none());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn is_hidden_file_flags_dotfiles_and_appledouble_sidecars() {
+        assert!(is_hidden_file(Path::new("._model.safetensors")));
+        assert!(is_hidden_file(Path::new("/a/b/._model.safetensors")));
+        assert!(is_hidden_file(Path::new("/a/b/.DS_Store")));
+        assert!(is_hidden_file(Path::new(".gitattributes")));
+        // Real shards — including the sharded form — must not be flagged.
+        assert!(!is_hidden_file(Path::new("model.safetensors")));
+        assert!(!is_hidden_file(Path::new("/a/b/model.safetensors")));
+        assert!(!is_hidden_file(Path::new(
+            "diffusion_pytorch_model-00001-of-00002.safetensors"
+        )));
+        // A leading dot on a *directory* component is not a hidden file name.
+        assert!(!is_hidden_file(Path::new("/a/.cache/model.safetensors")));
+    }
+
+    /// SceneWorks#1333: an AppleDouble sidecar (`._model.safetensors`) carries the `.safetensors`
+    /// extension and sorts *before* the real shard, so an extension-only filter opened it first and
+    /// died on its magic bytes. `from_dir` must skip it and load the real shard.
+    #[test]
+    fn from_dir_skips_appledouble_sidecar() {
+        let data: Vec<u8> = (0u8..16).collect();
+        let tv = StTensorView::new(Dtype::I32, vec![2, 2], &data).unwrap();
+        let bytes = safetensors::serialize([("blk.weight", tv)], &None).unwrap();
+
+        let dir = std::env::temp_dir().join(format!("gencore_appledouble_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+        // A real AppleDouble header: magic 0x00051607, version 0x00020000. Its first 8 bytes decode
+        // as a ~2.2 TB safetensors header length.
+        std::fs::write(
+            dir.join("._model.safetensors"),
+            [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+        // Sanity: the sidecar really does sort first, so this test would fail without the skip.
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names[0], std::ffi::OsStr::new("._model.safetensors"));
+
+        let meta = CheckpointMeta::from_dir(&dir).expect("sidecar must be skipped, not loaded");
+        assert_eq!(meta.keys().collect::<Vec<_>>(), vec!["blk.weight"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A dir holding *only* a sidecar has no shards — the error must say so rather than surfacing a
+    /// corrupt-header failure from the sidecar.
+    #[test]
+    fn from_dir_with_only_a_sidecar_reports_no_shards() {
+        let dir = std::env::temp_dir().join(format!("gencore_only_sidecar_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("._model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
+
+        let err = match CheckpointMeta::from_dir(&dir) {
+            Ok(_) => panic!("a dir holding only a sidecar must not load"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("no .safetensors files"), "unexpected: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

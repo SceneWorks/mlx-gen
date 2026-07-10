@@ -229,6 +229,12 @@ pub fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
+        // Never carry a hidden entry into an assembled tier: an AppleDouble sidecar copied in here
+        // would be uploaded with the turnkey and then break `Weights::from_dir` for everyone who
+        // downloads it (SceneWorks#1333).
+        if gen_core::weightsmeta::is_hidden_file(&path) {
+            continue;
+        }
         let target = dst.join(entry.file_name());
         if path.is_dir() {
             copy_dir(&path, &target)?;

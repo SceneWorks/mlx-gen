@@ -290,6 +290,7 @@ fn validate_against_base(
     let mut shards: Vec<PathBuf> = std::fs::read_dir(base_transformer_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !mlx_gen::gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     shards.sort();
     for shard in &shards {
