@@ -66,6 +66,7 @@ fn base_spec() -> LoadSpec {
         pid: None,
         identity: None,
         text_encoder: None,
+        offload_policy: Default::default(),
     }
 }
 

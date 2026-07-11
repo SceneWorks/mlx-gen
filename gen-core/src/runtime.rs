@@ -53,6 +53,24 @@ pub enum Precision {
     Fp32,
 }
 
+/// Component-residency policy across a generation (epic 10834). `Resident` (the default) keeps every
+/// component — text encoder(s), DiT/UNet, VAE — co-resident for the whole job and across jobs via the
+/// worker's warm generator cache; peak unified-memory use is the SUM of the components. `Sequential`
+/// loads → uses → drops each component in phase order (encode → denoise → decode) so peak allocation
+/// is bounded to the largest single component instead of the sum, at the cost of reloading a dropped
+/// component on the next job. The worker selects `Sequential` via its unified-memory fit-gate only
+/// when the full set won't fit but the largest single component will. A provider that has not
+/// implemented staged loading MAY treat `Sequential` as `Resident` — correctness-preserving, just no
+/// memory saving — so the policy is advisory, never a hard requirement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OffloadPolicy {
+    /// All components co-resident for the whole job (today's behavior).
+    #[default]
+    Resident,
+    /// Drop each component after its phase to bound peak to the largest single component.
+    Sequential,
+}
+
 /// How to load a model. `weights` is required; everything else defaults to dense bf16. The
 /// device is the process-default Metal GPU — the crate runs single-device (the MLX default
 /// device is not thread-safe; the worker serializes jobs per thread).
@@ -106,6 +124,11 @@ pub struct LoadSpec {
     /// (`LTX_GEMMA_DIR`, else `<root>/text_encoder`). Backend-neutral (just a path), so a caller can
     /// drive the TE location through the spec instead of a process-global env var.
     pub text_encoder: Option<WeightsSource>,
+    /// Component-residency policy for this load (epic 10834, sc-10836). Defaults to
+    /// [`OffloadPolicy::Resident`] — all components co-resident, today's behavior. Set via
+    /// [`with_offload_policy`](Self::with_offload_policy); see the enum docs. Providers that have not
+    /// implemented staged loading treat `Sequential` as `Resident`.
+    pub offload_policy: OffloadPolicy,
 }
 
 /// Where the optional PiD decoder's weights come from (epic 7840). A PiD decoder is tied to a
@@ -152,6 +175,7 @@ impl LoadSpec {
             pid: None,
             identity: None,
             text_encoder: None,
+            offload_policy: OffloadPolicy::Resident,
         }
     }
 
@@ -193,6 +217,13 @@ impl LoadSpec {
     /// [`crate::GenerationRequest::use_pid`] flag then selects it at decode.
     pub fn with_pid(mut self, checkpoint: WeightsSource, gemma: WeightsSource) -> Self {
         self.pid = Some(PidWeights { checkpoint, gemma });
+        self
+    }
+
+    /// Builder-style component-residency policy (epic 10834, sc-10836). See [`OffloadPolicy`];
+    /// defaults to [`OffloadPolicy::Resident`] (all components co-resident).
+    pub fn with_offload_policy(mut self, policy: OffloadPolicy) -> Self {
+        self.offload_policy = policy;
         self
     }
 }

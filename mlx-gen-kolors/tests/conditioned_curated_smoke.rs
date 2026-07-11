@@ -109,6 +109,7 @@ fn spec(base: PathBuf, control: Option<PathBuf>, ip: Option<PathBuf>) -> LoadSpe
         pid: None,
         identity: None,
         text_encoder: None,
+        offload_policy: Default::default(),
     }
 }
 

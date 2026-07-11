@@ -773,6 +773,7 @@ mod tests {
             pid: None,
             identity: None,
             text_encoder: None,
+            offload_policy: Default::default(),
         };
         let err = match mlx_gen::load("kolors", &spec) {
             Ok(_) => panic!("bogus weights dir must fail to load"),

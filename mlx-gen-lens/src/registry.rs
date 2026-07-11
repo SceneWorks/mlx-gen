@@ -376,6 +376,7 @@ mod tests {
                 pid: None,
                 identity: None,
                 text_encoder: None,
+                offload_policy: Default::default(),
             };
             let err = match mlx_gen::load(id, &spec) {
                 Ok(_) => panic!("bogus weights dir must fail to load"),
@@ -401,6 +402,7 @@ mod tests {
             pid: None,
             identity: None,
             text_encoder: None,
+            offload_policy: Default::default(),
         };
         // A ControlNet overlay is rejected (not part of the Lens port) — the message names it, before
         // any weights load.
