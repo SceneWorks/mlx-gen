@@ -381,13 +381,19 @@ impl BooguPipeline {
         // negated); only the renoise convention differs (the curated solver re-noises, the native loop
         // flow-blends). Unset (the default) is the native DMD student loop, byte-exact below.
         if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
+            // F-093 / sc-11122: a scheduler-only request (sampler unset) must NOT fall through to
+            // `run_flow_sampler`'s `None → Euler` mapping — the deterministic solver `descriptor_turbo`
+            // deliberately excludes as out-of-regime for the DMD student (sc-7491). Default the sampler to
+            // `lcm`, the surveyed closest match (the curated few-step default), so the curated branch never
+            // resolves to Euler on Turbo.
+            let sampler = turbo_curated_sampler(opts.sampler.as_deref());
             let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
             // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
             // scheduler re-shape over the same σ span.
             let sigmas = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
             let lat = run_flow_sampler(
-                opts.sampler.as_deref(),
+                Some(sampler),
                 TimestepConvention::OneMinusSigma,
                 &sigmas,
                 lat,
@@ -521,6 +527,10 @@ impl BooguPipeline {
         // is the F-093 / sc-11122 fix: the default img2img request now renders on the same native DMD
         // solver as t2i instead of the excluded Euler.
         if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
+            // F-093 / sc-11122: mirror the t2i split — a scheduler-only request (sampler unset) defaults
+            // to `lcm` (the surveyed curated few-step default) so the curated branch never falls through
+            // to `run_flow_sampler`'s excluded `None → Euler` deterministic solver on Turbo.
+            let sampler = turbo_curated_sampler(opts.sampler.as_deref());
             // The Turbo grid is linear in clean-fraction (no logistic shift), so the curated scheduler
             // re-shape uses `mu = 0` over the same σ span as the native DMD loop.
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
@@ -529,7 +539,7 @@ impl BooguPipeline {
             let lat = add_noise_by_interpolation(&clean, &noise, full[start])?;
             let sigmas = &full[start..];
             let lat = run_flow_sampler(
-                opts.sampler.as_deref(),
+                Some(sampler),
                 TimestepConvention::OneMinusSigma,
                 sigmas,
                 lat,
@@ -895,6 +905,21 @@ pub(crate) fn turbo_uses_curated(sampler: Option<&str>, scheduler: Option<&str>)
     sampler.is_some() || scheduler.is_some()
 }
 
+/// The curated sampler to feed [`run_flow_sampler`] once a request has already routed into the curated
+/// branch ([`turbo_uses_curated`]). A scheduler-only request (sampler unset) would otherwise pass `None`
+/// to `run_flow_sampler`, whose `None → Euler` mapping is the deterministic solver `descriptor_turbo`
+/// deliberately excludes as out-of-regime for the few-step DMD student (sc-7491). Default it instead to
+/// `lcm` — the surveyed closest match (the curated few-step default per [`TURBO_SAMPLERS`]) — so the
+/// curated branch never falls through to Euler on Turbo. This is the F-093 / sc-11122 fix.
+pub(crate) fn turbo_curated_sampler(sampler: Option<&str>) -> &str {
+    sampler.unwrap_or(TURBO_CURATED_DEFAULT_SAMPLER)
+}
+
+/// The curated few-step default sampler for the Turbo DMD student: `lcm` (sc-7491's surveyed closest
+/// match to the re-noised distillation regime). Used when a Turbo request selects a scheduler without a
+/// sampler so the curated branch resolves to `lcm` rather than the excluded Euler.
+pub(crate) const TURBO_CURATED_DEFAULT_SAMPLER: &str = "lcm";
+
 /// The Base/Edit static-shift `mu` — `lin_mu(SEQ_LEN) = 1.15` for the saturated `seq_len = 4096` (the
 /// snapshot's `time_shift_version="v1"` static config). Fed to the epic 7114 scheduler axis so a curated
 /// `normal` / `sgm_uniform` / … schedule re-shapes σ over the SAME shift the native schedule uses.
@@ -983,6 +1008,48 @@ mod tests {
             Some("euler_ancestral"),
             Some("sgm_uniform")
         ));
+    }
+
+    /// F-093 / sc-11122 (the adversarial-review follow-up): once a request has routed into the curated
+    /// branch, the sampler fed to `run_flow_sampler` must never be `None` — `None → Euler` is the
+    /// deterministic solver `descriptor_turbo` deliberately excludes (sc-7491). A **scheduler-only**
+    /// Turbo request (sampler unset, scheduler set) is exactly the case that used to fall through to
+    /// Euler on both t2i and img2img; it must now default to `lcm`, the surveyed curated few-step
+    /// default. This test is the guard against re-introducing the Euler fall-through.
+    #[test]
+    fn turbo_scheduler_only_request_defaults_to_lcm_not_euler() {
+        // The curated default is `lcm` and is an advertised Turbo sampler (not the excluded Euler).
+        assert_eq!(TURBO_CURATED_DEFAULT_SAMPLER, "lcm");
+        assert!(crate::model::descriptor_turbo()
+            .capabilities
+            .samplers
+            .contains(&TURBO_CURATED_DEFAULT_SAMPLER));
+
+        // Scheduler-only (sampler=None): both the t2i and img2img curated branches resolve the sampler
+        // via `turbo_curated_sampler` — it must default to `lcm`, never `None` (→ Euler) and never
+        // `euler`/`ddim`/... .
+        for scheduler in ["sgm_uniform", "normal", "karras"] {
+            assert!(
+                turbo_uses_curated(None, Some(scheduler)),
+                "a scheduler-only request still routes into the curated framework"
+            );
+            let resolved = turbo_curated_sampler(None);
+            assert_eq!(
+                resolved, "lcm",
+                "scheduler-only ({scheduler}) must default the sampler to lcm, not fall through to Euler"
+            );
+            assert_ne!(
+                resolved, "euler",
+                "must never resolve to the excluded Euler solver"
+            );
+        }
+
+        // An explicit sampler is preserved (the default only fills an unset sampler).
+        assert_eq!(
+            turbo_curated_sampler(Some("euler_ancestral")),
+            "euler_ancestral"
+        );
+        assert_eq!(turbo_curated_sampler(Some("dpmpp_sde")), "dpmpp_sde");
     }
 
     /// The native DMD img2img loop seeds the blended reference at the SAME noise level the curated
