@@ -380,7 +380,7 @@ impl BooguPipeline {
         // to the native loop (`x0 = x + (1−c)·v`, the OneMinusSigma flow denoise with the velocity
         // negated); only the renoise convention differs (the curated solver re-noises, the native loop
         // flow-blends). Unset (the default) is the native DMD student loop, byte-exact below.
-        if opts.sampler.is_some() || opts.scheduler.is_some() {
+        if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
             let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
             // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
@@ -407,16 +407,54 @@ impl BooguPipeline {
             return self.decode_latents(&lat, decoder);
         }
 
-        let mut lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let lat = self.denoise_turbo_native(
+            &cond,
+            &mask,
+            lat,
+            &sigmas,
+            0,
+            opts.height,
+            opts.width,
+            opts.seed,
+            cancel,
+            on_progress,
+        )?;
 
-        for i in 0..opts.steps {
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
+    /// The native DMD student few-step loop, shared by the Turbo t2i and img2img default paths so the
+    /// two never diverge (F-093 / sc-11122: the img2img path used to fall through to the excluded
+    /// deterministic Euler solver). Runs `sigmas[start..]` (clean-fraction ascending): each step
+    /// predicts the clean estimate `x += (1 − σ)·v` (f32), then — except on the final entry — renoises
+    /// to the next level `x = (1 − σ_next)·noise + σ_next·x` with fresh per-step noise. `lat` is the
+    /// already-seeded start latent (pure noise for t2i, the noise-blended reference for img2img);
+    /// progress streams over the `sigmas.len() − start` steps and cancellation is honored per step.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_turbo_native(
+        &self,
+        cond: &Array,
+        mask: &Array,
+        mut lat: Array,
+        sigmas: &[f32],
+        start: usize,
+        height: u32,
+        width: u32,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let total = (sigmas.len() - start) as u32;
+        for i in start..sigmas.len() {
             if cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
             let sigma = sigmas[i];
             let t = Array::from_slice(&[sigma], &[1]);
-            let pred = self.dit.forward(&lat, &t, &cond, &mask)?;
+            let pred = self.dit.forward(&lat, &t, cond, mask)?;
             // Predict (clean estimate): x += (1 − sigma)·v, in f32.
             lat = add(
                 &lat.as_dtype(Dtype::Float32)?,
@@ -426,9 +464,9 @@ impl BooguPipeline {
                 )?,
             )?;
             // Renoise to the next sigma level with fresh noise (all but the final step).
-            if i + 1 < opts.steps {
+            if i + 1 < sigmas.len() {
                 let sigma_next = sigmas[i + 1];
-                let noise = init_noise(opts.height, opts.width, opts.seed, (i + 1) as u64)?;
+                let noise = init_noise(height, width, seed, (i + 1) as u64)?;
                 lat = add(
                     &multiply(&noise, Array::from_f32(1.0 - sigma_next))?,
                     &multiply(&lat, Array::from_f32(sigma_next))?,
@@ -436,13 +474,11 @@ impl BooguPipeline {
             }
             eval([&lat])?;
             on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total: opts.steps as u32,
+                current: (i - start + 1) as u32,
+                total,
             });
         }
-
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        Ok(lat)
     }
 
     /// **img2img latent-init on the Turbo (DMD few-step, CFG-free) path** (epic 8588 A4.3, sc-10191).
@@ -471,34 +507,66 @@ impl BooguPipeline {
         let cond = self.te.last_hidden(&ids, &mask)?;
 
         // Reference → clean latent [1, 16, H/8, W/8] at the output resolution (same VAE space as
-        // `init_noise`). The Turbo grid is linear in clean-fraction (no logistic shift), so the curated
-        // scheduler re-shape uses `mu = 0` over the same σ span as the native DMD loop.
+        // `init_noise`).
         let clean = self
             .vae
             .encode(&preprocess_init_image(init, opts.width, opts.height)?)?;
         let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
-        let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
-        let full = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
-        let start = start_step.min(full.len().saturating_sub(1));
-        let lat = add_noise_by_interpolation(&clean, &noise, full[start])?;
-        let sigmas = &full[start..];
 
-        let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
-            sigmas,
+        // Curated sampler axis (epic 7114 sc-7491), mirroring the Turbo t2i split: a selected
+        // sampler/scheduler routes the img2img few-step denoise through the unified framework over the
+        // DMD σ grid's noise-fraction view. **Unset (the default) is the native DMD student loop** — NOT
+        // a fall-through to `run_flow_sampler`, whose `None → Euler` mapping is the deterministic solver
+        // `descriptor_turbo` deliberately excludes as out-of-regime for this DMD student (sc-7491). This
+        // is the F-093 / sc-11122 fix: the default img2img request now renders on the same native DMD
+        // solver as t2i instead of the excluded Euler.
+        if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
+            // The Turbo grid is linear in clean-fraction (no logistic shift), so the curated scheduler
+            // re-shape uses `mu = 0` over the same σ span as the native DMD loop.
+            let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
+            let full = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
+            let start = start_step.min(full.len().saturating_sub(1));
+            let lat = add_noise_by_interpolation(&clean, &noise, full[start])?;
+            let sigmas = &full[start..];
+            let lat = run_flow_sampler(
+                opts.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                sigmas,
+                lat,
+                opts.seed,
+                cancel,
+                on_progress,
+                |x, timestep| {
+                    let t = Array::from_slice(&[timestep], &[1]);
+                    let v = self.dit.forward(x, &t, &cond, &mask)?;
+                    Ok(multiply(
+                        &v.as_dtype(Dtype::Float32)?,
+                        Array::from_f32(-1.0),
+                    )?)
+                },
+            )?;
+            on_progress(Progress::Decoding);
+            return self.decode_latents(&lat, decoder);
+        }
+
+        // Native DMD student loop seeded from the noise-blended reference. `sigmas` is clean-fraction
+        // ascending ([`dmd_sigmas`]); at start clean-fraction `c_k` the noise-fraction is `1 − c_k`, so
+        // the blend `(1 − c_k)·noise + c_k·clean` matches the curated path's `add_noise_by_interpolation`
+        // seed byte-for-byte (`turbo_native_sigmas[k] = 1 − c_k`). `start` is clamped to leave ≥1 step.
+        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let start = start_step.min(sigmas.len().saturating_sub(1));
+        let lat = add_noise_by_interpolation(&clean, &noise, 1.0 - sigmas[start])?;
+        let lat = self.denoise_turbo_native(
+            &cond,
+            &mask,
             lat,
+            &sigmas,
+            start,
+            opts.height,
+            opts.width,
             opts.seed,
             cancel,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let v = self.dit.forward(x, &t, &cond, &mask)?;
-                Ok(multiply(
-                    &v.as_dtype(Dtype::Float32)?,
-                    Array::from_f32(-1.0),
-                )?)
-            },
         )?;
 
         on_progress(Progress::Decoding);
@@ -816,6 +884,17 @@ fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
     s
 }
 
+/// Whether a Turbo request selects the curated unified-sampler framework (epic 7114): true when a
+/// sampler **or** a scheduler name is set. `false` — the default — is the native DMD student loop
+/// (predict → flow-renoise), the byte-exact baseline. Shared by the Turbo t2i **and** img2img paths so
+/// neither silently falls through to `run_flow_sampler`, whose `None → Euler` mapping is the
+/// deterministic solver `descriptor_turbo` deliberately excludes as out-of-regime for the few-step DMD
+/// student (sc-7491). This shared predicate is the F-093 / sc-11122 guard: the img2img path used to
+/// route the default request straight through Euler.
+pub(crate) fn turbo_uses_curated(sampler: Option<&str>, scheduler: Option<&str>) -> bool {
+    sampler.is_some() || scheduler.is_some()
+}
+
 /// The Base/Edit static-shift `mu` — `lin_mu(SEQ_LEN) = 1.15` for the saturated `seq_len = 4096` (the
 /// snapshot's `time_shift_version="v1"` static config). Fed to the epic 7114 scheduler axis so a curated
 /// `normal` / `sgm_uniform` / … schedule re-shapes σ over the SAME shift the native schedule uses.
@@ -873,4 +952,72 @@ fn time_shift_v1(t: f64, mu: f64) -> f64 {
     let num = mu.exp();
     let denom = num + (1.0 / t1 - 1.0);
     1.0 - num / denom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// F-093 / sc-11122: the default Turbo request (no sampler, no scheduler) must select the native
+    /// DMD student loop on BOTH the t2i and img2img paths — never fall through to `run_flow_sampler`,
+    /// whose `None → Euler` mapping is the deterministic solver `descriptor_turbo` deliberately
+    /// excludes as out-of-regime for the few-step DMD student (sc-7491). A curated sampler OR scheduler
+    /// still routes to the unified framework.
+    #[test]
+    fn turbo_default_request_selects_native_dmd_not_curated_euler() {
+        let default = TurboOptions::default();
+        assert!(
+            default.sampler.is_none() && default.scheduler.is_none(),
+            "the Turbo default must be sampler/scheduler-unset"
+        );
+        // The default (img2img OR t2i) takes the native DMD branch, not the curated Euler runner.
+        assert!(!turbo_uses_curated(
+            default.sampler.as_deref(),
+            default.scheduler.as_deref()
+        ));
+        // A curated sampler routes to the unified framework.
+        assert!(turbo_uses_curated(Some("lcm"), None));
+        // A curated scheduler alone (the ComfyUI lcm/sgm_uniform combo half) also routes to it.
+        assert!(turbo_uses_curated(None, Some("sgm_uniform")));
+        assert!(turbo_uses_curated(
+            Some("euler_ancestral"),
+            Some("sgm_uniform")
+        ));
+    }
+
+    /// The native DMD img2img loop seeds the blended reference at the SAME noise level the curated
+    /// path uses, so moving the default request off the excluded Euler solver does not shift the
+    /// img2img start point: native clean-fraction `c_k` → noise-fraction `1 − c_k`, which equals the
+    /// curated `turbo_native_sigmas[k]` fed to `add_noise_by_interpolation`. F-093 / sc-11122.
+    #[test]
+    fn turbo_img2img_native_seed_matches_curated_blend() {
+        let (cs, steps) = (DEFAULT_TURBO_SIGMA_TEST, 4usize);
+        let clean = dmd_sigmas(cs, steps); // native clean-fraction, ascending, len == steps
+        let curated = turbo_native_sigmas(cs, steps); // noise-fraction, len == steps + 1 (trailing 0)
+        assert_eq!(clean.len(), steps);
+        assert_eq!(curated.len(), steps + 1);
+        for k in 0..steps {
+            assert!(
+                (1.0 - clean[k] - curated[k]).abs() < 1e-6,
+                "native seed noise-fraction (1 − c_{k}) must equal curated turbo_native_sigmas[{k}]"
+            );
+        }
+    }
+
+    /// The DMD clean-fraction grid is `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` — `steps`
+    /// ascending values starting at `conditioning_sigma`, strictly increasing toward (but excluding)
+    /// `1.0`. Guards the native img2img loop's `start`-clamp assumption (`sigmas.len() == steps`).
+    #[test]
+    fn dmd_sigmas_are_ascending_clean_fractions() {
+        let steps = 6usize;
+        let s = dmd_sigmas(DEFAULT_TURBO_SIGMA_TEST, steps);
+        assert_eq!(s.len(), steps);
+        assert!((s[0] - DEFAULT_TURBO_SIGMA_TEST).abs() < 1e-6);
+        for w in s.windows(2) {
+            assert!(w[1] > w[0], "clean-fraction sigmas must ascend");
+        }
+        assert!(*s.last().unwrap() < 1.0, "the trailing 1.0 is excluded");
+    }
+
+    const DEFAULT_TURBO_SIGMA_TEST: f32 = 0.001;
 }
