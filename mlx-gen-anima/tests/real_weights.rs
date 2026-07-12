@@ -369,6 +369,7 @@ fn generate_all_three_variants_1024() {
             guidance: variant.default_guidance(),
             seed: 42,
             sampler: None,
+            scheduler: None,
         };
         let cancel = CancelFlag::default();
         let mut prog = |_p: Progress| {};
@@ -397,6 +398,7 @@ fn generate_all_three_variants_1024() {
                     guidance: variant.default_guidance(),
                     seed: 42,
                     sampler: None,
+                    scheduler: None,
                 }
             };
             let img_e = pipeline
@@ -712,6 +714,7 @@ fn prompt_weighting_both_directions_and_image() {
         guidance: Variant::Turbo.default_guidance(),
         seed: 42,
         sampler: None,
+        scheduler: None,
     };
     let cancel = CancelFlag::default();
     let mut prog = |_p: Progress| {};

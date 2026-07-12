@@ -364,6 +364,7 @@ fn base_plus_turbo_lora_generates_coherent_image() {
         guidance: 1.0,
         seed: 42,
         sampler: None,
+        scheduler: None,
     };
     let cancel = CancelFlag::default();
     let mut prog = |_p: Progress| {};

@@ -9,7 +9,9 @@ use mlx_gen::adapters::loader::ApplyReport;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
-use mlx_gen::{run_flow_sampler, Progress, Result, TimestepConvention, WeightsSource};
+use mlx_gen::{
+    resolve_flow_schedule, run_flow_sampler, Progress, Result, TimestepConvention, WeightsSource,
+};
 
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
@@ -44,6 +46,22 @@ pub fn anima_sigmas(steps: usize) -> Vec<f32> {
     sigmas
 }
 
+/// Resolve the Anima σ schedule, honoring a per-generation curated `scheduler` name (epic 7114
+/// scheduler axis, sc-11123 / F-115). The engine advertises the full curated scheduler menu, so this
+/// threads `req.scheduler` into the σ-schedule construction instead of ignoring it:
+///
+/// - `None`, an unknown, or a native-aliased name (`linear` / `flow_match_euler`) returns
+///   [`anima_sigmas`] **byte-for-byte** — the N1 default-parity guarantee (never hard-fail a
+///   generation over a scheduling knob; the shared floor already rejects any non-curated name).
+/// - A curated name (`karras` / `simple` / `beta` / `beta57` / …) re-shapes σ over the SAME static
+///   `shift=3.0` (`mu = ln(3)`), so a schedule stays consistent with Anima's time-shift rather than
+///   degrading to a linear σ ramp. The scheduler picks WHERE the steps land; `req.sampler` still picks
+///   the integrator.
+pub fn anima_schedule(scheduler: Option<&str>, steps: usize) -> Vec<f32> {
+    let native = anima_sigmas(steps);
+    resolve_flow_schedule(scheduler, SIGMA_SHIFT.ln(), steps, &native)
+}
+
 /// Seeded initial latent noise `[1, 16, 1, H/8, W/8]` (f32 standard normal), the 5-D Cosmos latent.
 fn create_noise(seed: u64, width: u32, height: u32) -> Result<Array> {
     let key = random::key(seed)?;
@@ -66,6 +84,9 @@ pub struct GenOptions {
     pub seed: u64,
     /// Curated sampler name; `None` ⇒ [`DEFAULT_SAMPLER`].
     pub sampler: Option<String>,
+    /// Curated scheduler name (epic 7114 scheduler axis); `None` ⇒ the native [`anima_sigmas`]
+    /// schedule. Resolved via [`anima_schedule`].
+    pub scheduler: Option<String>,
 }
 
 /// The assembled Anima pipeline.
@@ -161,6 +182,7 @@ impl AnimaPipeline {
             opts.steps,
             opts.guidance,
             sampler,
+            opts.scheduler.as_deref(),
             opts.seed,
             Dtype::Bfloat16,
             cancel,
@@ -186,6 +208,7 @@ impl AnimaPipeline {
         steps: usize,
         guidance: f32,
         sampler: &str,
+        scheduler: Option<&str>,
         seed: u64,
         dtype: Dtype,
         cancel: &CancelFlag,
@@ -204,6 +227,7 @@ impl AnimaPipeline {
             steps,
             guidance,
             sampler,
+            scheduler,
             seed,
             dtype,
             cancel,
@@ -225,12 +249,13 @@ impl AnimaPipeline {
         steps: usize,
         guidance: f32,
         sampler: &str,
+        scheduler: Option<&str>,
         seed: u64,
         dit_dtype: Dtype,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Array> {
-        let sigmas = anima_sigmas(steps);
+        let sigmas = anima_schedule(scheduler, steps);
         let guidance = Array::from_slice(&[guidance], &[1]);
         let dit = &self.components.dit;
         let predict = |x: &Array, sigma: f32| -> Result<Array> {
@@ -278,8 +303,9 @@ impl AnimaPipeline {
     ) -> Result<Array> {
         let cancel = CancelFlag::default();
         let mut prog = |_p: Progress| {};
+        // Parity hook: native schedule (scheduler = None) so the injected-init trajectory is byte-exact.
         self.denoise_loop(
-            init, cond, uncond, steps, guidance, sampler, 0, dit_dtype, &cancel, &mut prog,
+            init, cond, uncond, steps, guidance, sampler, None, 0, dit_dtype, &cancel, &mut prog,
         )
     }
 
@@ -303,8 +329,10 @@ impl AnimaPipeline {
     ) -> Result<Array> {
         let cancel = CancelFlag::default();
         let mut prog = |_p: Progress| {};
+        // Parity hook: native schedule (scheduler = None) so the injected-init trajectory is byte-exact.
         self.denoise(
-            init, prompt, negative, variant, steps, guidance, sampler, 0, dtype, &cancel, &mut prog,
+            init, prompt, negative, variant, steps, guidance, sampler, None, 0, dtype, &cancel,
+            &mut prog,
         )
     }
 
@@ -541,5 +569,72 @@ mod tests {
         assert_eq!(anima_sigmas(10).len(), 11);
         assert_eq!(anima_sigmas(30).len(), 31);
         assert_eq!(anima_sigmas(1), vec![1.0, 0.0]); // shift(1.0)=1.0
+    }
+
+    // ----- sc-11123 / F-115: req.scheduler is wired into the σ schedule (was advertised-but-inert) -----
+
+    /// The default path (`scheduler == None`) MUST return the native [`anima_sigmas`] schedule
+    /// **byte-for-byte** — the epic-7114 N1 default-parity guarantee. Any drift here would silently
+    /// change every existing (scheduler-less) Anima generation.
+    #[test]
+    fn schedule_default_none_is_native_byte_for_byte() {
+        for steps in [1usize, 4, 10, 30] {
+            assert_eq!(
+                anima_schedule(None, steps),
+                anima_sigmas(steps),
+                "scheduler=None must equal the native schedule byte-for-byte (steps={steps})"
+            );
+        }
+    }
+
+    /// An unknown name or a native alias falls back to the native schedule (N3 — never hard-fail a
+    /// generation over a scheduling knob; the shared capability floor already rejects non-curated names
+    /// before we get here, so this is defense-in-depth for aliases).
+    #[test]
+    fn schedule_unknown_and_native_aliases_fall_back_to_native() {
+        let native = anima_sigmas(10);
+        for name in ["", "not_a_scheduler", "linear", "flow_match_euler"] {
+            assert_eq!(
+                anima_schedule(Some(name), 10),
+                native,
+                "unknown/native-aliased scheduler {name:?} must fall back to native"
+            );
+        }
+    }
+
+    /// EVERY advertised curated scheduler must produce a valid descending σ schedule terminating in
+    /// `0.0` — proving `req.scheduler` is actually consumed, not dropped. This is the exact
+    /// `curated_scheduler_names()` menu the descriptor advertises (F-115: advertised == honored).
+    #[test]
+    fn schedule_every_advertised_scheduler_is_valid() {
+        for name in mlx_gen::curated_scheduler_names() {
+            let s = anima_schedule(Some(name), 10);
+            assert!(s.len() >= 2, "{name}: schedule too short ({})", s.len());
+            assert_eq!(*s.last().unwrap(), 0.0, "{name}: must terminate at 0.0");
+            // Strictly descending (a valid flow schedule).
+            for w in s.windows(2) {
+                assert!(w[0] > w[1], "{name}: not descending: {} !> {}", w[0], w[1]);
+            }
+        }
+    }
+
+    /// The structurally-distinct curated schedulers (they re-distribute where the steps land) MUST
+    /// change the schedule vs the native default — the load-bearing proof that the wiring is live and
+    /// not a silent fallback. `karras`/`exponential`/`beta`/`beta57`/`ddim_uniform` are the ones that
+    /// visibly diverge from Anima's `linspace(1,1/N,N)`-through-shift ramp; `normal`/`sgm_uniform`/
+    /// `simple` can nearly coincide with it, so they are not asserted to differ (only to be valid,
+    /// above).
+    #[test]
+    fn schedule_distinct_schedulers_differ_from_native() {
+        let native = anima_sigmas(10);
+        for name in ["karras", "exponential", "beta", "beta57", "ddim_uniform"] {
+            let s = anima_schedule(Some(name), 10);
+            let differs =
+                s.len() != native.len() || s.iter().zip(&native).any(|(a, b)| (a - b).abs() > 1e-4);
+            assert!(
+                differs,
+                "{name}: must re-shape the schedule vs native (req.scheduler ignored?)"
+            );
+        }
     }
 }

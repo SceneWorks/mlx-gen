@@ -352,6 +352,7 @@ fn packed_q4_plus_style_lora_generates_a_visibly_restyled_image() {
         guidance: 4.5,
         seed: 42,
         sampler: None,
+        scheduler: None,
     };
     let prompt =
         "masterpiece, best quality, score_7, safe, 1girl, silver hair, castle, dramatic lighting";

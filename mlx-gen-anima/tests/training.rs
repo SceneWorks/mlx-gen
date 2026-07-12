@@ -219,6 +219,7 @@ fn generate(
         guidance: 4.5,
         seed,
         sampler: None,
+        scheduler: None,
     };
     let cancel = CancelFlag::default();
     let mut noop = |_p: Progress| {};

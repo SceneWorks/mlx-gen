@@ -158,6 +158,10 @@ impl Anima {
                 guidance,
                 seed: base_seed.wrapping_add(n as u64),
                 sampler: req.sampler.clone(),
+                // Epic 7114 scheduler axis (sc-11123 / F-115): honor the advertised curated schedulers
+                // instead of ignoring req.scheduler. The shared floor already validated the name against
+                // curated_scheduler_names(); anima_schedule resolves it → σ (None ⇒ native schedule).
+                scheduler: req.scheduler.clone(),
             };
             let img = self.pipeline.generate(
                 &req.prompt,
