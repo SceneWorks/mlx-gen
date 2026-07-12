@@ -142,58 +142,58 @@ impl QwenEditHeavyOwned {
 /// and whose VAE is all-conv (no `to_quantized` leaves). So the VL encoder and VAE stay bf16,
 /// matching the fork (sc-2565).
 ///
-/// Component residency (epic 10834 Phase 1, sc-11006): `Resident` (default) builds every heavy
-/// component now via [`load_components`] and holds it warm; `Sequential` keeps only the spec and
-/// re-loads per generate in phase order (VL-encode → drop the VL encoder → dual-latent/denoise/decode)
-/// to bound peak memory to `max(VL-encoder, DiT+VAE)`. Both use the same per-phase loaders, so the
-/// components are byte-identical.
+/// Component residency (epic 10834 Phase 1, sc-11006; hoisted to the shared [`Residency::from_policy`]
+/// seam in sc-11126, F-180): `Resident` (default) builds every heavy component now via
+/// [`build_residency`] and holds it warm; `Sequential` keeps only the spec and re-loads per generate in
+/// phase order (VL-encode → drop the VL encoder → dual-latent/denoise/decode) to bound peak memory to
+/// `max(VL-encoder, DiT+VAE)`. Both use the same per-phase loaders, so the components are
+/// byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, processor, residency) = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let c = load_components(spec)?;
-            (
-                c.tokenizer,
-                c.processor,
-                Residency::resident(
-                    c.vl_encoder,
-                    QwenEditHeavyOwned {
-                        transformer: c.transformer,
-                        vae: c.vae,
-                        pid: c.pid,
-                    },
-                ),
-            )
+    // Resolve the snapshot dir up front — fail-fast for BOTH policies — then the always-warm
+    // tokenizer/processor, then the shared [`build_residency`] dispatch.
+    let root = resolve_root(spec)?;
+    // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate. An
+    // already-packed turnkey loads packed (no re-quant); `Resident` quantizes once. So warn only for
+    // the Sequential-over-dense combination that actually pays the repeated cost.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+        {
+            mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
-        OffloadPolicy::Sequential => {
-            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
-            // build is deferred to each generate via the loader closures below.
-            let root = resolve_root(spec)?;
-            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
-            if let Some(q) = spec.quantize {
-                if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
-                    mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
-                }
-            }
-            let tokenizer = loader::load_tokenizer(root)?;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            let residency = Residency::sequential(
-                move || load_vl_encoder_only(resolve_root(&spec_text)?),
-                move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
-            );
-            (tokenizer, QwenImageProcessor::default(), residency)
-        }
-    };
+    }
+    let tokenizer = loader::load_tokenizer(root)?;
     Ok(Box::new(QwenImageEdit {
         descriptor: descriptor(),
         tokenizer,
-        processor,
-        residency,
+        processor: QwenImageProcessor::default(),
+        residency: build_residency(spec)?,
     }))
 }
 
+/// The policy→[`Residency`] dispatch, routed through the single [`Residency::from_policy`] seam
+/// (sc-11006; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in one
+/// place rather than a bespoke per-crate copy. `Resident` eager-loads the VL encoder + heavy bundle now
+/// (the heavy loader with `use_pid = true`, loading any PiD overlay once and reusing it); `Sequential`
+/// captures the two per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both
+/// use the same [`load_vl_encoder_only`] / [`load_heavy`], so the `Resident` composition is
+/// byte-identical to the pre-seam one. The deferral is weight-free-testable: under `Sequential` this
+/// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and fail
+/// the "Sequential defers" unit test.
+fn build_residency(
+    spec: &LoadSpec,
+) -> Result<Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_vl_encoder_only(resolve_root(&spec_text)?),
+        move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
+    )
+}
+
 /// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
-/// source), shared by [`load_components`] and the `Sequential` per-phase loaders (sc-11006).
+/// source), shared by [`load`] and [`build_residency`]'s per-phase loaders (sc-11006).
 fn resolve_root(spec: &LoadSpec) -> Result<&Path> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -257,35 +257,6 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHe
         transformer,
         vae,
         pid,
-    })
-}
-
-/// The Qwen-Image-Edit components loaded from a snapshot for the `Resident` path — composed
-/// (sc-11006) from the same per-phase loaders the `Sequential` residency uses, so both build the
-/// identical set.
-struct QwenEditComponents {
-    tokenizer: TextTokenizer,
-    processor: QwenImageProcessor,
-    vl_encoder: QwenVisionLanguageEncoder,
-    transformer: QwenTransformer,
-    vae: QwenVae,
-    pid: Option<PidEngine>,
-}
-
-fn load_components(spec: &LoadSpec) -> Result<QwenEditComponents> {
-    let root = resolve_root(spec)?;
-    let vl_encoder = load_vl_encoder_only(root)?;
-    // Resident loads the PiD overlay unconditionally (loaded once, reused); the per-request `use_pid`
-    // skip (F-177) applies only to the Sequential per-generate loader.
-    let heavy = load_heavy(spec, root, true)?;
-    let tokenizer = loader::load_tokenizer(root)?;
-    Ok(QwenEditComponents {
-        tokenizer,
-        processor: QwenImageProcessor::default(),
-        vl_encoder,
-        transformer: heavy.transformer,
-        vae: heavy.vae,
-        pid: heavy.pid,
     })
 }
 
@@ -705,5 +676,42 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].width, 8);
         assert_eq!(got.last().unwrap().width, 24);
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Edit's dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the up-front
+    // precision/single-file guard in `resolve_root` passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen2.5-VL vision-language encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
+    // default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/qwen-image-edit-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

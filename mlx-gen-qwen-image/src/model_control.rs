@@ -139,63 +139,61 @@ impl QwenControlHeavyOwned {
 /// quantizes both transformers (group_size 64). The text encoder + VAE stay dense (the fork's
 /// transformer-only quant scope — see [`crate::model::load`]).
 ///
-/// Component residency (epic 10834 Phase 1, sc-11006): `Resident` (default) builds every heavy
-/// component now via [`load_components`] and holds it warm; `Sequential` keeps only the spec and
-/// re-loads per generate in phase order (encode → drop the text encoder → denoise/decode) to bound
-/// peak memory to `max(text-encoder, DiT+control+VAE)`. Both use the same per-phase loaders, so the
-/// components are byte-identical.
+/// Component residency (epic 10834 Phase 1, sc-11006; hoisted to the shared [`Residency::from_policy`]
+/// seam in sc-11126, F-180): `Resident` (default) builds every heavy component now via
+/// [`build_residency`] and holds it warm; `Sequential` keeps only the spec and re-loads per generate in
+/// phase order (encode → drop the text encoder → denoise/decode) to bound peak memory to
+/// `max(text-encoder, DiT+control+VAE)`. Both use the same per-phase loaders, so the components are
+/// byte-identical.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let (tokenizer, residency) = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let c = load_components(spec)?;
-            (
-                c.tokenizer,
-                Residency::resident(
-                    c.text_encoder,
-                    QwenControlHeavyOwned {
-                        transformer: c.transformer,
-                        controlnet: c.controlnet,
-                        vae: c.vae,
-                        pid: c.pid,
-                    },
-                ),
-            )
+    // Resolve the base dir + required control checkpoint up front — fail-fast for BOTH policies — then
+    // the always-warm tokenizer, then the shared [`build_residency`] dispatch.
+    let (root, _control) = resolve_base_and_control(spec)?;
+    // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate. An
+    // already-packed turnkey loads packed (no re-quant); `Resident` quantizes once. So warn only for
+    // the Sequential-over-dense combination that actually pays the repeated cost.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+        {
+            mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
-        OffloadPolicy::Sequential => {
-            // Validate precision + base dir + the required control checkpoint up front (fail fast,
-            // same as `Resident`); the heavy build is deferred to each generate via the closures below.
-            let (root, _control) = resolve_base_and_control(spec)?;
-            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
-            if let Some(q) = spec.quantize {
-                if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
-                    mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
-                }
-            }
-            let tokenizer = loader::load_tokenizer(root)?;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            let residency = Residency::sequential(
-                move || {
-                    let (root, _control) = resolve_base_and_control(&spec_text)?;
-                    load_text_encoder_only(root)
-                },
-                move |use_pid| {
-                    let (root, control) = resolve_base_and_control(&spec_heavy)?;
-                    load_heavy(&spec_heavy, root, control, use_pid)
-                },
-            );
-            (tokenizer, residency)
-        }
-    };
+    }
+    let tokenizer = loader::load_tokenizer(root)?;
     Ok(Box::new(QwenImageControl {
         descriptor: descriptor(),
         tokenizer,
-        residency,
+        residency: build_residency(spec)?,
     }))
 }
 
+/// The policy→[`Residency`] dispatch, routed through the single [`Residency::from_policy`] seam
+/// (sc-11006; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in one
+/// place rather than a bespoke per-crate copy. `Resident` eager-loads the text encoder + heavy bundle
+/// now (the heavy loader with `use_pid = true`, loading any PiD overlay once and reusing it);
+/// `Sequential` captures the two per-phase loaders and loads nothing now, deferring each to
+/// [`Residency::run`]. Both use the same [`load_text_encoder_only`] / [`load_heavy`], so the `Resident`
+/// composition is byte-identical to the pre-seam one. The deferral is weight-free-testable: under
+/// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
+/// eager-load and fail the "Sequential defers" unit test.
+fn build_residency(spec: &LoadSpec) -> Result<Residency<QwenTextEncoder, QwenControlHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let (root, _control) = resolve_base_and_control(&spec_text)?;
+            load_text_encoder_only(root)
+        },
+        move |use_pid| {
+            let (root, control) = resolve_base_and_control(&spec_heavy)?;
+            load_heavy(&spec_heavy, root, control, use_pid)
+        },
+    )
+}
+
 /// Precision guard (only dense bf16 is wired) + base-snapshot-dir resolution + the **required**
-/// control-checkpoint resolution, shared by [`load_components`] and the `Sequential` per-phase loaders
+/// control-checkpoint resolution, shared by [`load`] and [`build_residency`]'s per-phase loaders
 /// (sc-11006). Preserves the original message order: a single-file base is rejected first (via
 /// [`require_base_dir`]), then a missing control checkpoint (via [`require_control`]).
 fn resolve_base_and_control(spec: &LoadSpec) -> Result<(&Path, &WeightsSource)> {
@@ -286,35 +284,6 @@ fn load_heavy(
         controlnet,
         vae,
         pid,
-    })
-}
-
-/// The Qwen-Image-Control components loaded from a base snapshot + control checkpoint for the
-/// `Resident` path — composed (sc-11006) from the same per-phase loaders the `Sequential` residency
-/// uses, so both build the identical set.
-struct QwenControlComponents {
-    tokenizer: TextTokenizer,
-    text_encoder: QwenTextEncoder,
-    transformer: QwenTransformer,
-    controlnet: QwenFunControlBranch,
-    vae: QwenVae,
-    pid: Option<PidEngine>,
-}
-
-fn load_components(spec: &LoadSpec) -> Result<QwenControlComponents> {
-    let (root, control) = resolve_base_and_control(spec)?;
-    let text_encoder = load_text_encoder_only(root)?;
-    // Resident loads the PiD overlay unconditionally (loaded once, reused); the per-request `use_pid`
-    // skip (F-177) applies only to the Sequential per-generate loader.
-    let heavy = load_heavy(spec, root, control, true)?;
-    let tokenizer = loader::load_tokenizer(root)?;
-    Ok(QwenControlComponents {
-        tokenizer,
-        text_encoder,
-        transformer: heavy.transformer,
-        controlnet: heavy.controlnet,
-        vae: heavy.vae,
-        pid: heavy.pid,
     })
 }
 
@@ -533,5 +502,48 @@ mod tests {
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Qwen-Image-Control's dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent base snapshot *directory* (with a
+    // control checkpoint present so `resolve_base_and_control`'s up-front precision/single-file/missing-
+    // control guards all pass) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen2.5-VL text encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
+    // default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/qwen-image-control-residency-test-snapshot".into(),
+        ))
+        .with_control(WeightsSource::Dir(
+            "/nonexistent/qwen-image-control-residency-test-control".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file")
+                && !msg.contains("precision override")
+                && !msg.contains("Qwen-Image-2512-Fun-Controlnet-Union"),
+            "expected an eager-load failure, not an up-front guard: {msg}"
+        );
     }
 }

@@ -355,23 +355,60 @@ mod tests {
         assert!(err.contains("snapshot directory"), "got: {err}");
     }
 
+    // ── F-180 (sc-11126): weight-free, default-run proof that the Z-Image BASE dispatch HONORS
+    // `offload_policy`. Upgraded from the sc-11124 smoke test (which pointed a *single File* at both
+    // arms, so both merely hit the shared up-front single-file rejection — an always-`Resident` impl
+    // passed it). This drives the shared `build_residency` seam with a non-existent snapshot
+    // *directory* (so the precision/single-file guard passes) and asserts the real discriminator —
+    // deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the text encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident` — the exact F-172 base regression this
+    // seam fixed) would eager-load under a `Sequential` request and fail the first assertion. The
+    // real-weight A/B in `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by
+    // default. Uses the base's own precision/single-file messages so the guard strings match `load`.
+    const BASE_PRECISION_MSG: &str =
+        "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
+         internally (drop the precision override)";
+    const BASE_FILE_MSG: &str =
+        "z_image expects a snapshot directory (tokenizer/ text_encoder/ transformer/ vae/), \
+         not a single .safetensors file";
+
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        use mlx_gen::WeightsSource;
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/z-image-base-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
     #[test]
-    fn load_honors_sequential_offload_policy() {
-        // F-172 (sc-11124): before the fix the base ignored `offload_policy` and always went
-        // `Resident`. Now `load` routes through the shared `load_residency` seam under either policy —
-        // proven weight-free by the up-front single-file rejection running on the `Sequential` arm too
-        // (a File is not a snapshot dir), exactly as `Resident` rejects it. If `Sequential` were still
-        // dropped on the floor this path would not reach the same validation. Companion of the ignored
-        // real-weight A/B in `tests/sequential_residency_real_weights.rs`.
-        use mlx_gen::{OffloadPolicy, WeightsSource};
-        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
-                .with_offload_policy(policy);
-            let err = load(&spec).err().expect("expected an error").to_string();
-            assert!(
-                err.contains("snapshot directory"),
-                "policy {policy:?} must reach the shared snapshot-dir validation, got: {err}"
-            );
-        }
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = crate::model::build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            BASE_PRECISION_MSG,
+            BASE_FILE_MSG,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = crate::model::build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            BASE_PRECISION_MSG,
+            BASE_FILE_MSG,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

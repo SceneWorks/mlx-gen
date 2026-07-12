@@ -14,8 +14,8 @@
 use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
-    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Residency, Result,
+    Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Precision,
+    Progress, Residency, Result,
 };
 
 use mlx_gen::default_seed;
@@ -97,20 +97,31 @@ impl ControlHeavyOwned {
 /// Raw-trained LoRA/LoKr in `spec.adapters` install onto the base DiT (the branch is never an adapter
 /// target). A `spec.quantize` override is rejected — the pose overlay is dense-only.
 ///
-/// Component residency (epic 10834 Phase 1, sc-11101): `Resident` (default) builds every component now
-/// and holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode
-/// → drop the text phase → denoise/decode). Both use the same per-phase loaders, so the components are
-/// byte-identical. Validity (base dir, control present, no quant, bf16) is checked up front either way.
+/// Component residency (epic 10834 Phase 1, sc-11101; hoisted to the shared [`Residency::from_policy`]
+/// seam in sc-11126, F-180): `Resident` (default) builds every component now and holds it warm;
+/// `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop the text
+/// phase → denoise/decode). Both use the same per-phase loaders, so the components are byte-identical.
+/// Validity (base dir, control present, no quant, bf16) is checked up front either way.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // Fail fast — validate the whole spec up front for BOTH residencies (mirrors the pre-sc-11101 load
     // order): dense bf16, a base snapshot dir, the required control overlay, and no quant override.
+    validate_control_spec(spec)?;
+    Ok(Box::new(KreaTurboControl {
+        descriptor: descriptor(),
+        residency: build_control_residency(spec)?,
+    }))
+}
+
+/// The up-front spec validation shared by [`load`] and [`build_control_residency`] (fail-fast for BOTH
+/// residencies): dense bf16, a base snapshot dir, the required pose overlay, and no quant override.
+fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(format!(
             "{KREA_2_TURBO_CONTROL_ID}: only the default dense bf16 precision is wired (drop the \
              precision override)"
         )));
     }
-    let root = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
+    let _ = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
     if spec.quantize.is_some() {
         return Err(Error::Msg(format!(
@@ -118,43 +129,44 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
              quantization is not supported (drop the quant override, point at a dense snapshot)"
         )));
     }
+    Ok(())
+}
 
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let text = KreaText::from_snapshot(root)?;
-            let heavy = load_control_heavy(spec, root)?;
-            Residency::resident(text, heavy)
-        }
-        OffloadPolicy::Sequential => {
-            // Dense bf16 only (quant is rejected above), so there is no F-181 re-quant concern here.
-            // The pose branch carries no PiD overlay, so the seam's `use_pid` arg is unused.
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            Residency::sequential(
-                move || {
-                    let root = require_base_dir(
-                        &spec_text,
-                        KREA_2_TURBO_CONTROL_ID,
-                        "a base snapshot directory",
-                    )?;
-                    KreaText::from_snapshot(root)
-                },
-                move |_use_pid| {
-                    let root = require_base_dir(
-                        &spec_heavy,
-                        KREA_2_TURBO_CONTROL_ID,
-                        "a base snapshot directory",
-                    )?;
-                    load_control_heavy(&spec_heavy, root)
-                },
-            )
-        }
-    };
-
-    Ok(Box::new(KreaTurboControl {
-        descriptor: descriptor(),
-        residency,
-    }))
+/// The policy→[`Residency`] dispatch, routed through the single [`Residency::from_policy`] seam
+/// (sc-11101; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in one
+/// place rather than a bespoke per-crate copy. `Resident` eager-loads the text phase + heavy bundle now;
+/// `Sequential` captures the two per-phase loaders and loads nothing now, deferring each to
+/// [`Residency::run`]. Both go through the same [`KreaText::from_snapshot`] / [`load_control_heavy`], so
+/// the `Resident` composition is byte-identical to the pre-seam one. Dense bf16 only (quant is rejected
+/// by [`validate_control_spec`]), so there is no F-181 re-quant concern; the pose branch carries no PiD
+/// overlay, so the seam's `use_pid` arg is unused. The deferral is weight-free-testable: under
+/// `Sequential` this touches no component weights, so a dispatch that mapped `Sequential → Resident`
+/// (ignoring `offload_policy`) would eager-load here and fail the "Sequential defers" unit test.
+fn build_control_residency(spec: &LoadSpec) -> Result<Residency<KreaText, ControlHeavyOwned>> {
+    // Up-front fail-fast for both policies (precision + base dir + control present + no quant), so a
+    // direct call (e.g. the F-180 unit test) rejects an invalid spec exactly as `load` does.
+    validate_control_spec(spec)?;
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let root = require_base_dir(
+                &spec_text,
+                KREA_2_TURBO_CONTROL_ID,
+                "a base snapshot directory",
+            )?;
+            KreaText::from_snapshot(root)
+        },
+        move |_use_pid| {
+            let root = require_base_dir(
+                &spec_heavy,
+                KREA_2_TURBO_CONTROL_ID,
+                "a base snapshot directory",
+            )?;
+            load_control_heavy(&spec_heavy, root)
+        },
+    )
 }
 
 /// Load the pose-control heavy phase — the base DiT + VAE ([`KreaHeavy`]), Raw-trained LoRA/LoKr on the
@@ -279,7 +291,7 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::{Conditioning, ControlKind, Modality, Quant, WeightsSource};
+    use mlx_gen::{Conditioning, ControlKind, Modality, OffloadPolicy, Quant, WeightsSource};
 
     #[test]
     fn descriptor_is_krea_2_turbo_control() {
@@ -367,5 +379,51 @@ mod tests {
             kind: ControlKind::Pose,
             scale: Some(0.6),
         };
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Krea-Control's dispatch HONORS
+    // `offload_policy` — not a smoke test. `build_control_residency` points at a non-existent base
+    // snapshot *directory* (with a control overlay present, so the up-front precision/single-file/
+    // missing-control/quant guards all pass). The discriminator is the deferral:
+    //   * `Sequential` must capture the two loaders and touch NO component weights → `Ok`, and the built
+    //     residency is `Sequential` (`is_sequential()`).
+    //   * `Resident` must eager-load the text phase from that non-existent dir → `Err`.
+    // A dispatch that ignored `offload_policy` and always built `Resident` (the F-172 bug class) would
+    // eager-load under a `Sequential` request and turn the first assertion's `Ok` into an `Err` — this
+    // test would fail. The A/B real-weight test is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/krea-control-residency-test-snapshot".into(),
+        ))
+        .with_control(WeightsSource::File(
+            "/nonexistent/krea-control-residency-test-overlay.safetensors".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential residency (the deferred state machine)"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        // A load/IO error, not one of the up-front guards (which this valid Dir+control spec passes).
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file")
+                && !msg.contains("precision override")
+                && !msg.contains("pose control overlay")
+                && !msg.contains("quantization is not supported"),
+            "expected an eager-load failure, got an up-front guard: {msg}"
+        );
     }
 }

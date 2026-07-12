@@ -387,21 +387,54 @@ mod tests {
         assert!(err.contains("base snapshot directory"), "got: {err}");
     }
 
+    // ── F-180 (sc-11126): weight-free, default-run proof that the Z-Image BASE-CONTROL dispatch
+    // HONORS `offload_policy`. Upgraded from the sc-11124 smoke test (which pointed a *single File*
+    // base at both arms, so both merely hit the shared up-front single-file rejection — an
+    // always-`Resident` impl passed it). This drives the shared `build_control_residency` seam with the
+    // base control variant's own `MODEL_ID`/`PRECISION_MSG` past that guard, using a non-existent base
+    // dir + control (so no weights load), and asserts the deferral discriminator:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the text encoder from the missing base dir → `Err`.
+    // A `Sequential → Resident` regression (the exact F-172 bug this seam fixed) would eager-load under
+    // the Sequential request and fail the first assertion. The real-weight A/B in
+    // `tests/sequential_residency_real_weights.rs` is `#[ignore]`d; this runs by default.
+    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/z-image-base-control-residency-test-base".into(),
+        ))
+        .with_control(WeightsSource::File(
+            "/nonexistent/z-image-base-control-residency-test-overlay.safetensors".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
     #[test]
-    fn load_honors_sequential_offload_policy() {
-        // F-172 (sc-11124): the base control variant now shares the Turbo control variant's
-        // `load_control_residency` seam, so `offload_policy` is honored (previously ignored → always
-        // `Resident`). Proven weight-free by the single-file base rejection running on the `Sequential`
-        // arm too, exactly as `Resident` rejects it.
-        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
-            let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
-                .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
-                .with_offload_policy(policy);
-            let err = load(&spec).err().expect("expected an error").to_string();
-            assert!(
-                err.contains("base snapshot directory"),
-                "policy {policy:?} must reach the shared base-dir validation, got: {err}"
-            );
-        }
+    fn build_control_residency_sequential_defers_all_component_loads() {
+        let res = crate::model_control::build_control_residency(
+            &missing_control_spec(OffloadPolicy::Sequential),
+            MODEL_ID,
+            PRECISION_MSG,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) base/control weights");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) control residency"
+        );
+    }
+
+    #[test]
+    fn build_control_residency_resident_eager_loads_and_fails() {
+        let err = crate::model_control::build_control_residency(
+            &missing_control_spec(OffloadPolicy::Resident),
+            MODEL_ID,
+            PRECISION_MSG,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on the missing base snapshot");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }
