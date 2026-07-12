@@ -24,7 +24,7 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     gen_core, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Quant, Result, WeightsSource,
+    OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::concatenate_axis;
@@ -92,33 +92,15 @@ pub struct QwenImageEdit {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
     processor: QwenImageProcessor,
-    /// Component-residency strategy (epic 10834 Phase 1, sc-11006), selected from
-    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the Qwen2.5-VL vision-language encoder,
-    /// the DiT, and the VAE warm; `Sequential` holds only the [`LoadSpec`] and re-loads per generation
-    /// in phase order (VL-encode, then **drop the VL encoder**, then dual-latent/denoise/decode),
-    /// bounding peak unified memory to `max(VL-encoder, DiT+VAE)` — the Qwen2.5-VL encoder ≈16 GB is
-    /// comparable to the DiT.
-    residency: Residency,
-}
-
-/// The heavy-component residency for a [`QwenImageEdit`] (sc-11006). Mirrors [`crate::model`].
-enum Residency {
-    /// Every component loaded once at [`load`] and held (today's warm-cache path). `generate`
-    /// borrows these. Boxed so this heavy variant doesn't bloat every `Sequential` handle
-    /// (`clippy::large_enum_variant`).
-    Resident(Box<ResidentComponents>),
-    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and frees
-    /// them after, so peak memory is `max(VL-encoder, DiT+VAE)` and nothing stays resident across
-    /// jobs. The per-phase loaders rebuild byte-identical components to the `Resident` path.
-    Sequential(Box<LoadSpec>),
-}
-
-/// The Qwen2.5-VL vision-language encoder held resident (the phase-A component dropped first under
-/// `Sequential`), paired with the heavy render bundle. Split so the `Resident` and `Sequential`
-/// paths hand the render body the exact same [`QwenEditHeavy`] borrow.
-struct ResidentComponents {
-    vl_encoder: QwenVisionLanguageEncoder,
-    heavy: QwenEditHeavyOwned,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-11006; hoisted to the shared seam in
+    /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the
+    /// Qwen2.5-VL vision-language encoder, the DiT, and the VAE warm; `Sequential` holds only the
+    /// per-phase loader closures and re-loads per generation in phase order (VL-encode, then **drop
+    /// the VL encoder**, then dual-latent/denoise/decode), bounding peak unified memory to
+    /// `max(VL-encoder, DiT+VAE)` — the Qwen2.5-VL encoder ≈16 GB is comparable to the DiT. The
+    /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
+    /// the error-safe cache flush.
+    residency: Residency<QwenVisionLanguageEncoder, QwenEditHeavyOwned>,
 }
 
 /// The heavy render-phase components (the edit MMDiT transformer, the VAE, and the optional PiD
@@ -170,25 +152,34 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             (
                 c.tokenizer,
                 c.processor,
-                Residency::Resident(Box::new(ResidentComponents {
-                    vl_encoder: c.vl_encoder,
-                    heavy: QwenEditHeavyOwned {
+                Residency::resident(
+                    c.vl_encoder,
+                    QwenEditHeavyOwned {
                         transformer: c.transformer,
                         vae: c.vae,
                         pid: c.pid,
                     },
-                })),
+                ),
             )
         }
         OffloadPolicy::Sequential => {
             // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
-            // build is deferred to each generate.
+            // build is deferred to each generate via the loader closures below.
             let root = resolve_root(spec)?;
-            (
-                loader::load_tokenizer(root)?,
-                QwenImageProcessor::default(),
-                Residency::Sequential(Box::new(spec.clone())),
-            )
+            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
+            if let Some(q) = spec.quantize {
+                if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
+                    mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
+                }
+            }
+            let tokenizer = loader::load_tokenizer(root)?;
+            let spec_text = spec.clone();
+            let spec_heavy = spec.clone();
+            let residency = Residency::sequential(
+                move || load_vl_encoder_only(resolve_root(&spec_text)?),
+                move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
+            );
+            (tokenizer, QwenImageProcessor::default(), residency)
         }
     };
     Ok(Box::new(QwenImageEdit {
@@ -233,7 +224,7 @@ fn load_vl_encoder_only(root: &Path) -> Result<QwenVisionLanguageEncoder> {
 /// Quantize-then-adapters order matches the pre-sc-11006 `load`; the components are independent of the
 /// VL encoder (separate weight files, deterministic RNG-free quant), so the `Resident` composition is
 /// byte-identical.
-fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<QwenEditHeavyOwned> {
+fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<QwenEditHeavyOwned> {
     // Edit-2511 transformer (zero_cond_t on): clean-timestep modulation for the conditioning tokens.
     let mut transformer = loader::load_transformer_edit(root)?;
     if let Some(q) = spec.quantize {
@@ -248,11 +239,17 @@ fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<QwenEditHeavyOwned> {
     if !spec.adapters.is_empty() {
         crate::adapters::apply_qwen_adapters(&mut transformer, &spec.adapters)?;
     }
-    let pid = spec
-        .pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()?;
+    // Optional PiD overlay, loaded only when the spec carries it AND this generate uses it (`load_pid`,
+    // F-177) — Resident passes `true`, Sequential passes `req.use_pid` so a non-PiD generate skips the
+    // student + its Gemma-2 caption encoder entirely.
+    let pid = if load_pid {
+        spec.pid
+            .as_ref()
+            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
     let vae = loader::load_vae(root)?;
     Ok(QwenEditHeavyOwned {
         transformer,
@@ -276,7 +273,9 @@ struct QwenEditComponents {
 fn load_components(spec: &LoadSpec) -> Result<QwenEditComponents> {
     let root = resolve_root(spec)?;
     let vl_encoder = load_vl_encoder_only(root)?;
-    let heavy = load_heavy(spec, root)?;
+    // Resident loads the PiD overlay unconditionally (loaded once, reused); the per-request `use_pid`
+    // skip (F-177) applies only to the Sequential per-generate loader.
+    let heavy = load_heavy(spec, root, true)?;
     let tokenizer = loader::load_tokenizer(root)?;
     Ok(QwenEditComponents {
         tokenizer,
@@ -307,16 +306,14 @@ impl QwenImageEdit {
         Ok(embeds.as_dtype(Dtype::Float16)?)
     }
 
-    /// Run the full phase-A VL pass per the residency (epic 10834 Phase 1, sc-11006): preprocess the
-    /// **first** reference, run the **vision tower** over it, then the **LM** over the positive (and,
-    /// for true CFG, negative) prompts reusing that vision output. `Resident` borrows the warm VL
-    /// encoder (byte-identical to the pre-sc-11006 calls); `Sequential` loads it, runs the whole pass,
-    /// forces materialization (`eval`), then DROPS the encoder + `clear_cache()` so its ~16 GB frees
-    /// before the DiT loads. The drop point is after ALL VL usage — the vision tower AND both LM
-    /// forwards — so the dual-latent reference VAE-encode (which uses the VAE) is the only encode-side
-    /// work left for the heavy phase. `neg` is `None` under Lightning (CFG-distilled → one forward/step).
-    fn encode(
+    /// Run the full phase-A VL pass (epic 10834 Phase 1, sc-11006): preprocess the **first** reference,
+    /// run the **vision tower** over it, then the **LM** over the positive (and, for true CFG, negative)
+    /// prompts reusing that vision output. The tower runs once (image-only), so the positive + negative
+    /// encodes reuse it (F-004). `neg` is `None` under Lightning (CFG-distilled → one forward/step).
+    /// Called by the shared residency seam's encode closure with the phase-A `vl` encoder.
+    fn encode_phase_a(
         &self,
+        vl: &QwenVisionLanguageEncoder,
         req: &GenerationRequest,
         is_lightning: bool,
     ) -> Result<(Array, Option<Array>)> {
@@ -328,71 +325,24 @@ impl QwenImageEdit {
         let first = *references
             .first()
             .ok_or_else(|| Error::Msg("qwen_image_edit: no reference image to encode".into()))?;
-        // The whole phase-A pass, parameterized by the encoder so the two residency paths share it.
-        let encode_all = |vl: &QwenVisionLanguageEncoder| -> Result<(Array, Option<Array>)> {
-            let pre = preprocess_edit_image(&self.processor, image_input(first))?;
-            let grids: Vec<Grid> = host_i32(&pre.grid_thw)?
-                .chunks(3)
-                .map(|c| [c[0], c[1], c[2]])
-                .collect();
-            // The tower runs once (image-only), so the positive + negative encodes reuse it (F-004).
-            let vision = vl.encode_vision(&pre.pixel_values, &grids)?;
-            let pos = self.encode_edit(vl, &req.prompt, pre.n_image_tokens, &vision)?;
-            let neg = if is_lightning {
-                None
-            } else {
-                Some(self.encode_edit(
-                    vl,
-                    req.negative_prompt.as_deref().unwrap_or(""),
-                    pre.n_image_tokens,
-                    &vision,
-                )?)
-            };
-            Ok((pos, neg))
+        let pre = preprocess_edit_image(&self.processor, image_input(first))?;
+        let grids: Vec<Grid> = host_i32(&pre.grid_thw)?
+            .chunks(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect();
+        let vision = vl.encode_vision(&pre.pixel_values, &grids)?;
+        let pos = self.encode_edit(vl, &req.prompt, pre.n_image_tokens, &vision)?;
+        let neg = if is_lightning {
+            None
+        } else {
+            Some(self.encode_edit(
+                vl,
+                req.negative_prompt.as_deref().unwrap_or(""),
+                pre.n_image_tokens,
+                &vision,
+            )?)
         };
-        match &self.residency {
-            Residency::Resident(c) => encode_all(&c.vl_encoder),
-            Residency::Sequential(spec) => {
-                let root = resolve_root(spec)?;
-                let vl = load_vl_encoder_only(root)?;
-                let (pos, neg) = encode_all(&vl)?;
-                // MLX is lazy — materialize NOW while `vl` is alive (this forces the vision-tower AND
-                // LM forwards), else `pos`/`neg` keep the encoder weights referenced through the graph
-                // and the drop frees nothing (cf. the T2I `QwenImage::encode`).
-                match &neg {
-                    Some(neg) => mlx_rs::transforms::eval([&pos, neg])?,
-                    None => mlx_rs::transforms::eval([&pos])?,
-                }
-                drop(vl);
-                mlx_rs::memory::clear_cache();
-                Ok((pos, neg))
-            }
-        }
-    }
-
-    /// Load the heavy render components (edit DiT + VAE + PiD) for a `Sequential` job — after
-    /// [`Self::encode`] dropped the VL encoder — or `None` under `Resident` (already held). Kept
-    /// separate from [`Self::heavy`] so the owned bundle outlives the render-body borrow.
-    fn load_seq_heavy(&self) -> Result<Option<QwenEditHeavyOwned>> {
-        match &self.residency {
-            Residency::Resident(_) => Ok(None),
-            Residency::Sequential(spec) => {
-                let root = resolve_root(spec)?;
-                Ok(Some(load_heavy(spec, root)?))
-            }
-        }
-    }
-
-    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
-    /// `seq_heavy` under `Sequential`. The render body is written once against this borrow.
-    fn heavy<'a>(&'a self, seq_heavy: &'a Option<QwenEditHeavyOwned>) -> QwenEditHeavy<'a> {
-        match (&self.residency, seq_heavy) {
-            (Residency::Resident(c), _) => c.heavy.as_ref(),
-            (_, Some(owned)) => owned.as_ref(),
-            (Residency::Sequential(_), None) => {
-                unreachable!("Sequential residency always loads seq_heavy before rendering")
-            }
-        }
+        Ok((pos, neg))
     }
 }
 
@@ -432,102 +382,111 @@ impl QwenImageEdit {
         let (out_w, out_h) = (req.width, req.height);
         let params = resolve_run_params(req, out_w, out_h);
 
-        // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006). Under
-        // `Sequential` this loads the Qwen2.5-VL encoder, runs the vision tower over the reference +
-        // the LM over pos/neg, forces materialization, then DROPS it + `clear_cache()` so its ~16 GB
-        // frees before the DiT/VAE load below. Under `Resident` it borrows the warm encoder. The
+        // Phase A: reference + prompts → conditioning embeds (epic 10834 Phase 1, sc-11006; sc-11125).
+        // Under `Sequential` the shared seam loads the Qwen2.5-VL encoder, runs the vision tower over
+        // the reference + the LM over pos/neg, materializes, then DROPS it + `clear_cache()` so its
+        // ~16 GB frees before the DiT/VAE load below. Under `Resident` it borrows the warm encoder. The
         // encode carries no RNG, so ordering it before the dual-latent VAE-encode is byte-identical.
-        let (pos, neg) = self.encode(req, params.is_lightning)?;
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            |vl: &QwenVisionLanguageEncoder| self.encode_phase_a(vl, req, params.is_lightning),
+            // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
+            // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
+            // drop would free nothing.
+            |(pos, neg)| {
+                match neg {
+                    Some(neg) => mlx_rs::transforms::eval([pos, neg])?,
+                    None => mlx_rs::transforms::eval([pos])?,
+                }
+                Ok(())
+            },
+            // ── Establish the heavy render components (edit DiT + VAE + PiD) and run the dual-latent
+            // VAE-encode + denoise/decode body once against the `heavy` borrow — identical for both.
+            |heavy_owned, enc| {
+                let heavy = heavy_owned.as_ref();
+                let (pos, neg) = enc;
 
-        // Establish the heavy render components (edit DiT + VAE + PiD). `Resident` borrows the warm
-        // bundle; `Sequential` loads it NOW — after the VL encoder was dropped — and frees it when the
-        // job ends. The dual-latent VAE-encode + denoise/decode body below runs identically for both.
-        let seq_heavy = self.load_seq_heavy()?;
-        let heavy = self.heavy(&seq_heavy);
+                let references = reference_images(req);
+                let last = *references.last().expect("validated non-empty");
 
-        let references = reference_images(req);
-        let last = *references.last().expect("validated non-empty");
+                // VL condition / dual-latent reference resolution (~384² area, /32). The fork's
+                // `_compute_dimensions` derives all dims from `image_paths[-1]`, so the dual-latent resolution
+                // comes from the **last** reference's aspect (identical to the first when the references share
+                // an aspect ratio, the common case).
+                let (vl_w, vl_h) = condition_resize_dims(last.width as usize, last.height as usize);
 
-        // VL condition / dual-latent reference resolution (~384² area, /32). The fork's
-        // `_compute_dimensions` derives all dims from `image_paths[-1]`, so the dual-latent resolution
-        // comes from the **last** reference's aspect (identical to the first when the references share
-        // an aspect ratio, the common case).
-        let (vl_w, vl_h) = condition_resize_dims(last.width as usize, last.height as usize);
+                // Dual-latent references (static across steps + samples): VAE-encode **each** reference at the
+                // VL resolution, pack, and concatenate over the sequence axis — one `cond_grid` per reference
+                // so the MMDiT RoPE spans `[noise] + references` (fork
+                // `QwenEditUtil.create_image_conditioning_latents` + `forward_multi`). This is a deterministic
+                // VAE encode, independent of `pos`/`neg`, so under `Sequential` running it here — after the VL
+                // drop, with the VAE just loaded — is byte-identical to the Resident order (same hoist
+                // argument as the T2I img2img `encode_init_latents`).
+                let mut packed = Vec::with_capacity(references.len());
+                let mut cond_grids = Vec::with_capacity(references.len());
+                for im in &references {
+                    let (latents, grid) = encode_reference_latents(
+                        heavy.vae,
+                        image_input(im),
+                        vl_w as u32,
+                        vl_h as u32,
+                    )?;
+                    packed.push(latents);
+                    cond_grids.push(grid);
+                }
+                let static_latents = if packed.len() == 1 {
+                    packed.pop().expect("len checked")
+                } else {
+                    concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
+                };
 
-        // Dual-latent references (static across steps + samples): VAE-encode **each** reference at the
-        // VL resolution, pack, and concatenate over the sequence axis — one `cond_grid` per reference
-        // so the MMDiT RoPE spans `[noise] + references` (fork
-        // `QwenEditUtil.create_image_conditioning_latents` + `forward_multi`). This is a deterministic
-        // VAE encode, independent of `pos`/`neg`, so under `Sequential` running it here — after the VL
-        // drop, with the VAE just loaded — is byte-identical to the Resident order (same hoist
-        // argument as the T2I img2img `encode_init_latents`).
-        let mut packed = Vec::with_capacity(references.len());
-        let mut cond_grids = Vec::with_capacity(references.len());
-        for im in &references {
-            let (latents, grid) =
-                encode_reference_latents(heavy.vae, image_input(im), vl_w as u32, vl_h as u32)?;
-            packed.push(latents);
-            cond_grids.push(grid);
-        }
-        let static_latents = if packed.len() == 1 {
-            packed.pop().expect("len checked")
-        } else {
-            concatenate_axis(&packed.iter().collect::<Vec<_>>(), 1)?
-        };
-
-        // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): the partially-denoised x_k at the
-        // achieved σ (truncated schedule) when use_pid + pid_capture_sigma; else the clean σ=0 path.
-        // Edit denoises from full noise (no img2img init), so `start_step = 0`.
-        let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, 0);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            heavy.pid,
-            req,
-            params.base_seed,
-            MODEL_ID,
-            capture_sigma,
-        )?;
-        let decoder: &dyn LatentDecoder = match &pid_decoder {
-            Some(d) => d,
-            None => heavy.vae,
-        };
-        let denoise_sigmas = &params.sigmas[..keep];
-        let images = decode_and_collect(
-            decoder,
-            req.count,
-            params.base_seed,
-            out_w,
-            out_h,
-            on_progress,
-            |seed, progress| {
-                let noise = create_noise(seed, out_w, out_h)?;
-                denoise_edit_with_progress(
-                    heavy.transformer,
-                    params.sampler_name.as_deref(),
-                    denoise_sigmas,
-                    seed,
-                    noise,
-                    &static_latents,
-                    &cond_grids,
-                    &pos,
-                    neg.as_ref(),
-                    params.guidance,
+                // Decode seam (sc-7845) + `from_ldm` early-stop (sc-7993): the partially-denoised x_k at the
+                // achieved σ (truncated schedule) when use_pid + pid_capture_sigma; else the clean σ=0 path.
+                // Edit denoises from full noise (no img2img init), so `start_step = 0`.
+                let (capture_sigma, keep) = flow_capture_for_request(req, &params.sigmas, 0);
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    heavy.pid,
+                    req,
+                    params.base_seed,
+                    MODEL_ID,
+                    capture_sigma,
+                )?;
+                let decoder: &dyn LatentDecoder = match &pid_decoder {
+                    Some(d) => d,
+                    None => heavy.vae,
+                };
+                let denoise_sigmas = &params.sigmas[..keep];
+                let images = decode_and_collect(
+                    decoder,
+                    req.count,
+                    params.base_seed,
                     out_w,
                     out_h,
-                    &req.cancel,
-                    progress,
-                )
+                    on_progress,
+                    |seed, progress| {
+                        let noise = create_noise(seed, out_w, out_h)?;
+                        denoise_edit_with_progress(
+                            heavy.transformer,
+                            params.sampler_name.as_deref(),
+                            denoise_sigmas,
+                            seed,
+                            noise,
+                            &static_latents,
+                            &cond_grids,
+                            &pos,
+                            neg.as_ref(),
+                            params.guidance,
+                            out_w,
+                            out_h,
+                            &req.cancel,
+                            progress,
+                        )
+                    },
+                )?;
+                Ok(GenerationOutput::Images(images))
             },
-        )?;
-        // Sequential (sc-11006): free the DiT/VAE/PiD working set now that every image is rendered,
-        // then `clear_cache()` to return the pages to the OS. `heavy` (a struct of borrows) is unused
-        // past the render, so NLL has already ended its borrow of `seq_heavy`; dropping the owned
-        // bundle frees the components before `clear_cache()`. Resident is a no-op (`seq_heavy` None).
-        let was_sequential = seq_heavy.is_some();
-        drop(seq_heavy);
-        if was_sequential {
-            mlx_rs::memory::clear_cache();
-        }
-        Ok(GenerationOutput::Images(images))
+        )
     }
 }
 
