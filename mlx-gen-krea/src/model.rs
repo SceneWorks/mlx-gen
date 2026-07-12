@@ -127,6 +127,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -548,6 +550,7 @@ impl Krea {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |text: &KreaText| {
                 self.encode_contexts(text, req, is_raw, is_edit, guidance, &negative, edit_source)
             },
@@ -562,7 +565,7 @@ impl Krea {
             },
             // Phase B: heavy render components (DiT + VAE + PiD). The render dispatch below runs
             // identically for both residencies.
-            |heavy_owned, ctx| {
+            |heavy_owned, ctx, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
                 // PiD decode overlay (sc-7845): one decoder serves the whole count loop (same prompt → same

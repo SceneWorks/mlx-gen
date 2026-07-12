@@ -213,12 +213,13 @@ impl KreaTurboControl {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |text: &KreaText| text.encode(&req.prompt),
             // Materialize the context while the text phase is still alive (Sequential only).
             |ctx: &Array| Ok(mlx_rs::transforms::eval([ctx])?),
             // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
             // identically for both residencies.
-            |heavy_owned, context| {
+            |heavy_owned, context, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
                 let mut images = Vec::with_capacity(req.count as usize);

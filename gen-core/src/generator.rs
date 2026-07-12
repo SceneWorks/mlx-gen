@@ -512,6 +512,15 @@ pub struct Capabilities {
     // Loader hints.
     pub supports_kv_cache: bool,
     pub requires_sigma_shift: bool,
+    /// Whether this engine honors [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
+    /// (epic 10765, sc-11126). [`OffloadPolicy::Sequential`] is *advisory* — a provider that has not
+    /// wired the load→use→drop residency lifecycle silently treats it as `Resident` (never an error),
+    /// which makes the fallback undiscoverable from the outside. This bit is the discovery signal: a
+    /// consumer (worker / UI) reads it to know whether requesting `Sequential` will actually bound peak
+    /// memory on this engine or be a no-op. `Default` is `false` so an unwired engine does not
+    /// over-advertise; a provider that drives the shared [`crate::runtime`] residency seam sets it
+    /// `true`.
+    pub supports_sequential_offload: bool,
 }
 
 impl Capabilities {

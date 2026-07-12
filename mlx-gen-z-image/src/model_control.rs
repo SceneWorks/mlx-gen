@@ -68,6 +68,8 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -301,6 +303,7 @@ impl ZImageTurboControl {
             // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
             // this flag, so `false` avoids loading a student that would never be used.
             false,
+            on_progress,
             // ── Phase A: prompt → cap_feats. The fork's control path is **mixed precision**, NOT pure
             // bf16: it feeds the latents (`x`) and `cap_feats` as bf16 but `control_context` as **f32**
             // (sc-2720, verified against the fork). The f32 control branch then promotes the bf16
@@ -323,7 +326,7 @@ impl ZImageTurboControl {
             // drop would free nothing.
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
             // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, cap| {
+            |heavy_owned, cap, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
                 // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An

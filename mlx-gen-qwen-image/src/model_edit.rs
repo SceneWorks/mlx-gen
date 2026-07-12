@@ -82,6 +82,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: true,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -390,6 +392,7 @@ impl QwenImageEdit {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |vl: &QwenVisionLanguageEncoder| self.encode_phase_a(vl, req, params.is_lightning),
             // Materialize pos (+neg) while the VL encoder is still alive (Sequential only) — this forces
             // the vision-tower AND LM forwards, else the outputs keep the encoder referenced and the
@@ -403,7 +406,7 @@ impl QwenImageEdit {
             },
             // ── Establish the heavy render components (edit DiT + VAE + PiD) and run the dual-latent
             // VAE-encode + denoise/decode body once against the `heavy` borrow — identical for both.
-            |heavy_owned, enc| {
+            |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
 

@@ -109,6 +109,12 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // NOT yet wired onto the shared `Residency` seam (F-148/F-176): the monolithic `Kolors`
+            // struct fuses the ChatGLM3 encoder with the U-Net/VAE and hosts every `denoise_*_latents`
+            // method, so splitting the encoder into a droppable phase-A component is a dedicated
+            // decomposition (tracked as its own wiring story under epic 11120, matching the per-family
+            // wiring stories sc-11000/sc-11030). Advertise `false` until then so it does not over-promise.
+            supports_sequential_offload: false,
         },
     }
 }

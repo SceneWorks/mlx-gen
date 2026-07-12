@@ -120,6 +120,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: true,
             // Wan pins a static `sample_shift` from config (not the empirical per-resolution mu).
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }
@@ -604,6 +606,8 @@ pub fn descriptor_t2v_14b() -> ModelDescriptor {
             // Cross-attention text K/V is cached across denoise steps (per expert).
             supports_kv_cache: true,
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }
@@ -1101,6 +1105,8 @@ pub fn descriptor_i2v_14b() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }

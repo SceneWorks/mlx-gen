@@ -75,6 +75,8 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: true,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }

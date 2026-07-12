@@ -204,6 +204,8 @@ impl Flux2Variant {
                 supports_kv_cache: self.is_kv(),
                 // FLUX.2 uses the empirical-mu shifted flow-match schedule.
                 requires_sigma_shift: true,
+                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+                supports_sequential_offload: false,
             },
         }
     }

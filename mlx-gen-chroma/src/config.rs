@@ -133,6 +133,8 @@ impl ChromaVariant {
                 supports_kv_cache: false,
                 // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.
                 requires_sigma_shift: true,
+                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+                supports_sequential_offload: false,
             },
         }
     }

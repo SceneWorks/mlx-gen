@@ -89,6 +89,8 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -175,50 +177,49 @@ pub(crate) fn load_residency(
     precision_msg: &'static str,
     file_msg: &'static str,
 ) -> Result<(TextTokenizer, Residency<TextEncoder, ZImageHeavyOwned>)> {
-    match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let c = load_components(spec, precision_msg, file_msg)?;
-            Ok((
-                c.tokenizer,
-                Residency::resident(
-                    c.text_encoder,
-                    ZImageHeavyOwned {
-                        transformer: c.transformer,
-                        vae: c.vae,
-                        pid: c.pid,
-                    },
-                ),
-            ))
-        }
-        OffloadPolicy::Sequential => {
-            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
-            // build is deferred to each generate via the loader closures below.
-            let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
-            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
-            // An already-packed turnkey loads packed (no re-quant), so gate on the same precise
-            // predicate qwen uses — only warn when a load-time (re)quant over a dense snapshot will
-            // actually happen.
-            if let Some(q) = spec.quantize {
-                if loader::needs_load_time_quant(root, q.bits(), MODEL_ID)? {
-                    mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
-                }
-            }
-            let tokenizer = loader::load_tokenizer(root)?;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            let residency = Residency::sequential(
-                move || {
-                    let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
-                    load_text_encoder_only(root, spec_text.quantize)
-                },
-                move |use_pid| {
-                    let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
-                    load_heavy(&spec_heavy, root, use_pid)
-                },
-            );
-            Ok((tokenizer, residency))
+    // Precision + snapshot-dir guard up front for BOTH policies (fail fast), then the always-warm
+    // tokenizer; the heavy component dispatch is the shared [`build_residency`] seam below.
+    let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
+    // F-181: a `Sequential` + load-time (re)quant over a *dense* snapshot re-quantizes the whole model
+    // on every generate. An already-packed turnkey loads packed (no re-quant); `Resident` quantizes
+    // once. So warn only for the Sequential-over-dense combination that actually pays the repeated cost.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?
+        {
+            mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
         }
     }
+    let tokenizer = loader::load_tokenizer(root)?;
+    Ok((tokenizer, build_residency(spec, precision_msg, file_msg)?))
+}
+
+/// The policy→[`Residency`] dispatch every Z-Image variant shares (sc-11126, F-180), routed through
+/// the single [`Residency::from_policy`] seam so no variant re-derives the `match offload_policy`
+/// (the divergence that let a sibling silently ignore `offload_policy` before sc-11124). `Resident`
+/// eager-loads the text encoder + heavy bundle (byte-identical to the pre-seam composition — the same
+/// per-phase loaders over independent weight files); `Sequential` captures the two loader closures and
+/// loads nothing now, deferring each to [`Residency::run`]. The deferral is weight-free-testable: under
+/// `Sequential` this touches no files, so a dispatch that ignored the policy would eager-load and fail
+/// the residency unit test's "Sequential defers" assertion.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    precision_msg: &'static str,
+    file_msg: &'static str,
+) -> Result<Residency<TextEncoder, ZImageHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
+            load_text_encoder_only(root, spec_text.quantize)
+        },
+        move |use_pid| {
+            let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
+            load_heavy(&spec_heavy, root, use_pid)
+        },
+    )
 }
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the `Resident`
@@ -370,6 +371,7 @@ impl ZImageTurbo {
         let images = self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             // ── Phase A: prompt → cap_feats. txt2img runs the DiT in bf16 (the parity-proven path);
             // img2img matches the fork's f32 init latents, so keep cap f32. PARITY-BF16 (sc-2609):
             // round the text embeddings to bf16 to match the fork's golden; f32 is sharper — flip to
@@ -389,7 +391,7 @@ impl ZImageTurbo {
             // post-cast `cap`, not the pre-cast f32 graph.
             |cap| Ok(mlx_rs::transforms::eval([cap])?),
             // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, cap| {
+            |heavy_owned, cap, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
                 // Static shift=3.0 schedule (the model's scheduler_config.json), resolution- and

@@ -95,6 +95,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }

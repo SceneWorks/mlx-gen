@@ -105,6 +105,8 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             supports_kv_cache: false,
             // The Lens schedule computes its own empirical-μ shift internally (not a loader hint).
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -306,6 +308,7 @@ impl LensGenerator {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |text: &LensText| {
                 text.encode_prompt(&req.prompt, negative, DEFAULT_DATE, Some(&req.cancel))
             },
@@ -319,7 +322,7 @@ impl LensGenerator {
             },
             // ── Establish the heavy render components (DiT + VAE + PiD) and run the render body once
             // against the `heavy` borrow — identical for both residencies.
-            |heavy_owned, enc| {
+            |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (encoder_features, encoder_mask) = enc;
 

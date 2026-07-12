@@ -170,6 +170,8 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -581,6 +583,7 @@ impl Sdxl {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |text: &(ClipTextEncoder, ClipTextEncoder)| {
                 encode_conditioning(&text.0, &text.1, &tokens)
             },
@@ -590,7 +593,8 @@ impl Sdxl {
             |enc| Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
             // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
             // denoise/decode body once against the `heavy` borrow — identical for both residencies.
-            |heavy_owned, enc| {
+            // `on_progress` is threaded through the seam (F-179) and shadows the outer sink here.
+            |heavy_owned, enc, on_progress| {
         let heavy = heavy_owned.as_ref();
         let (conditioning, pooled) = enc;
 

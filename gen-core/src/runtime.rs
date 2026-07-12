@@ -59,7 +59,9 @@ pub enum Precision {
 /// transformer/UNet → VAE) so peak VRAM is bounded to the largest single working set instead of the sum,
 /// letting a small card run a model that would OOM resident — at the cost of the cross-request weight
 /// cache. Advisory, never an error: a provider that has not wired it treats `Sequential` as `Resident`.
-/// The candle FLUX provider honors it today; the rest ignore it until wired.
+/// Whether a given engine actually honors it is not FLUX/backend-specific — it is advertised per model
+/// via [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload),
+/// which a consumer reads to tell "bounds peak memory here" from "no-op fallback" (sc-11126).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OffloadPolicy {
     /// All components co-resident for the whole generation (today's behavior). Fast; keeps the cache.
@@ -126,8 +128,9 @@ pub struct LoadSpec {
     /// Component-residency strategy (epic 10765, sc-10821). [`OffloadPolicy::Resident`] (default) keeps
     /// every component resident for the whole generation; [`OffloadPolicy::Sequential`] asks a supporting
     /// provider to load→use→drop each heavy component after its phase so peak VRAM is the largest single
-    /// working set, not the sum. Advisory — providers that have not wired it (everything except the
-    /// candle FLUX lane today) ignore it. Backend-neutral.
+    /// working set, not the sum. Advisory — a provider that has not wired the residency lifecycle
+    /// ignores it and stays `Resident`; [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload)
+    /// advertises which engines honor it (sc-11126). Backend-neutral.
     pub offload_policy: OffloadPolicy,
 }
 
@@ -186,8 +189,9 @@ impl LoadSpec {
     }
 
     /// Builder-style component-residency override (epic 10765, sc-10821). [`OffloadPolicy::Sequential`]
-    /// asks a supporting provider (the candle FLUX lane today) to load→use→drop each heavy component to
-    /// cap peak VRAM; the default [`OffloadPolicy::Resident`] keeps everything co-resident.
+    /// asks a supporting provider to load→use→drop each heavy component to cap peak VRAM; the default
+    /// [`OffloadPolicy::Resident`] keeps everything co-resident. Which engines honor it is advertised by
+    /// [`Capabilities::supports_sequential_offload`](crate::generator::Capabilities::supports_sequential_offload).
     pub fn with_offload_policy(mut self, offload_policy: OffloadPolicy) -> Self {
         self.offload_policy = offload_policy;
         self
@@ -331,4 +335,22 @@ pub enum Progress {
     Step { current: u32, total: u32 },
     /// VAE decode underway (post-denoise).
     Decoding,
+    /// A heavy model component is (re)loading (epic 10765, sc-11126). Emitted only under
+    /// [`OffloadPolicy::Sequential`], where the residency seam load→use→drops each component *inside*
+    /// `generate` — a multi-second, multi-GB step during which no `Step`/`Decoding` event fires, so
+    /// without this the UI would freeze silently while a component streams from disk (F-179). The
+    /// [`Resident`](OffloadPolicy::Resident) path loads everything before `generate` and never emits it.
+    Loading(LoadPhase),
+}
+
+/// Which component the residency seam is loading when it emits [`Progress::Loading`] (sc-11126). The
+/// `Sequential` lifecycle has two in-`generate` load phases: the phase-A text/vision encoder, then the
+/// heavy render bundle (transformer/U-Net + VAE + any control/PiD overlay).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadPhase {
+    /// The phase-A prompt encoder (text or vision-language), loaded first and dropped before the
+    /// render bundle materializes.
+    TextEncoder,
+    /// The heavy render bundle — the transformer/U-Net, the VAE, and any control/PiD overlay.
+    Renderer,
 }

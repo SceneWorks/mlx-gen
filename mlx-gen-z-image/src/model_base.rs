@@ -87,6 +87,8 @@ pub fn descriptor() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -172,6 +174,7 @@ impl ZImage {
         let images = self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             // ── Phase A: prompt → (cap, neg_cap). The base is undistilled and runs real CFG; unlike
             // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
             // encoder's native precision and let the DiT promote per-op against the bf16 weights.
@@ -200,7 +203,7 @@ impl ZImage {
                 Ok(())
             },
             // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
-            |heavy_owned, (cap, neg_cap)| {
+            |heavy_owned, (cap, neg_cap), on_progress| {
                 let heavy = heavy_owned.as_ref();
 
                 // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An

@@ -37,7 +37,7 @@
 //! only affect an already-cancelled request (one that produces no output).
 
 use crate::error::{Error, Result};
-use crate::runtime::CancelFlag;
+use crate::runtime::{CancelFlag, LoadPhase, OffloadPolicy, Progress};
 
 /// Boxed phase-A loader: rebuilds the `Text` component (text/vision encoder) from the captured load
 /// spec on each `Sequential` generate. `Send + Sync` so a `Residency`-holding generator keeps the
@@ -115,6 +115,37 @@ impl<Text, Heavy> Residency<Text, Heavy> {
         matches!(self.inner, Inner::Sequential(_))
     }
 
+    /// The single dispatch every wired provider shares (sc-11126, F-180): map an
+    /// [`OffloadPolicy`] to a [`Residency`] built from the two per-phase loader closures, so no
+    /// provider re-derives the `match policy { … }` (the earlier per-crate copies is exactly what let
+    /// a sibling silently ignore `offload_policy`). `load_text` / `load_heavy` are the same closures
+    /// [`sequential`](Self::sequential) captures:
+    ///
+    /// * [`OffloadPolicy::Resident`] runs **both eagerly now** and holds the products warm — the heavy
+    ///   loader is invoked with `use_pid = true` so any PiD overlay in the spec is loaded once and
+    ///   reused across generates (the per-request F-177 skip applies only to the `Sequential`
+    ///   per-generate loader, which re-runs `load_heavy` each generate).
+    /// * [`OffloadPolicy::Sequential`] captures the closures and loads **nothing now**; each
+    ///   [`run`](Self::run) re-runs them in phase order and frees the products.
+    ///
+    /// The deferral is the discriminator a weight-free test asserts: under `Sequential` this returns
+    /// without touching either loader, so a dispatch that mapped `Sequential → Resident` (the
+    /// ignore-`offload_policy` bug) would eager-load here and fail the "no load at construction" check.
+    pub fn from_policy(
+        policy: OffloadPolicy,
+        load_text: impl Fn() -> Result<Text> + Send + Sync + 'static,
+        load_heavy: impl Fn(bool) -> Result<Heavy> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        match policy {
+            OffloadPolicy::Resident => {
+                let text = load_text()?;
+                let heavy = load_heavy(true)?;
+                Ok(Self::resident(text, heavy))
+            }
+            OffloadPolicy::Sequential => Ok(Self::sequential(load_text, load_heavy)),
+        }
+    }
+
     /// Drive one generation through the staged residency lifecycle, running identically for both
     /// policies:
     ///
@@ -134,14 +165,21 @@ impl<Text, Heavy> Residency<Text, Heavy> {
     /// success, error, or cancel — via an RAII guard (F-174). `materialize` is never called under
     /// `Resident` (which does not eval), preserving byte-identical warm-cache behavior.
     ///
+    /// `on_progress` receives a [`Progress::Loading`] event before each `Sequential` in-`generate`
+    /// component load (F-179) — the multi-GB text-encoder and heavy-bundle loads that fire *inside*
+    /// `generate`, during which no `Step`/`Decoding` event otherwise reaches the UI. It is emitted only
+    /// under `Sequential` (the `Resident` path loads before `generate`), and is threaded on to `render`
+    /// so the denoise/decode body keeps emitting `Step`/`Decoding` as before.
+    ///
     /// `E` is the provider's encode output (conditioning tensors); `Out` is the generation result.
     pub fn run<E, Out>(
         &self,
         cancel: &CancelFlag,
         use_pid: bool,
+        on_progress: &mut dyn FnMut(Progress),
         encode: impl FnOnce(&Text) -> Result<E>,
         materialize: impl FnOnce(&E) -> Result<()>,
-        render: impl FnOnce(&Heavy, E) -> Result<Out>,
+        render: impl FnOnce(&Heavy, E, &mut dyn FnMut(Progress)) -> Result<Out>,
     ) -> Result<Out> {
         // F-173: a request cancelled before the (Sequential) load preamble returns promptly.
         check_cancel(cancel)?;
@@ -151,7 +189,7 @@ impl<Text, Heavy> Residency<Text, Heavy> {
                 // F-173: before render (cheap under Resident; the analogue of Sequential's pre-heavy
                 // check, kept so both policies drive the identical boundary set).
                 check_cancel(cancel)?;
-                render(&pair.heavy, enc)
+                render(&pair.heavy, enc, on_progress)
             }
             Inner::Sequential(loaders) => {
                 // ── Phase A: load the encoder, encode, materialize, then FREE it + clear_cache().
@@ -160,6 +198,8 @@ impl<Text, Heavy> Residency<Text, Heavy> {
                 // path AND on any `?` early return within the block (F-174). `enc` is moved out.
                 let enc = {
                     let _text_cleanup = ClearCacheGuard;
+                    // F-179: signal the phase-A encoder load so the UI shows activity during it.
+                    on_progress(Progress::Loading(LoadPhase::TextEncoder));
                     let text = (loaders.load_text)()?;
                     let enc = encode(&text)?;
                     materialize(&enc)?;
@@ -170,10 +210,12 @@ impl<Text, Heavy> Residency<Text, Heavy> {
                 // ── Phase B: load the heavy bundle (skipping PiD when !use_pid, F-177), render, then
                 // FREE it + clear_cache() on every exit. Same guard-before-value ordering as Phase A.
                 let _heavy_cleanup = ClearCacheGuard;
+                // F-179: signal the heavy-bundle load (the biggest silent gap — DiT + VAE + overlays).
+                on_progress(Progress::Loading(LoadPhase::Renderer));
                 let heavy = (loaders.load_heavy)(use_pid)?;
                 // F-173: after the heavy load (a cancel during the ~20 GB load returns before denoise).
                 check_cancel(cancel)?;
-                render(&heavy, enc)
+                render(&heavy, enc, on_progress)
             }
         }
     }
@@ -288,6 +330,9 @@ mod tests {
         CLEAR_CACHE_CALLS.with(|c| c.set(0));
     }
 
+    /// A progress sink that ignores every event — used where a test asserts loads/drops, not progress.
+    fn ignore_progress(_p: Progress) {}
+
     fn seq_residency(log: &Log) -> Residency<FakeText, FakeHeavy> {
         let lt = log.clone();
         let lh = log.clone();
@@ -329,6 +374,7 @@ mod tests {
             .run(
                 &CancelFlag::new(),
                 false,
+                &mut ignore_progress,
                 |_t| {
                     record(&l, "encode");
                     Ok(7u32)
@@ -338,7 +384,7 @@ mod tests {
                     record(&l, "materialize");
                     Ok(())
                 },
-                |_h, e| {
+                |_h, e, _op| {
                     record(&l, "render");
                     Ok(e + 1)
                 },
@@ -356,10 +402,19 @@ mod tests {
         let res = seq_residency(&log);
         reset_clear_cache_calls();
         let l = log.clone();
+        // Record the progress events too, so this test also pins the F-179 Loading signals.
+        let prog = new_log();
+        let pl = prog.clone();
+        let mut on_progress = |p: Progress| {
+            if let Progress::Loading(phase) = p {
+                record(&pl, &format!("loading:{phase:?}"));
+            }
+        };
         let out = res
             .run(
                 &CancelFlag::new(),
                 true,
+                &mut on_progress,
                 |_t| {
                     record(&l, "encode");
                     Ok(1u32)
@@ -368,7 +423,7 @@ mod tests {
                     record(&l, "materialize");
                     Ok(())
                 },
-                |_h, e| {
+                |_h, e, _op| {
                     record(&l, "render");
                     Ok(e)
                 },
@@ -389,6 +444,11 @@ mod tests {
         );
         // clear_cache fires twice: once after the text drop, once after the heavy drop.
         assert_eq!(clear_cache_calls(), 2);
+        // F-179: a Loading signal fires before EACH Sequential component load, in phase order.
+        assert_eq!(
+            events(&prog),
+            vec!["loading:TextEncoder", "loading:Renderer"]
+        );
     }
 
     #[test]
@@ -399,9 +459,10 @@ mod tests {
         res.run(
             &CancelFlag::new(),
             false,
+            &mut ignore_progress,
             |_t| Ok(()),
             |_e| Ok(()),
-            |_h, _e| Ok(()),
+            |_h, _e, _op| Ok(()),
         )
         .unwrap();
         let ev = events(&log);
@@ -418,7 +479,14 @@ mod tests {
         let cancel = CancelFlag::new();
         cancel.cancel();
         let err = res
-            .run(&cancel, true, |_t| Ok(()), |_e| Ok(()), |_h, _e| Ok(()))
+            .run(
+                &cancel,
+                true,
+                &mut ignore_progress,
+                |_t| Ok(()),
+                |_e| Ok(()),
+                |_h, _e, _op| Ok(()),
+            )
             .unwrap_err();
         assert!(matches!(err, Error::Canceled));
         assert!(
@@ -441,12 +509,13 @@ mod tests {
             .run(
                 &cancel,
                 true,
+                &mut ignore_progress,
                 |_t| {
                     c2.cancel(); // simulate a cancel arriving mid-encode
                     Ok(())
                 },
                 |_e| Ok(()),
-                |_h: &FakeHeavy, _e: ()| -> Result<()> {
+                |_h: &FakeHeavy, _e: (), _op: &mut dyn FnMut(Progress)| -> Result<()> {
                     panic!("render must not run after a pre-heavy cancel")
                 },
             )
@@ -490,9 +559,10 @@ mod tests {
             .run(
                 &cancel,
                 true,
+                &mut ignore_progress,
                 |_t| Ok(()),
                 |_e| Ok(()),
-                |_h: &FakeHeavy, _e: ()| -> Result<()> {
+                |_h: &FakeHeavy, _e: (), _op: &mut dyn FnMut(Progress)| -> Result<()> {
                     panic!("render must not run after a post-heavy-load cancel")
                 },
             )
@@ -518,14 +588,141 @@ mod tests {
             .run(
                 &CancelFlag::new(),
                 true,
+                &mut ignore_progress,
                 |_t| Ok(()),
                 |_e| Ok(()),
-                |_h, _e: ()| Err::<(), _>(Error::Msg("boom".into())),
+                |_h, _e: (), _op: &mut dyn FnMut(Progress)| Err::<(), _>(Error::Msg("boom".into())),
             )
             .unwrap_err();
         assert!(matches!(err, Error::Msg(_)));
         let ev = events(&log);
         assert!(ev.iter().any(|e| e == "drop_heavy_pid"), "{ev:?}");
         assert_eq!(clear_cache_calls(), 2);
+    }
+
+    #[test]
+    fn resident_emits_no_loading_progress() {
+        // F-179: the Resident path loads before `generate`, so it never emits a Loading event — the
+        // signal is Sequential-only. (The Sequential ordering is asserted in
+        // `sequential_runs_full_lifecycle_in_order`.)
+        let log: Log = new_log();
+        let res = Residency::resident(
+            FakeText { log: log.clone() },
+            FakeHeavy {
+                log: log.clone(),
+                with_pid: true,
+            },
+        );
+        let mut loading = 0usize;
+        res.run(
+            &CancelFlag::new(),
+            false,
+            &mut |p| {
+                if matches!(p, Progress::Loading(_)) {
+                    loading += 1;
+                }
+            },
+            |_t| Ok(0u32),
+            |_e| Ok(()),
+            |_h, e, _op| Ok(e),
+        )
+        .unwrap();
+        assert_eq!(loading, 0, "Resident must not emit Loading");
+    }
+
+    // ── F-180: the shared `from_policy` dispatch every wired provider routes through. These are the
+    // meaningful (not smoke) state-machine assertions: `Sequential` must DEFER — construct without
+    // touching either loader — so a dispatch that mapped `Sequential → Resident` (the ignore-
+    // `offload_policy` bug the 2026-07-11 review flagged) would eager-load here and fail the count.
+
+    /// A loader pair that counts how many times each is invoked, so a test can prove `Sequential`
+    /// defers (0/0 at construction) while `Resident` loads eagerly (1/1).
+    fn counting_loaders(
+        text_calls: &Arc<Mutex<usize>>,
+        heavy_calls: &Arc<Mutex<usize>>,
+    ) -> (
+        impl Fn() -> Result<FakeText> + Send + Sync + 'static,
+        impl Fn(bool) -> Result<FakeHeavy> + Send + Sync + 'static,
+    ) {
+        let (tc, hc) = (text_calls.clone(), heavy_calls.clone());
+        let log = new_log();
+        let (lt, lh) = (log.clone(), log);
+        (
+            move || {
+                *tc.lock().unwrap() += 1;
+                Ok(FakeText { log: lt.clone() })
+            },
+            move |use_pid| {
+                *hc.lock().unwrap() += 1;
+                Ok(FakeHeavy {
+                    log: lh.clone(),
+                    with_pid: use_pid,
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn from_policy_sequential_defers_all_loads() {
+        let text_calls = Arc::new(Mutex::new(0usize));
+        let heavy_calls = Arc::new(Mutex::new(0usize));
+        let (lt, lh) = counting_loaders(&text_calls, &heavy_calls);
+        let res = Residency::from_policy(OffloadPolicy::Sequential, lt, lh).unwrap();
+        assert!(res.is_sequential(), "Sequential policy must build a Sequential residency");
+        // The discriminator: neither loader ran at construction. A dispatch that ignored the policy
+        // and always went Resident would have eager-loaded, tripping these to 1.
+        assert_eq!(*text_calls.lock().unwrap(), 0, "Sequential must not load the text encoder eagerly");
+        assert_eq!(*heavy_calls.lock().unwrap(), 0, "Sequential must not load the heavy bundle eagerly");
+    }
+
+    #[test]
+    fn from_policy_resident_loads_eagerly_with_pid() {
+        let text_calls = Arc::new(Mutex::new(0usize));
+        let heavy_calls = Arc::new(Mutex::new(0usize));
+        let (lt, lh) = counting_loaders(&text_calls, &heavy_calls);
+        let res = Residency::from_policy(OffloadPolicy::Resident, lt, lh).unwrap();
+        assert!(!res.is_sequential(), "Resident policy must build a Resident residency");
+        assert_eq!(*text_calls.lock().unwrap(), 1, "Resident loads the text encoder once, eagerly");
+        assert_eq!(*heavy_calls.lock().unwrap(), 1, "Resident loads the heavy bundle once, eagerly");
+    }
+
+    #[test]
+    fn from_policy_resident_heavy_gets_use_pid_true() {
+        // Resident loads any PiD overlay once (use_pid=true), reused across generates (F-177 skip is
+        // Sequential-only). Assert the heavy build carried the PiD flag.
+        let log = new_log();
+        let lh_log = log.clone();
+        let res = Residency::from_policy(
+            OffloadPolicy::Resident,
+            {
+                let lt = log.clone();
+                move || Ok(FakeText { log: lt.clone() })
+            },
+            move |use_pid| {
+                Ok(FakeHeavy {
+                    log: lh_log.clone(),
+                    with_pid: use_pid,
+                })
+            },
+        )
+        .unwrap();
+        // Drive a run and inspect the heavy's recorded drop tag (pid vs nopid).
+        res.run(
+            &CancelFlag::new(),
+            false,
+            &mut ignore_progress,
+            |_t| Ok(()),
+            |_e| Ok(()),
+            |_h, _e, _op| Ok(()),
+        )
+        .unwrap();
+        // Resident holds its components through `run`; the heavy's drop tag (pid vs nopid) only lands
+        // once the residency itself is dropped. Drop it, then inspect the recorded tag.
+        drop(res);
+        assert!(
+            events(&log).iter().any(|e| e == "drop_heavy_pid"),
+            "Resident heavy must be built with use_pid=true: {:?}",
+            events(&log)
+        );
     }
 }

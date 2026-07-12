@@ -116,6 +116,8 @@ impl FluxVariant {
                 mac_only: true,
                 supports_kv_cache: false,
                 requires_sigma_shift: self.requires_sigma_shift(),
+                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+                supports_sequential_offload: false,
             },
         }
     }

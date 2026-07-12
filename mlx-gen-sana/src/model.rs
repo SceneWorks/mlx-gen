@@ -122,6 +122,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }
@@ -166,6 +168,8 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
+            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
+            supports_sequential_offload: false,
         },
     }
 }

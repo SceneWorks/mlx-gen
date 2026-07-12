@@ -95,8 +95,8 @@ pub use registry::{
 pub use registry::{load_trainer, TrainerRegistration};
 pub use residency::Residency;
 pub use runtime::{
-    AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadSpec, MoeExpert, OffloadPolicy,
-    PidWeights, Precision, Progress, Quant, WeightsSource,
+    AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadPhase, LoadSpec, MoeExpert,
+    OffloadPolicy, PidWeights, Precision, Progress, Quant, WeightsSource,
 };
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, resolve_flow_schedule, resolve_schedule,

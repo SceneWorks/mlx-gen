@@ -70,6 +70,8 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             // Flow-match schedule uses the resolution-dependent sigma shift.
             requires_sigma_shift: true,
+            // Wired onto the shared `Residency` seam; honors Sequential offload (F-176).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -351,6 +353,7 @@ impl QwenImage {
         self.residency.run(
             &req.cancel,
             req.use_pid,
+            on_progress,
             |te: &QwenTextEncoder| {
                 let pos = encode_prompt(&self.tokenizer, te, &req.prompt, MODEL_ID)?;
                 let neg = if params.is_lightning {
@@ -376,7 +379,7 @@ impl QwenImage {
             },
             // ── Establish the heavy render components (DiT + VAE + PiD) and run the denoise/decode
             // body once against the `heavy` borrow — identical for both residencies.
-            |heavy_owned, enc| {
+            |heavy_owned, enc, on_progress| {
                 let heavy = heavy_owned.as_ref();
                 let (pos, neg) = enc;
 
