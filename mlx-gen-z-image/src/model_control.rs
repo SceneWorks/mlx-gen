@@ -20,9 +20,11 @@ use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
     require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
     ControlBranch, Error, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result,
+    WeightsSource,
 };
 use mlx_rs::Dtype;
+use std::path::Path;
 
 use crate::control_transformer::ZImageControlTransformer;
 use crate::loader;
@@ -70,15 +72,165 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded control generator: base components + the control transformer assembled from the base
-/// snapshot and the Fun-Controlnet-Union overlay.
+/// A loaded control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
+/// component-residency strategy (base text encoder + control transformer + VAE), driven through the
+/// shared [`Residency`] seam so the control variant honors [`LoadSpec::offload_policy`] family-wide
+/// (sc-11124, F-172) — `Sequential` drops the text encoder after the encode phase, bounding peak
+/// unified memory to `max(text-encoder, control-DiT+VAE)`.
 pub struct ZImageTurboControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    text_encoder: TextEncoder,
-    transformer: ZImageControlTransformer,
-    vae: Vae,
+    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
+    /// shared [`load_control_residency`] builder.
+    residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
+
+/// The heavy render-phase components for both Z-Image ControlNet variants (the composed base+control
+/// transformer and the VAE) — everything but the text encoder. There is no PiD overlay on the control
+/// path (sc-7846 is base-`z_image_turbo`-only), so the seam's `use_pid` loader flag is ignored. Owned
+/// by the `Resident` components or by a `Sequential` generate. `pub(crate)` so the **base** control
+/// sibling ([`crate::model_base_control`]) shares the identical bundle + seam (sc-11124).
+pub(crate) struct ZImageControlHeavyOwned {
+    pub(crate) transformer: ZImageControlTransformer,
+    pub(crate) vae: Vae,
+}
+
+/// A borrow of the heavy control components, so the denoise/decode body runs identically whether they
+/// are held resident or were just loaded by the `Sequential` path.
+pub(crate) struct ZImageControlHeavy<'a> {
+    pub(crate) transformer: &'a ZImageControlTransformer,
+    pub(crate) vae: &'a Vae,
+}
+
+impl ZImageControlHeavyOwned {
+    pub(crate) fn as_ref(&self) -> ZImageControlHeavy<'_> {
+        ZImageControlHeavy {
+            transformer: &self.transformer,
+            vae: &self.vae,
+        }
+    }
+}
+
+/// Precision guard (only dense bf16 is wired) + base-snapshot-dir resolution + the **required**
+/// control-checkpoint resolution, shared by [`load_control_residency`]'s `Resident` composition and its
+/// `Sequential` per-phase loaders (sc-11124). Preserves the original message order: a single-file base
+/// is rejected first (via [`require_base_dir`]), then a missing control checkpoint (via
+/// [`require_control`]). `precision_msg` is the per-id override-rejection text (turbo vs base control).
+pub(crate) fn resolve_control_base_and_control<'a>(
+    spec: &'a LoadSpec,
+    model_id: &str,
+    precision_msg: &str,
+) -> Result<(&'a Path, &'a WeightsSource)> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(precision_msg.into()));
+    }
+    let root = require_base_dir(spec, model_id, "a base snapshot directory")?;
+    let control = require_control(spec, model_id, "Fun-Controlnet-Union")?;
+    Ok((root, control))
+}
+
+/// Load the text encoder — the phase-A component dropped first under `Sequential`. Quantized with the
+/// whole-model bits when `quant` is set (the Z-Image control quant scope covers the text encoder), so
+/// the `Resident` and `Sequential` paths build byte-identical encoders.
+pub(crate) fn load_control_text_encoder_only(
+    root: &Path,
+    quant: Option<Quant>,
+) -> Result<TextEncoder> {
+    let mut text_encoder = loader::load_text_encoder(root)?;
+    if let Some(q) = quant {
+        text_encoder.quantize(q.bits())?;
+    }
+    Ok(text_encoder)
+}
+
+/// Load the heavy control render components — the composed base+control transformer (+ Q4/Q8 + the
+/// base's LoRA/LoKr residuals) and the VAE (+ Q4/Q8) — everything but the text encoder. The
+/// overlay-then-quantize order (dense base + dense control, THEN quantize) matches the pre-sc-11124
+/// hand-written `load`; the components are independent of the text encoder (separate weight files,
+/// deterministic RNG-free quant), so the `Resident` composition is byte-identical. Shared by both
+/// control variants (turbo + base) — they differ only in the generate-time schedule + CFG.
+pub(crate) fn load_control_heavy(
+    spec: &LoadSpec,
+    root: &Path,
+    control: &WeightsSource,
+) -> Result<ZImageControlHeavyOwned> {
+    // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
+    // before the overlay would replace the control Linears with QuantizedLinear that can't accept
+    // the raw bf16 control weights.
+    let mut transformer = loader::load_control_transformer(root, control)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
+    // LoRA/LoKr (sc-2602): install onto the composed base DiT (the control branch is not an adapter
+    // target). Same load-time, post-quantize, residual-over-base path. No-op when `spec.adapters` is
+    // empty.
+    if !spec.adapters.is_empty() {
+        crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
+    }
+    Ok(ZImageControlHeavyOwned { transformer, vae })
+}
+
+/// Build the tokenizer + [`Residency`] seam for either Z-Image ControlNet variant, honoring
+/// [`LoadSpec::offload_policy`] (sc-11124, F-172). `Resident` (default) builds every heavy component
+/// now and holds it warm; `Sequential` keeps only the spec and re-loads per generate in phase order
+/// (encode → drop the text encoder → denoise/decode). Both use the same per-phase loaders, so the
+/// components are byte-identical. Parameterized by `model_id` + the per-id precision-override message so
+/// the base control sibling shares it (before sc-11124 both control variants ignored `offload_policy`
+/// and silently loaded full-`Resident`).
+pub(crate) fn load_control_residency(
+    spec: &LoadSpec,
+    model_id: &'static str,
+    precision_msg: &'static str,
+) -> Result<(
+    TextTokenizer,
+    Residency<TextEncoder, ZImageControlHeavyOwned>,
+)> {
+    match spec.offload_policy {
+        OffloadPolicy::Resident => {
+            let (root, control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
+            let text_encoder = load_control_text_encoder_only(root, spec.quantize)?;
+            let heavy = load_control_heavy(spec, root, control)?;
+            let tokenizer = loader::load_tokenizer(root)?;
+            Ok((tokenizer, Residency::resident(text_encoder, heavy)))
+        }
+        OffloadPolicy::Sequential => {
+            // Validate precision + base dir + the required control checkpoint up front (fail fast,
+            // same as `Resident`); the heavy build is deferred to each generate via the closures below.
+            let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
+            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
+            if let Some(q) = spec.quantize {
+                if loader::needs_load_time_quant(root, q.bits(), model_id)? {
+                    mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
+                }
+            }
+            let tokenizer = loader::load_tokenizer(root)?;
+            let spec_text = spec.clone();
+            let spec_heavy = spec.clone();
+            let residency = Residency::sequential(
+                move || {
+                    let (root, _control) =
+                        resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
+                    load_control_text_encoder_only(root, spec_text.quantize)
+                },
+                move |_use_pid| {
+                    let (root, control) =
+                        resolve_control_base_and_control(&spec_heavy, model_id, precision_msg)?;
+                    load_control_heavy(&spec_heavy, root, control)
+                },
+            );
+            Ok((tokenizer, residency))
+        }
+    }
+}
+
+/// The per-id precision-override rejection message for the turbo control variant, shared by
+/// [`load_control_residency`]'s eager guard and its `Sequential` per-phase loaders.
+const PRECISION_MSG: &str =
+    "z_image_turbo_control: only dense bf16 is wired (the text encoder runs \
+     f32 internally); drop the precision override";
 
 /// Construct a [`ZImageTurboControl`] from a [`LoadSpec`].
 ///
@@ -87,43 +239,16 @@ pub struct ZImageTurboControl {
 /// or a `Dir` of them). Weights load dense (bf16); `spec.quantize` (Q4/Q8) then quantizes the whole
 /// transformer (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model
 /// quant, with the control patch embedder left dense (its in-features is not a multiple of 64).
+///
+/// Component residency (sc-11124, F-172): `Resident` (default) holds every heavy component warm;
+/// `Sequential` re-loads per generate in phase order to bound peak memory — routed through the shared
+/// [`load_control_residency`] builder.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "z_image_turbo_control: only dense bf16 is wired (the text encoder runs f32 \
-             internally); drop the precision override"
-                .into(),
-        ));
-    }
-    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
-    // required. The model id + labels keep the messages byte-identical to the hand-written originals.
-    let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
-    let control = require_control(spec, MODEL_ID, "Fun-Controlnet-Union")?;
-
-    // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
-    // before the overlay would replace the control Linears with QuantizedLinear that can't accept
-    // the raw bf16 control weights.
-    let mut transformer = loader::load_control_transformer(root, control)?;
-    let mut text_encoder = loader::load_text_encoder(root)?;
-    let mut vae = loader::load_vae(root)?;
-    if let Some(q) = spec.quantize {
-        let bits = q.bits();
-        transformer.quantize(bits)?;
-        text_encoder.quantize(bits)?;
-        vae.quantize(bits)?;
-    }
-    // LoRA/LoKr (sc-2602): install onto the composed base DiT (the control branch is not an adapter
-    // target). Same load-time, post-quantize, residual-over-base path as the plain turbo. No-op when
-    // `spec.adapters` is empty.
-    if !spec.adapters.is_empty() {
-        crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
-    }
+    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageTurboControl {
         descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(root)?,
-        text_encoder,
-        transformer,
-        vae,
+        tokenizer,
+        residency,
     }))
 }
 
@@ -165,82 +290,105 @@ impl ZImageTurboControl {
         };
         let is_img2img = start_step > 0;
 
-        // Prompt → cap_feats. The fork's control path is **mixed precision**, NOT pure bf16: it feeds
-        // the latents (`x`) and `cap_feats` as bf16 but `control_context` as **f32** (sc-2720, verified
-        // against the fork). The f32 control branch then promotes the bf16 image/caption stream to f32
-        // when its hints are added, and `latents += dt·velocity` makes the latents f32 after step 0 —
-        // so most of the loop runs f32. We match that exactly: bf16 cap (txt2img) + f32 control_context
-        // below. (img2img keeps f32 cap, mirroring the base img2img; the DiT promotes per-op either way.)
-        let cap =
-            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
-        let cap = if is_img2img {
-            cap
-        } else {
-            // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's cap_feats.
-            cap.as_dtype(Dtype::Bfloat16)?
-        };
+        // The staged residency lifecycle (encode → drop the text encoder under `Sequential` → load the
+        // control DiT/VAE → denoise/decode → free the heavy bundle) is driven by the shared
+        // [`Residency::run`] seam (sc-11124), owning the eval/drop/clear discipline, the stage-boundary
+        // cancel checks, and the error-safe cache flush — identically to the base `z_image_turbo`. The
+        // control variant is guidance-distilled (no CFG / negative prompt), so the encode phase is a
+        // single cond `cap`.
+        let images = self.residency.run(
+            &req.cancel,
+            // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
+            // this flag, so `false` avoids loading a student that would never be used.
+            false,
+            // ── Phase A: prompt → cap_feats. The fork's control path is **mixed precision**, NOT pure
+            // bf16: it feeds the latents (`x`) and `cap_feats` as bf16 but `control_context` as **f32**
+            // (sc-2720, verified against the fork). The f32 control branch then promotes the bf16
+            // image/caption stream to f32 when its hints are added, and `latents += dt·velocity` makes
+            // the latents f32 after step 0 — so most of the loop runs f32. We match that exactly: bf16
+            // cap (txt2img) + f32 control_context below. (img2img keeps f32 cap, mirroring the base
+            // img2img; the DiT promotes per-op either way.)
+            |text_encoder: &TextEncoder| {
+                let cap =
+                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                if is_img2img {
+                    Ok(cap)
+                } else {
+                    // PARITY-BF16 (sc-2609): round the text embeddings to bf16 to match the fork's cap.
+                    Ok(cap.as_dtype(Dtype::Bfloat16)?)
+                }
+            },
+            // Materialize the post-cast `cap` while the encoder is still alive (Sequential only) — MLX
+            // is lazy, so an un-evaluated `cap` keeps the encoder referenced through the graph and the
+            // drop would free nothing.
+            |cap| Ok(mlx_rs::transforms::eval([cap])?),
+            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
+            |heavy_owned, cap| {
+                let heavy = heavy_owned.as_ref();
 
-        // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An unset
-        // `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ over the shift.
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
-            req.scheduler.as_deref(),
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        ))?;
+                // Static shift=3.0 schedule (shared with the base turbo, sc-2536) — build once. An
+                // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
+                // over the shift.
+                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+                    req.scheduler.as_deref(),
+                    SCHEDULE_SHIFT.ln(),
+                    steps,
+                    &native.sigmas,
+                ))?;
 
-        // The 33ch control context is constant across steps + the batch — build once. It stays **f32**
-        // (the fork feeds it f32, which promotes the whole control branch to f32 — see the forward).
-        let control_context =
-            encode_control_context(&self.vae, control_image, req.width, req.height)?;
+                // The 33ch control context is constant across steps + the batch — build once. It stays
+                // **f32** (the fork feeds it f32, which promotes the whole control branch to f32).
+                let control_context =
+                    encode_control_context(heavy.vae, control_image, req.width, req.height)?;
 
-        // VAE-encode the init image once too: like control_context, the clean img2img latents depend
-        // only on the init image + dims, not the per-image seed, so they're constant across the batch
-        // (F-034). Only the noise (and its blend) vary per image.
-        let clean = if is_img2img {
-            let (image, _) = reference.expect("is_img2img implies a reference");
-            Some(encode_init_latents(
-                &self.vae, image, req.width, req.height,
-            )?)
-        } else {
-            None
-        };
+                // VAE-encode the init image once too: like control_context, the clean img2img latents
+                // depend only on the init image + dims, not the per-image seed, so they're constant
+                // across the batch (F-034). Only the noise (and its blend) vary per image.
+                let clean = if is_img2img {
+                    let (image, _) = reference.expect("is_img2img implies a reference");
+                    Some(encode_init_latents(
+                        heavy.vae, image, req.width, req.height,
+                    )?)
+                } else {
+                    None
+                };
 
-        // Per-image batch render shared with the base variant (F-035); the control branch's only
-        // difference is the `denoise_control_with_progress` step threading the f32 control context +
-        // scale (the mixed-precision dtype flow, sc-2720, is preserved inside the closure).
-        let sampler_name = req.sampler.as_deref();
-        // The Fun-ControlNet variant is outside the PiD decode scope of sc-7846 (which targets the base
-        // `z_image_turbo` / FLUX.1 / Boogu / Chroma generators); pass `None` so it keeps the native VAE
-        // decode unchanged. Wiring PiD onto the control path would need a `pid` field here and is a
-        // separate follow-on (epic 7840) if/when the control variant should super-resolve.
-        let images = pipeline::render_batch(
-            &self.vae,
-            None,
-            &scheduler,
-            clean.as_ref(),
-            start_step,
-            base_seed,
-            req,
-            on_progress,
-            |latents, seed, op| {
-                denoise_control_with_progress(
-                    &self.transformer,
+                // Per-image batch render shared with the base variant (F-035); the control branch's
+                // only difference is the `denoise_control_with_progress` step threading the f32 control
+                // context + scale (the mixed-precision dtype flow, sc-2720, is preserved in the closure).
+                let sampler_name = req.sampler.as_deref();
+                // The Fun-ControlNet variant is outside the PiD decode scope of sc-7846; pass `None` so
+                // it keeps the native VAE decode unchanged.
+                let images = pipeline::render_batch(
+                    heavy.vae,
+                    None,
                     &scheduler,
-                    sampler_name,
-                    seed,
-                    latents,
-                    &cap,
-                    &control_context,
-                    control_scale,
+                    clean.as_ref(),
                     start_step,
-                    &req.cancel,
-                    op,
-                )
+                    base_seed,
+                    req,
+                    on_progress,
+                    |latents, seed, op| {
+                        denoise_control_with_progress(
+                            heavy.transformer,
+                            &scheduler,
+                            sampler_name,
+                            seed,
+                            latents,
+                            &cap,
+                            &control_context,
+                            control_scale,
+                            start_step,
+                            &req.cancel,
+                            op,
+                        )
+                    },
+                )?;
+                Ok(GenerationOutput::Images(images))
             },
         )?;
-        Ok(GenerationOutput::Images(images))
+        Ok(images)
     }
 }
 
@@ -275,7 +423,7 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::WeightsSource;
+    // `WeightsSource` + `OffloadPolicy` come in via `super::*` (both used by `load`/its helpers).
 
     #[test]
     fn descriptor_is_z_image_turbo_control() {
@@ -302,5 +450,23 @@ mod tests {
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("base snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn load_honors_sequential_offload_policy() {
+        // F-172 (sc-11124): before the fix the control variant ignored `offload_policy` and always
+        // went `Resident`. Now `load` routes through the shared `load_control_residency` seam under
+        // either policy — proven weight-free by the up-front single-file base rejection running on the
+        // `Sequential` arm too, exactly as `Resident` rejects it.
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
+                .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
+                .with_offload_policy(policy);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                err.contains("base snapshot directory"),
+                "policy {policy:?} must reach the shared base-dir validation, got: {err}"
+            );
+        }
     }
 }

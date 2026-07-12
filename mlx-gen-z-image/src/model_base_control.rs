@@ -26,22 +26,20 @@
 use mlx_gen::gen_core;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
-    require_control, resolve_flow_schedule, AcceptedControlKinds, Capabilities, ConditioningKind,
-    ControlBranch, ControlKind, Error, FlowMatchEuler, GenerationOutput, GenerationRequest,
-    Generator, LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result,
+    curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
+    AcceptedControlKinds, Capabilities, ConditioningKind, ControlBranch, ControlKind,
+    FlowMatchEuler, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
+    ModelDescriptor, Progress, Quant, Residency, Result,
 };
 
-use crate::control_transformer::ZImageControlTransformer;
-use crate::loader;
 use crate::model::validate_request;
 use crate::model_base::{DEFAULT_GUIDANCE, DEFAULT_STEPS, SCHEDULE_SHIFT};
+use crate::model_control::{load_control_residency, ZImageControlHeavyOwned};
 use crate::pipeline::{
     self, denoise_control_cfg_with_progress, encode_control_context, encode_init_latents,
     init_time_step,
 };
 use crate::text_encoder::TextEncoder;
-use crate::vae::Vae;
 
 /// Registry id for the **base** (non-Turbo) Z-Image Fun-Controlnet-Union variant. Coexists with
 /// `z_image`, `z_image_turbo`, and `z_image_turbo_control` — distinct id, separate `inventory`
@@ -83,15 +81,23 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded base control generator: base components + the control transformer assembled from the base
-/// snapshot and the base Fun-Controlnet-Union overlay.
+/// A loaded base control generator: the cached descriptor, the (tiny, always-warm) tokenizer, and the
+/// component-residency strategy (base text encoder + control transformer + VAE), driven through the
+/// shared [`Residency`] seam so the base control variant honors [`LoadSpec::offload_policy`] family-wide
+/// (sc-11124, F-172). Same component set + seam as [`crate::model_control::ZImageTurboControl`]; only the
+/// generate-time schedule + CFG differ.
 pub struct ZImageControl {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    text_encoder: TextEncoder,
-    transformer: ZImageControlTransformer,
-    vae: Vae,
+    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
+    /// shared [`load_control_residency`] builder (reused from the Turbo control variant).
+    residency: Residency<TextEncoder, ZImageControlHeavyOwned>,
 }
+
+/// The per-id precision-override rejection message for the base control variant, threaded into the
+/// shared [`load_control_residency`] builder.
+const PRECISION_MSG: &str = "z_image_control: only dense bf16 is wired (the text encoder runs f32 \
+     internally); drop the precision override";
 
 /// Construct a [`ZImageControl`] from a [`LoadSpec`].
 ///
@@ -101,45 +107,15 @@ pub struct ZImageControl {
 /// them). Weights load dense (bf16); `spec.quantize` (Q4/Q8) then quantizes the whole transformer
 /// (base + control, group_size 64) plus the text encoder + VAE — the fork's whole-model quant, with the
 /// control patch embedder left dense (its in-features is not a multiple of 64). Byte-identical load path
-/// to [`crate::model_control::load`] (the control branch shape is identical — see the module doc); only
-/// the generate-time schedule + CFG differ.
+/// to [`crate::model_control::load`] (the control branch shape is identical — see the module doc) — it
+/// shares the same [`load_control_residency`] builder, so `offload_policy` is honored identically
+/// (sc-11124, F-172); only the generate-time schedule + CFG differ.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(
-            "z_image_control: only dense bf16 is wired (the text encoder runs f32 \
-             internally); drop the precision override"
-                .into(),
-        ));
-    }
-    // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
-    // required. The model id + labels keep the messages consistent with the Turbo control variant.
-    let root = require_base_dir(spec, MODEL_ID, "a base snapshot directory")?;
-    let control = require_control(spec, MODEL_ID, "Fun-Controlnet-Union")?;
-
-    // Base + control applied dense first, THEN quantize together (the fork's ordering): quantizing
-    // before the overlay would replace the control Linears with QuantizedLinear that can't accept
-    // the raw bf16 control weights.
-    let mut transformer = loader::load_control_transformer(root, control)?;
-    let mut text_encoder = loader::load_text_encoder(root)?;
-    let mut vae = loader::load_vae(root)?;
-    if let Some(q) = spec.quantize {
-        let bits = q.bits();
-        transformer.quantize(bits)?;
-        text_encoder.quantize(bits)?;
-        vae.quantize(bits)?;
-    }
-    // LoRA/LoKr (sc-2602): install onto the composed base DiT (the control branch is not an adapter
-    // target). Same load-time, post-quantize, residual-over-base path as the base/turbo variants. No-op
-    // when `spec.adapters` is empty.
-    if !spec.adapters.is_empty() {
-        crate::adapters::apply_z_image_adapters(&mut transformer, &spec.adapters)?;
-    }
+    let (tokenizer, residency) = load_control_residency(spec, MODEL_ID, PRECISION_MSG)?;
     Ok(Box::new(ZImageControl {
         descriptor: descriptor(),
-        tokenizer: loader::load_tokenizer(root)?,
-        text_encoder,
-        transformer,
-        vae,
+        tokenizer,
+        residency,
     }))
 }
 
@@ -204,85 +180,112 @@ impl ZImageControl {
         };
         let is_img2img = start_step > 0;
 
-        // Prompt → cap_feats. The base is undistilled and runs real CFG; like the base `z_image` (and
-        // unlike the Turbo bf16 seed-parity golden), keep the conditioning at the text encoder's native
-        // precision and let the DiT promote per-op against the bf16 weights. The control branch's f32
-        // mixed-precision flow (sc-2720) is preserved inside the denoise closure regardless.
-        let cap =
-            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
-        // Uncond conditioning = the negative prompt (empty string when unset), encoded only when CFG
-        // is active. Empty prompt is valid for the negative branch (the unconditional embedding).
-        let neg_cap = if cfg_on {
-            let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(pipeline::encode_uncond(
-                &self.tokenizer,
-                &self.text_encoder,
-                neg,
-            )?)
-        } else {
-            None
-        };
+        // The staged residency lifecycle (encode cond+uncond → drop the text encoder under `Sequential`
+        // → load the control DiT/VAE → denoise/decode → free the heavy bundle) is driven by the shared
+        // [`Residency::run`] seam (sc-11124). Base-control delta vs the Turbo control variant: real CFG
+        // (a negative-prompt uncond branch) and no bf16 cap cast.
+        let images = self.residency.run(
+            &req.cancel,
+            // No PiD overlay on the control path (sc-7846 is base-turbo-only); the heavy loader ignores
+            // this flag.
+            false,
+            // ── Phase A: prompt → (cap, neg_cap). The base is undistilled and runs real CFG; like the
+            // base `z_image` (and unlike the Turbo bf16 seed-parity golden), keep the conditioning at
+            // the text encoder's native precision and let the DiT promote per-op against the bf16
+            // weights. The control branch's f32 mixed-precision flow (sc-2720) is preserved inside the
+            // denoise closure regardless.
+            |text_encoder: &TextEncoder| {
+                let cap =
+                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Uncond conditioning = the negative prompt (empty string when unset), encoded only
+                // when CFG is active. Empty prompt is valid for the negative branch.
+                let neg_cap = if cfg_on {
+                    let neg = req.negative_prompt.as_deref().unwrap_or("");
+                    Some(pipeline::encode_uncond(&self.tokenizer, text_encoder, neg)?)
+                } else {
+                    None
+                };
+                Ok((cap, neg_cap))
+            },
+            // Materialize cap (+neg_cap) while the encoder is still alive (Sequential only).
+            |(cap, neg_cap)| {
+                match neg_cap {
+                    Some(neg) => mlx_rs::transforms::eval([cap, neg])?,
+                    None => mlx_rs::transforms::eval([cap])?,
+                }
+                Ok(())
+            },
+            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
+            |heavy_owned, (cap, neg_cap)| {
+                let heavy = heavy_owned.as_ref();
 
-        // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An unset
-        // `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ over shift=6.0.
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
-            req.scheduler.as_deref(),
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        ))?;
+                // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
+                // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
+                // over shift=6.0.
+                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+                    req.scheduler.as_deref(),
+                    SCHEDULE_SHIFT.ln(),
+                    steps,
+                    &native.sigmas,
+                ))?;
 
-        // The 33ch control context is constant across steps + the batch + both CFG branches — build
-        // once. It stays **f32** (the fork feeds it f32, which promotes the whole control branch to f32).
-        let control_context =
-            encode_control_context(&self.vae, control_image, req.width, req.height)?;
+                // The 33ch control context is constant across steps + the batch + both CFG branches —
+                // build once. It stays **f32** (the fork feeds it f32, promoting the control branch to
+                // f32).
+                let control_context =
+                    encode_control_context(heavy.vae, control_image, req.width, req.height)?;
 
-        // VAE-encode the init image once too (constant across the batch — only the noise varies, F-034).
-        let clean = if is_img2img {
-            let (image, _) = reference.expect("is_img2img implies a reference");
-            Some(encode_init_latents(
-                &self.vae, image, req.width, req.height,
-            )?)
-        } else {
-            None
-        };
+                // VAE-encode the init image once too (constant across the batch — only the noise
+                // varies, F-034).
+                let clean = if is_img2img {
+                    let (image, _) = reference.expect("is_img2img implies a reference");
+                    Some(encode_init_latents(
+                        heavy.vae, image, req.width, req.height,
+                    )?)
+                } else {
+                    None
+                };
 
-        // Per-image batch render shared with the base/turbo variants (F-035); the control+CFG branch's
-        // only difference is the `denoise_control_cfg_with_progress` step threading the f32 control
-        // context + scale through both the cond and uncond forward of the CFG combine.
-        let sampler_name = req.sampler.as_deref();
-        let neg_cap_ref = neg_cap.as_ref();
-        // The Fun-ControlNet variant is outside the PiD decode scope (sc-7846); pass `None` so it keeps
-        // the native VAE decode unchanged (epic 7840 is a separate follow-on for the control path).
-        let images = pipeline::render_batch(
-            &self.vae,
-            None,
-            &scheduler,
-            clean.as_ref(),
-            start_step,
-            base_seed,
-            req,
-            on_progress,
-            |latents, seed, op| {
-                denoise_control_cfg_with_progress(
-                    &self.transformer,
+                // Per-image batch render shared with the base/turbo variants (F-035); the control+CFG
+                // branch's only difference is the `denoise_control_cfg_with_progress` step threading the
+                // f32 control context + scale through both the cond and uncond forward of the CFG
+                // combine.
+                let sampler_name = req.sampler.as_deref();
+                let neg_cap_ref = neg_cap.as_ref();
+                // The Fun-ControlNet variant is outside the PiD decode scope (sc-7846); pass `None` so
+                // it keeps the native VAE decode unchanged.
+                let images = pipeline::render_batch(
+                    heavy.vae,
+                    None,
                     &scheduler,
-                    sampler_name,
-                    seed,
-                    latents,
-                    &cap,
-                    neg_cap_ref,
-                    guidance,
-                    &control_context,
-                    control_scale,
+                    clean.as_ref(),
                     start_step,
-                    &req.cancel,
-                    op,
-                )
+                    base_seed,
+                    req,
+                    on_progress,
+                    |latents, seed, op| {
+                        denoise_control_cfg_with_progress(
+                            heavy.transformer,
+                            &scheduler,
+                            sampler_name,
+                            seed,
+                            latents,
+                            &cap,
+                            neg_cap_ref,
+                            guidance,
+                            &control_context,
+                            control_scale,
+                            start_step,
+                            &req.cancel,
+                            op,
+                        )
+                    },
+                )?;
+                Ok(GenerationOutput::Images(images))
             },
         )?;
-        Ok(GenerationOutput::Images(images))
+        Ok(images)
     }
 }
 
@@ -318,7 +321,7 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mlx_gen::WeightsSource;
+    use mlx_gen::{OffloadPolicy, WeightsSource};
 
     #[test]
     fn descriptor_is_z_image_control() {
@@ -379,5 +382,23 @@ mod tests {
             .with_control(WeightsSource::File("/tmp/control.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("base snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn load_honors_sequential_offload_policy() {
+        // F-172 (sc-11124): the base control variant now shares the Turbo control variant's
+        // `load_control_residency` seam, so `offload_policy` is honored (previously ignored → always
+        // `Resident`). Proven weight-free by the single-file base rejection running on the `Sequential`
+        // arm too, exactly as `Resident` rejects it.
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
+                .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
+                .with_offload_policy(policy);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                err.contains("base snapshot directory"),
+                "policy {policy:?} must reach the shared base-dir validation, got: {err}"
+            );
+        }
     }
 }

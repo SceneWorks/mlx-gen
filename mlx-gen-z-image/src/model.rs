@@ -111,25 +111,27 @@ pub struct ZImageTurbo {
 
 /// The heavy render-phase components (the DiT transformer, the VAE, and the optional PiD decoder) —
 /// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
-struct ZImageHeavyOwned {
-    transformer: ZImageTransformer,
-    vae: Vae,
+/// `pub(crate)` so the **base** (non-distilled) `z_image` sibling ([`crate::model_base`]) shares the
+/// identical heavy bundle on the same shared [`load_residency`] seam (sc-11124, F-172).
+pub(crate) struct ZImageHeavyOwned {
+    pub(crate) transformer: ZImageTransformer,
+    pub(crate) vae: Vae,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
     /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`. Z-Image shares Flux1's VAE
     /// latent space, so it reuses the `flux` PiD student via the `zimage-turbo` registry alias.
-    pid: Option<PidEngine>,
+    pub(crate) pid: Option<PidEngine>,
 }
 
 /// A borrow of the heavy render-phase components, so the denoise/decode body runs identically
 /// whether they are held resident or were just loaded by the `Sequential` path (candle's `DitRef`).
-struct ZImageHeavy<'a> {
-    transformer: &'a ZImageTransformer,
-    vae: &'a Vae,
-    pid: Option<&'a PidEngine>,
+pub(crate) struct ZImageHeavy<'a> {
+    pub(crate) transformer: &'a ZImageTransformer,
+    pub(crate) vae: &'a Vae,
+    pub(crate) pid: Option<&'a PidEngine>,
 }
 
 impl ZImageHeavyOwned {
-    fn as_ref(&self) -> ZImageHeavy<'_> {
+    pub(crate) fn as_ref(&self) -> ZImageHeavy<'_> {
         ZImageHeavy {
             transformer: &self.transformer,
             vae: &self.vae,
@@ -149,14 +151,34 @@ impl ZImageHeavyOwned {
 /// full memory saving and fork-matching output (sc-2532). An fp32 precision override is not wired
 /// (the validated dense path is bf16) and is rejected rather than silently ignored.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // Component residency (epic 10834 Phase 1, sc-10839): `Resident` (default) builds every heavy
-    // component now via [`load_components`] and holds it warm; `Sequential` keeps only the spec and
-    // re-loads per generate in phase order (encode → drop the text encoder → denoise/decode) to bound
-    // peak memory. Both use the same per-phase loaders, so the components are byte-identical.
-    let (tokenizer, residency) = match spec.offload_policy {
+    let (tokenizer, residency) = load_residency(spec, PRECISION_MSG, FILE_MSG)?;
+    Ok(Box::new(ZImageTurbo {
+        descriptor: descriptor(),
+        tokenizer,
+        residency,
+    }))
+}
+
+/// Build the tokenizer + [`Residency`] seam for a non-control Z-Image generator from a [`LoadSpec`],
+/// honoring [`LoadSpec::offload_policy`] (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
+/// sc-11125). `Resident` (default) builds every heavy component now via [`load_components`] and holds
+/// it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop
+/// the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both use
+/// the same per-phase loaders, so the components are byte-identical.
+///
+/// `pub(crate)` and parameterized by the two per-id error strings (precision override / single-file
+/// rejection) so the **base** `z_image` sibling ([`crate::model_base`]) shares the identical policy
+/// routing rather than re-deriving it (sc-11124, F-172 — before which the base always loaded
+/// `Resident`, silently OOMing a fit-gated Sequential request).
+pub(crate) fn load_residency(
+    spec: &LoadSpec,
+    precision_msg: &'static str,
+    file_msg: &'static str,
+) -> Result<(TextTokenizer, Residency<TextEncoder, ZImageHeavyOwned>)> {
+    match spec.offload_policy {
         OffloadPolicy::Resident => {
-            let c = load_components(spec, PRECISION_MSG, FILE_MSG)?;
-            (
+            let c = load_components(spec, precision_msg, file_msg)?;
+            Ok((
                 c.tokenizer,
                 Residency::resident(
                     c.text_encoder,
@@ -166,12 +188,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                         pid: c.pid,
                     },
                 ),
-            )
+            ))
         }
         OffloadPolicy::Sequential => {
             // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
             // build is deferred to each generate via the loader closures below.
-            let root = resolve_precision_and_root(spec, PRECISION_MSG, FILE_MSG)?;
+            let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
             // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
             // An already-packed turnkey loads packed (no re-quant), so gate on the same precise
             // predicate qwen uses — only warn when a load-time (re)quant over a dense snapshot will
@@ -186,22 +208,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             let spec_heavy = spec.clone();
             let residency = Residency::sequential(
                 move || {
-                    let root = resolve_precision_and_root(&spec_text, PRECISION_MSG, FILE_MSG)?;
+                    let root = resolve_precision_and_root(&spec_text, precision_msg, file_msg)?;
                     load_text_encoder_only(root, spec_text.quantize)
                 },
                 move |use_pid| {
-                    let root = resolve_precision_and_root(&spec_heavy, PRECISION_MSG, FILE_MSG)?;
+                    let root = resolve_precision_and_root(&spec_heavy, precision_msg, file_msg)?;
                     load_heavy(&spec_heavy, root, use_pid)
                 },
             );
-            (tokenizer, residency)
+            Ok((tokenizer, residency))
         }
-    };
-    Ok(Box::new(ZImageTurbo {
-        descriptor: descriptor(),
-        tokenizer,
-        residency,
-    }))
+    }
 }
 
 /// The `z_image_turbo` precision-override / single-file rejection messages, shared by the `Resident`
