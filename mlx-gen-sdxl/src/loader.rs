@@ -39,6 +39,38 @@ fn is_packed(w: &Weights) -> bool {
     w.keys().any(|k| k.ends_with(".scales"))
 }
 
+/// Read the on-disk packed-quantization bits from `unet/config.json`, if the snapshot is a
+/// pre-quantized (Group-B packed) turnkey. The converter writes `"quantization": {"bits",
+/// "group_size"}` (see `mlx_gen::quant::write_quantized_config`); a dense snapshot has no such
+/// marker. The U-Net is the representative heavy component, as the transformer is for qwen. Returns
+/// `None` for a dense snapshot or a missing/unreadable config.
+fn packed_quant_bits(root: &Path) -> Option<i32> {
+    let cfg = std::fs::read(root.join("unet").join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&cfg).ok()?;
+    v.get("quantization")?
+        .get("bits")?
+        .as_i64()
+        .map(|b| b as i32)
+}
+
+/// Tier guard mirroring `mlx_gen_qwen_image::loader::needs_load_time_quant`: if the snapshot is
+/// already a pre-quantized packed turnkey, the loaders detect the packed weights ([`is_packed`] /
+/// `{base}.scales`) and skip `quantize()`, so a load-time (re)quant never happens. Compares the
+/// requested bits against the [`packed_quant_bits`] marker: errors on a tier mismatch; returns
+/// `false` (no load-time quant) when the turnkey is already packed at the requested bits; and returns
+/// `true` (load-time quantize needed) for a dense snapshot, where the request stands.
+pub fn needs_load_time_quant(root: &Path, requested_bits: i32, model_id: &str) -> Result<bool> {
+    match packed_quant_bits(root) {
+        Some(packed) if packed != requested_bits => Err(Error::Msg(format!(
+            "{model_id}: snapshot is a pre-quantized Q{packed} turnkey but Q{requested_bits} was \
+             requested; quantize() is a no-op on packed weights so the request would silently \
+             serve Q{packed}. Point at a Q{requested_bits} snapshot (or a dense one)."
+        ))),
+        Some(_) => Ok(false),
+        None => Ok(true),
+    }
+}
+
 /// Resolve a component's weight file inside `subdir`, picking the variant that best matches `dtype`.
 /// diffusers snapshots ship the f32 master (`<stem>.safetensors`) and/or an fp16 variant
 /// (`<stem>.fp16.safetensors`); the fp16 file is exactly `astype(f16)` of the f32 master, so for an
@@ -214,4 +246,64 @@ pub fn load_vae(root: &Path) -> Result<Autoencoder> {
     let mut w = Weights::from_file(&file)?;
     w.cast_all(Dtype::Float32)?;
     Autoencoder::from_weights(&w, &VaeConfig::sdxl_base())
+}
+
+/// F-181: the `Sequential` re-quant warn (and the `needs_load_time_quant` tier guard) must fire only
+/// when a load-time (re)quant over a **dense** snapshot will actually happen — an already-packed
+/// turnkey loads packed and must NOT warn. Weight-free: writes only a `unet/config.json`.
+#[cfg(test)]
+mod quant_tier_tests {
+    use super::needs_load_time_quant;
+
+    /// Make a fresh temp snapshot root with `unet/config.json` = `body` (skip the file when `body` is
+    /// `None` — a dense snapshot with no quantization marker).
+    fn snapshot(body: Option<&str>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "sdxl-tier-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+        ));
+        let ud = root.join("unet");
+        std::fs::create_dir_all(&ud).unwrap();
+        if let Some(b) = body {
+            std::fs::write(ud.join("config.json"), b).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn dense_snapshot_needs_quant_and_warns() {
+        // No config.json at all, and a config with no `quantization` marker, both read as dense.
+        for body in [None, Some("{}"), Some(r#"{"in_channels": 4}"#)] {
+            let root = snapshot(body);
+            assert!(
+                needs_load_time_quant(&root, 4, "sdxl").unwrap(),
+                "dense snapshot must report a load-time quant (→ warn)"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    #[test]
+    fn already_packed_at_requested_bits_does_not_warn() {
+        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        assert!(
+            !needs_load_time_quant(&root, 8, "sdxl").unwrap(),
+            "an already-packed Q8 turnkey must NOT report a load-time quant (no warn)"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn tier_mismatch_errors() {
+        let root = snapshot(Some(r#"{"quantization": {"bits": 8, "group_size": 64}}"#));
+        let err = needs_load_time_quant(&root, 4, "sdxl").unwrap_err();
+        assert!(
+            format!("{err}").contains("pre-quantized Q8"),
+            "requesting Q4 over a packed Q8 turnkey must error, got: {err}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

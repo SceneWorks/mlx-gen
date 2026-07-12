@@ -291,8 +291,13 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         }
         OffloadPolicy::Sequential => {
             // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
+            // An already-packed turnkey loads packed (no re-quant), so gate on the same precise
+            // predicate qwen uses — only warn when a load-time (re)quant over a dense snapshot will
+            // actually happen.
             if let Some(q) = spec.quantize {
-                mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
+                if loader::needs_load_time_quant(root, q.bits(), descriptor().id)? {
+                    mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
+                }
             }
             let spec_text = spec.clone();
             let spec_heavy = spec.clone();
