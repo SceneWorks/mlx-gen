@@ -26,15 +26,13 @@ use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, resolve_flow_schedule,
     Capabilities, ConditioningKind, FlowMatchEuler, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result,
+    LatentDecoder, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Residency, Result,
 };
-use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
+use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma};
 
-use crate::model::validate_request;
+use crate::model::{validate_request, ZImageHeavyOwned};
 use crate::pipeline::{self, denoise_cfg_with_progress, encode_init_latents, init_time_step};
 use crate::text_encoder::TextEncoder;
-use crate::transformer::ZImageTransformer;
-use crate::vae::Vae;
 
 /// Base Z-Image default steps — undistilled foundation model. The card recommends 28–50; 50 matches
 /// the reference `ZImagePipeline` example (`num_inference_steps=50`). Used when a request omits `steps`.
@@ -93,17 +91,20 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// A loaded base Z-Image generator — the four model components assembled from a snapshot directory,
-/// plus the cached descriptor and an optional PiD overlay. Same component set as [`crate::model::ZImageTurbo`].
+/// A loaded base Z-Image generator — the cached descriptor, the (tiny, always-warm) tokenizer, and the
+/// component-residency strategy. Same component set as [`crate::model::ZImageTurbo`] (Qwen text
+/// encoder, DiT, VAE, and an optional PiD overlay), driven through the identical shared [`Residency`]
+/// seam so the base honors [`LoadSpec::offload_policy`] family-wide (sc-11124, F-172): `Sequential`
+/// drops the Qwen text encoder after the encode phase, bounding peak unified memory to
+/// `max(text-encoder, DiT+VAE)`.
 pub struct ZImage {
     descriptor: ModelDescriptor,
     tokenizer: TextTokenizer,
-    text_encoder: TextEncoder,
-    transformer: ZImageTransformer,
-    vae: Vae,
-    /// Optional PiD super-resolving decoder overlay (epic 7840). `Some` only when the `LoadSpec`
-    /// carried `pid`; selected per-generation by `req.use_pid`. Same `zimage-turbo` PiD alias as Turbo.
-    pid: Option<PidEngine>,
+    /// Component-residency strategy (sc-11124), selected from [`LoadSpec::offload_policy`] via the
+    /// shared [`crate::model::load_residency`] builder. `Resident` holds the text encoder + DiT + VAE
+    /// warm; `Sequential` holds only the per-phase loader closures and re-loads per generate in phase
+    /// order (encode → drop the text encoder → denoise/decode).
+    residency: Residency<TextEncoder, ZImageHeavyOwned>,
 }
 
 /// Construct a [`ZImage`] from a [`LoadSpec`].
@@ -114,9 +115,12 @@ pub struct ZImage {
 /// schedule + CFG differ. `spec.quantize` (Q4/Q8) quantizes the **whole model** after the dense bf16
 /// load, exactly as Turbo.
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    // F-090: the non-control load body is byte-identical to the plain Turbo loader (same loaders,
-    // whole-model quant order, adapter path, PiD overlay); share it, passing only the per-id error text.
-    let c = crate::model::load_components(
+    // F-090 + F-172: the non-control load body is byte-identical to the plain Turbo loader (same
+    // loaders, whole-model quant order, adapter path, PiD overlay) AND now shares its `offload_policy`
+    // routing — `load_residency` runs the identical `Resident`/`Sequential` match, so a fit-gated
+    // Sequential base request is honored instead of silently loading full-Resident (sc-11124). Only the
+    // per-id error text (precision override / single-file rejection) differs.
+    let (tokenizer, residency) = crate::model::load_residency(
         spec,
         "z_image: only dense bf16 is wired in the Rust port; the text encoder already runs f32 \
          internally (drop the precision override)",
@@ -125,11 +129,8 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     )?;
     Ok(Box::new(ZImage {
         descriptor: descriptor(),
-        tokenizer: c.tokenizer,
-        text_encoder: c.text_encoder,
-        transformer: c.transformer,
-        vae: c.vae,
-        pid: c.pid,
+        tokenizer,
+        residency,
     }))
 }
 
@@ -140,6 +141,12 @@ mlx_gen::impl_generator!(ZImage {
 
 impl ZImage {
     /// The rich-`Result` body behind [`Generator::generate`].
+    ///
+    /// The staged residency lifecycle (encode cond+uncond → drop the text encoder under `Sequential`
+    /// → load the DiT/VAE/PiD → denoise/decode → free the heavy bundle) is driven by the shared
+    /// [`Residency::run`] seam (sc-11124), which owns the eval/drop/clear discipline, the
+    /// stage-boundary cancel checks, and the error-safe cache flush — identically to the Turbo
+    /// flagship. Base delta vs Turbo: real CFG (a negative-prompt uncond branch) and no bf16 cap cast.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -162,89 +169,112 @@ impl ZImage {
         };
         let is_img2img = start_step > 0;
 
-        // Prompt → cap_feats. The base is undistilled and runs real CFG; unlike Turbo there is no
-        // bf16 seed-parity golden to match, so keep the conditioning at the text encoder's native
-        // precision and let the DiT promote per-op against the bf16 weights.
-        let cap =
-            pipeline::encode_prompt(&self.tokenizer, &self.text_encoder, &req.prompt, MODEL_ID)?;
-        // Uncond conditioning = the negative prompt (empty string when unset), encoded only when CFG
-        // is active. Empty prompt is valid for the negative branch (the unconditional embedding).
-        let neg_cap = if cfg_on {
-            let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(pipeline::encode_uncond(
-                &self.tokenizer,
-                &self.text_encoder,
-                neg,
-            )?)
-        } else {
-            None
-        };
+        let images = self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            // ── Phase A: prompt → (cap, neg_cap). The base is undistilled and runs real CFG; unlike
+            // Turbo there is no bf16 seed-parity golden to match, so keep the conditioning at the text
+            // encoder's native precision and let the DiT promote per-op against the bf16 weights.
+            |text_encoder: &TextEncoder| {
+                let cap =
+                    pipeline::encode_prompt(&self.tokenizer, text_encoder, &req.prompt, MODEL_ID)?;
+                // Uncond conditioning = the negative prompt (empty string when unset), encoded only
+                // when CFG is active. Empty prompt is valid for the negative branch (the
+                // unconditional embedding).
+                let neg_cap = if cfg_on {
+                    let neg = req.negative_prompt.as_deref().unwrap_or("");
+                    Some(pipeline::encode_uncond(&self.tokenizer, text_encoder, neg)?)
+                } else {
+                    None
+                };
+                Ok((cap, neg_cap))
+            },
+            // Materialize cap (+neg_cap) while the encoder is still alive (Sequential only) — MLX is
+            // lazy, so an un-evaluated output keeps the encoder referenced through the graph and the
+            // drop would free nothing.
+            |(cap, neg_cap)| {
+                match neg_cap {
+                    Some(neg) => mlx_rs::transforms::eval([cap, neg])?,
+                    None => mlx_rs::transforms::eval([cap])?,
+                }
+                Ok(())
+            },
+            // ── Phase B: denoise/decode from the heavy bundle. Runs identically for both residencies.
+            |heavy_owned, (cap, neg_cap)| {
+                let heavy = heavy_owned.as_ref();
 
-        // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An unset
-        // `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ over `shift=6.0`.
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let resolved_sigmas = resolve_flow_schedule(
-            req.scheduler.as_deref(),
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        );
-        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): mint a decoder when
-        // `use_pid` is set AND a PiD overlay was loaded, else `None` → the native VAE (errors loudly if
-        // requested without one). Z-Image base is flow-match (`vp_frame=false`), so the schedule σ *is*
-        // the degrade σ: `flow_capture_for_request` folds a `pid_capture_sigma` ceiling + schedule into
-        // `(capture_sigma, keep)` — mint the decoder at `capture_sigma` and build the scheduler over the
-        // *truncated* `resolved_sigmas[..keep]` (the img2img blend still reads `sigmas[start_step]`, valid
-        // since `keep > start_step`). The clean path yields `(0.0, len())` → full schedule, σ=0, byte-
-        // identical. `start_step` is the img2img noise-blend offset.
-        let (capture_sigma, keep) = flow_capture_for_request(req, &resolved_sigmas, start_step);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            MODEL_ID,
-            capture_sigma,
-        )?;
-        let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
+                // Static shift=6.0 schedule (the base model's scheduler_config.json) — build once. An
+                // unset `req.scheduler` keeps it byte-exact (epic 7114 N1); a curated name re-shapes σ
+                // over `shift=6.0`.
+                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+                let resolved_sigmas = resolve_flow_schedule(
+                    req.scheduler.as_deref(),
+                    SCHEDULE_SHIFT.ln(),
+                    steps,
+                    &native.sigmas,
+                );
+                // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): mint a
+                // decoder when `use_pid` is set AND a PiD overlay was loaded, else `None` → the native
+                // VAE (errors loudly if requested without one). Z-Image base is flow-match
+                // (`vp_frame=false`), so the schedule σ *is* the degrade σ: `flow_capture_for_request`
+                // folds a `pid_capture_sigma` ceiling + schedule into `(capture_sigma, keep)` — mint
+                // the decoder at `capture_sigma` and build the scheduler over the *truncated*
+                // `resolved_sigmas[..keep]` (the img2img blend still reads `sigmas[start_step]`, valid
+                // since `keep > start_step`). The clean path yields `(0.0, len())` → full schedule,
+                // σ=0, byte-identical. `start_step` is the img2img noise-blend offset.
+                let (capture_sigma, keep) =
+                    flow_capture_for_request(req, &resolved_sigmas, start_step);
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    heavy.pid,
+                    req,
+                    base_seed,
+                    MODEL_ID,
+                    capture_sigma,
+                )?;
+                let scheduler = FlowMatchEuler::from_sigmas(resolved_sigmas[..keep].to_vec())?;
 
-        // VAE-encode the init image once (constant across the count loop — only the noise varies).
-        let clean = if is_img2img {
-            let (image, _) = reference.expect("is_img2img implies a reference");
-            Some(encode_init_latents(
-                &self.vae, image, req.width, req.height,
-            )?)
-        } else {
-            None
-        };
+                // VAE-encode the init image once (constant across the count loop — only the noise
+                // varies).
+                let clean = if is_img2img {
+                    let (image, _) = reference.expect("is_img2img implies a reference");
+                    Some(encode_init_latents(
+                        heavy.vae, image, req.width, req.height,
+                    )?)
+                } else {
+                    None
+                };
 
-        let sampler_name = req.sampler.as_deref();
-        let neg_cap_ref = neg_cap.as_ref();
-        let images = pipeline::render_batch(
-            &self.vae,
-            pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-            &scheduler,
-            clean.as_ref(),
-            start_step,
-            base_seed,
-            req,
-            on_progress,
-            |latents, seed, op| {
-                denoise_cfg_with_progress(
-                    &self.transformer,
+                let sampler_name = req.sampler.as_deref();
+                let neg_cap_ref = neg_cap.as_ref();
+                let images = pipeline::render_batch(
+                    heavy.vae,
+                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                     &scheduler,
-                    sampler_name,
-                    seed,
-                    latents,
-                    &cap,
-                    neg_cap_ref,
-                    guidance,
+                    clean.as_ref(),
                     start_step,
-                    &req.cancel,
-                    op,
-                )
+                    base_seed,
+                    req,
+                    on_progress,
+                    |latents, seed, op| {
+                        denoise_cfg_with_progress(
+                            heavy.transformer,
+                            &scheduler,
+                            sampler_name,
+                            seed,
+                            latents,
+                            &cap,
+                            neg_cap_ref,
+                            guidance,
+                            start_step,
+                            &req.cancel,
+                            op,
+                        )
+                    },
+                )?;
+                Ok(GenerationOutput::Images(images))
             },
         )?;
-        Ok(GenerationOutput::Images(images))
+        Ok(images)
     }
 }
 
@@ -320,5 +350,25 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    #[test]
+    fn load_honors_sequential_offload_policy() {
+        // F-172 (sc-11124): before the fix the base ignored `offload_policy` and always went
+        // `Resident`. Now `load` routes through the shared `load_residency` seam under either policy —
+        // proven weight-free by the up-front single-file rejection running on the `Sequential` arm too
+        // (a File is not a snapshot dir), exactly as `Resident` rejects it. If `Sequential` were still
+        // dropped on the floor this path would not reach the same validation. Companion of the ignored
+        // real-weight A/B in `tests/sequential_residency_real_weights.rs`.
+        use mlx_gen::{OffloadPolicy, WeightsSource};
+        for policy in [OffloadPolicy::Resident, OffloadPolicy::Sequential] {
+            let spec = LoadSpec::new(WeightsSource::File("/tmp/z.safetensors".into()))
+                .with_offload_policy(policy);
+            let err = load(&spec).err().expect("expected an error").to_string();
+            assert!(
+                err.contains("snapshot directory"),
+                "policy {policy:?} must reach the shared snapshot-dir validation, got: {err}"
+            );
+        }
     }
 }

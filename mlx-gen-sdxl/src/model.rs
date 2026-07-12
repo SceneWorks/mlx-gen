@@ -17,7 +17,7 @@ use mlx_gen::{
     Conditioning, ConditioningKind, DiffusionSampler, DiscreteModelSampling, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LcmSampler,
     LightningSampler, LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress,
-    Quant, Result, Scheduler, Solver, TcdSampler, WeightsSource,
+    Quant, Residency, Result, Scheduler, Solver, TcdSampler, WeightsSource,
 };
 use mlx_rs::ops::{add, concatenate_axis, multiply};
 use mlx_rs::Dtype;
@@ -184,37 +184,20 @@ pub struct Sdxl {
     /// DDPM `alphas_cumprod` from the SDXL `scaled_linear` betas — shared by the acceleration
     /// samplers (sc-2769). Built once at load (the ancestral `sampler` keeps its own σ table).
     alpha_schedule: AlphaSchedule,
-    /// Component-residency strategy (epic 10834 Phase 1, sc-10839), selected from
-    /// [`LoadSpec::offload_policy`] at [`load`]. `Resident` (default) holds every heavy component
-    /// (both CLIP encoders + U-Net + control/IP/VAE/PiD) warm for the whole job and across jobs;
-    /// `Sequential` holds only the [`LoadSpec`] and re-loads each component in phase order per
-    /// generation (text encode → **drop the encoders** → U-Net/VAE denoise+decode), bounding peak
-    /// unified memory to the largest single working set instead of the sum, at the cost of the warm
-    /// cache — for Macs where the resident set would OOM.
-    residency: Residency,
-}
-
-/// The heavy-component residency for an [`Sdxl`] (sc-10839). See [`Sdxl::residency`].
-enum Residency {
-    /// Every component loaded once at [`load`] and held for the whole job and across jobs (today's
-    /// warm-cache path). `generate` borrows these; nothing is re-loaded or dropped mid-job. Boxed so
-    /// this heavy variant doesn't bloat every `Sequential` handle (`clippy::large_enum_variant`).
-    Resident(Box<ResidentComponents>),
-    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and
-    /// frees them afterward, so peak memory is `max(text-encoders, U-Net+VAE)` rather than their
-    /// sum, and nothing stays resident across jobs. The stored spec is a plain clone of the load
-    /// request (paths + quant + adapter/control/IP/PiD sources), so the per-phase loaders rebuild
-    /// byte-identical components to the `Resident` path.
-    Sequential(Box<LoadSpec>),
-}
-
-/// The dual CLIP text encoders held resident (the phase-A component dropped first under
-/// `Sequential`). Split from [`SdxlHeavyOwned`] so the `Resident` path can hand the render body the
-/// exact same [`SdxlHeavy`] borrow the `Sequential` path builds from its freshly-loaded bundle.
-struct ResidentComponents {
-    te1: ClipTextEncoder,
-    te2: ClipTextEncoder,
-    heavy: SdxlHeavyOwned,
+    /// Number of loaded ControlNet branches (`spec.control` + `spec.extra_controls`), computed at
+    /// load so `generate` can reject a `Control`-count mismatch under either residency (the
+    /// `Sequential` seam holds loader closures, not the spec, so this is captured up front).
+    control_count: usize,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
+    /// sc-11125), selected from [`LoadSpec::offload_policy`] at [`load`]. `Resident` (default) holds
+    /// every heavy component (both CLIP encoders + U-Net + control/IP/VAE/PiD) warm for the whole job
+    /// and across jobs; `Sequential` holds only the per-phase loader closures and re-loads each
+    /// component in phase order per generation (text encode → **drop the encoders** → U-Net/VAE
+    /// denoise+decode), bounding peak unified memory to the largest single working set instead of the
+    /// sum, at the cost of the warm cache — for Macs where the resident set would OOM. The
+    /// [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
+    /// the error-safe cache flush once for all providers.
+    residency: Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>,
 }
 
 /// The heavy render-phase components (everything but the text encoders): the U-Net, its ControlNet
@@ -297,19 +280,39 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // phase order (encode → drop encoders → denoise/decode) to bound peak memory. The `Resident`
     // build is byte-identical to the pre-sc-10839 `load` — the same loaders, adapter/quant order,
     // and PiD overlay, just assembled through the shared per-phase helpers.
+    let control_count = spec.control.is_some() as usize + spec.extra_controls.len();
     let residency = match spec.offload_policy {
         OffloadPolicy::Resident => {
             let (te1, te2) = load_text_encoders(root, spec.quantize)?;
-            let heavy = load_heavy(spec, root)?;
-            Residency::Resident(Box::new(ResidentComponents { te1, te2, heavy }))
+            // Resident loads the PiD overlay unconditionally (loaded once, reused across generates);
+            // the per-request `use_pid` skip (F-177) applies only to the Sequential per-generate loader.
+            let heavy = load_heavy(spec, root, true)?;
+            Residency::resident((te1, te2), heavy)
         }
-        OffloadPolicy::Sequential => Residency::Sequential(Box::new(spec.clone())),
+        OffloadPolicy::Sequential => {
+            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
+            // An already-packed turnkey loads packed (no re-quant), so gate on the same precise
+            // predicate qwen uses — only warn when a load-time (re)quant over a dense snapshot will
+            // actually happen.
+            if let Some(q) = spec.quantize {
+                if loader::needs_load_time_quant(root, q.bits(), descriptor().id)? {
+                    mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
+                }
+            }
+            let spec_text = spec.clone();
+            let spec_heavy = spec.clone();
+            Residency::sequential(
+                move || load_text_encoders(resolve_root(&spec_text)?, spec_text.quantize),
+                move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
+            )
+        }
     };
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
         sampler: EulerSampler::new_with_dtype(&cfg, true, DTYPE)?,
         alpha_schedule,
+        control_count,
         residency,
     }))
 }
@@ -351,7 +354,7 @@ fn load_text_encoders(
 /// dropped (bounding peak to `max(encoders, U-Net+VAE)`), and the `Resident` path builds the same
 /// bundle up front. The operation order matches the pre-sc-10839 `load` (adapter merge before quant),
 /// and the components are independent of the text encoders, so both residencies are byte-identical.
-fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<SdxlHeavyOwned> {
+fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyOwned> {
     let mut unet = loader::load_unet_dtype(root, DTYPE)?;
     if !spec.adapters.is_empty() {
         // Merge LoRA (kohya `lora_unet_` / PEFT, sc-2639) and LoKr (sc-2640) into the dense fp16
@@ -426,13 +429,18 @@ fn load_heavy(spec: &LoadSpec, root: &Path) -> Result<SdxlHeavyOwned> {
     }
 
     // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
-    // when the spec carries it. Shared across the whole SDXL family (sdxl/realvisxl) — and Kolors,
-    // which loads its own engine via `mlx_gen_sdxl::model::PID_BACKBONE`.
-    let pid = spec
-        .pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()?;
+    // when the spec carries it AND this generate uses it (`load_pid`, F-177) — Resident passes `true`
+    // (loaded once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips the student +
+    // its Gemma caption encoder entirely. Shared across the whole SDXL family (sdxl/realvisxl) — and
+    // Kolors, which loads its own engine via `mlx_gen_sdxl::model::PID_BACKBONE`.
+    let pid = if load_pid {
+        spec.pid
+            .as_ref()
+            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
 
     Ok(SdxlHeavyOwned {
         unet,
@@ -449,69 +457,14 @@ mlx_gen::impl_generator!(Sdxl {
 });
 
 impl Sdxl {
-    /// Text-encode `tokens` into `(conditioning, pooled)` per the residency (epic 10834 Phase 1,
-    /// sc-10839). `Resident` borrows the warm CLIP encoders (byte-identical to the pre-sc-10839
-    /// call); `Sequential` loads them, encodes, forces materialization (`eval`), then DROPS them +
-    /// `clear_cache()` so their ~1 GB frees before the U-Net loads — the whole peak-bounding win for
-    /// the image lane (the text encoders are ≥ the DiT on the LLM-TE stacks).
-    fn encode(&self, tokens: &mlx_rs::Array) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
-        match &self.residency {
-            Residency::Resident(c) => encode_conditioning(&c.te1, &c.te2, tokens),
-            Residency::Sequential(spec) => {
-                let root = resolve_root(spec)?;
-                let (te1, te2) = load_text_encoders(root, spec.quantize)?;
-                let (conditioning, pooled) = encode_conditioning(&te1, &te2, tokens)?;
-                // MLX is lazy — force the encoder forwards to materialize NOW, while `te1`/`te2` are
-                // still alive. Without this `eval`, `conditioning`/`pooled` would keep the encoder
-                // weights referenced through the compute graph and the drop below would free nothing
-                // (this is exactly what Wan's `encode_text_staged` does).
-                mlx_rs::transforms::eval([&conditioning, &pooled])?;
-                drop((te1, te2));
-                mlx_rs::memory::clear_cache();
-                Ok((conditioning, pooled))
-            }
-        }
-    }
-
-    /// Load the heavy render components (U-Net + control/IP + VAE + PiD) for a `Sequential` job —
-    /// after [`Self::encode`] dropped the text encoders — or `None` under `Resident` (already held).
-    /// Kept separate from [`Self::heavy`] so the owned bundle outlives the render-body borrow.
-    fn load_seq_heavy(&self) -> Result<Option<SdxlHeavyOwned>> {
-        match &self.residency {
-            Residency::Resident(_) => Ok(None),
-            Residency::Sequential(spec) => Ok(Some(load_heavy(spec, resolve_root(spec)?)?)),
-        }
-    }
-
-    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
-    /// `seq_heavy` under `Sequential`. The render body is written once against this borrow.
-    fn heavy<'a>(&'a self, seq_heavy: &'a Option<SdxlHeavyOwned>) -> SdxlHeavy<'a> {
-        match (&self.residency, seq_heavy) {
-            (Residency::Resident(c), _) => c.heavy.as_ref(),
-            (_, Some(owned)) => owned.as_ref(),
-            (Residency::Sequential(_), None) => {
-                unreachable!("Sequential residency always loads seq_heavy before rendering")
-            }
-        }
-    }
-
-    /// Number of loaded ControlNet branches. Works pre-load under `Sequential` (counts the spec's
-    /// control sources) so `generate` can reject a `Control`-count mismatch before the heavy bundle
-    /// is built — it always equals `heavy.controls.len()` after the load. (The IP-Adapter presence
-    /// check has no pre-load caller: `ip_mode` is resolved after `heavy` is established, so it reads
-    /// `heavy.ip_adapter` directly.)
-    fn control_count(&self) -> usize {
-        match &self.residency {
-            Residency::Resident(c) => c.heavy.controls.len(),
-            Residency::Sequential(spec) => {
-                spec.control.is_some() as usize + spec.extra_controls.len()
-            }
-        }
-    }
-
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    ///
+    /// The staged residency lifecycle (text encode → drop the CLIP encoders under `Sequential` → load
+    /// the U-Net/control/IP/VAE/PiD → denoise/decode → free the heavy bundle) is driven by the shared
+    /// [`Residency::run`] seam (sc-11125), which owns the eval/drop/clear discipline, the
+    /// stage-boundary cancel checks, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -598,12 +551,12 @@ impl Sdxl {
                     "sdxl: ControlNet is not supported with the acceleration samplers".into(),
                 ));
             }
-            if control_reqs.len() != self.control_count() {
+            if control_reqs.len() != self.control_count {
                 return Err(Error::Msg(format!(
                     "sdxl: {} Control conditioning(s) passed but the model was loaded with {} control \
                      checkpoint(s) (set LoadSpec::control + extra_controls, one per Control, in order)",
                     control_reqs.len(),
-                    self.control_count()
+                    self.control_count
                 )));
             }
             if mask_img.is_some() {
@@ -614,24 +567,32 @@ impl Sdxl {
             }
         }
 
-        // ── Phase A: text encode (epic 10834 Phase 1, sc-10839). Under `Sequential` this LOADS the
-        // dual CLIP encoders, encodes, forces materialization, then DROPS them + `clear_cache()` so
-        // their ~1 GB frees before the U-Net/control/IP bundle loads below — bounding peak to
-        // `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders (byte-identical
-        // to the pre-sc-10839 `encode_conditioning`). Seed-independent (no RNG) — hoisting it above
-        // the control/IP builds and the per-image loop is byte-identical to the F-068 order.
+        // ── Phase A: text encode (epic 10834 Phase 1, sc-10839; sc-11125). Seed-independent (no RNG)
+        // — tokenizing above the residency lifecycle, then hoisting the encode above the control/IP
+        // builds and the per-image loop, is byte-identical to the F-068 order. Under `Sequential` the
+        // shared seam LOADS the dual CLIP encoders, encodes, materializes, then DROPS them +
+        // `clear_cache()` so their ~1 GB frees before the U-Net/control/IP bundle loads below —
+        // bounding peak to `max(encoders, U-Net+VAE)`. Under `Resident` it borrows the warm encoders
+        // (byte-identical to the pre-sc-10839 `encode_conditioning`).
         let tokens = self
             .tokenizer
             .tokenize_batch(&req.prompt, if cfg_on { Some(negative) } else { None })?;
-        let (conditioning, pooled) = self.encode(&tokens)?;
 
-        // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD). `Resident`
-        // borrows the warm bundle; `Sequential` loads it NOW — after the encoders were dropped — and
-        // frees it when the job ends (nothing stays resident across jobs). The denoise/decode body
-        // below is written once against this `heavy` borrow, running identically for both residencies
-        // (mirrors candle's `DitRef`, sc-10769).
-        let seq_heavy = self.load_seq_heavy()?;
-        let heavy = self.heavy(&seq_heavy);
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            |text: &(ClipTextEncoder, ClipTextEncoder)| {
+                encode_conditioning(&text.0, &text.1, &tokens)
+            },
+            // Materialize the conditioning + pooled while the encoders are still alive (Sequential
+            // only) — MLX is lazy, so an un-evaluated output keeps the encoders referenced through the
+            // graph and the drop would free nothing (cf. Wan's `encode_text_staged`).
+            |enc| Ok(mlx_rs::transforms::eval([&enc.0, &enc.1])?),
+            // ── Establish the heavy render components (U-Net + control/IP + VAE + PiD) and run the
+            // denoise/decode body once against the `heavy` borrow — identical for both residencies.
+            |heavy_owned, enc| {
+        let heavy = heavy_owned.as_ref();
+        let (conditioning, pooled) = enc;
 
         // Build the ControlNet contexts once (seed-independent): preprocess each control image to
         // [0,1] NHWC and CFG-batch it to match the U-Net input, paired by order with a loaded branch.
@@ -1016,18 +977,9 @@ impl Sdxl {
             on_progress(Progress::Decoding);
             images.push(decode_image(heavy.vae, &latents, pid_ref)?);
         }
-        // Sequential (sc-10839): free the U-Net/control/IP/VAE/PiD working set now that every image
-        // is rendered, then `clear_cache()` to return the pages to the OS — so a repeat job re-loads
-        // from the (page-cached) snapshot rather than pinning the resident sum across jobs. `heavy`
-        // (a struct of borrows) is unused past the render loop, so NLL has already ended its borrow of
-        // `seq_heavy` here; dropping the owned bundle frees the components before `clear_cache()`.
-        // Resident is a no-op (nothing to free; `seq_heavy` is `None`).
-        let was_sequential = seq_heavy.is_some();
-        drop(seq_heavy);
-        if was_sequential {
-            mlx_rs::memory::clear_cache();
-        }
-        Ok(GenerationOutput::Images(images))
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 

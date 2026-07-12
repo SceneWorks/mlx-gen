@@ -33,6 +33,7 @@ pub mod memory;
 pub mod mllm;
 pub mod nn;
 pub mod quant;
+pub mod residency;
 pub mod sampler;
 pub mod scheduler;
 pub mod text_sample;
@@ -92,6 +93,7 @@ pub use registry::{
     TransformRegistration,
 };
 pub use registry::{load_trainer, TrainerRegistration};
+pub use residency::Residency;
 pub use runtime::{
     AdapterKind, AdapterSpec, CancelFlag, IdentityWeights, LoadSpec, MoeExpert, OffloadPolicy,
     PidWeights, Precision, Progress, Quant, WeightsSource,

@@ -15,7 +15,7 @@ use mlx_gen::gen_core;
 use mlx_gen::{
     require_base_dir, require_control, AcceptedControlKinds, ConditioningKind, ControlBranch,
     Error, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor,
-    OffloadPolicy, Precision, Progress, Result,
+    OffloadPolicy, Precision, Progress, Residency, Result,
 };
 
 use mlx_gen::default_seed;
@@ -54,29 +54,14 @@ pub fn descriptor() -> ModelDescriptor {
 /// (the base Turbo text phase + DiT/VAE + the pose control branch).
 pub struct KreaTurboControl {
     descriptor: ModelDescriptor,
-    /// Component-residency strategy (epic 10834 Phase 1, sc-11101), selected from
-    /// [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase + DiT + VAE + branch warm;
-    /// `Sequential` holds only the [`LoadSpec`] and re-loads per generation in phase order (encode →
-    /// **drop the text phase** → denoise/decode), bounding peak unified memory to `max(text, DiT+VAE+
-    /// branch)`. Dense bf16 only, so the tier that matters here is bf16 (no Q8/Q4 lever).
-    residency: ControlResidency,
-}
-
-/// The heavy-component residency for a [`KreaTurboControl`] (sc-11101). See [`KreaTurboControl::residency`].
-enum ControlResidency {
-    /// Every component loaded once at [`load`] and held (today's warm path). Boxed so this heavy variant
-    /// doesn't bloat every `Sequential` handle (`clippy::large_enum_variant`).
-    Resident(Box<ControlResident>),
-    /// Only the [`LoadSpec`] is held; each `generate` re-loads the components in phase order and frees
-    /// them after. The per-phase loaders rebuild byte-identical components to the `Resident` path.
-    Sequential(Box<LoadSpec>),
-}
-
-/// The Krea text phase held resident (dropped first under `Sequential`), paired with the heavy render
-/// bundle (DiT + VAE + the pose control branch).
-struct ControlResident {
-    text: KreaText,
-    heavy: ControlHeavyOwned,
+    /// Component-residency strategy (epic 10834 Phase 1, sc-11101; hoisted to the shared seam in
+    /// sc-11125), selected from [`LoadSpec::offload_policy`]. `Resident` (default) holds the text phase +
+    /// DiT + VAE + branch warm; `Sequential` holds only the per-phase loader closures and re-loads per
+    /// generation in phase order (encode → **drop the text phase** → denoise/decode), bounding peak
+    /// unified memory to `max(text, DiT+VAE+branch)`. Dense bf16 only, so the tier that matters here is
+    /// bf16 (no Q8/Q4 lever). The [`Residency`] seam owns the eval/drop/clear discipline, the
+    /// stage-boundary cancel checks, and the error-safe cache flush.
+    residency: Residency<KreaText, ControlHeavyOwned>,
 }
 
 /// The heavy render-phase components for pose control: the single-stream DiT + VAE ([`KreaHeavy`]) plus
@@ -138,9 +123,32 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         OffloadPolicy::Resident => {
             let text = KreaText::from_snapshot(root)?;
             let heavy = load_control_heavy(spec, root)?;
-            ControlResidency::Resident(Box::new(ControlResident { text, heavy }))
+            Residency::resident(text, heavy)
         }
-        OffloadPolicy::Sequential => ControlResidency::Sequential(Box::new(spec.clone())),
+        OffloadPolicy::Sequential => {
+            // Dense bf16 only (quant is rejected above), so there is no F-181 re-quant concern here.
+            // The pose branch carries no PiD overlay, so the seam's `use_pid` arg is unused.
+            let spec_text = spec.clone();
+            let spec_heavy = spec.clone();
+            Residency::sequential(
+                move || {
+                    let root = require_base_dir(
+                        &spec_text,
+                        KREA_2_TURBO_CONTROL_ID,
+                        "a base snapshot directory",
+                    )?;
+                    KreaText::from_snapshot(root)
+                },
+                move |_use_pid| {
+                    let root = require_base_dir(
+                        &spec_heavy,
+                        KREA_2_TURBO_CONTROL_ID,
+                        "a base snapshot directory",
+                    )?;
+                    load_control_heavy(&spec_heavy, root)
+                },
+            )
+        }
     };
 
     Ok(Box::new(KreaTurboControl {
@@ -182,53 +190,6 @@ impl ControlBranch for KreaTurboControl {
 }
 
 impl KreaTurboControl {
-    /// Text-encode the prompt per the residency (sc-11101). Pose control is CFG-free (one context, no
-    /// negative). `Resident` borrows the warm text phase (byte-identical to the pre-sc-11101 per-image
-    /// re-encode); `Sequential` loads the text phase, encodes, forces materialization (`eval`), then
-    /// DROPS it + `clear_cache()` so its ~4 GB frees before the DiT/VAE/branch load.
-    fn encode(&self, prompt: &str) -> Result<Array> {
-        match &self.residency {
-            ControlResidency::Resident(c) => c.text.encode(prompt),
-            ControlResidency::Sequential(spec) => {
-                let root =
-                    require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
-                let text = KreaText::from_snapshot(root)?;
-                let ctx = text.encode(prompt)?;
-                // MLX is lazy — materialize NOW while `text` is alive, else `ctx` keeps the encoder
-                // weights referenced through the graph and the drop frees nothing.
-                mlx_rs::transforms::eval([&ctx])?;
-                drop(text);
-                mlx_rs::memory::clear_cache();
-                Ok(ctx)
-            }
-        }
-    }
-
-    /// Load the heavy render components (DiT + VAE + branch) for a `Sequential` job — after
-    /// [`Self::encode`] dropped the text phase — or `None` under `Resident` (already held).
-    fn load_seq_heavy(&self) -> Result<Option<ControlHeavyOwned>> {
-        match &self.residency {
-            ControlResidency::Resident(_) => Ok(None),
-            ControlResidency::Sequential(spec) => {
-                let root =
-                    require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
-                Ok(Some(load_control_heavy(spec, root)?))
-            }
-        }
-    }
-
-    /// Borrow the heavy render components: the warm bundle under `Resident`, or the just-loaded
-    /// `seq_heavy` under `Sequential`. The render loop is written once against this borrow.
-    fn heavy<'a>(&'a self, seq_heavy: &'a Option<ControlHeavyOwned>) -> ControlHeavyRef<'a> {
-        match (&self.residency, seq_heavy) {
-            (ControlResidency::Resident(c), _) => c.heavy.as_ref(),
-            (_, Some(owned)) => owned.as_ref(),
-            (ControlResidency::Sequential(_), None) => {
-                unreachable!("Sequential residency always loads seq_heavy before rendering")
-            }
-        }
-    }
-
     /// The rich-`Result` body behind [`Generator::generate`] (the crate's own [`mlx_gen::Error`] so `?`
     /// lifts `mlx_rs` device exceptions; the trait wrapper bridges into [`gen_core::Error`]). Renders
     /// `req.count` CFG-free Turbo images, one per pose per seed (`seed + n`), each pose-locked by the
@@ -246,44 +207,44 @@ impl KreaTurboControl {
         // The required pose skeleton + its resolved scale (unset → the 0.6 default; Some(0.0) inert).
         let (control_image, control_scale) = self.resolve_control(req)?;
 
-        // Phase A: prompt → context (sc-11101). Under `Sequential` this loads the text phase, encodes,
-        // forces materialization, then DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
-        let context = self.encode(&req.prompt)?;
+        // Phase A: prompt → context (sc-11101; sc-11125). Pose control is CFG-free (one context, no
+        // negative). Under `Sequential` the shared seam loads the text phase, encodes, materializes,
+        // then DROPS it + `clear_cache()` before the DiT/VAE/branch load below.
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            |text: &KreaText| text.encode(&req.prompt),
+            // Materialize the context while the text phase is still alive (Sequential only).
+            |ctx: &Array| Ok(mlx_rs::transforms::eval([ctx])?),
+            // Phase B: heavy render components (DiT + VAE + the pose branch). The render loop below runs
+            // identically for both residencies.
+            |heavy_owned, context| {
+                let heavy = heavy_owned.as_ref();
 
-        // Phase B: heavy render components (DiT + VAE + the pose branch). `Resident` borrows the warm
-        // bundle; `Sequential` loads it NOW — after the text phase was dropped — and frees it when done.
-        let seq_heavy = self.load_seq_heavy()?;
-        let heavy = self.heavy(&seq_heavy);
-
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            let opts = TurboOptions {
-                width: req.width,
-                height: req.height,
-                steps,
-                seed: base_seed.wrapping_add(n as u64),
-                sampler: req.sampler.clone(),
-                scheduler: req.scheduler.clone(),
-            };
-            let img = heavy.heavy.render_turbo_control(
-                &context,
-                heavy.branch,
-                control_image,
-                control_scale,
-                &opts,
-                &req.cancel,
-                on_progress,
-            )?;
-            images.push(img);
-        }
-        // Sequential (sc-11101): free the DiT/VAE/branch working set now that every image is rendered,
-        // then `clear_cache()`. Resident is a no-op (`seq_heavy` None).
-        let was_sequential = seq_heavy.is_some();
-        drop(seq_heavy);
-        if was_sequential {
-            mlx_rs::memory::clear_cache();
-        }
-        Ok(GenerationOutput::Images(images))
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let opts = TurboOptions {
+                        width: req.width,
+                        height: req.height,
+                        steps,
+                        seed: base_seed.wrapping_add(n as u64),
+                        sampler: req.sampler.clone(),
+                        scheduler: req.scheduler.clone(),
+                    };
+                    let img = heavy.heavy.render_turbo_control(
+                        &context,
+                        heavy.branch,
+                        control_image,
+                        control_scale,
+                        &opts,
+                        &req.cancel,
+                        on_progress,
+                    )?;
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 

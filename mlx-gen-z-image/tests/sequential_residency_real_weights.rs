@@ -20,6 +20,7 @@ use mlx_gen::{
     GenerationOutput, GenerationRequest, Image, LoadSpec, OffloadPolicy, Quant, WeightsSource,
 };
 use mlx_rs::memory::{clear_cache, get_peak_memory, reset_peak_memory};
+use std::path::PathBuf;
 
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
@@ -44,17 +45,59 @@ fn probe_request() -> GenerationRequest {
     }
 }
 
-fn base_spec() -> LoadSpec {
-    let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot()));
+/// A base-`z_image` probe (F-172, sc-11124): the base is undistilled, so it runs **real CFG** — a
+/// negative prompt + guidance — which exercises the seam's pos+neg encode/materialize/drop path (the
+/// Turbo probe only encodes a single cond). Small step count keeps the ignored test tractable.
+fn base_probe_request() -> GenerationRequest {
+    let size = env_u32("ZIMAGE_SEQ_SIZE", 768);
+    GenerationRequest {
+        prompt: "a red fox in a snowy forest, photograph".into(),
+        negative_prompt: Some("blurry, low quality".into()),
+        guidance: Some(4.0),
+        width: size,
+        height: size,
+        seed: Some(1234),
+        steps: Some(env_u32("ZIMAGE_SEQ_STEPS", 8)),
+        ..Default::default()
+    }
+}
+
+/// The base `Tongyi-MAI/Z-Image` snapshot, from `ZIMAGE_BASE_SNAPSHOT` (a distinct repo from the Turbo
+/// snapshot). Returns `None` so the base A/B skips rather than panics when only the Turbo snapshot is
+/// available.
+fn base_model_snapshot_opt() -> Option<PathBuf> {
+    std::env::var("ZIMAGE_BASE_SNAPSHOT")
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn spec_for(snapshot: PathBuf) -> LoadSpec {
+    let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot));
     if std::env::var("ZIMAGE_SEQ_Q8").is_ok() {
         spec = spec.with_quant(Quant::Q8);
     }
     spec
 }
 
+fn base_spec() -> LoadSpec {
+    spec_for(snapshot())
+}
+
 fn render_measured(policy: OffloadPolicy, req: &GenerationRequest) -> (Vec<u8>, usize) {
-    let spec = base_spec().with_offload_policy(policy);
-    let model = mlx_gen::load("z_image_turbo", &spec).expect("load z_image_turbo");
+    render_measured_id("z_image_turbo", base_spec(), policy, req)
+}
+
+/// The generalized A/B render: load `model_id` from `spec` under `policy`, measure peak, return the
+/// single output image's bytes + peak. Shared by the Turbo flagship probe and the base `z_image`
+/// sibling probe (sc-11124) so both exercise the identical shared [`mlx_gen::Residency`] seam.
+fn render_measured_id(
+    model_id: &str,
+    spec: LoadSpec,
+    policy: OffloadPolicy,
+    req: &GenerationRequest,
+) -> (Vec<u8>, usize) {
+    let spec = spec.with_offload_policy(policy);
+    let model = mlx_gen::load(model_id, &spec).expect("load model");
     reset_peak_memory();
     let out = model.generate(req, &mut |_| {}).expect("generate");
     let peak = get_peak_memory();
@@ -127,5 +170,59 @@ fn sequential_repeat_job_stays_bounded() {
         "repeat Sequential job peaked higher ({:.3} vs {:.3} GiB) — a component stayed resident",
         peak2 as f64 / GIB,
         peak1 as f64 / GIB,
+    );
+}
+
+#[test]
+#[ignore = "needs a real base Z-Image snapshot (set ZIMAGE_BASE_SNAPSHOT)"]
+fn base_z_image_sequential_bounds_peak_and_is_byte_identical() {
+    // F-172 (sc-11124): the base `z_image` sibling now honors `offload_policy` via the SAME shared
+    // `mlx_gen::Residency` seam as the Turbo flagship — before the fix it ignored the policy and always
+    // loaded `Resident` (silently OOMing a fit-gated Sequential request). This is the base analog of
+    // `sequential_bounds_peak_and_is_byte_identical`, gated on a distinct base snapshot; it runs REAL
+    // CFG (pos+neg encode), the harder seam path. The two control siblings share this same seam via
+    // `load_control_residency` (weight-free routing covered by their unit tests); a control real-weight
+    // A/B is a follow-up needing the base + control checkpoints (overlaps sc-11126 F-180).
+    let Some(snap) = base_model_snapshot_opt() else {
+        eprintln!("skipping: set ZIMAGE_BASE_SNAPSHOT to run the base z_image residency A/B");
+        return;
+    };
+    let req = base_probe_request();
+    let (pixels_resident, peak_resident) = render_measured_id(
+        "z_image",
+        spec_for(snap.clone()),
+        OffloadPolicy::Resident,
+        &req,
+    );
+    let (pixels_sequential, peak_sequential) =
+        render_measured_id("z_image", spec_for(snap), OffloadPolicy::Sequential, &req);
+
+    println!(
+        "base z_image {}x{} @ {} steps (CFG):\n  Resident   peak = {:.3} GiB\n  Sequential peak = {:.3} GiB",
+        req.width,
+        req.height,
+        req.steps.unwrap(),
+        peak_resident as f64 / GIB,
+        peak_sequential as f64 / GIB,
+    );
+
+    let diff = pixels_resident
+        .iter()
+        .zip(&pixels_sequential)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert_eq!(
+        diff,
+        0,
+        "base z_image Sequential residency changed the output: {diff}/{} bytes differ (must be \
+         byte-identical)",
+        pixels_resident.len()
+    );
+    assert!(
+        peak_sequential < peak_resident,
+        "base z_image Sequential peak {:.3} GiB was not below Resident {:.3} GiB — the text-encoder \
+         drop did not reduce peak",
+        peak_sequential as f64 / GIB,
+        peak_resident as f64 / GIB,
     );
 }
