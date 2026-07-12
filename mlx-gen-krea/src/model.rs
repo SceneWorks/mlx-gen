@@ -75,6 +75,17 @@ const DEFAULT_RAW_GUIDANCE: f32 = 3.5;
 /// LoRA rides `spec.adapters`.
 pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 
+/// Registry id for the **CFG-free Turbo image-edit** variant (sc-11640, follow-on to epic 10871). Same
+/// Kontext edit surface as [`KREA_2_EDIT_ID`] — a source image (or scene+person pair) drives the dual
+/// conditioning (in-context VAE tokens + Qwen3-VL grounding) through
+/// [`KreaPipeline::render_edit`] — but on the **distilled Turbo** checkpoint: the few-step
+/// `turbo_schedule` run **CFG-free** (`guidance = 0`, a single conditional forward, no cond/uncond
+/// split), the fast-path alternative to the ~52-step full-CFG Raw edit. The `krea2_identity_edit` LoRA
+/// (trained on the Raw DiT, family-compatible with Turbo) folds in via `spec.adapters` exactly as on
+/// Raw. A DISTINCT id so the worker's edit lane can select the fast tier by model, the same way
+/// `krea_2_edit` disambiguates edit from img2img.
+pub const KREA_2_TURBO_EDIT_ID: &str = "krea_2_turbo_edit";
+
 /// Krea 2 Turbo identity + capabilities — constructible without loading weights (registry
 /// introspection / capability advertisement). Distilled few-step text-to-image: **CFG-free** (the TDM
 /// distillation baked the guided velocity into the weights, so no unconditional branch / `guidance`),
@@ -156,6 +167,26 @@ pub fn edit_descriptor() -> ModelDescriptor {
     // P1.3 — scene = image 1, person = image 2, fixed order). The img2img Raw/Turbo descriptors stay
     // single-`Reference`; only the edit surface advertises `MultiReference`, so `validate_request`
     // accepts a two-source edit here while still rejecting it on the img2img path.
+    d.capabilities.conditioning = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    d
+}
+
+/// Krea 2 **CFG-free Turbo image-edit** identity + capabilities (sc-11640). Same Kontext edit
+/// conditioning surface as [`edit_descriptor`] (single `Reference` source OR a scene+person
+/// `MultiReference`, + the `krea2_identity_edit` LoRA) but derived from the distilled Turbo
+/// [`descriptor`] rather than Raw: **CFG-free** (`supports_guidance = false`, no user negative prompt),
+/// so the edit runs a single conditional forward on the few-step `turbo_schedule`. Only the id (→ the
+/// `generate_impl` `is_turbo_edit` branch: `turbo_schedule` / 8-step default / `guidance = 0`) and the
+/// widened `conditioning` differ from [`descriptor`].
+pub fn turbo_edit_descriptor() -> ModelDescriptor {
+    let mut d = descriptor();
+    d.id = KREA_2_TURBO_EDIT_ID;
+    // Same edit conditioning surface as `edit_descriptor` — a single source `Reference` or one
+    // scene+person `MultiReference`. The Turbo img2img descriptor stays single-`Reference`; only the
+    // edit surfaces advertise `MultiReference`.
     d.capabilities.conditioning = vec![
         ConditioningKind::Reference,
         ConditioningKind::MultiReference,
@@ -257,6 +288,16 @@ pub fn load_raw(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// the grounded half of the dual conditioning; the turnkey keeps it dense ([`crate::convert`]).
 pub fn load_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_variant(spec, edit_descriptor())
+}
+
+/// Load the **CFG-free Turbo image-edit** generator (`krea_2_turbo_edit`, sc-11640). Identical snapshot
+/// assembly to [`load_edit`] — same dual-conditioning edit surface — but `spec.weights` must point at a
+/// **Turbo** (distilled) snapshot and the stored [`turbo_edit_descriptor`] makes `generate` route the
+/// source(s) to the edit entrypoint on the **few-step CFG-free** schedule (`turbo_schedule`, single
+/// conditional forward). The snapshot MUST carry the Qwen3-VL vision tower (`text_encoder/` `visual.*`)
+/// for the grounded conditioning — the Turbo turnkey shares Raw's dense text encoder, so it does.
+pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+    load_variant(spec, turbo_edit_descriptor())
 }
 
 /// Shared loader behind [`load`] / [`load_raw`] / [`load_edit`]: build the residency from a snapshot
@@ -479,8 +520,14 @@ impl Krea {
         // variant (epic 10871) shares Raw's full-CFG sampler — an edit denoises from noise under true CFG
         // — so `is_raw` (the full-CFG path selector for schedule/steps/guidance) covers edit too; only the
         // per-image entrypoint below differs (`is_edit` → the Kontext edit path, not img2img/t2i).
-        let is_edit = self.descriptor.id == KREA_2_EDIT_ID;
-        let is_raw = self.descriptor.id == KREA_2_RAW_ID || is_edit;
+        // The distilled CFG-free Turbo edit (sc-11640): routes to the SAME Kontext edit entrypoint as
+        // `krea_2_edit`, but on the few-step `turbo_schedule` at `guidance = 0` (single conditional
+        // forward). So it is an edit (`is_edit`) but NOT a full-CFG variant (`is_raw`).
+        let is_turbo_edit = self.descriptor.id == KREA_2_TURBO_EDIT_ID;
+        let is_edit = self.descriptor.id == KREA_2_EDIT_ID || is_turbo_edit;
+        // `is_raw` gates the full-CFG sampler (52-step, dynamic-mu `base_schedule`, guidance) — Raw and
+        // the full-CFG `krea_2_edit`, but NOT `krea_2_turbo_edit` (distilled few-step, CFG-free).
+        let is_raw = self.descriptor.id == KREA_2_RAW_ID || (is_edit && !is_turbo_edit);
         let steps = req.steps.unwrap_or(if is_raw {
             DEFAULT_RAW_STEPS
         } else {
@@ -522,8 +569,15 @@ impl Krea {
             )));
         }
         // Raw CFG knobs: guidance defaults to the reference Raw preset, an empty/absent negative → ""
-        // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) path.
-        let guidance = req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE);
+        // (reference `negative_prompts = [""] * n`). Inert on the Turbo (CFG-free) t2i/img2img path.
+        // FORCED to 0 for `krea_2_turbo_edit` so the edit runs a single conditional forward — its
+        // descriptor advertises no guidance, so `req.guidance` is already rejected upstream; this just
+        // pins the CFG-free default that makes `encode` skip the unconditional grounded context.
+        let guidance = if is_turbo_edit {
+            0.0
+        } else {
+            req.guidance.unwrap_or(DEFAULT_RAW_GUIDANCE)
+        };
         let negative = req.negative_prompt.clone().unwrap_or_default();
 
         // Phase A: prompt → context(s) (sc-11101). Under `Sequential` this loads the Qwen3-VL-4B text
@@ -579,6 +633,9 @@ impl Krea {
                     &ctx.pos,
                     ctx.neg.as_ref(),
                     guidance,
+                    // Distilled Turbo edit → few-step `turbo_schedule`; Raw edit → dynamic-mu
+                    // `base_schedule`. Matches the capture-σ `sigmas` selector above (`is_raw`).
+                    is_turbo_edit,
                     &edit_sources,
                     &opts,
                     decoder,
@@ -739,13 +796,15 @@ fn img2img_conflicts_with_capture(has_reference: bool, keep: usize, num_sigmas: 
 }
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
-// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Three variants register
-// here — `krea_2_turbo` (distilled, CFG-free), `krea_2_raw` (undistilled, full-CFG; epic 9992), and
-// `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871).
+// crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. Four variants register
+// here — `krea_2_turbo` (distilled t2i, CFG-free), `krea_2_raw` (undistilled t2i, full-CFG; epic 9992),
+// `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
+// `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
 mlx_gen::register_generators! {
     descriptor => load,
     raw_descriptor => load_raw,
     edit_descriptor => load_edit,
+    turbo_edit_descriptor => load_turbo_edit,
 }
 
 #[cfg(test)]
@@ -1099,6 +1158,63 @@ mod tests {
         // Same snapshot loader as Raw/Turbo — a single-file weights source is rejected the same way.
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_edit(&file).err().expect("error").to_string();
+        assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    // --- CFG-free Turbo image-edit variant — sc-11640 ---
+
+    #[test]
+    fn turbo_edit_descriptor_is_krea_2_turbo_edit_and_cfg_free() {
+        let d = turbo_edit_descriptor();
+        assert_eq!(d.id, "krea_2_turbo_edit");
+        assert_eq!(d.id, KREA_2_TURBO_EDIT_ID);
+        assert_eq!(d.family, "krea_2");
+        assert_eq!(d.backend, "mlx");
+        assert_eq!(d.modality, Modality::Image);
+        // Derived from the distilled Turbo descriptor: CFG-free (no guidance, no user negative prompt),
+        // UNLIKE the full-CFG `krea_2_edit`. This is the recipe difference the spike validates.
+        assert!(!d.capabilities.supports_guidance);
+        assert!(!d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        // Same edit conditioning surface as `edit_descriptor` — a single `Reference` or a scene+person
+        // `MultiReference`; the `krea2_identity_edit` LoRA rides `spec.adapters`.
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference
+            ]
+        );
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        // Same curated sampler/scheduler menu + size bounds as Turbo t2i (shared `descriptor()` base).
+        assert_eq!(d.capabilities.samplers, descriptor().capabilities.samplers);
+        assert!(d.capabilities.mac_only);
+    }
+
+    #[test]
+    fn turbo_edit_rejects_guidance_and_negative_prompt() {
+        // The CFG-free floor (like Turbo t2i) rejects both — the edit runs a single conditional forward.
+        let mut r = ref_req(1, None);
+        r.guidance = Some(3.5);
+        assert!(validate_request(&turbo_edit_descriptor(), &r).is_err());
+        let mut r = ref_req(1, None);
+        r.negative_prompt = Some("blurry".into());
+        assert!(validate_request(&turbo_edit_descriptor(), &r).is_err());
+        // A source Reference with NO CFG knobs passes the capability floor.
+        assert!(validate_request(&turbo_edit_descriptor(), &ref_req(1, None)).is_ok());
+    }
+
+    #[test]
+    fn turbo_edit_reachable_via_registry_by_id() {
+        assert!(
+            gen_core::registry::generators()
+                .any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
+            "id {KREA_2_TURBO_EDIT_ID} not registered"
+        );
+        // Same snapshot loader as the other variants — a single-file weights source is rejected.
+        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        let e = load_turbo_edit(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
     }
 }

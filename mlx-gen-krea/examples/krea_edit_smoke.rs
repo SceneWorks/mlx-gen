@@ -21,7 +21,7 @@ use mlx_gen::gen_core::{
 };
 use mlx_gen::media::Image;
 use mlx_gen::{AdapterKind, AdapterSpec};
-use mlx_gen_krea::model::load_edit;
+use mlx_gen_krea::model::{load_edit, load_turbo_edit};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -48,9 +48,19 @@ fn save_png(img: &Image, path: &str) {
 }
 
 fn main() {
+    // sc-11640: `KREA_EDIT_VARIANT=turbo` drives the CFG-free distilled Turbo edit (`load_turbo_edit`:
+    // few-step `turbo_schedule`, guidance=0, single conditional forward, no negative prompt). Anything
+    // else = the full-CFG Raw edit (`load_edit`). The Turbo weights are the cached turnkey bf16 (distilled
+    // DiT + the SAME dense Qwen3-VL vision tower Raw carries, so grounding works identically).
+    let variant = env_or("KREA_EDIT_VARIANT", "raw");
+    let turbo = variant.eq_ignore_ascii_case("turbo");
     let snapshot = env_or(
         "KREA_SNAPSHOT",
-        "/Users/michael/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494",
+        if turbo {
+            "/Users/michael/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/d009674080cc1bccf2b629d834c34bf5eccdb723/bf16"
+        } else {
+            "/Users/michael/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494"
+        },
     );
     let lora = env_or(
         "KREA_EDIT_LORA",
@@ -65,7 +75,11 @@ fn main() {
         "change the background to a snowy mountain landscape",
     );
     let out_path = env_or("KREA_EDIT_OUT", "/tmp/krea_edit_out.png");
-    let steps: u32 = env_or("KREA_EDIT_STEPS", "16").parse().expect("steps");
+    // Turbo defaults to the distilled 8-step preset; Raw to 16 (a shorter-than-52 manual smoke). Turbo is
+    // CFG-free so its `guidance` is unused (the request omits it entirely — the descriptor rejects any).
+    let steps: u32 = env_or("KREA_EDIT_STEPS", if turbo { "8" } else { "16" })
+        .parse()
+        .expect("steps");
     let guidance: f32 = env_or("KREA_EDIT_GUIDANCE", "3.0")
         .parse()
         .expect("guidance");
@@ -90,8 +104,13 @@ fn main() {
             AdapterKind::Lora,
         )])
     };
-    eprintln!("[smoke] loading krea_2_edit generator from {snapshot}");
-    let generator = load_edit(&spec).expect("load krea_2_edit generator");
+    let engine_id = if turbo { "krea_2_turbo_edit" } else { "krea_2_edit" };
+    eprintln!("[smoke] loading {engine_id} generator from {snapshot}");
+    let generator = if turbo {
+        load_turbo_edit(&spec).expect("load krea_2_turbo_edit generator")
+    } else {
+        load_edit(&spec).expect("load krea_2_edit generator")
+    };
 
     let src = load_rgb(&source);
     let (sw, sh) = (src.width, src.height);
@@ -127,15 +146,17 @@ fn main() {
 
     // The worker's exact request shape; `generate_impl` sees the `krea_2_edit` descriptor and routes the
     // Reference / MultiReference source(s) to the edit entrypoint.
+    // Turbo edit is CFG-free: its descriptor advertises no guidance / no negative prompt, so the request
+    // MUST omit both (the capability floor rejects `Some(_)`). Raw edit carries the full-CFG knobs.
     let request = GenerationRequest {
         prompt: instruction.clone(),
-        negative_prompt: Some(String::new()),
+        negative_prompt: if turbo { None } else { Some(String::new()) },
         width: 1024,
         height: 1024,
         count: 1,
         seed: Some(42),
         steps: Some(steps),
-        guidance: Some(guidance),
+        guidance: if turbo { None } else { Some(guidance) },
         conditioning,
         cancel: CancelFlag::new(),
         ..Default::default()

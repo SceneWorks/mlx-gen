@@ -443,6 +443,12 @@ impl KreaHeavy {
         ctx_pos: &Array,
         ctx_neg: Option<&Array>,
         guidance: f32,
+        // `true` = the CFG-free distilled Turbo edit (`krea_2_turbo_edit`, sc-11640): denoise on the
+        // few-step `turbo_schedule` (fixed mu) the distilled student was trained on. `false` = the Raw
+        // edit (`krea_2_edit`, epic 10871): the resolution-dynamic `base_schedule`. Both denoise the
+        // whole schedule from pure noise; only the sigma trajectory (and, via the caller, the CFG
+        // branching) differ.
+        distilled: bool,
         sources: &[&Image],
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
@@ -477,13 +483,19 @@ impl KreaHeavy {
             None => None,
         };
 
-        // Full resolution-dynamic Raw schedule (the edit runs the whole schedule from noise, like t2i).
-        let sigmas = base_schedule(
-            opts.steps,
-            opts.width,
-            opts.height,
-            opts.scheduler.as_deref(),
-        );
+        // The edit runs the whole schedule from noise (like t2i). Turbo edit uses the distilled few-step
+        // `turbo_schedule` (fixed mu) the CFG-free student expects; Raw edit uses the resolution-dynamic
+        // `base_schedule`. This must match `generate_impl`'s capture-σ schedule selector (`is_raw`).
+        let sigmas = if distilled {
+            turbo_schedule(opts.steps, opts.scheduler.as_deref())
+        } else {
+            base_schedule(
+                opts.steps,
+                opts.width,
+                opts.height,
+                opts.scheduler.as_deref(),
+            )
+        };
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -828,6 +840,9 @@ impl KreaPipeline {
             &ctx_pos,
             ctx_neg.as_ref(),
             guidance,
+            // The KreaPipeline delegator is the Raw-edit (`krea_2_edit`) helper — full-CFG base schedule.
+            // The distilled Turbo edit is driven through the `Generator` seam (`generate_impl`), not here.
+            false,
             sources,
             opts,
             decoder,
