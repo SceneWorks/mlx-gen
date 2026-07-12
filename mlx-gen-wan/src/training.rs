@@ -601,8 +601,7 @@ impl WanMoeTrainer {
                 // Each expert's `micro` is per-expert (steps routed to it), so it is NOT the global
                 // step — replay the deterministic selection to restore it exactly (same rule as the loop).
                 for s in 1..=start_step {
-                    let ei = if dual && s % 2 == 1 { 1 } else { 0 };
-                    states[ei].micro += 1;
+                    states[expert_index(s, dual)].micro += 1;
                 }
                 eprintln!("[F-125] wan resuming from step {start_step}");
             }
@@ -616,14 +615,11 @@ impl WanMoeTrainer {
                 break;
             }
             // Dual: high (index 1) on odd steps, low (index 0) on even. Dense: the single expert.
-            let ei = if dual && step % 2 == 1 { 1 } else { 0 };
-            // F-016: DECOUPLE the expert alternation from the item selection. With the old
-            // `(step-1) % cache.len()` index, step parity and item parity were locked, so an
-            // EVEN-sized dataset gave each expert only half the items for the whole run (expert 1
-            // saw odd-indexed items, expert 0 even-indexed). Advance the item index by one per
-            // `n_experts` steps instead so both experts sweep the full dataset.
-            let n_experts = if dual { 2 } else { 1 };
-            let (clean, ctxs) = &cache[(((step - 1) as usize) / n_experts) % cache.len()];
+            let ei = expert_index(step, dual);
+            // F-016 / F-082: the item index is DECOUPLED from expert parity so both experts sweep the
+            // full dataset (an even-sized set would otherwise parity-lock each expert to a disjoint
+            // half for the whole run). See `expert_item_index`.
+            let (clean, ctxs) = &cache[expert_item_index(step, dual, cache.len())];
             let ctx = &ctxs[ei];
             let band = states[ei].band;
             let t = sample_band_timestep(
@@ -818,6 +814,30 @@ fn accum_window(micro: u32, accum: u32) -> u32 {
     } else {
         micro % accum
     }
+}
+
+/// Which expert trains on 1-based global micro-`step`. The dual MoE **alternates by step parity** —
+/// the **high-noise** expert (index 1) on odd steps, the **low-noise** expert (index 0) on even; the
+/// dense path trains its single expert (index 0) every step. Pure so the expert↔dataset assignment is
+/// unit-testable. (mlx orders `experts`/`states` high-at-1; candle-gen orders high-at-0 — same
+/// behaviour, "high-noise on odd steps", different array slot.)
+fn expert_index(step: u32, dual: bool) -> usize {
+    if dual && step % 2 == 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Which dataset item `step` consumes, **decoupled from expert parity** (F-016 / F-082 lockstep with
+/// candle-gen's `expert_item_index`). The item index advances by one per `n_experts` steps, so each
+/// expert independently sweeps the FULL dataset (`0,1,2,… mod len`). The old parity-locked
+/// `(step-1) % len` gave each expert a disjoint half of any even-sized set for the whole run. Pure;
+/// pinned by the `experts_each_cover_the_whole_dataset` / `even_dataset_expert_is_not_parity_locked`
+/// tests.
+fn expert_item_index(step: u32, dual: bool, len: usize) -> usize {
+    let n_experts: usize = if dual { 2 } else { 1 };
+    (((step - 1) as usize) / n_experts) % len
 }
 
 /// One optimizer update from `st`'s pending grad accumulator, averaged by `window` (the actual
@@ -1149,7 +1169,63 @@ fn decode_image(path: &Path) -> Result<Image> {
 
 #[cfg(test)]
 mod tests {
-    use super::accum_window;
+    use super::{accum_window, expert_index, expert_item_index};
+
+    /// F-082 lockstep with candle-gen: on the dual MoE **every expert sweeps the whole dataset** —
+    /// the two experts alternate by step parity, and the item index is decoupled from that parity so
+    /// each expert's own visits walk `0,1,2,… mod N`. Checked across even and odd `N` (the even sizes
+    /// are the ones the old parity-locked index corrupted).
+    #[test]
+    fn experts_each_cover_the_whole_dataset() {
+        for n in [2usize, 3, 4, 7, 10, 20] {
+            // High-noise (index 1) trains on odd steps, low-noise (index 0) on even.
+            let mut seen_high = vec![false; n];
+            let mut seen_low = vec![false; n];
+            // Enough steps for each expert to make N visits (2 experts ⇒ 2·N steps).
+            for step in 1..=(2 * n as u32) {
+                let ei = expert_index(step, true);
+                let item = expert_item_index(step, true, n);
+                if ei == 1 {
+                    seen_high[item] = true;
+                } else {
+                    seen_low[item] = true;
+                }
+            }
+            assert!(
+                seen_high.iter().all(|&s| s),
+                "high-noise expert missed items on N={n}"
+            );
+            assert!(
+                seen_low.iter().all(|&s| s),
+                "low-noise expert missed items on N={n}"
+            );
+        }
+    }
+
+    /// The regression guard proper: on an even-sized dataset the high-noise expert must reach an
+    /// **odd** item index — impossible under the old `(step-1) % N` scheme, where odd steps (high)
+    /// forever hit even items. Pins the decoupling that keeps mlx and candle in lockstep.
+    #[test]
+    fn even_dataset_expert_is_not_parity_locked() {
+        let n = 10usize;
+        let high_reaches_odd = (1..=(2 * n as u32))
+            .filter(|&step| expert_index(step, true) == 1)
+            .any(|step| expert_item_index(step, true, n) % 2 == 1);
+        assert!(
+            high_reaches_odd,
+            "high-noise expert never reached an odd item — parity lock regressed"
+        );
+    }
+
+    /// The dense (single-expert) path advances the item every step: `(step-1) % N`.
+    #[test]
+    fn dense_path_walks_every_step() {
+        let n = 5usize;
+        for step in 1..=12u32 {
+            assert_eq!(expert_index(step, false), 0);
+            assert_eq!(expert_item_index(step, false, n), ((step - 1) as usize) % n);
+        }
+    }
 
     /// F-017: pins the grad-accum averaging-window math — the full `accum` on a window boundary,
     /// the in-window remainder on a partial (final-step / loop-exit tail) flush.
