@@ -104,7 +104,11 @@ fn main() {
             AdapterKind::Lora,
         )])
     };
-    let engine_id = if turbo { "krea_2_turbo_edit" } else { "krea_2_edit" };
+    let engine_id = if turbo {
+        "krea_2_turbo_edit"
+    } else {
+        "krea_2_edit"
+    };
     eprintln!("[smoke] loading {engine_id} generator from {snapshot}");
     let generator = if turbo {
         load_turbo_edit(&spec).expect("load krea_2_turbo_edit generator")

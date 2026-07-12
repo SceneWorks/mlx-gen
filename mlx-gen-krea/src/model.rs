@@ -1167,8 +1167,7 @@ mod tests {
     #[test]
     fn turbo_edit_reachable_via_registry_by_id() {
         assert!(
-            gen_core::registry::generators()
-                .any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
+            gen_core::registry::generators().any(|r| (r.descriptor)().id == KREA_2_TURBO_EDIT_ID),
             "id {KREA_2_TURBO_EDIT_ID} not registered"
         );
         // Same snapshot loader as the other variants — a single-file weights source is rejected.
