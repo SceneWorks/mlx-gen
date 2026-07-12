@@ -206,7 +206,7 @@ pub struct Sdxl {
 /// branches / IP-Adapter, the VAE, and the optional PiD decoder. Owned by the `Resident` components
 /// (held for the whole job) or by a `Sequential` generate (loaded after the encoders are dropped,
 /// freed when the job ends).
-struct SdxlHeavyOwned {
+pub(crate) struct SdxlHeavyOwned {
     unet: UNet2DConditionModel,
     /// ControlNet branches (sc-3058; MultiControlNet sc-3378), loaded from `LoadSpec::control` +
     /// `LoadSpec::extra_controls`. Empty when no control checkpoint was supplied. `generate` requires
@@ -283,32 +283,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     // build is byte-identical to the pre-sc-10839 `load` — the same loaders, adapter/quant order,
     // and PiD overlay, just assembled through the shared per-phase helpers.
     let control_count = spec.control.is_some() as usize + spec.extra_controls.len();
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let (te1, te2) = load_text_encoders(root, spec.quantize)?;
-            // Resident loads the PiD overlay unconditionally (loaded once, reused across generates);
-            // the per-request `use_pid` skip (F-177) applies only to the Sequential per-generate loader.
-            let heavy = load_heavy(spec, root, true)?;
-            Residency::resident((te1, te2), heavy)
+    // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate. An
+    // already-packed turnkey loads packed (no re-quant); `Resident` quantizes once. So warn only for
+    // the Sequential-over-dense combination that actually pays the repeated cost.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && loader::needs_load_time_quant(root, q.bits(), descriptor().id)?
+        {
+            mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
         }
-        OffloadPolicy::Sequential => {
-            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
-            // An already-packed turnkey loads packed (no re-quant), so gate on the same precise
-            // predicate qwen uses — only warn when a load-time (re)quant over a dense snapshot will
-            // actually happen.
-            if let Some(q) = spec.quantize {
-                if loader::needs_load_time_quant(root, q.bits(), descriptor().id)? {
-                    mlx_gen::residency::warn_sequential_requantize(descriptor().id, q.bits());
-                }
-            }
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            Residency::sequential(
-                move || load_text_encoders(resolve_root(&spec_text)?, spec_text.quantize),
-                move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
-            )
-        }
-    };
+    }
+    let residency = build_residency(spec)?;
     Ok(Box::new(Sdxl {
         descriptor: descriptor(),
         tokenizer: loader::load_tokenizer(root)?,
@@ -317,6 +302,27 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         control_count,
         residency,
     }))
+}
+
+/// The policy→[`Residency`] dispatch, routed through the single [`Residency::from_policy`] seam
+/// (sc-10839; hoisted to the shared seam in sc-11126, F-180) so the `match offload_policy` lives in
+/// exactly one place. `Resident` eager-loads the dual CLIP text encoders + heavy bundle now (the heavy
+/// loader with `use_pid = true`, loading any PiD overlay once and reusing it); `Sequential` captures
+/// the two per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both use the
+/// same [`load_text_encoders`] / [`load_heavy`], so the `Resident` composition is byte-identical to the
+/// pre-seam one. The deferral is weight-free-testable: under `Sequential` this touches no component
+/// weights, so a dispatch that ignored `offload_policy` would eager-load and fail the "Sequential
+/// defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+) -> Result<Residency<(ClipTextEncoder, ClipTextEncoder), SdxlHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_text_encoders(resolve_root(&spec_text)?, spec_text.quantize),
+        move |use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy)?, use_pid),
+    )
 }
 
 /// Resolve the snapshot directory from the load spec, rejecting a single-file source (SDXL needs the
@@ -1332,5 +1338,42 @@ mod tests {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/sdxl.safetensors".into()));
         let err = load(&spec).err().expect("expected an error").to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that SDXL's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* (so the single-file guard in
+    // `resolve_root` passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the CLIP text encoders from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The `sequential_residency_real_weights.rs` A/B is
+    // `#[ignore]`d; this is the default-run guard.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/sdxl-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

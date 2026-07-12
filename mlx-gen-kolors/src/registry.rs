@@ -112,8 +112,9 @@ pub fn descriptor() -> ModelDescriptor {
             // NOT yet wired onto the shared `Residency` seam (F-148/F-176): the monolithic `Kolors`
             // struct fuses the ChatGLM3 encoder with the U-Net/VAE and hosts every `denoise_*_latents`
             // method, so splitting the encoder into a droppable phase-A component is a dedicated
-            // decomposition (tracked as its own wiring story under epic 11120, matching the per-family
-            // wiring stories sc-11000/sc-11030). Advertise `false` until then so it does not over-promise.
+            // decomposition, tracked as its own wiring story (sc-11670, epic 11120) matching the
+            // per-family wiring stories sc-11000/sc-11030/sc-11101. Advertise `false` until then so a
+            // fit-gate does not over-trust a `Sequential` request that would silently stay `Resident`.
             supports_sequential_offload: false,
         },
     }

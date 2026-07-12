@@ -190,42 +190,54 @@ pub(crate) fn load_control_residency(
     TextTokenizer,
     Residency<TextEncoder, ZImageControlHeavyOwned>,
 )> {
-    match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let (root, control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-            let text_encoder = load_control_text_encoder_only(root, spec.quantize)?;
-            let heavy = load_control_heavy(spec, root, control)?;
-            let tokenizer = loader::load_tokenizer(root)?;
-            Ok((tokenizer, Residency::resident(text_encoder, heavy)))
-        }
-        OffloadPolicy::Sequential => {
-            // Validate precision + base dir + the required control checkpoint up front (fail fast,
-            // same as `Resident`); the heavy build is deferred to each generate via the closures below.
-            let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
-            // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate.
-            if let Some(q) = spec.quantize {
-                if loader::needs_load_time_quant(root, q.bits(), model_id)? {
-                    mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
-                }
-            }
-            let tokenizer = loader::load_tokenizer(root)?;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            let residency = Residency::sequential(
-                move || {
-                    let (root, _control) =
-                        resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
-                    load_control_text_encoder_only(root, spec_text.quantize)
-                },
-                move |_use_pid| {
-                    let (root, control) =
-                        resolve_control_base_and_control(&spec_heavy, model_id, precision_msg)?;
-                    load_control_heavy(&spec_heavy, root, control)
-                },
-            );
-            Ok((tokenizer, residency))
+    // Validate precision + base dir + the required control checkpoint up front (fail fast, same for
+    // BOTH policies); then the always-warm tokenizer, then the shared [`build_control_residency`]
+    // dispatch.
+    let (root, _control) = resolve_control_base_and_control(spec, model_id, precision_msg)?;
+    // F-181: Sequential + a load-time quant over a dense snapshot re-quantizes every generate; only
+    // that combination pays the repeated cost, so gate the warning on it.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential)
+            && loader::needs_load_time_quant(root, q.bits(), model_id)?
+        {
+            mlx_gen::residency::warn_sequential_requantize(model_id, q.bits());
         }
     }
+    let tokenizer = loader::load_tokenizer(root)?;
+    Ok((
+        tokenizer,
+        build_control_residency(spec, model_id, precision_msg)?,
+    ))
+}
+
+/// The policy→[`Residency`] dispatch both Z-Image control variants share (turbo + base control),
+/// routed through the single [`Residency::from_policy`] seam (sc-11126, F-180) so neither re-derives
+/// the `match offload_policy` (before sc-11124 both control variants ignored `offload_policy` and
+/// silently loaded full-`Resident`). `Resident` eager-loads the text encoder + heavy (base DiT +
+/// control branch + VAE) now; `Sequential` captures the two per-phase loaders and loads nothing now.
+/// The pose branch carries no PiD overlay, so the seam's `use_pid` arg is unused. Weight-free-testable:
+/// under `Sequential` this touches no component weights, so a dispatch that ignored the policy would
+/// eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_control_residency(
+    spec: &LoadSpec,
+    model_id: &'static str,
+    precision_msg: &'static str,
+) -> Result<Residency<TextEncoder, ZImageControlHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let (root, _control) =
+                resolve_control_base_and_control(&spec_text, model_id, precision_msg)?;
+            load_control_text_encoder_only(root, spec_text.quantize)
+        },
+        move |_use_pid| {
+            let (root, control) =
+                resolve_control_base_and_control(&spec_heavy, model_id, precision_msg)?;
+            load_control_heavy(&spec_heavy, root, control)
+        },
+    )
 }
 
 /// The per-id precision-override rejection message for the turbo control variant, shared by
@@ -471,5 +483,55 @@ mod tests {
                 "policy {policy:?} must reach the shared base-dir validation, got: {err}"
             );
         }
+    }
+
+    // ── F-180 (sc-11126): the MEANINGFUL control-variant test the smoke test above cannot be. The
+    // `load_honors_sequential_offload_policy` case only proves BOTH policies reach the same up-front
+    // base-dir guard — a dispatch that ignored `offload_policy` would pass it too. This drives the
+    // dispatch itself (`build_control_residency`) past that guard with a *valid-looking* base dir and
+    // control (non-existent, so no weights load) and asserts the deferral discriminator:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the text encoder from the missing base dir → `Err`.
+    // A `Sequential → Resident` regression (the F-172 bug this seam prevents) would eager-load under
+    // the Sequential request and fail the first assertion. Covers the turbo control variant directly;
+    // the base control variant (`model_base_control`) shares this exact `build_control_residency`.
+    fn missing_control_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/z-image-control-base".into(),
+        ))
+        .with_control(WeightsSource::File(
+            "/nonexistent/z-image-control-overlay.safetensors".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_control_residency_sequential_defers_all_component_loads() {
+        let res = build_control_residency(
+            &missing_control_spec(OffloadPolicy::Sequential),
+            MODEL_ID,
+            PRECISION_MSG,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) base/control weights");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) control residency"
+        );
+    }
+
+    #[test]
+    fn build_control_residency_resident_eager_loads_and_fails() {
+        let err = build_control_residency(
+            &missing_control_spec(OffloadPolicy::Resident),
+            MODEL_ID,
+            PRECISION_MSG,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on the missing base snapshot");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

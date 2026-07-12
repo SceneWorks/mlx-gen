@@ -668,11 +668,22 @@ mod tests {
         let heavy_calls = Arc::new(Mutex::new(0usize));
         let (lt, lh) = counting_loaders(&text_calls, &heavy_calls);
         let res = Residency::from_policy(OffloadPolicy::Sequential, lt, lh).unwrap();
-        assert!(res.is_sequential(), "Sequential policy must build a Sequential residency");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential residency"
+        );
         // The discriminator: neither loader ran at construction. A dispatch that ignored the policy
         // and always went Resident would have eager-loaded, tripping these to 1.
-        assert_eq!(*text_calls.lock().unwrap(), 0, "Sequential must not load the text encoder eagerly");
-        assert_eq!(*heavy_calls.lock().unwrap(), 0, "Sequential must not load the heavy bundle eagerly");
+        assert_eq!(
+            *text_calls.lock().unwrap(),
+            0,
+            "Sequential must not load the text encoder eagerly"
+        );
+        assert_eq!(
+            *heavy_calls.lock().unwrap(),
+            0,
+            "Sequential must not load the heavy bundle eagerly"
+        );
     }
 
     #[test]
@@ -681,9 +692,20 @@ mod tests {
         let heavy_calls = Arc::new(Mutex::new(0usize));
         let (lt, lh) = counting_loaders(&text_calls, &heavy_calls);
         let res = Residency::from_policy(OffloadPolicy::Resident, lt, lh).unwrap();
-        assert!(!res.is_sequential(), "Resident policy must build a Resident residency");
-        assert_eq!(*text_calls.lock().unwrap(), 1, "Resident loads the text encoder once, eagerly");
-        assert_eq!(*heavy_calls.lock().unwrap(), 1, "Resident loads the heavy bundle once, eagerly");
+        assert!(
+            !res.is_sequential(),
+            "Resident policy must build a Resident residency"
+        );
+        assert_eq!(
+            *text_calls.lock().unwrap(),
+            1,
+            "Resident loads the text encoder once, eagerly"
+        );
+        assert_eq!(
+            *heavy_calls.lock().unwrap(),
+            1,
+            "Resident loads the heavy bundle once, eagerly"
+        );
     }
 
     #[test]

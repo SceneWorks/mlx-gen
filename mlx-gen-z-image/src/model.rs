@@ -163,7 +163,7 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 /// Build the tokenizer + [`Residency`] seam for a non-control Z-Image generator from a [`LoadSpec`],
 /// honoring [`LoadSpec::offload_policy`] (epic 10834 Phase 1, sc-10839; hoisted to the shared seam in
-/// sc-11125). `Resident` (default) builds every heavy component now via [`load_components`] and holds
+/// sc-11125). `Resident` (default) builds every heavy component now via [`build_residency`] and holds
 /// it warm; `Sequential` keeps only the spec and re-loads per generate in phase order (encode → drop
 /// the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both use
 /// the same per-phase loaders, so the components are byte-identical.
@@ -222,27 +222,15 @@ pub(crate) fn build_residency(
     )
 }
 
-/// The `z_image_turbo` precision-override / single-file rejection messages, shared by the `Resident`
-/// [`load_components`] call and the `Sequential` [`resolve_precision_and_root`] guard.
+/// The `z_image_turbo` precision-override / single-file rejection messages, shared by the
+/// [`build_residency`] dispatch and the `Sequential` [`resolve_precision_and_root`] guard.
 const PRECISION_MSG: &str = "z_image_turbo: only dense bf16 is wired in the Rust port; the text \
      encoder already runs f32 internally (drop the precision override)";
 const FILE_MSG: &str = "z_image_turbo expects a snapshot directory (tokenizer/ text_encoder/ \
      transformer/ vae/), not a single .safetensors file";
 
-/// The non-control Z-Image model components loaded from a snapshot — the shared body of the plain
-/// [`load`] and the full-model [`crate::model_base::load`] (F-090). Both build the identical set with
-/// the identical loaders, quantize order, adapter path and PiD overlay; they differ only in the model
-/// struct they wrap these in, the descriptor, and the two precision/file error strings (passed in).
-pub(crate) struct ZImageComponents {
-    pub tokenizer: TextTokenizer,
-    pub text_encoder: TextEncoder,
-    pub transformer: ZImageTransformer,
-    pub vae: Vae,
-    pub pid: Option<PidEngine>,
-}
-
 /// Precision guard + snapshot-dir resolution (rejecting a single-file source), shared by
-/// [`load_components`] and the `Sequential` per-phase loaders (sc-10839).
+/// [`build_residency`]'s per-phase loaders (sc-10839, sc-11126).
 fn resolve_precision_and_root<'a>(
     spec: &'a LoadSpec,
     precision_msg: &str,
@@ -272,7 +260,7 @@ fn load_text_encoder_only(root: &Path, quant: Option<Quant>) -> Result<TextEncod
 /// (+ Q4/Q8), and the optional PiD overlay — everything but the text encoder. Factored so the
 /// `Sequential` path loads these AFTER the encoder is dropped (bounding peak to
 /// `max(text-encoder, DiT+VAE)`). Quantize-then-adapters order matches the pre-sc-10839
-/// `load_components`; the components are independent of the text encoder (separate weight files,
+/// resident composition; the components are independent of the text encoder (separate weight files,
 /// deterministic RNG-free quant), so the `Resident` composition below is byte-identical.
 fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<ZImageHeavyOwned> {
     let mut transformer = loader::load_transformer(root)?;
@@ -305,34 +293,6 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<ZImageHeav
         transformer,
         vae,
         pid,
-    })
-}
-
-/// Shared non-control load body (F-090): precision guard → resolve the snapshot dir → dense load of
-/// text-encoder/transformer/VAE → whole-model Q4/Q8 → LoRA/LoKr residuals → optional PiD overlay.
-/// Composed (sc-10839) from the same per-phase loaders the `Sequential` residency uses, so all three
-/// consumers (plain-Turbo, full-model, ControlNet) build the identical component set. The only
-/// per-variant text (the precision override + single-file rejection messages) is passed in.
-pub(crate) fn load_components(
-    spec: &LoadSpec,
-    precision_msg: &str,
-    file_msg: &str,
-) -> Result<ZImageComponents> {
-    let root = resolve_precision_and_root(spec, precision_msg, file_msg)?;
-    // Whole-model Q4/Q8 (the fork's `nn.quantize` over transformer, text_encoder, vae — group_size
-    // 64, every quantizable Linear + the text encoder's token Embedding; sc-2532) and the LoRA/LoKr
-    // residual path live in the per-phase loaders below.
-    let text_encoder = load_text_encoder_only(root, spec.quantize)?;
-    // Resident loads the PiD overlay unconditionally (loaded once, reused across generates); the
-    // per-request `use_pid` skip (F-177) applies only to the Sequential per-generate loader.
-    let heavy = load_heavy(spec, root, true)?;
-    let tokenizer = loader::load_tokenizer(root)?;
-    Ok(ZImageComponents {
-        tokenizer,
-        text_encoder,
-        transformer: heavy.transformer,
-        vae: heavy.vae,
-        pid: heavy.pid,
     })
 }
 
@@ -691,5 +651,51 @@ mod tests {
             let err = load(&spec).err().expect("expected an error").to_string();
             assert!(!err.contains("quantization"), "got: {err}");
         }
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Z-Image Turbo's dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot *directory* (so the
+    // up-front precision/single-file guard passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the text encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident` — the F-172 regression this whole
+    // seam exists to prevent) would eager-load under a `Sequential` request and fail the first
+    // assertion. The existing `sequential_residency_real_weights.rs` A/B is `#[ignore]`d; this runs
+    // by default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/z-image-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Sequential),
+            PRECISION_MSG,
+            FILE_MSG,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Resident),
+            PRECISION_MSG,
+            FILE_MSG,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

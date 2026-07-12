@@ -26,7 +26,7 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
+    ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
@@ -137,7 +137,7 @@ pub struct LensGenerator {
 
 /// The heavy render-phase components (the DiT + VAE via [`LensHeavy`], plus the optional PiD decoder) —
 /// everything but the text encoder. Owned by the `Resident` components or by a `Sequential` generate.
-struct LensHeavyOwned {
+pub(crate) struct LensHeavyOwned {
     heavy: LensHeavy,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
     /// `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes through the `flux2` student (4× SR).
@@ -172,38 +172,39 @@ impl LensHeavyOwned {
 /// drop the text encoder → denoise/decode) to bound peak memory to `max(text-encoder, DiT+VAE)`. Both
 /// use the same per-phase loaders, so the components are byte-identical.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> Result<Box<dyn Generator>> {
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let (root, dtype) = resolve_root(spec)?;
-            let text = load_text_phase(spec, &root, dtype)?;
-            // Resident loads the PiD overlay unconditionally (loaded once, reused); the per-request
-            // `use_pid` skip (F-177) applies only to the Sequential per-generate loader.
-            let heavy = load_heavy_phase(spec, &root, dtype, true)?;
-            Residency::resident(text, heavy)
-        }
-        OffloadPolicy::Sequential => {
-            // Validate the spec up front (fail fast, same as `Resident`); the heavy build is deferred
-            // to each generate via the loader closures below.
-            resolve_root(spec)?;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            Residency::sequential(
-                move || {
-                    let (root, dtype) = resolve_root(&spec_text)?;
-                    load_text_phase(&spec_text, &root, dtype)
-                },
-                move |use_pid| {
-                    let (root, dtype) = resolve_root(&spec_heavy)?;
-                    load_heavy_phase(&spec_heavy, &root, dtype, use_pid)
-                },
-            )
-        }
-    };
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        residency,
+        residency: build_residency(spec)?,
     }))
+}
+
+/// The policy→[`Residency`] dispatch both Lens variants share (sc-11030; hoisted to the shared
+/// [`Residency::from_policy`] seam in sc-11126, F-180) so the `match offload_policy` lives in one
+/// place. `Resident` eager-loads the gpt-oss text phase + heavy bundle now (the heavy loader with
+/// `use_pid = true`, loading any PiD overlay once and reusing it); `Sequential` captures the two
+/// per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both use the same
+/// [`load_text_phase`] / [`load_heavy_phase`], so the `Resident` composition is byte-identical to the
+/// pre-seam one. The up-front [`resolve_root`] fails fast for BOTH policies (single-file and
+/// unsupported-overlay rejection, plus the precision→dtype mapping). Weight-free-testable: under
+/// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
+/// eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<LensText, LensHeavyOwned>> {
+    // Up-front fail-fast for both policies (mirrors the pre-seam load order).
+    resolve_root(spec)?;
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let (root, dtype) = resolve_root(&spec_text)?;
+            load_text_phase(&spec_text, &root, dtype)
+        },
+        move |use_pid| {
+            let (root, dtype) = resolve_root(&spec_heavy)?;
+            load_heavy_phase(&spec_heavy, &root, dtype, use_pid)
+        },
+    )
 }
 
 /// Snapshot-dir + precision→dtype resolution (rejecting a single-file source / unsupported overlays),
@@ -570,5 +571,42 @@ mod tests {
             ..ok.clone()
         };
         assert!(validate_request(MODEL_ID_TURBO, &caps, &bad_dims).is_err());
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Lens's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* (so the single-file /
+    // unsupported-overlay guard in `resolve_root` passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the gpt-oss text phase from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The A/B real-weight test is `#[ignore]`d; this runs by
+    // default.
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/lens-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(&missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(&missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
     }
 }

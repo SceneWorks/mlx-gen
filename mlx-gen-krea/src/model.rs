@@ -14,8 +14,8 @@ use mlx_gen::media::Image;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
-    Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result,
+    WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
@@ -215,7 +215,7 @@ pub struct Krea {
 /// The heavy render-phase components (the single-stream DiT + VAE, via [`KreaHeavy`], plus the optional
 /// PiD decoder) — everything but the text phase. Owned by the `Resident` components or by a
 /// `Sequential` generate.
-struct KreaHeavyOwned {
+pub(crate) struct KreaHeavyOwned {
     heavy: KreaHeavy,
     /// Optional PiD super-resolving decoder (epic 7840, sc-7845), loaded when `spec.pid` is set; Krea
     /// reuses the Qwen-Image latent space, so it shares the `qwenimage` PiD student. `req.use_pid`
@@ -291,34 +291,36 @@ pub fn load_turbo_edit(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// ([`load_krea_text`] / [`load_krea_heavy`]), so the components are byte-identical. `descriptor`
 /// selects the variant (Turbo vs Raw vs edit) the returned [`Krea`] renders.
 fn load_variant(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
-    let residency = match spec.offload_policy {
-        OffloadPolicy::Resident => {
-            let root = resolve_root(spec, descriptor.id)?;
-            let text = load_krea_text(spec, root, descriptor.id)?;
-            // Resident loads the PiD overlay unconditionally (loaded once, reused); the per-request
-            // `use_pid` skip (F-177) applies only to the Sequential per-generate loader.
-            let heavy = load_krea_heavy(spec, root, descriptor.id, true)?;
-            Residency::resident(text, heavy)
-        }
-        OffloadPolicy::Sequential => {
-            // Validate precision + snapshot dir up front (fail fast, same as `Resident`); the heavy
-            // build is deferred to each generate via the loader closures below.
-            let _ = resolve_root(spec, descriptor.id)?;
-            let id = descriptor.id;
-            let spec_text = spec.clone();
-            let spec_heavy = spec.clone();
-            Residency::sequential(
-                move || load_krea_text(&spec_text, resolve_root(&spec_text, id)?, id),
-                move |use_pid| {
-                    load_krea_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, id, use_pid)
-                },
-            )
-        }
-    };
+    let residency = build_residency(spec, descriptor.id)?;
     Ok(Box::new(Krea {
         descriptor,
         residency,
     }))
+}
+
+/// The policy→[`Residency`] dispatch every Krea variant shares (sc-11101; routed through the single
+/// [`Residency::from_policy`] seam in sc-11126, F-180), so no variant re-derives the
+/// `match offload_policy`. `Resident` eager-loads the text phase + heavy bundle now (the heavy loader
+/// with `use_pid = true` so any PiD overlay is loaded once and reused); `Sequential` captures the two
+/// per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both go through the
+/// same [`load_krea_text`] / [`load_krea_heavy`], so the `Resident` composition is byte-identical to
+/// the pre-seam one. The up-front [`resolve_root`] fails fast (precision + single-file rejection) for
+/// BOTH policies. The deferral is weight-free-testable: under `Sequential` this touches no component
+/// weights, so a dispatch that mapped `Sequential → Resident` (ignoring `offload_policy`) would
+/// eager-load here and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    id: &'static str,
+) -> Result<Residency<KreaText, KreaHeavyOwned>> {
+    // Up-front fail-fast for both policies (precision override + single-file rejection).
+    let _ = resolve_root(spec, id)?;
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_krea_text(&spec_text, resolve_root(&spec_text, id)?, id),
+        move |use_pid| load_krea_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, id, use_pid),
+    )
 }
 
 /// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
@@ -773,7 +775,7 @@ mlx_gen::register_generators! {
 mod tests {
     use super::*;
     use mlx_gen::gen_core;
-    use mlx_gen::{AdapterKind, AdapterSpec};
+    use mlx_gen::{AdapterKind, AdapterSpec, OffloadPolicy};
 
     fn req(w: u32, h: u32) -> GenerationRequest {
         GenerationRequest {
@@ -1177,5 +1179,54 @@ mod tests {
         let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
         let e = load_turbo_edit(&file).err().expect("error").to_string();
         assert!(e.contains("snapshot directory"), "got: {e}");
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Krea's dispatch HONORS
+    // `offload_policy` — not a smoke test. `build_residency` points at a non-existent snapshot dir
+    // (a *directory* source, so the up-front `resolve_root` precision/single-file guard passes). The
+    // discriminator is the deferral:
+    //   * `Sequential` must capture the two loaders and touch NO component weights → `Ok`, and the
+    //     built residency is `Sequential` (`is_sequential()`).
+    //   * `Resident` must eager-load the text encoder from that non-existent dir → `Err`.
+    // A dispatch that ignored `offload_policy` and always built `Resident` (the F-172 bug class) would
+    // eager-load under a `Sequential` request and turn the first assertion's `Ok` into an `Err` —
+    // this test would fail. That is exactly the ignore-`offload_policy` regression the smoke tests miss.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/krea-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        // Sequential defers every heavy/text load, so a missing snapshot dir is NOT touched here.
+        let res = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Sequential),
+            KREA_2_TURBO_ID,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential residency (the deferred state machine)"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        // Resident eager-loads the text encoder now, so the missing snapshot dir surfaces as an error
+        // at construction — the flip side that proves the Sequential test's `Ok` came from deferral.
+        let err = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Resident),
+            KREA_2_TURBO_ID,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        // A load/IO error, not the precision/single-file guard (which a Dir source passes).
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, got the up-front guard: {msg}"
+        );
     }
 }
