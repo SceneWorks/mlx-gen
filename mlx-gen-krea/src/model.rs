@@ -690,28 +690,6 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
             req.width, req.height
         )));
     }
-    // F-080: the edit lanes (`krea_2_edit` / `krea_2_turbo_edit`) denoise from PURE NOISE with the
-    // source(s) as in-context Kontext conditioning — there is no img2img blend, so a `strength` (either
-    // the request-level `req.strength` or a per-`Reference` strength) has no effect. Reject it typed
-    // rather than silently ignoring the knob; the img2img lanes (Raw/Turbo) still honor strength.
-    if id == KREA_2_EDIT_ID || id == KREA_2_TURBO_EDIT_ID {
-        let per_ref_strength = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference {
-                    strength: Some(_),
-                    ..
-                }
-            )
-        });
-        if req.strength.is_some() || per_ref_strength {
-            return Err(Error::Unsupported(format!(
-                "{id}: strength is not applicable to the Kontext edit path (it denoises from noise \
-                 with the source as in-context conditioning, not an img2img init); drop the \
-                 strength (use krea_2_turbo / krea_2_raw img2img for strength-controlled blends)"
-            )));
-        }
-    }
     Ok(())
 }
 
@@ -958,43 +936,6 @@ mod tests {
         }
         assert!(validate_request(&descriptor(), &req(128, 128)).is_err()); // below min
         assert!(validate_request(&descriptor(), &req(2064, 256)).is_err()); // above max
-    }
-
-    #[test]
-    fn edit_lanes_reject_strength_typed() {
-        // F-080: `strength` (request-level or per-Reference) is inert on the Kontext edit lanes → a
-        // typed Unsupported, not a silent no-op. Covers both the Raw edit and the Turbo edit id.
-        for edit_desc in [edit_descriptor(), turbo_edit_descriptor()] {
-            // Request-level strength on an edit request.
-            let mut r = ref_req(1, None);
-            r.strength = Some(0.5);
-            assert!(
-                matches!(validate_request(&edit_desc, &r), Err(Error::Unsupported(_))),
-                "{}: request-level strength must be a typed Unsupported",
-                edit_desc.id
-            );
-            // Per-Reference strength on an edit request.
-            let per_ref = ref_req(1, Some(0.5));
-            assert!(
-                matches!(
-                    validate_request(&edit_desc, &per_ref),
-                    Err(Error::Unsupported(_))
-                ),
-                "{}: per-Reference strength must be a typed Unsupported",
-                edit_desc.id
-            );
-            // Sanity: the SAME edit request without any strength validates.
-            assert!(
-                validate_request(&edit_desc, &ref_req(1, None)).is_ok(),
-                "{}: an edit request without strength must validate",
-                edit_desc.id
-            );
-        }
-        // The img2img lanes still HONOR strength (not rejected).
-        let mut r = ref_req(1, None);
-        r.strength = Some(0.5);
-        assert!(validate_request(&descriptor(), &r).is_ok());
-        assert!(validate_request(&raw_descriptor(), &r).is_ok());
     }
 
     #[test]

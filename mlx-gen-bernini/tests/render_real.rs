@@ -108,7 +108,9 @@ fn t2i_real_weight_smoke() {
             assert_eq!(imgs.len(), 1, "1-frame t2i yields one image");
             assert_coherent_image(&imgs[0], 256, 256);
         }
-        GenerationOutput::Video { .. } => panic!("expected Images for a 1-frame request"),
+        GenerationOutput::Video { .. } | GenerationOutput::Videos(_) => {
+            panic!("expected Images for a 1-frame request")
+        }
     }
 }
 
@@ -141,6 +143,8 @@ fn r2v_real_weight_smoke() {
             assert_eq!(imgs.len(), 1);
             assert_coherent_image(&imgs[0], 256, 256);
         }
-        GenerationOutput::Video { .. } => panic!("expected Images for a 1-frame request"),
+        GenerationOutput::Video { .. } | GenerationOutput::Videos(_) => {
+            panic!("expected Images for a 1-frame request")
+        }
     }
 }

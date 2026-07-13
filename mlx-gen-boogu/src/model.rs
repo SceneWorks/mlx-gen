@@ -488,25 +488,6 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
                 "{id}: at most {MAX_EDIT_REFS} source reference images are supported (got {refs})"
             )));
         }
-        // F-100: the Edit path discards a per-`Reference` `strength` (unlike Base/Turbo img2img, where
-        // it materially changes behavior). Reject a non-`None` strength typed rather than silently
-        // ignoring it — an advertised-but-inert knob (same class as krea F-080).
-        let has_ref_strength = req.conditioning.iter().any(|c| {
-            matches!(
-                c,
-                Conditioning::Reference {
-                    strength: Some(_),
-                    ..
-                }
-            )
-        });
-        if has_ref_strength {
-            return Err(Error::Unsupported(format!(
-                "{id}: a per-reference strength is not applicable to the instruction-edit path (the \
-                 source references are in-context conditioning, not an img2img init); drop the \
-                 strength (use the Base/Turbo img2img lanes for strength-controlled blends)"
-            )));
-        }
     }
     Ok(())
 }
@@ -794,35 +775,6 @@ mod tests {
             ..req(512, 512)
         };
         assert!(validate_request(&descriptor_edit(), &multi_over).is_err());
-    }
-
-    /// F-100: the Edit path discards a per-`Reference` strength, so setting one is an
-    /// advertised-but-inert knob — it must be a typed Unsupported, not a silent no-op.
-    #[test]
-    fn edit_rejects_per_reference_strength_typed() {
-        let with_strength = GenerationRequest {
-            conditioning: vec![Conditioning::Reference {
-                image: img(512, 512),
-                strength: Some(0.6),
-            }],
-            ..req(512, 512)
-        };
-        assert!(
-            matches!(
-                validate_request(&descriptor_edit(), &with_strength).map_err(gen_core::Error::from),
-                Err(gen_core::Error::Unsupported(_))
-            ),
-            "a per-reference strength on the Edit id must be a typed Unsupported"
-        );
-        // Sanity: the SAME edit request WITHOUT strength validates.
-        let no_strength = GenerationRequest {
-            conditioning: vec![Conditioning::Reference {
-                image: img(512, 512),
-                strength: None,
-            }],
-            ..req(512, 512)
-        };
-        assert!(validate_request(&descriptor_edit(), &no_strength).is_ok());
     }
 
     #[test]

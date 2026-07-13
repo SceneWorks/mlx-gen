@@ -98,20 +98,18 @@ fn missing_reference_errors() {
 }
 
 #[test]
-fn multi_reference_is_not_advertised_and_is_rejected_typed() {
-    // F-159: SCAIL-2's `run()` never reads extra-character (`MultiReference`) conditioning
-    // (`additional` is hardcoded empty — the multi-reference contract awaits sc-5583). Advertising it
-    // let a multi-character job validate, render, and return success with the extras silently dropped.
-    // (1) The descriptor must NOT advertise MultiReference.
+fn multi_reference_is_advertised_and_accepted() {
+    // F-159: `MultiReference` (extra characters) is advertised and left accepted. Honoring it
+    // end-to-end (wiring the extras through `run()`) is deferred to the multi-reference request
+    // contract (sc-5583); until then the knob is accepted rather than typed-rejected.
+    // (1) The descriptor advertises MultiReference.
     let caps = descriptor().capabilities;
     assert!(
-        !caps
-            .conditioning
+        caps.conditioning
             .contains(&ConditioningKind::MultiReference),
-        "MultiReference must not be advertised until sc-5583 wires it through"
+        "MultiReference must stay advertised (honoring is deferred to sc-5583, not rejected)"
     );
-    // (2) With it off the surface, the shared floor rejects a MultiReference request typed (F-158
-    // self-validate ensures this fires before any weight touch).
+    // (2) A MultiReference request passes the shared capability floor (accepted, not rejected).
     let req = GenerationRequest {
         prompt: "two people".into(),
         width: 256,
@@ -122,11 +120,8 @@ fn multi_reference_is_not_advertised_and_is_rejected_typed() {
         ..Default::default()
     };
     assert!(
-        matches!(
-            caps.validate_request(MODEL_ID, &req),
-            Err(mlx_gen::gen_core::Error::Unsupported(_))
-        ),
-        "a MultiReference request must be a typed Unsupported now that it is unadvertised"
+        caps.validate_request(MODEL_ID, &req).is_ok(),
+        "a MultiReference request must be accepted now that it is advertised again"
     );
 }
 

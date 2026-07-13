@@ -41,7 +41,7 @@ pub use face::{DetectedFace, FaceEmbedder, FaceEmbedderDescriptor};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
-    ReplacementMode, VideoClipRef,
+    ReplacementMode, VideoBundle, VideoClipRef,
 };
 pub use image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
 pub use json_constraint::JsonState;

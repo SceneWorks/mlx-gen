@@ -38,6 +38,19 @@ pub enum GenerationOutput {
         fps: u32,
         audio: Option<AudioTrack>,
     },
+    /// Several independent video clips from a single `generate` — the video analogue of
+    /// `Images(Vec<_>)`. Emitted when a video path honors `count > 1` (one clip per seed, e.g. the
+    /// SeedVR2 upscaler). Single-clip renders keep using [`Video`](Self::Video) unchanged.
+    Videos(Vec<VideoBundle>),
+}
+
+/// One rendered video clip. Element of [`GenerationOutput::Videos`], carrying the same payload as the
+/// single-clip [`GenerationOutput::Video`] variant.
+#[derive(Clone, Debug)]
+pub struct VideoBundle {
+    pub frames: Vec<Image>,
+    pub fps: u32,
+    pub audio: Option<AudioTrack>,
 }
 
 /// The request union (lifted from the SceneWorks worker's `ImageRequest`/`VideoRequest`). Most

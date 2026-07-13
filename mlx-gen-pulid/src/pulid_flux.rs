@@ -212,28 +212,6 @@ impl PulidFlux {
     }
 }
 
-/// F-110: PuLID honors `negative_prompt` ONLY in the real-CFG branch (`true_cfg > 1`). The fake-CFG
-/// branch sets `flux_req.negative_prompt = None`, so a negative prompt supplied without `true_cfg > 1`
-/// is silently inert. The descriptor advertises `supports_negative_prompt` unconditionally, so reject
-/// the dead knob typed here rather than accept it and drop it. An empty negative prompt is a no-op
-/// either way, so only a non-empty one is rejected.
-fn reject_inert_negative_prompt(req: &GenerationRequest) -> Result<()> {
-    let has_negative = req
-        .negative_prompt
-        .as_deref()
-        .is_some_and(|s| !s.trim().is_empty());
-    // The real-CFG branch engages at `true_cfg > 1.0` (see `generate_impl`); default (unset) is 1.0.
-    let real_cfg = req.true_cfg.unwrap_or(1.0) > 1.0 + 1e-3;
-    if has_negative && !real_cfg {
-        return Err(Error::Unsupported(
-            "pulid_flux: negative_prompt is honored only under real-CFG — set true_cfg > 1 to use \
-             it, or drop the negative_prompt (it would otherwise be silently ignored)"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 /// Pick the single reference-face conditioning, rejecting any other kind. PuLID-FLUX advertises only
 /// `ConditioningKind::Reference`, so a stray Control/Mask/etc. attached by a worker must **error**
 /// rather than be silently dropped when `generate` clears `flux_req.conditioning` (F-094).
@@ -284,11 +262,6 @@ impl Generator for PulidFlux {
             .validate_request(self.descriptor.id, req)?;
         // PuLID-specific: a reference face image is required (consumed into the identity injector).
         self.reference_face(req)?;
-        // F-110: `negative_prompt` is honored ONLY in the real-CFG branch (`true_cfg > 1`); the
-        // fake-CFG branch drops it (`flux_req.negative_prompt = None`). The descriptor advertises
-        // `supports_negative_prompt` unconditionally, so a negative prompt without `true_cfg > 1`
-        // would silently have zero effect — reject it typed instead of accepting a dead knob.
-        reject_inert_negative_prompt(req)?;
         Ok(())
     }
 
@@ -316,10 +289,6 @@ impl PulidFlux {
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
         }
-        // F-110: `generate_impl` does not call `self.validate` (F-106 tracks that gap separately), so
-        // re-check the inert-negative-prompt guard here — a negative prompt without `true_cfg > 1` is
-        // silently dropped below, so reject it typed rather than accept a dead knob.
-        reject_inert_negative_prompt(req)?;
         let (image, id_weight) = self.reference_face(req)?;
         let id_embedding = self.compute_id_embedding(
             &image.pixels,
@@ -616,52 +585,6 @@ mod tests {
             caps.validate_request(descriptor().id, &ok).is_ok(),
             "curated sampler + real-CFG should pass PuLID's floor"
         );
-    }
-
-    /// F-110: a `negative_prompt` without `true_cfg > 1` is a typed Unsupported (the fake-CFG branch
-    /// silently drops it); with `true_cfg > 1` (real-CFG) it is honored, and an empty/absent negative
-    /// prompt is a no-op regardless.
-    #[test]
-    fn negative_prompt_without_true_cfg_is_rejected_typed() {
-        let base = GenerationRequest {
-            prompt: "a portrait".into(),
-            width: 1024,
-            height: 1024,
-            ..Default::default()
-        };
-        // Negative prompt, no true_cfg → inert → typed Unsupported.
-        let inert = GenerationRequest {
-            negative_prompt: Some("blurry".into()),
-            ..base.clone()
-        };
-        assert!(matches!(
-            reject_inert_negative_prompt(&inert),
-            Err(Error::Unsupported(_))
-        ));
-        // Negative prompt + true_cfg <= 1 → still inert → rejected.
-        let low_cfg = GenerationRequest {
-            negative_prompt: Some("blurry".into()),
-            true_cfg: Some(1.0),
-            ..base.clone()
-        };
-        assert!(matches!(
-            reject_inert_negative_prompt(&low_cfg),
-            Err(Error::Unsupported(_))
-        ));
-        // Negative prompt + real-CFG (true_cfg > 1) → honored → ok.
-        let real_cfg = GenerationRequest {
-            negative_prompt: Some("blurry".into()),
-            true_cfg: Some(2.0),
-            ..base.clone()
-        };
-        assert!(reject_inert_negative_prompt(&real_cfg).is_ok());
-        // No / empty negative prompt → no-op regardless of true_cfg.
-        assert!(reject_inert_negative_prompt(&base).is_ok());
-        let empty_neg = GenerationRequest {
-            negative_prompt: Some("   ".into()),
-            ..base
-        };
-        assert!(reject_inert_negative_prompt(&empty_neg).is_ok());
     }
 
     /// Two reference faces are rejected, and an empty request is rejected as missing.

@@ -127,22 +127,6 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             "{FLUX1_DEV_CONTROL_ID}: only dense bf16 is wired (Q4/Q8 = spec.quantize)"
         )));
     }
-    // F-109: the control lane wires neither a PiD super-resolving decoder nor an IP-Adapter — the base
-    // `flux1_dev` lane errors loudly on `use_pid` without a PiD overlay, so these load-spec fields must
-    // fail LOUD here too rather than being silently dropped at load (the epic-7840 "no silent VAE
-    // fallback" convention; `req.use_pid` is rejected symmetrically in `validate_capability`).
-    if spec.pid.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{FLUX1_DEV_CONTROL_ID}: a PiD decode overlay (LoadSpec::pid) is not wired on the control \
-             lane; drop it (PiD super-resolution is available on the base flux1_dev lane)"
-        )));
-    }
-    if spec.ip_adapter.is_some() {
-        return Err(Error::Unsupported(format!(
-            "{FLUX1_DEV_CONTROL_ID}: an IP-Adapter (LoadSpec::ip_adapter) is not wired on the control \
-             lane; drop it"
-        )));
-    }
     // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
     // required. The model id + labels keep the messages aligned with the other control ports.
     let root = require_base_dir(
@@ -312,25 +296,8 @@ impl Flux1DevControl {
                 req.width, req.height
             )));
         }
-        // F-109: PiD is not wired on the control lane. `req.use_pid` is a hard error on `flux1_dev`; it
-        // must be one here too, not a silent decode through the native VAE (an undetectable
-        // super-resolution downgrade on exactly one flux entry point).
-        reject_unwired_use_pid(req)?;
         Ok(())
     }
-}
-
-/// F-109: the control lane wires no PiD decoder, so `req.use_pid` must fail loud (typed `Unsupported`)
-/// rather than silently decode through the native VAE. Free-standing so the policy is unit-testable
-/// without a loaded generator (`validate_capability` delegates here).
-fn reject_unwired_use_pid(req: &GenerationRequest) -> Result<()> {
-    if req.use_pid {
-        return Err(Error::Unsupported(format!(
-            "{FLUX1_DEV_CONTROL_ID}: use_pid is not wired on the control lane; PiD \
-             super-resolution is available on the base flux1_dev lane"
-        )));
-    }
-    Ok(())
 }
 
 /// The control kinds the Shakker Union-Pro-2.0 checkpoint admits: pose / canny / depth (input-agnostic
@@ -540,52 +507,5 @@ mod tests {
             .expect("expected error")
             .to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
-    }
-
-    // ── F-109: PiD / IP-Adapter are NOT wired on the control lane, so the advertised-but-inert
-    // load-spec fields and `req.use_pid` must fail LOUD (typed), matching the base flux1_dev posture.
-
-    #[test]
-    fn load_rejects_spec_pid_typed() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
-            .with_pid(
-                WeightsSource::File("/tmp/pid.safetensors".into()),
-                WeightsSource::Dir("/tmp/gemma".into()),
-            );
-        let err = load_dev_control(&spec).err().expect("expected error");
-        assert!(
-            matches!(gen_core::Error::from(err), gen_core::Error::Unsupported(_)),
-            "spec.pid on the control lane must be a typed Unsupported"
-        );
-    }
-
-    #[test]
-    fn load_rejects_spec_ip_adapter_typed() {
-        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()))
-            .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
-            .with_ip_adapter(WeightsSource::File("/tmp/ip.safetensors".into()));
-        let err = load_dev_control(&spec).err().expect("expected error");
-        assert!(
-            matches!(gen_core::Error::from(err), gen_core::Error::Unsupported(_)),
-            "spec.ip_adapter on the control lane must be a typed Unsupported"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_use_pid_typed() {
-        let mut req = GenerationRequest {
-            prompt: "a fox".into(),
-            width: 1024,
-            height: 1024,
-            ..Default::default()
-        };
-        req.use_pid = true;
-        assert!(
-            matches!(reject_unwired_use_pid(&req), Err(Error::Unsupported(_))),
-            "req.use_pid on the control lane must be a typed Unsupported"
-        );
-        req.use_pid = false;
-        assert!(reject_unwired_use_pid(&req).is_ok());
     }
 }
