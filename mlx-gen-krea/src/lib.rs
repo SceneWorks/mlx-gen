@@ -24,16 +24,27 @@
 //! - **Scheduler** — `FlowMatchEulerDiscreteScheduler`, v-param, dynamic exponential time-shift; Turbo
 //!   fixes mu 1.15 / 8 steps / CFG 0.
 //!
-//! ## Slice plan (epic 7565 P1 — complete)
-//! The provider scaffold, the `krea_2_turbo` registration, the architecture-validated [`model::load`],
-//! and the offline Q4/Q8 converter ([`convert`]) landed in sc-7567; the single-stream DiT in sc-7568
-//! ([`transformer`], reusing `mlx-gen-boogu`'s 3-axis-RoPE single-stream + refiner blocks); the
-//! Qwen3-VL-4B text encoder + layer-stack in sc-7569 ([`text_encoder`], reusing `mlx-gen-ideogram`'s
-//! encoder); the VAE + rectified-flow sampler in sc-7570 ([`vae`], reusing `mlx-gen-qwen-image`'s
-//! `QwenVae`; [`schedule`], the exponential-mu flow-match schedule over the core
-//! [`mlx_gen::FlowMatchSampler`]); and the end-to-end Turbo t2i [`pipeline`] in sc-7571 — the runnable
-//! `krea_2_turbo` engine ([`model::Krea::generate`]). P2+ extends to the worker/web surfaces, the Raw
-//! LoRA-training base, and the candle backend.
+//! ## Surfaces (all landed)
+//! The core Turbo t2i vertical (provider scaffold, `krea_2_turbo` registration, architecture-validated
+//! [`model::load`], offline Q4/Q8 [`convert`]; the single-stream DiT [`transformer`] reusing
+//! `mlx-gen-boogu`'s 3-axis-RoPE blocks; the Qwen3-VL-4B [`text_encoder`]; the [`vae`] reusing
+//! `mlx-gen-qwen-image`'s `QwenVae` over the core [`mlx_gen::FlowMatchSampler`] [`schedule`]) landed in
+//! epic 7565 P1 (sc-7567…sc-7571). Since then the crate grew four more registered generators plus a
+//! trainer and the residency split — all in this crate:
+//! - **`krea_2_raw`** ([`raw_descriptor`] / [`load_raw`]) — the undistilled full-CFG base (epic 9992):
+//!   real guidance + a user negative prompt, resolution-dynamic mu, 52 steps.
+//! - **`krea_2_edit`** ([`edit_descriptor`] / [`load_edit`]) — Kontext-style image edit on the Raw path
+//!   (epic 10871): dual conditioning (in-context VAE reference tokens + the Qwen3-VL grounded encode),
+//!   one source `Reference` or a scene+person `MultiReference`.
+//! - **`krea_2_turbo_edit`** ([`turbo_edit_descriptor`] / [`load_turbo_edit`]) — the same edit surface
+//!   on the distilled CFG-free few-step schedule (sc-11640).
+//! - **`krea_2_turbo_control`** ([`KreaTurboControl`], `model_control::load`) — pose-ControlNet on
+//!   Turbo (epic 8459), a `control_scale`-scaled RMS-clamped residual branch ([`control`]).
+//! - **Raw LoRA/LoKr trainer** ([`KreaRawTrainer`] / [`load_trainer`]) — LoRAs train on Raw and apply at
+//!   Turbo inference (the Lens / Z-Image precedent, epic 7565 P3).
+//! - **Component residency** (epic 10834 / sc-11101) — the [`KreaText`] + [`KreaHeavy`] phase split that
+//!   bounds peak unified memory under `Sequential`; the img2img, PiD-decode (`mlx-gen-pid`) and
+//!   `from_ldm` early-stop seams thread through it.
 
 pub mod config;
 pub mod control;
@@ -52,7 +63,11 @@ pub mod vae;
 pub use config::Krea2Config;
 pub use control::Krea2ControlBranch;
 pub use loader::{load_text_encoder, load_transformer};
-pub use model::{descriptor, load, load_raw, raw_descriptor, Krea, KREA_2_RAW_ID, KREA_2_TURBO_ID};
+pub use model::{
+    descriptor, edit_descriptor, load, load_edit, load_raw, load_turbo_edit, raw_descriptor,
+    turbo_edit_descriptor, Krea, KREA_2_EDIT_ID, KREA_2_RAW_ID, KREA_2_TURBO_EDIT_ID,
+    KREA_2_TURBO_ID,
+};
 pub use model_control::{KreaTurboControl, KREA_2_TURBO_CONTROL_ID};
 pub use pipeline::{KreaHeavy, KreaPipeline, KreaText, TurboOptions};
 pub use schedule::{krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
@@ -60,3 +75,25 @@ pub use text_encoder::{KreaTeConfig, KreaTextEncoder, KreaTokenizer};
 pub use training::{load_trainer, KreaRawTrainer, KREA_2_RAW_TRAINER_ID};
 pub use transformer::Krea2Transformer;
 pub use vae::{load_vae, QwenVae};
+
+#[cfg(test)]
+mod reexport_tests {
+    //! F-077: the crate-root re-exports must cover the FULL registered surface — including the edit API
+    //! (`load_edit`, `edit_descriptor`, `KREA_2_EDIT_ID`, and the Turbo-edit trio) which was previously
+    //! reachable only via the `model::` path. Referencing each at the crate root pins the re-export.
+    #[test]
+    fn edit_surface_is_reexported_at_crate_root() {
+        // Ids.
+        assert_eq!(crate::KREA_2_EDIT_ID, "krea_2_edit");
+        assert_eq!(crate::KREA_2_TURBO_EDIT_ID, "krea_2_turbo_edit");
+        // Descriptors + loaders: referencing each function item at the crate root fails to compile if
+        // the re-export is missing, and their ids must match.
+        let _ = crate::load_edit;
+        let _ = crate::load_turbo_edit;
+        assert_eq!(crate::edit_descriptor().id, crate::KREA_2_EDIT_ID);
+        assert_eq!(
+            crate::turbo_edit_descriptor().id,
+            crate::KREA_2_TURBO_EDIT_ID
+        );
+    }
+}

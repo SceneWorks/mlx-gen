@@ -61,30 +61,84 @@ pub fn krea_vision_config() -> VisionConfig {
     }
 }
 
-/// Image-grounded (edit) condition encoding for a **single** reference (epic 10871 P2.1): the full
-/// orchestration behind the Qwen3-VL "dual conditioning" text half — preprocess the source image, run
-/// the [`VisionTower`], build the grounded template ids (`<|image_pad|>`×merged-count), and run
-/// [`KreaTextEncoder::forward_with_image`]. Returns the DiT-consumable `context`
-/// `[1, s - prefix_tokens, num_select, hidden]` (used downstream with `mask = None`, exactly like the
-/// text-only [`KreaTextEncoder::forward`] output). Mirrors boogu's `encode_image_instruction`.
-///
-/// Two-reference edits (scene + subject) extend this to the multi-image splice (epic 10871 P1.3/P2.3);
-/// the tokenizer + MRoPE helpers already handle N images.
+/// The vision-tower output for a grounded edit, computed ONCE per request and reused across the
+/// positive/negative CFG branches (F-073): per-reference merged image embeds `[nⱼ, hidden]`, the
+/// deepstack features (one stack per reference), the `[t, h, w]` patch grids, and the merged-token
+/// counts that drive the chat template. The vision forward is the expensive, text-independent half of
+/// the grounded encode — only the instruction text differs between pos and neg, so running the tower
+/// twice was pure waste.
+pub struct GroundedVision {
+    pub embeds: Vec<Array>,
+    pub deepstack: Vec<Vec<Array>>,
+    pub grids: Vec<[i32; 3]>,
+    pub counts: Vec<usize>,
+}
+
+/// Run the Qwen3-VL [`VisionTower`] over EVERY edit source (epic 10871 P1.3/P2.3, F-071) — preprocess
+/// each reference (its own smart-resize / grid), forward it through the tower, and collect the per-image
+/// embeds / deepstack / grid + merged-token count. Split out from [`encode_grounded_from_vision`] so a
+/// CFG edit runs the tower ONCE and grounds both the positive and negative instruction on the shared
+/// output (F-073). At least one source is required.
+pub fn run_vision(vision: &VisionTower, sources: &[&Image]) -> Result<GroundedVision> {
+    if sources.is_empty() {
+        return Err(Error::Msg(
+            "krea grounded: at least one source image is required".into(),
+        ));
+    }
+    let mut embeds = Vec::with_capacity(sources.len());
+    let mut deepstack = Vec::with_capacity(sources.len());
+    let mut grids = Vec::with_capacity(sources.len());
+    let mut counts = Vec::with_capacity(sources.len());
+    for &src in sources {
+        let rgb = RgbImage::from_raw(src.width, src.height, src.pixels.clone())
+            .ok_or_else(|| Error::Msg("krea grounded: source image is not valid RGB8".into()))?;
+        let (pixels, grid) = preprocess_image(&rgb)?;
+        // Merged image embeds `[nⱼ, hidden]` + deepstack (one per `deepstack_visual_indexes` entry).
+        let (emb, ds) = vision.forward(&pixels, &[grid])?;
+        counts.push(emb.shape()[0] as usize);
+        embeds.push(emb);
+        deepstack.push(ds);
+        grids.push(grid);
+    }
+    Ok(GroundedVision {
+        embeds,
+        deepstack,
+        grids,
+        counts,
+    })
+}
+
+/// Build the DiT-consumable grounded `context` `[1, s - prefix_tokens, num_select, hidden]` for one
+/// `instruction`, reusing a pre-computed [`GroundedVision`] (epic 10871 P2.3, F-071/F-073): render the
+/// chat template with one `<|image_pad|>` block per reference (`counts`), then run the multi-image
+/// [`KreaTextEncoder::forward_with_images`] so BOTH edit sources reach the grounded encode. Used
+/// downstream with `mask = None`, exactly like the text-only [`KreaTextEncoder::forward`] output.
+pub fn encode_grounded_from_vision(
+    gv: &GroundedVision,
+    tok: &KreaTokenizer,
+    te: &KreaTextEncoder,
+    instruction: &str,
+) -> Result<Array> {
+    let (ids, mask) = tok.encode_with_images(instruction, &gv.counts)?;
+    te.forward_with_images(&ids, &mask, &gv.embeds, &gv.deepstack, &gv.grids)
+}
+
+/// Image-grounded (edit) condition encoding for one or more references (epic 10871 P2.1, F-071): the
+/// full orchestration behind the Qwen3-VL "dual conditioning" text half — run the [`VisionTower`] over
+/// every source, build the grounded template ids (`<|image_pad|>`×merged-count per image), and run
+/// [`KreaTextEncoder::forward_with_images`]. Returns the DiT-consumable `context`
+/// `[1, s - prefix_tokens, num_select, hidden]`. Mirrors boogu's `encode_image_instruction`. Callers
+/// that build both a positive and a negative grounded context should instead call [`run_vision`] once
+/// and [`encode_grounded_from_vision`] per instruction to avoid a redundant tower forward (F-073).
 pub fn encode_grounded(
     vision: &VisionTower,
     tok: &KreaTokenizer,
     te: &KreaTextEncoder,
-    reference: &Image,
+    sources: &[&Image],
     instruction: &str,
 ) -> Result<Array> {
-    let rgb = RgbImage::from_raw(reference.width, reference.height, reference.pixels.clone())
-        .ok_or_else(|| Error::Msg("krea grounded: source image is not valid RGB8".into()))?;
-    let (pixels, grid) = preprocess_image(&rgb)?;
-    // Merged image embeds `[n, hidden]` + deepstack (one per `deepstack_visual_indexes` entry).
-    let (embeds, deepstack) = vision.forward(&pixels, &[grid])?;
-    let n = embeds.shape()[0] as usize;
-    let (ids, mask) = tok.encode_with_images(instruction, &[n])?;
-    te.forward_with_image(&ids, &mask, &embeds, &deepstack, grid)
+    let gv = run_vision(vision, sources)?;
+    encode_grounded_from_vision(&gv, tok, te, instruction)
 }
 
 /// Qwen3-VL-4B text-tower architecture (verified from the published `text_encoder/config.json`:

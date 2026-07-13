@@ -248,6 +248,14 @@ impl KreaTurboControl {
             |heavy_owned, context, on_progress| {
                 let heavy = heavy_owned.as_ref();
 
+                // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
+                // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
+                // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
+                let plan =
+                    heavy
+                        .heavy
+                        .prepare_control(&context, control_image, req.width, req.height)?;
+
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
@@ -258,10 +266,9 @@ impl KreaTurboControl {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
-                    let img = heavy.heavy.render_turbo_control(
-                        &context,
+                    let img = heavy.heavy.render_control_from(
+                        &plan,
                         heavy.branch,
-                        control_image,
                         control_scale,
                         &opts,
                         &req.cancel,

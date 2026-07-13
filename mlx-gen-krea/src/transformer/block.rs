@@ -655,10 +655,13 @@ mod tests {
         assert!(gated().adaptable_mut(&["nope"]).is_none());
     }
 
-    /// sc-8465: `RmsScale::from_weights` accepts EITHER the base snapshot's raw `*.weight` (folded `+1`
-    /// at load) OR the Krea control overlay's pre-folded `*.weight_p1` (`= scale + 1`, used verbatim), so
-    /// the pose branch loads the candle overlay directly. Both must yield the SAME effective weight, and
-    /// the pre-folded variant must win only when the raw one is absent (base loading stays unchanged).
+    /// sc-8465 / F-074: `RmsScale::from_weights` accepts EITHER the base snapshot's raw `*.weight`
+    /// (folded `+1` at load) OR the Krea control overlay's pre-folded `*.weight_p1` (`= scale + 1`, used
+    /// verbatim), so the pose branch loads the candle overlay directly. Both must yield the SAME
+    /// effective weight. PRECEDENCE (F-074): `*.weight_p1` WINS when present — it is the overlay's
+    /// explicit pre-folded convention, and the code checks it first (a base snapshot simply never carries
+    /// it, so base loading is unaffected). The earlier doc claimed the pre-folded variant won "only when
+    /// the raw one is absent", which contradicted the code and went untested for the both-present case.
     #[test]
     fn rms_scale_accepts_raw_weight_or_prefolded_weight_p1() {
         // raw scale [1.5, -0.5] under `*.weight` → effective weight = scale + 1 = [2.5, 0.5].
@@ -673,6 +676,19 @@ mod tests {
 
         assert_eq!(from_raw.weight.as_slice::<f32>(), &[2.5f32, 0.5]);
         assert_eq!(from_folded.weight.as_slice::<f32>(), &[2.5f32, 0.5]);
+
+        // BOTH present (F-074): `*.weight_p1` wins verbatim — the raw `*.weight` is NOT re-folded. Here
+        // the raw scale is 1.0 (→ would fold to 2.0) but the pre-folded value 5.0 is used as-is, pinning
+        // the documented precedence.
+        let mut both = Weights::empty();
+        both.insert("n.weight", Array::from_slice(&[1.0f32, 1.0], &[2]));
+        both.insert("n.weight_p1", Array::from_slice(&[5.0f32, 5.0], &[2]));
+        let from_both = RmsScale::from_weights(&both, "n.weight", 1e-5).unwrap();
+        assert_eq!(
+            from_both.weight.as_slice::<f32>(),
+            &[5.0f32, 5.0],
+            "weight_p1 must win when both are present (used verbatim, raw not re-folded)"
+        );
 
         // Missing both → the canonical MissingTensor error on the raw key (not a silent `_p1` miss).
         assert!(RmsScale::from_weights(&Weights::empty(), "n.weight", 1e-5).is_err());

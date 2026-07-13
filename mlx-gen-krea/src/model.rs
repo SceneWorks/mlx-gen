@@ -23,7 +23,10 @@ use mlx_gen_qwen_image::pipeline::PID_BACKBONE;
 use mlx_rs::Array;
 use std::path::Path;
 
-use crate::pipeline::{base_schedule, turbo_schedule, KreaHeavy, KreaText, TurboOptions};
+use crate::pipeline::{
+    base_schedule, turbo_schedule, EditPlan, Img2ImgPlan, KreaHeavy, KreaText, T2iPlan,
+    TurboOptions,
+};
 
 /// Read the on-disk packed-quantization bits from `transformer/config.json` for a pre-quantized
 /// (Group-B packed) Krea turnkey (`"quantization": {"bits", "group_size"}`); `None` for dense.
@@ -435,18 +438,21 @@ impl Krea {
         is_edit: bool,
         guidance: f32,
         negative: &str,
-        edit_source: Option<&Image>,
+        edit_sources: &[&Image],
     ) -> Result<KreaContexts> {
         if is_edit {
-            let src = edit_source.ok_or_else(|| {
-                Error::Msg(format!(
+            if edit_sources.is_empty() {
+                return Err(Error::Msg(format!(
                     "{}: edit requires a source image",
                     self.descriptor.id
-                ))
-            })?;
-            let pos = text.encode_grounded(src, &req.prompt)?;
+                )));
+            }
+            // Ground on ALL edit sources (scene + person), not just the first (F-071); run the vision
+            // tower ONCE and reuse it for both the positive and (CFG) negative grounded encode (F-073).
+            let gv = text.run_vision(edit_sources)?;
+            let pos = text.encode_grounded_from_vision(&gv, &req.prompt)?;
             let neg = if guidance > 0.0 {
-                Some(text.encode_grounded(src, negative)?)
+                Some(text.encode_grounded_from_vision(&gv, negative)?)
             } else {
                 None
             };
@@ -518,7 +524,7 @@ impl Krea {
         let reference = if is_edit {
             None
         } else {
-            single_reference(req)?
+            single_reference(self.descriptor.id, req)?
         };
         // A PiD `from_ldm` early-stop CAPTURE is not wired for img2img yet (sc-10121): reject THAT combo
         // rather than silently desync the decoder's σ from the img2img-sliced schedule. A capture is
@@ -547,14 +553,21 @@ impl Krea {
         // Phase A: prompt → context(s) (sc-11101; sc-11125). Under `Sequential` the shared seam loads
         // the Qwen3-VL-4B text phase, encodes, materializes, then DROPS it + `clear_cache()` so its
         // ~4 GB frees before the DiT/VAE load below — the peak-bounding win. Under `Resident` it borrows
-        // the warm text phase. Edit grounds on the first source image.
-        let edit_source = edit_sources.first().copied();
+        // the warm text phase. Edit grounds on ALL source images (scene + person), F-071.
         self.residency.run(
             &req.cancel,
             req.use_pid,
             on_progress,
             |text: &KreaText| {
-                self.encode_contexts(text, req, is_raw, is_edit, guidance, &negative, edit_source)
+                self.encode_contexts(
+                    text,
+                    req,
+                    is_raw,
+                    is_edit,
+                    guidance,
+                    &negative,
+                    &edit_sources,
+                )
             },
             // Materialize pos (+neg) while the text phase is still alive (Sequential only) — MLX is
             // lazy, so an un-evaluated context keeps the encoder referenced and the drop frees nothing.
@@ -582,6 +595,64 @@ impl Krea {
                 )?;
                 let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
+                // Hoist the count-invariant work OUT of the per-image loop (F-073): the reference/pose
+                // VAE encodes and the step-invariant text-fusion + host-RoPE prep depend only on the
+                // (shared) context + target geometry, NOT the per-seed noise. Build the plan ONCE here;
+                // each seed below reuses it via the `render_*_from` seam (byte-identical to the pre-hoist
+                // per-seed build — the prep only ever read the latent *shape*). An 8-count two-source
+                // edit thus does 2 VAE encodes + 2 preps total, not 16 + 16.
+                let plan = if is_edit {
+                    // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
+                    // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
+                    // img2img init. `edit_sources` is the ordered slice the pipeline VAE-encodes at
+                    // successive RoPE frames; the `krea2_identity_edit` LoRA in `spec.adapters` steers it.
+                    KreaRenderPlan::Edit(heavy.heavy.prepare_edit_plan(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        &edit_sources,
+                        req.width,
+                        req.height,
+                    )?)
+                } else if let Some((init, ref_strength)) = reference {
+                    // Reference fidelity: the Reference's own strength wins, else the request-level
+                    // img2img strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
+                    let strength = ref_strength.or(req.strength).unwrap_or(0.5);
+                    let img2img = heavy.heavy.prepare_img2img(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        init,
+                        req.width,
+                        req.height,
+                    )?;
+                    // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
+                    // negative prompt honored, sc-10224); Turbo the CFG-free distilled one (sc-10135).
+                    if is_raw {
+                        KreaRenderPlan::Img2ImgRaw {
+                            plan: img2img,
+                            strength,
+                        }
+                    } else {
+                        KreaRenderPlan::Img2ImgTurbo {
+                            plan: img2img,
+                            strength,
+                        }
+                    }
+                } else if is_raw {
+                    KreaRenderPlan::BaseCfg(heavy.heavy.prepare_t2i(
+                        &ctx.pos,
+                        ctx.neg.as_ref(),
+                        req.width,
+                        req.height,
+                    )?)
+                } else {
+                    // Turbo t2i is CFG-free (`ctx.neg` is always `None` here).
+                    KreaRenderPlan::Turbo(
+                        heavy
+                            .heavy
+                            .prepare_t2i(&ctx.pos, None, req.width, req.height)?,
+                    )
+                };
+
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
@@ -592,76 +663,63 @@ impl Krea {
                         sampler: req.sampler.clone(),
                         scheduler: req.scheduler.clone(),
                     };
-                    // The one render body per path (sc-11101): the same `KreaHeavy::render_*` for both
-                    // residencies, so a Sequential job (text phase already dropped) is byte-identical to Resident.
-                    let img = if is_edit {
-                        // Kontext-style edit (epic 10871): the source image(s) are kept as in-context
-                        // conditioning (VAE tokens + the Qwen3-VL grounding baked into `ctx`) — NOT a noised
-                        // img2img init. Denoises from PURE NOISE under full CFG, so a reference's strength is
-                        // ignored; `edit_sources` is the ordered slice the pipeline VAE-encodes at successive
-                        // RoPE frames. The `krea2_identity_edit` LoRA in `spec.adapters` steers the edit.
-                        heavy.heavy.render_edit(
-                            &ctx.pos,
-                            ctx.neg.as_ref(),
+                    // The one render body per path (sc-11101): the same `KreaHeavy::render_*_from` for
+                    // both residencies, so a Sequential job (text phase already dropped) is byte-identical
+                    // to Resident.
+                    let img = match &plan {
+                        KreaRenderPlan::Edit(p) => heavy.heavy.render_edit_from(
+                            p,
                             guidance,
                             // Distilled Turbo edit → few-step `turbo_schedule`; Raw edit → dynamic-mu
                             // `base_schedule`. Matches the capture-σ `sigmas` selector above (`is_raw`).
                             is_turbo_edit,
-                            &edit_sources,
                             &opts,
                             decoder,
+                            // Honor the PiD `from_ldm` early-stop on the edit path (F-069): `keep`
+                            // truncates the schedule so the decoder built at `capture_sigma` receives the
+                            // partially-denoised latent it expects, instead of the σ=0 clean one.
+                            keep,
                             &req.cancel,
                             on_progress,
-                        )?
-                    } else if let Some((init, ref_strength)) = reference {
-                        // Reference fidelity: the Reference's own strength wins, else the request-level img2img
-                        // strength, else the 0.5 mid default (the full-range slider's default; A2/A3).
-                        let strength = ref_strength.or(req.strength).unwrap_or(0.5);
-                        // img2img dispatch splits by variant: Raw takes the true-CFG entrypoint (guidance +
-                        // negative prompt honored, sc-10224); Turbo takes the CFG-free distilled one (sc-10135).
-                        if is_raw {
-                            heavy.heavy.render_base_img2img(
-                                &ctx.pos,
-                                ctx.neg.as_ref(),
+                        )?,
+                        KreaRenderPlan::Img2ImgRaw { plan, strength } => {
+                            heavy.heavy.render_base_img2img_from(
+                                plan,
                                 guidance,
-                                init,
-                                strength,
-                                &opts,
-                                decoder,
-                                &req.cancel,
-                                on_progress,
-                            )?
-                        } else {
-                            heavy.heavy.render_turbo_img2img(
-                                &ctx.pos,
-                                init,
-                                strength,
+                                *strength,
                                 &opts,
                                 decoder,
                                 &req.cancel,
                                 on_progress,
                             )?
                         }
-                    } else if is_raw {
-                        heavy.heavy.render_base(
-                            &ctx.pos,
-                            ctx.neg.as_ref(),
+                        KreaRenderPlan::Img2ImgTurbo { plan, strength } => {
+                            heavy.heavy.render_turbo_img2img_from(
+                                plan,
+                                *strength,
+                                &opts,
+                                decoder,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        }
+                        KreaRenderPlan::BaseCfg(p) => heavy.heavy.render_base_from(
+                            p,
                             guidance,
                             &opts,
                             decoder,
                             keep,
                             &req.cancel,
                             on_progress,
-                        )?
-                    } else {
-                        heavy.heavy.render_turbo(
-                            &ctx.pos,
+                        )?,
+                        KreaRenderPlan::Turbo(p) => heavy.heavy.render_turbo_from(
+                            p,
                             &opts,
                             decoder,
                             keep,
                             &req.cancel,
                             on_progress,
-                        )?
+                        )?,
                     };
                     images.push(img);
                 }
@@ -698,14 +756,30 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 /// than one `Reference` errors. Both variants advertise `Reference` (Turbo → CFG-free img2img sc-10135,
 /// Raw → CFG img2img sc-10224), so this is reached on either path; the `generate_impl` dispatch then
 /// picks the matching entrypoint by `is_raw`. Mirrors the FLUX single-reference idiom.
-fn single_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+fn single_reference<'a>(
+    id: &str,
+    req: &'a GenerationRequest,
+) -> Result<Option<(&'a Image, Option<f32>)>> {
     match req.conditioning.as_slice() {
         [] => Ok(None),
         [Conditioning::Reference { image, strength }] => Ok(Some((image, *strength))),
-        _ => Err(Error::Msg(
-            "krea_2_turbo: img2img supports exactly one Reference image".into(),
-        )),
+        // F-076: name the actual variant (`krea_2_raw` reaches this too), not a hardcoded `krea_2_turbo`.
+        _ => Err(Error::Msg(format!(
+            "{id}: img2img supports exactly one Reference image"
+        ))),
     }
+}
+
+/// The per-request, count-invariant render plan (F-073), built ONCE from the shared context + target
+/// geometry before the count loop and reused for every seed via the `KreaHeavy::render_*_from` seam. It
+/// carries the hoisted heavy work (reference/pose VAE encodes + the step-invariant DiT prep(s)); only
+/// the per-seed noise varies across the loop. The variant mirrors `generate_impl`'s path dispatch.
+enum KreaRenderPlan {
+    Edit(EditPlan),
+    Img2ImgRaw { plan: Img2ImgPlan, strength: f32 },
+    Img2ImgTurbo { plan: Img2ImgPlan, strength: f32 },
+    BaseCfg(T2iPlan),
+    Turbo(T2iPlan),
 }
 
 /// The most reference images a Krea edit accepts (epic 10871 P1.3): scene = image 1, person = image 2.
@@ -859,13 +933,27 @@ mod tests {
     #[test]
     fn single_reference_extracts_one_or_errors() {
         // No conditioning → plain txt2img.
-        assert!(single_reference(&req(1024, 1024)).unwrap().is_none());
+        assert!(single_reference(KREA_2_TURBO_ID, &req(1024, 1024))
+            .unwrap()
+            .is_none());
         // Exactly one → the image + its strength.
         let r1 = ref_req(1, Some(0.4));
-        let one = single_reference(&r1).unwrap();
+        let one = single_reference(KREA_2_TURBO_ID, &r1).unwrap();
         assert_eq!(one.map(|(_, s)| s), Some(Some(0.4)));
         // More than one → error (Krea conditions on a single reference).
-        assert!(single_reference(&ref_req(2, None)).is_err());
+        assert!(single_reference(KREA_2_TURBO_ID, &ref_req(2, None)).is_err());
+    }
+
+    /// F-076: the img2img single-reference error names the ACTUAL descriptor id — `krea_2_raw` reaches
+    /// this path too (both variants advertise `Reference`), so a hardcoded `krea_2_turbo` misled Raw
+    /// img2img diagnostics.
+    #[test]
+    fn single_reference_error_uses_the_descriptor_id() {
+        let err = single_reference(KREA_2_RAW_ID, &ref_req(2, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(KREA_2_RAW_ID), "{err}");
+        assert!(!err.contains(KREA_2_TURBO_ID), "{err}");
     }
 
     #[test]

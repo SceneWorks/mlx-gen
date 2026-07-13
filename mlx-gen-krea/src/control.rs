@@ -91,8 +91,10 @@ impl Krea2ControlBranch {
     }
 
     /// Assemble the branch from an already-loaded overlay. Infers `N` from the `blocks.{i}.*` keys and
-    /// builds each block through the unmodified [`SingleStreamBlock::from_weights`] (the converter
-    /// pre-unfolds the RMSNorm scales to the raw `*.weight` this expects) plus its `proj_out`.
+    /// builds each block through the unmodified [`SingleStreamBlock::from_weights`] plus its `proj_out`.
+    /// F-075: there is NO offline convert step — the candle-gen pose overlay ships the RMSNorm scales
+    /// pre-folded as `*.weight_p1` (`= scale + 1`), and `crate::transformer::block::RmsScale::from_weights`
+    /// loads that verbatim (native `weight_p1` load, sc-8465), so the overlay drops straight in.
     pub fn from_weights(w: &Weights, cfg: &Krea2Config) -> Result<Self> {
         let (heads, kv, hd, hidden, eps) = (
             cfg.num_attention_heads as i32,
@@ -105,7 +107,8 @@ impl Krea2ControlBranch {
         if n == 0 {
             return Err(Error::Msg(
                 "krea_2_turbo_control: overlay has no `blocks.{i}.*` control-branch tensors — is this \
-                 the converted MLX pose overlay (examples/krea-control-convert.rs)?"
+                 the Krea 2 pose-control overlay (the candle-gen `.safetensors` with `blocks.{i}.*` + \
+                 `blocks.{i}.proj_out` and pre-folded `*.weight_p1` RMSNorm scales)?"
                     .into(),
             ));
         }

@@ -143,8 +143,9 @@ impl KreaTextEncoder {
                 self.prefix_tokens
             )));
         }
-        let idx: Vec<i32> = (self.prefix_tokens..n).collect();
-        Ok(stacked.take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)?)
+        // Drop the leading `prefix_tokens` via a contiguous split (F-078), not an arange-gather: keep
+        // the tail `[prefix_tokens, n)`.
+        Ok(stacked.split_axis(&[self.prefix_tokens], 1)?.swap_remove(1))
     }
 
     /// **Image-grounded** condition encoding (epic 10871 P2.1) — the Qwen3-VL "dual conditioning" text
@@ -169,24 +170,66 @@ impl KreaTextEncoder {
         deepstack: &[Array],
         grid_thw: [i32; 3],
     ) -> Result<Array> {
+        // The single-image forward is the N = 1 case of the multi-image path (epic 10871 P2.3, F-071):
+        // one embeds array, one deepstack stack, one grid. Kept as a convenience for single-source edits
+        // and the existing tests; byte-identical to the multi splice for one image.
+        self.forward_with_images(
+            input_ids,
+            attention_mask,
+            std::slice::from_ref(image_embeds),
+            std::slice::from_ref(&deepstack.to_vec()),
+            &[grid_thw],
+        )
+    }
+
+    /// **Multi-image-grounded** condition encoding (epic 10871 P1.3/P2.3, F-071) — the scene+person (or
+    /// N-source) generalization of [`forward_with_image`]. Splices each reference's `image_embeds[j]`
+    /// (`[nⱼ, hidden]`) at its own contiguous `<|image_pad|>` run, runs the decoder under the 3-D
+    /// interleaved MRoPE (positions advance `max(hⱼ, wⱼ)/merge` per image, [`mrope_positions_multi`]),
+    /// and additively injects each image's `deepstack[j][i]` feature at that image's run for the first
+    /// `deepstack.len()` layers. `grids[j]` is image `j`'s `[t, h, w]` patch grid, in the same order the
+    /// runs appear in `input_ids`. `b = 1`. Mirrors [`mlx_gen_boogu::…::last_hidden_with_image_multi`],
+    /// so BOTH edit sources reach the grounded encode — not just the first (the prior single-source gap).
+    pub fn forward_with_images(
+        &self,
+        input_ids: &Array,
+        attention_mask: &Array,
+        image_embeds: &[Array],
+        deepstack: &[Vec<Array>],
+        grids: &[[i32; 3]],
+    ) -> Result<Array> {
         let sh = input_ids.shape();
         let (b, s) = (sh[0], sh[1]);
         let ids_arr = input_ids.as_dtype(Dtype::Int32)?;
         let ids: Vec<i32> = ids_arr.as_slice::<i32>().to_vec();
-        let (img_start, img_end) = *image_token_runs(&ids, self.image_token_id, s)
-            .first()
-            .ok_or_else(|| {
-                Error::Msg("krea te (grounded): prompt has no <|image_pad|> tokens".into())
-            })?;
 
-        // Embed tokens, then splice the vision features over the <|image_pad|> block.
+        // One contiguous <|image_pad|> run per reference image, in sequence order.
+        let runs = image_token_runs(&ids, self.image_token_id, s);
+        if runs.is_empty() {
+            return Err(Error::Msg(
+                "krea te (grounded): prompt has no <|image_pad|> tokens".into(),
+            ));
+        }
+        if runs.len() != image_embeds.len() || runs.len() != grids.len() {
+            return Err(Error::Msg(format!(
+                "krea te (grounded): {} <|image_pad|> run(s) but {} embeds / {} grids",
+                runs.len(),
+                image_embeds.len(),
+                grids.len()
+            )));
+        }
+
+        // Embed tokens, then splice each image's vision features over its <|image_pad|> block.
         let mut hidden = self.embed_tokens.forward(input_ids)?; // [1, s, hidden]
         let dt = hidden.dtype();
-        let img = image_embeds.expand_dims(0)?; // [1, n, hidden]
-        hidden = replace_seq(&hidden, &img, img_start, img_end, s)?;
+        for (&(start, end), emb) in runs.iter().zip(image_embeds) {
+            let img = emb.expand_dims(0)?.as_dtype(dt)?; // [1, nⱼ, hidden]
+            hidden = replace_seq(&hidden, &img, start, end, s)?;
+        }
 
-        // 3-D MRoPE: text tokens sequential; the image block carries its merged (h/m × w/m) grid.
-        let (pt, ph, pw) = mrope_positions(&ids, self.image_token_id, grid_thw[1], grid_thw[2]);
+        // 3-D MRoPE: text tokens sequential; each image block carries its merged (h/m × w/m) grid, with
+        // the per-image position advance.
+        let (pt, ph, pw) = mrope_positions_multi(&ids, self.image_token_id, grids);
         let (cos, sin) = mrope_cos_sin(
             &pt,
             &ph,
@@ -201,12 +244,14 @@ impl KreaTextEncoder {
         let mut saved: Vec<(usize, Array)> = Vec::with_capacity(self.out_layers.len());
         for (i, layer) in self.layers.iter().enumerate() {
             hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
-            // Deepstack: add the i-th merged vision feature at the image positions for LM layers
+            // Deepstack: add each image's i-th merged vision feature at its run for LM layers
             // 0..deepstack.len() (the Qwen3-VL deepstack contract).
-            if i < deepstack.len() {
-                let mid = slice_seq(&hidden, img_start, img_end)?;
-                let inj = add(&mid, &deepstack[i].expand_dims(0)?)?;
-                hidden = replace_seq(&hidden, &inj, img_start, img_end, s)?;
+            for (&(start, end), ds_img) in runs.iter().zip(deepstack) {
+                if i < ds_img.len() {
+                    let mid = slice_seq(&hidden, start, end)?;
+                    let inj = add(&mid, &ds_img[i].expand_dims(0)?.as_dtype(dt)?)?;
+                    hidden = replace_seq(&hidden, &inj, start, end, s)?;
+                }
             }
             if self.out_layers.contains(&i) {
                 saved.push((i, hidden.clone()));
@@ -218,17 +263,21 @@ impl KreaTextEncoder {
 
 // ── Image-grounded helpers (ported from `mlx-gen-boogu`'s Qwen3-VL text encoder) ─────────────────
 
-/// Slice `[b, s, d]` along the sequence axis to `[start, end)`.
+/// Slice `[b, s, d]` along the sequence axis to `[start, end)`. A contiguous `split_axis` (F-078), not
+/// an arange + `take_axis` gather: MLX's `as_slice` ignores strides, so a gather round-trip through
+/// host indices is both slower and stride-fragile — the split returns the same elements directly.
 fn slice_seq(x: &Array, start: i32, end: i32) -> Result<Array> {
-    let idx: Vec<i32> = (start..end).collect();
-    Ok(x.take_axis(Array::from_slice(&idx, &[end - start]), 1)?)
+    Ok(x.split_axis(&[start, end], 1)?.swap_remove(1))
 }
 
-/// Replace `x[:, start:end, :]` with `repl` (`[b, end-start, d]`) via concat of the surrounding slices —
-/// the masked-replace splice (no in-place scatter).
-fn replace_seq(x: &Array, repl: &Array, start: i32, end: i32, s: i32) -> Result<Array> {
-    let before = slice_seq(x, 0, start)?;
-    let after = slice_seq(x, end, s)?;
+/// Replace `x[:, start:end, :]` with `repl` (`[b, end-start, d]`) via concat of the surrounding
+/// (contiguous-split) slices — the masked-replace splice (no in-place scatter). F-078: the surrounding
+/// slices come from `split_axis`, not an arange-gather. `s` is unused now (the split names the
+/// trailing boundary implicitly) but kept in the signature for call-site symmetry with the runs.
+fn replace_seq(x: &Array, repl: &Array, start: i32, end: i32, _s: i32) -> Result<Array> {
+    let mut parts = x.split_axis(&[start, end], 1)?;
+    let after = parts.swap_remove(2);
+    let before = parts.swap_remove(0);
     Ok(concatenate_axis(&[&before, repl, &after], 1)?)
 }
 
@@ -251,9 +300,12 @@ fn image_token_runs(ids: &[i32], image_token_id: i32, s: i32) -> Vec<(i32, i32)>
     runs
 }
 
-/// 3-D MRoPE positions per token: text tokens advance `(i, i, i)`; an image block (at offset `cur`) gets
-/// `t = cur`, `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then
-/// `cur += max(h, w) / merge`. Mirrors Qwen3-VL `get_rope_index`.
+/// 3-D MRoPE positions per token for a SINGLE image: text tokens advance `(i, i, i)`; an image block
+/// (at offset `cur`) gets `t = cur`, `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)`
+/// merged grid, then `cur += max(h, w) / merge`. Mirrors Qwen3-VL `get_rope_index`. F-071: production
+/// now always goes through [`mrope_positions_multi`] (the single case is `grids.len() == 1`); this is
+/// retained as the test oracle that pins the multi path equal on one image.
+#[cfg(test)]
 fn mrope_positions(
     ids: &[i32],
     image_token_id: i32,
@@ -274,6 +326,44 @@ fn mrope_positions(
             }
             cur += step;
             i += (llm_h * llm_w) as usize;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
+}
+
+/// Multi-image 3-D MRoPE positions (F-071; mirrors Qwen3-VL `get_rope_index` over `image_grid_thw`):
+/// text tokens advance `(i, i, i)`; the `k`-th image block (using `grids[k]`) at offset `cur` gets
+/// `t = cur`, `h = cur + row`, `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then
+/// `cur += max(h, w) / merge`. The single-image [`mrope_positions`] is exactly the `grids.len() == 1`
+/// case (verified by [`tests::mrope_multi_matches_single_for_one_image`]).
+fn mrope_positions_multi(
+    ids: &[i32],
+    image_token_id: i32,
+    grids: &[[i32; 3]],
+) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i32;
+    let mut img_i = 0usize;
+    let mut i = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            let g = grids[img_i];
+            let (llm_h, llm_w) = (g[1] / SPATIAL_MERGE, g[2] / SPATIAL_MERGE);
+            let step = g[1].max(g[2]) / SPATIAL_MERGE;
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+            img_i += 1;
         } else {
             pt.push(cur);
             ph.push(cur);
@@ -352,5 +442,78 @@ mod tests {
         assert_eq!(pt, vec![0, 1, 2, 3]);
         assert_eq!(pt, ph);
         assert_eq!(pt, pw);
+    }
+
+    /// F-071: the multi-image position layout is the exact generalization of the single-image one — for
+    /// a single image + grid it produces byte-identical `(pt, ph, pw)`, so the multi path is a safe
+    /// superset (the single `forward_with_image` delegates to it).
+    #[test]
+    fn mrope_multi_matches_single_for_one_image() {
+        let img = 99;
+        let ids = vec![1, 2, img, img, img, img, 3];
+        let single = mrope_positions(&ids, img, 4, 4);
+        let multi = mrope_positions_multi(&ids, img, &[[1, 4, 4]]);
+        assert_eq!(single, multi);
+    }
+
+    /// F-071: TWO reference images (scene + person) each get their own merged grid block, and the second
+    /// block's cursor starts AFTER the first image's `max(h,w)/merge` advance — so the person image is
+    /// grounded at a distinct frame, not overlaid on the scene. This is the layout the two-source edit
+    /// LoRA was trained against.
+    #[test]
+    fn mrope_multi_lays_out_two_image_blocks() {
+        let img = 99;
+        // [txt, img×4 (2×2 grid), img×4 (2×2 grid), txt]
+        let ids = vec![1, img, img, img, img, img, img, img, img, 2];
+        let (pt, ph, pw) = mrope_positions_multi(&ids, img, &[[1, 4, 4], [1, 4, 4]]);
+        // txt@0 → 0. img1@cur=1: (1, 1+row, 1+col) over 2×2 → advance +2. img2@cur=3: (3, 3+row, 3+col)
+        // → advance +2. txt@cur=5 → 5.
+        assert_eq!(pt, vec![0, 1, 1, 1, 1, 3, 3, 3, 3, 5]);
+        assert_eq!(ph, vec![0, 1, 1, 2, 2, 3, 3, 4, 4, 5]);
+        assert_eq!(pw, vec![0, 1, 2, 1, 2, 3, 4, 3, 4, 5]);
+    }
+
+    /// F-078: the contiguous-`split_axis` `slice_seq`/`replace_seq` return element-identical results to
+    /// the arange + `take_axis` gather they replaced. `as_slice` ignores strides, so a split view and a
+    /// gather could in principle diverge — this pins them equal on a strided sequence axis.
+    #[test]
+    fn split_slice_and_replace_match_arange_gather() {
+        // [1, 5, 2] so the sequence axis (axis 1) is strided over the last dim.
+        let x = Array::from_slice(&[0.0f32, 1., 2., 3., 4., 5., 6., 7., 8., 9.], &[1, 5, 2]);
+        let (start, end, s) = (1i32, 4i32, 5i32);
+
+        // Old gather reference for slice_seq.
+        let idx: Vec<i32> = (start..end).collect();
+        let gathered = x
+            .take_axis(Array::from_slice(&idx, &[idx.len() as i32]), 1)
+            .unwrap();
+        let split = slice_seq(&x, start, end).unwrap();
+        assert_eq!(
+            split.as_slice::<f32>(),
+            gathered.as_slice::<f32>(),
+            "slice_seq split must equal the arange-gather"
+        );
+
+        // replace_seq: swap [start,end) for a marker block, compare against a gather-built reference.
+        let repl = Array::from_slice(&[-1.0f32, -2., -3., -4., -5., -6.], &[1, 3, 2]);
+        let before_idx: Vec<i32> = (0..start).collect();
+        let after_idx: Vec<i32> = (end..s).collect();
+        let before = x
+            .take_axis(
+                Array::from_slice(&before_idx, &[before_idx.len() as i32]),
+                1,
+            )
+            .unwrap();
+        let after = x
+            .take_axis(Array::from_slice(&after_idx, &[after_idx.len() as i32]), 1)
+            .unwrap();
+        let gather_ref = concatenate_axis(&[&before, &repl, &after], 1).unwrap();
+        let via_split = replace_seq(&x, &repl, start, end, s).unwrap();
+        assert_eq!(via_split.shape(), gather_ref.shape());
+        assert_eq!(
+            via_split.as_slice::<f32>(),
+            gather_ref.as_slice::<f32>(),
+            "replace_seq split must equal the arange-gather splice"
+        );
     }
 }
