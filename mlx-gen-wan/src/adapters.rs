@@ -100,8 +100,20 @@ const SUFFIXES: [(&str, Role); 5] = [
 
 /// Read a scalar `.alpha` as f32 regardless of on-disk dtype (real files ship it bf16; a direct
 /// `as_slice::<f32>()` would panic on a dtype mismatch). A `[]`- or `[1]`-shaped scalar both read.
+///
+/// A size-0 `.alpha` tensor (a malformed/truncated third-party adapter file) has no element to read,
+/// so `as_slice::<f32>()[0]` would index an empty slice and PANIC — aborting the worker on any of the
+/// five Wan generator entries (F-059). Fail this one job with a typed error instead, mirroring the core
+/// loader's `scalar_alpha` (sc-11129).
 fn read_alpha(a: &Array) -> Result<f32> {
-    Ok(a.as_dtype(Dtype::Float32)?.as_slice::<f32>()[0])
+    a.as_dtype(Dtype::Float32)?
+        .try_as_slice::<f32>()
+        .map_err(|e| Error::Msg(format!("read_alpha: not a readable scalar array: {e}")))?
+        .first()
+        .copied()
+        .ok_or_else(|| {
+            Error::Msg("read_alpha: empty .alpha tensor (malformed adapter file)".into())
+        })
 }
 
 /// Normalize a LoRA module path to the Wan checkpoint's naming (the reference
@@ -331,6 +343,22 @@ fn merge_one(
             report.skipped.push(path);
             continue;
         };
+        // Reject degenerate factors BEFORE deriving the scale (F-058, mirroring the additive twin's
+        // guard at `install_one_lora_additive`). A non-2-D factor or a 0-size `lora_A` leading dim
+        // would make `rank = 0`, so `alpha/rank = 0/0 = NaN` (or `∞`) silently replaces the ENTIRE base
+        // weight with NaN via the merge below — every subsequent render is garbage while the load
+        // reports success. Fail this one job with a typed error instead (sc-11129).
+        if down.shape().len() != 2 || up.shape().len() != 2 {
+            return Err(format!(
+                "wan LoRA at '{path}' has non-2-D factors (down {:?}, up {:?})",
+                down.shape(),
+                up.shape()
+            )
+            .into());
+        }
+        if down.shape()[0] == 0 {
+            return Err(format!("wan LoRA at '{path}' has zero rank").into());
+        }
         // lora_A: [rank, in], lora_B: [out, rank]. delta = B·A → [out, in], the weight's shape.
         // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
         // rank (today's default). The denominator honors the blob `r`/`rank_pattern` when given
@@ -880,6 +908,21 @@ fn non_deferrable_lokr_error(path: &str) -> mlx_gen::Error {
     .into()
 }
 
+/// The typed [`Error::Unsupported`] for a LoHa target on a packed base (F-060 / sc-10051). LoHa's
+/// Hadamard delta has no deferred form, so applying it on a packed base would materialize the full
+/// dense-weight-sized delta on top of the packed weights — the OOM the tier's low-memory point exists
+/// to avoid. Steer the user to the bf16 tier (where LoHa folds into the dense weight in place) or a
+/// plain LoRA/LoKr. Mirrors the file-level `reject_loha_on_packed`, per target.
+fn loha_on_packed_target_error(path: &str) -> mlx_gen::Error {
+    Error::Unsupported(format!(
+        "LoHa at '{path}' (LyCORIS Hadamard) cannot be applied on a quantized (packed Q4/Q8) Wan \
+         tier: its delta is a Hadamard product of two low-rank branches with no deferred/additive \
+         form, so it would materialize the full dense weight-sized delta on top of the packed weights. \
+         Use the bf16 tier for this adapter (LoHa merges into the dense weight in place), or a plain \
+         LoRA/LoKr (which apply additively on any tier). Tracked in sc-10051 (epic 10043)."
+    ))
+}
+
 /// Install a third-party LyCORIS **LoKr** file as residuals (sc-3671/sc-10044). As
 /// [`install_one_lokr_additive`] but with per-module lycoris factors + key resolution (kohya-flattened
 /// stem table, else the dotted `normalize`). The reconstructed delta bakes in the lycoris per-module
@@ -961,9 +1004,20 @@ fn install_thirdparty_delta(
     report: &mut WanLoraReport,
 ) -> Result<()> {
     let parts: Vec<&str> = path.split('.').collect();
-    let Some(base_shape) = host.adaptable_mut(&parts).map(|lin| lin.base_shape()) else {
-        report.skipped.push(path);
-        return Ok(());
+    let base_shape = match host.adaptable_mut(&parts) {
+        // Per-target packed-base guard (F-060, sc-10051). LoHa has no allocation-free deferred form —
+        // every install materializes the full `[out,in]` bf16 delta. The LoKr additive installers
+        // already refuse a materialization on a packed base per target; the LoHa installer did not, so
+        // its only safety was the call-site file-level `reject_loha_on_packed` being invoked first. Add
+        // the same per-target refusal so a future direct caller cannot silently materialize the
+        // ~28 GB/expert dense delta on a packed base (the OOM sc-10051 exists to prevent). Typed
+        // `Error::Unsupported` bridges 1:1 to gen_core so the worker surfaces actionable guidance.
+        Some(lin) if lin.is_quantized() => return Err(loha_on_packed_target_error(&path)),
+        Some(lin) => lin.base_shape(),
+        None => {
+            report.skipped.push(path);
+            return Ok(());
+        }
     };
     let delta = delta_at(&base_shape)?;
     push_at(
@@ -2545,5 +2599,141 @@ mod tests {
             vec!["blocks.99.self_attn.q".to_string()],
             "the absent target is surfaced, not fatal"
         );
+    }
+
+    #[test]
+    fn read_alpha_empty_tensor_errors_not_panic() {
+        // F-059 (sc-11129): a size-0 `.alpha` from a malformed/truncated adapter file must produce a
+        // TYPED error, not the `as_slice()[0]` panic that would abort the worker on any Wan entry.
+        // (safetensors cannot serialize an empty array, so exercise `read_alpha` directly on the
+        // in-memory empty tensor — the exact value a truncated file would deserialize to.)
+        let empty = Array::from_slice::<f32>(&[], &[0]);
+        let err = read_alpha(&empty).expect_err("an empty .alpha must error, not panic");
+        assert!(
+            matches!(err, Error::Msg(_)),
+            "expected a typed Msg error, got {err:?}"
+        );
+        // Happy-path regression: a well-formed bf16 scalar still reads its value.
+        let good = Array::from_slice(&[8.0f32], &[1])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        assert_eq!(read_alpha(&good).unwrap(), 8.0);
+    }
+
+    /// Write a PEFT LoRA file for `blocks.0.self_attn.q` whose factors are **1-D** (non-2-D) — a
+    /// malformed adapter that would otherwise derive a degenerate rank and merge garbage (sc-11129,
+    /// F-058). A true 0-size `lora_A` leading dim triggers the same guard but is not serializable.
+    fn write_lora_non_2d(name: &str) -> PathBuf {
+        let a = Array::from_slice(&[0.1f32; 8], &[8])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let b = Array::from_slice(&[0.1f32; 16], &[16])
+            .as_dtype(Dtype::Bfloat16)
+            .unwrap();
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.blocks.0.self_attn.q.lora_A.weight", &a),
+                ("diffusion_model.blocks.0.self_attn.q.lora_B.weight", &b),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn fold_path_rejects_degenerate_factors_instead_of_nan_merge() {
+        // F-058 (sc-11129): the fold path must reject degenerate factors with a typed error, exactly
+        // like the additive twin's guard (`install_one_lora_additive`) — rather than deriving a
+        // NaN/degenerate `alpha/rank` and silently replacing the whole base weight. Before the fix the
+        // fold path had no such guard; the additive twin did (fixes-don't-travel).
+        let lora = write_lora_non_2d("f058_non2d.safetensors");
+        let mut w = synthetic_weights();
+        let err = merge_wan_adapters(&mut w, &[spec(lora, 1.0, None)], MoeExpert::High)
+            .expect_err("degenerate factors must be rejected on the fold path");
+        match err {
+            Error::Msg(s) => assert!(
+                s.contains("non-2-D") || s.contains("zero rank"),
+                "unexpected error text: {s}"
+            ),
+            other => panic!("expected a typed Msg error, got {other:?}"),
+        }
+        // The base weight is untouched (not corrupted) — the guard fired before the merge.
+        let got = w.require("blocks.0.self_attn.q.weight").unwrap();
+        assert!(
+            !got.as_dtype(Dtype::Float32)
+                .unwrap()
+                .sum(None)
+                .unwrap()
+                .item::<f32>()
+                .is_nan(),
+            "the base weight must not be NaN-poisoned when the guard rejects"
+        );
+    }
+
+    /// Write a synthetic third-party LyCORIS **LoHa** for `blocks.0.self_attn.q` at `[128,64]`
+    /// (`(w1_a·w1_b) ⊙ (w2_a·w2_b)`, rank 4) — the shape `QuantWanHost` carries (sc-11129, F-060).
+    fn write_thirdparty_loha_q(name: &str) -> PathBuf {
+        let r = 4;
+        let wa = Array::from_slice(
+            &(0..128 * r)
+                .map(|i| (i as f32 * 0.001).sin() * 0.05)
+                .collect::<Vec<_>>(),
+            &[128, r],
+        );
+        let wb = Array::from_slice(
+            &(0..r * 64)
+                .map(|i| (i as f32 * 0.002).cos() * 0.05)
+                .collect::<Vec<_>>(),
+            &[r, 64],
+        );
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("blocks.0.self_attn.q.hada_w1_a", &wa),
+                ("blocks.0.self_attn.q.hada_w1_b", &wb),
+                ("blocks.0.self_attn.q.hada_w2_a", &wa),
+                ("blocks.0.self_attn.q.hada_w2_b", &wb),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn loha_additive_installer_rejects_packed_base_per_target() {
+        // F-060 (sc-11129): the LoHa additive installer must refuse a materialization on a PACKED base
+        // per target (not rely solely on the call-site file-level `reject_loha_on_packed`). Install a
+        // third-party LoHa directly via `apply_wan_adapters_additive` onto a packed q — it must return
+        // the typed `Error::Unsupported`, and on a DENSE q the same file installs fine (guard parity).
+        let loha = write_thirdparty_loha_q("f060_loha.safetensors");
+
+        let mut packed = QuantWanHost::new();
+        packed.q.quantize(8, Some(64)).unwrap();
+        assert!(
+            packed.q.is_quantized(),
+            "base must be packed before install"
+        );
+        let err = apply_wan_adapters_additive(
+            &mut packed,
+            &[spec(loha.clone(), 1.0, None)],
+            MoeExpert::High,
+        )
+        .expect_err("a LoHa on a packed base must be rejected per target");
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "LoHa-on-packed must be a typed Unsupported error, got {err:?}"
+        );
+
+        // Guard parity: on a DENSE base the identical file installs (materialized), never rejected.
+        let mut dense = QuantWanHost::new();
+        let report =
+            apply_wan_adapters_additive(&mut dense, &[spec(loha, 1.0, None)], MoeExpert::High)
+                .expect("a LoHa on a dense base must still install");
+        assert_eq!(report.applied, 1, "the LoHa materializes on a dense base");
     }
 }

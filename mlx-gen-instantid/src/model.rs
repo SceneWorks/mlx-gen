@@ -178,6 +178,10 @@ pub struct InstantId {
     /// through the `sdxl` PiD student (4× SR) instead of the native VAE. InstantID composes the SDXL
     /// VAE, so it shares the same `sdxl` checkpoint as the registered SDXL provider (sc-7848).
     pid: Option<PidEngine>,
+    /// The SDXL base snapshot dir ([`InstantIdPaths::sdxl_base`]), kept so [`quantize`](Self::quantize)
+    /// can reject a requested-vs-packed tier mismatch (F-144, sc-11129) — `quantize()` no-ops on an
+    /// already-packed U-Net, so a Q4 request over a pre-quantized Q8 snapshot would otherwise serve Q8.
+    sdxl_root: PathBuf,
 }
 
 impl InstantId {
@@ -245,6 +249,7 @@ impl InstantId {
             ),
             face: None,
             pid: None,
+            sdxl_root: root.to_path_buf(),
         })
     }
 
@@ -306,6 +311,11 @@ impl InstantId {
     /// the **VAE** stays f32. Call after [`load`](Self::load) (so the IP pairs quantize with the UNet),
     /// before [`with_face`](Self::with_face).
     pub fn quantize(mut self, bits: i32) -> Result<Self> {
+        // F-144 (sc-11129): reject a requested-vs-packed tier mismatch before quantizing. `quantize()`
+        // silently no-ops on an already-packed U-Net, so a Q4 request over a pre-quantized Q8 snapshot
+        // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check on the base snapshot
+        // (the U-Net `unet/config.json` is the representative heavy component).
+        mlx_gen_sdxl::loader::needs_load_time_quant(&self.sdxl_root, bits, "instantid")?;
         self.unet.quantize(bits)?;
         self.te1.quantize(bits)?;
         self.te2.quantize(bits)?;

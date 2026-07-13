@@ -304,9 +304,10 @@ where
 
     // Pass 1 — resolve every group to a concrete plan, consuming the `factors` probe (which is cheap:
     // it builds the small Kronecker factors or returns `None`, but never the `[out,in]` delta). Sum the
-    // bytes the packed + non-deferrable **materializations** will allocate, so we can budget-check them
-    // before the (potentially multi-GB) delta reconstruction runs. Deferred / dense / unmatched groups
-    // add nothing to `projected_materialize`.
+    // bytes EVERY **materialization** will allocate — the packed + non-deferrable case AND the dense-base
+    // case, both of which stack a full `[out,in]` bf16 delta per target (F-011, sc-11129) — so we can
+    // budget-check them before the (potentially multi-GB) reconstruction runs. Only deferred (structured,
+    // allocation-free) and unmatched groups add nothing to `projected_materialize`.
     let mut plans: Vec<LycorisPlan<F>> = Vec::new();
     let mut projected_materialize: usize = 0;
     for (raw, delta, factors) in groups {
@@ -333,28 +334,33 @@ where
                     }
                 }
             }
-            Some(_) => plans.push(LycorisPlan::Dense { dotted, delta }),
+            Some(lin) => {
+                // Dense base still materializes the same `[out,in]` bf16 delta as a stacked residual —
+                // the OOM the guard prevents on packed tiers is reachable here too (F-011). Project it.
+                projected_materialize += projected_delta_bytes(&lin.base_shape());
+                plans.push(LycorisPlan::Dense { dotted, delta });
+            }
             None => plans.push(LycorisPlan::Unmatched(raw.into())),
         }
     }
 
-    // sc-10678 — pre-flight memory guard. A non-deferrable adapter (LoHa / tucker-LoKr) on a PACKED
-    // (q4/q8) base must materialize a dense `[out,in]` delta per target; over a whole model that can
-    // dwarf the packed footprint (and exceed even the dense tier). Left unchecked it OOMs the worker via
-    // an uncatchable SIGKILL mid-run. Refuse UP FRONT — but only when the projected materialization would
-    // actually exceed the budget, so a LoHa that fits still runs on the user's chosen tier (a plain LoRA,
-    // an all-deferred LoKr, or a dense base never reach this branch: `projected_materialize == 0`).
+    // sc-10678 — pre-flight memory guard. A non-deferrable adapter (LoHa / tucker-LoKr) must materialize
+    // a dense `[out,in]` delta per target — on a PACKED (q4/q8) base (no deferred form) OR a dense base
+    // (F-011: the stacked residual is the same footprint). Over a whole model that can dwarf the base
+    // footprint; left unchecked it OOMs the worker via an uncatchable SIGKILL mid-run. Refuse UP FRONT —
+    // but only when the projected materialization would actually exceed the budget, so an adapter that
+    // fits still runs on the user's chosen tier (a plain LoRA or an all-deferred LoKr never reach this
+    // branch: `projected_materialize == 0`).
     if projected_materialize > 0 {
         let active = get_active_memory();
         let limit = get_memory_limit();
         if materialization_exceeds_budget(active, projected_materialize, limit) {
             return Err(Error::Msg(format!(
-                "This adapter (LoHa / tucker-LoKr) cannot run unmerged on a quantized (q4/q8) tier: it \
-                 has no allocation-free form, so it must materialize a dense delta for every target — \
-                 ~{:.1} GB on top of the ~{:.1} GB already resident, over the ~{:.1} GB budget. Use a \
-                 plain LoRA/LoKr instead (near-zero extra memory on any tier, and it keeps the quantized \
-                 tier's look). Or, if you have it, the bf16 tier — note bf16 renders differently from the \
-                 quantized tier.",
+                "This adapter (LoHa / tucker-LoKr) has no allocation-free form, so it must materialize a \
+                 dense `[out,in]` delta for every target — ~{:.1} GB on top of the ~{:.1} GB already \
+                 resident, over the ~{:.1} GB budget. Use a plain LoRA/LoKr instead (near-zero extra \
+                 memory on any tier). On a quantized tier, the bf16 tier merges this adapter into the \
+                 dense weight in place — note bf16 renders differently from the quantized tier.",
                 projected_materialize as f64 / GIB,
                 active as f64 / GIB,
                 (limit as f64 * MATERIALIZE_BUDGET_HEADROOM) / GIB,
@@ -366,6 +372,10 @@ where
     // deferrable packed module, materialized `Adapter::Lokr` on a non-deferrable packed or dense module,
     // and `unmatched_paths` under the raw key. Re-resolving by `dotted` is a cheap map lookup (the host
     // is not structurally mutated between passes).
+    // A pass-2 re-resolution that returns `None` (the module vanished between passes — unreachable on a
+    // stable host today, but lazy/offloaded module trees are now a live pattern, epic 10834) must be
+    // SURFACED in `unmatched_paths`, never silently dropped, honoring the function's contract (F-012,
+    // sc-11129). The dotted path is the resolved spelling (the raw key is gone by pass 2).
     for plan in plans {
         match plan {
             LycorisPlan::Unmatched(raw) => report.unmatched_paths.push(raw),
@@ -374,6 +384,8 @@ where
                 if let Some(lin) = host.adaptable_mut(&parts) {
                     lin.push(Adapter::LokrStructured { factors });
                     report.applied += 1;
+                } else {
+                    report.unmatched_paths.push(dotted);
                 }
             }
             LycorisPlan::Materialize {
@@ -386,6 +398,8 @@ where
                 if let Some(lin) = host.adaptable_mut(&parts) {
                     lin.push(Adapter::Lokr { delta, scale });
                     report.applied += 1;
+                } else {
+                    report.unmatched_paths.push(dotted);
                 }
             }
             LycorisPlan::Dense { dotted, delta } => {
@@ -395,6 +409,8 @@ where
                     let delta = delta(&base_shape)?;
                     lin.push(Adapter::Lokr { delta, scale });
                     report.applied += 1;
+                } else {
+                    report.unmatched_paths.push(dotted);
                 }
             }
         }
@@ -1212,7 +1228,25 @@ pub fn apply_lora_bfl(
                         None => v.clone(),
                     });
                 }
-                KohyaRole::Alpha => parts.alpha = scalar_alpha(v)?,
+                KohyaRole::Alpha => {
+                    // Detect a genuine conflict rather than nondeterministic last-wins (F-014,
+                    // sc-11129): a file with two `.alpha` spellings mapping to one target resolved by
+                    // HashMap visit order, installing at a nondeterministic scale across runs while
+                    // reporting success. Mirror `apply_lora_peft`'s hard "alpha conflict" error. A
+                    // repeated identical value (the same key visited twice) is not a conflict.
+                    if let Some(new) = scalar_alpha(v)? {
+                        match parts.alpha {
+                            Some(existing) if existing != new => {
+                                return Err(Error::Msg(format!(
+                                    "LoRA alpha conflict for `{}`: {existing} vs {new} \
+                                     (duplicate alpha keys for one BFL target)",
+                                    slot.target
+                                )));
+                            }
+                            _ => parts.alpha = Some(new),
+                        }
+                    }
+                }
             }
         }
     }
@@ -1311,13 +1345,33 @@ where
     F: FnOnce(&[i32]) -> Result<Array>,
 {
     let mut report = ApplyReport::default();
+
+    // One resolved BFL module: its split destinations, the fused `[Σout, in]` shape to reconstruct at,
+    // and the (deferred) reconstruction closure — held so pass 1 can budget-check the total before any
+    // pass-2 allocation.
+    struct BflPlan<F> {
+        targets: Vec<BflLycorisTarget>,
+        fused_shape: [i32; 2],
+        reconstruct: F,
+    }
+
+    // Pass 1 — resolve each module's fused shape and sum the bytes the reconstruction will materialize
+    // (F-010, sc-11129). This BFL fused→split path has NO deferred/allocation-free form: each
+    // destination row-slices the fully reconstructed `[Σout,in]` bf16 delta, so every install
+    // materializes. Its plain-path twin (`install_lycoris_groups`) already applies the sc-10678 memory
+    // guard; this sibling did not, so a full-coverage BFL LoKr on FLUX could hold multiple GB of
+    // resident deltas with no up-front refusal and OOM the worker mid-load via an uncatchable SIGKILL.
+    let mut plans: Vec<BflPlan<F>> = Vec::new();
+    let mut projected_materialize: usize = 0;
     for (module, reconstruct) in groups {
         let Some(targets) = map.get(&module) else {
             report.unmatched_paths.push(module);
             continue;
         };
-        // Fused reconstruction shape: rows = Σ destination out dims, cols = the shared in dim. Resolve
-        // each destination's base shape up front (the mutable apply borrow comes after reconstruction).
+        // Fused reconstruction shape: rows = Σ destination out dims, cols = the shared in dim. Every
+        // fused destination MUST share one in_dim — the reconstruction uses the first destination's
+        // input dim for all rows, so a miswritten `bfl_targets()` entry fusing mismatched in-dims would
+        // otherwise surface as an opaque kron/reshape error far from the cause (F-013, sc-11129).
         let mut fused_out = 0i32;
         let mut in_dim: Option<i32> = None;
         let mut resolvable = true;
@@ -1326,7 +1380,19 @@ where
             match host.adaptable_mut(&parts).map(|lin| lin.base_shape()) {
                 Some(shape) if shape.len() == 2 => {
                     fused_out += shape[0];
-                    in_dim.get_or_insert(shape[1]);
+                    match in_dim {
+                        None => in_dim = Some(shape[1]),
+                        Some(existing) if existing != shape[1] => {
+                            return Err(Error::Msg(format!(
+                                "BFL LyCORIS module '{module}': fused destination '{}' has in_dim {} \
+                                 but a prior destination in the same fused group had in_dim {existing} \
+                                 — a fused qkv/mlp split must share one input dim",
+                                tgt.target_path,
+                                shape[1],
+                            )));
+                        }
+                        Some(_) => {}
+                    }
                 }
                 _ => {
                     resolvable = false;
@@ -1340,8 +1406,41 @@ where
             report.unmatched_paths.push(module);
             continue;
         };
-        let delta = reconstruct(&[fused_out, in_dim])?;
-        for tgt in targets {
+        projected_materialize += projected_delta_bytes(&[fused_out, in_dim]);
+        plans.push(BflPlan {
+            targets: targets.clone(),
+            fused_shape: [fused_out, in_dim],
+            reconstruct,
+        });
+    }
+
+    // sc-10678 / F-010 — pre-flight memory guard, the same policy as `install_lycoris_groups`.
+    if projected_materialize > 0 {
+        let active = get_active_memory();
+        let limit = get_memory_limit();
+        if materialization_exceeds_budget(active, projected_materialize, limit) {
+            return Err(Error::Msg(format!(
+                "This BFL/ComfyUI LyCORIS adapter must reconstruct a fused dense `[out,in]` delta for \
+                 every target (the fused→split path has no allocation-free form) — ~{:.1} GB on top of \
+                 the ~{:.1} GB already resident, over the ~{:.1} GB budget. Use a plain LoRA instead \
+                 (near-zero extra memory on any tier). On a quantized tier, the bf16 tier merges this \
+                 adapter into the dense weight in place — note bf16 renders differently.",
+                projected_materialize as f64 / GIB,
+                active as f64 / GIB,
+                (limit as f64 * MATERIALIZE_BUDGET_HEADROOM) / GIB,
+            )));
+        }
+    }
+
+    // Pass 2 — reconstruct each fused delta and row-slice every destination's share.
+    for plan in plans {
+        let BflPlan {
+            targets,
+            fused_shape,
+            reconstruct,
+        } = plan;
+        let delta = reconstruct(&fused_shape)?;
+        for tgt in &targets {
             let parts: Vec<&str> = tgt.target_path.split('.').collect();
             let Some(lin) = host.adaptable_mut(&parts) else {
                 report.unmatched_paths.push(tgt.target_path.clone());
@@ -4226,6 +4325,252 @@ mod tests {
         assert!(
             packed.lin.adapters().is_empty(),
             "nothing installed on failure"
+        );
+    }
+
+    /// Write a third-party LoHa file targeting `lin` at `[PK_OUT, PK_IN]` (rank 4).
+    fn write_loha_lin(name: &str) -> Weights {
+        let r = 4;
+        let a: Vec<f32> = (0..(PK_OUT * r) as usize)
+            .map(|i| (i % 5) as f32 * 0.1)
+            .collect();
+        let b: Vec<f32> = (0..(r * PK_IN) as usize)
+            .map(|i| (i % 7) as f32 * 0.1)
+            .collect();
+        let (wa, wb) = (
+            Array::from_slice(&a, &[PK_OUT, r]),
+            Array::from_slice(&b, &[r, PK_IN]),
+        );
+        let path = tmp(name);
+        Array::save_safetensors(
+            vec![
+                ("lin.hada_w1_a", &wa),
+                ("lin.hada_w1_b", &wb),
+                ("lin.hada_w2_a", &wa),
+                ("lin.hada_w2_b", &wb),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        Weights::from_file(&path).unwrap()
+    }
+
+    #[test]
+    #[ignore = "mutates the process-global MLX memory limit; run alone"]
+    fn dense_base_loha_over_budget_is_refused() {
+        // F-011 (sc-11129): a DENSE-base LoHa materializes the same `[out,in]` bf16 delta as a stacked
+        // residual, so it must be included in the sc-10678 budget projection — the OOM the packed guard
+        // prevents is reachable on the dense tier too. Before the fix a dense group added 0 to the
+        // projection and this install went through unchecked.
+        let w = write_loha_lin("f011_dense_over_budget_loha.safetensors");
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        let prev = mlx_rs::memory::set_memory_limit(1);
+        let result = apply_loha_thirdparty(&mut dense, &w, 1.0);
+        mlx_rs::memory::set_memory_limit(prev);
+        result.expect_err("a dense LoHa over budget must now be refused up front (F-011)");
+        assert!(
+            dense.lin.adapters().is_empty(),
+            "a refused install must leave no partial adapter on the dense base"
+        );
+    }
+
+    #[test]
+    fn dense_base_loha_within_budget_still_installs() {
+        // F-011 regression: counting the dense materialization must only refuse GENUINELY over-budget
+        // runs — a LoHa that fits still installs on the dense base (the default, unlimited-limit path).
+        let w = write_loha_lin("f011_dense_ok_loha.safetensors");
+        let mut dense = OneLinear {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+        };
+        assert_eq!(
+            apply_loha_thirdparty(&mut dense, &w, 1.0).unwrap().applied,
+            1,
+            "a within-budget dense LoHa must still install"
+        );
+    }
+
+    #[test]
+    fn lycoris_pass2_resolution_miss_is_surfaced_not_dropped() {
+        // F-012 (sc-11129): if a module resolves in pass 1 but vanishes by pass 2 (a lazy/offloaded
+        // host, epic 10834), the plan must be SURFACED in `unmatched_paths`, never silently dropped —
+        // honoring `install_lycoris_groups`'s contract. Modeled with a host whose `adaptable_mut`
+        // returns the linear only on its FIRST call (pass 1) and `None` after (pass 2).
+        struct VanishingHost {
+            lin: AdaptableLinear,
+            calls: usize,
+        }
+        impl AdaptableHost for VanishingHost {
+            fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+                if path != ["lin"] {
+                    return None;
+                }
+                self.calls += 1;
+                if self.calls == 1 {
+                    Some(&mut self.lin)
+                } else {
+                    None
+                }
+            }
+        }
+        let w = pk_lokr_file("f012_vanishing_lokr.safetensors");
+        let mut host = VanishingHost {
+            lin: AdaptableLinear::dense(pk_base_weight(), None),
+            calls: 0,
+        };
+        let report = apply_lokr(&mut host, &w, 1.0).unwrap();
+        assert_eq!(report.applied, 0, "the vanished target installs nothing");
+        assert_eq!(
+            report.unmatched_paths,
+            vec!["lin".to_string()],
+            "a pass-2 resolution miss must be surfaced in unmatched_paths"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn bfl_lycoris_fused_mismatched_in_dim_errors() {
+        // F-013 (sc-11129): a fused BFL destination set that does not share one input dim must fail with
+        // a NAMED validation error (module + dims), not an opaque downstream kron/reshape error. Drive
+        // `install_bfl_lycoris` directly with a host whose two fused destinations disagree on in_dim.
+        struct MismatchHost {
+            q: AdaptableLinear,
+            k: AdaptableLinear,
+        }
+        impl AdaptableHost for MismatchHost {
+            fn adaptable_mut(&mut self, path: &[&str]) -> Option<&mut AdaptableLinear> {
+                match path {
+                    ["attn", "to_q"] => Some(&mut self.q),
+                    ["attn", "to_k"] => Some(&mut self.k),
+                    _ => None,
+                }
+            }
+            fn adaptable_paths(&self) -> Vec<String> {
+                vec!["attn.to_q".to_string(), "attn.to_k".to_string()]
+            }
+            fn bfl_targets(&self) -> Vec<BflTarget> {
+                let up = vec!["diffusion_model.blk.qkv.lora_B.weight".to_string()];
+                let down = vec!["diffusion_model.blk.qkv.lora_A.weight".to_string()];
+                let alpha = vec!["diffusion_model.blk.qkv.alpha".to_string()];
+                ["to_q", "to_k"]
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, dst)| BflTarget {
+                        target_path: format!("attn.{dst}"),
+                        up_keys: up.clone(),
+                        down_keys: down.clone(),
+                        alpha_keys: alpha.clone(),
+                        up_slice: Some(LoraRowSlice::Chunk {
+                            n: 2,
+                            index: idx as i32,
+                        }),
+                        down_slice: None,
+                    })
+                    .collect()
+            }
+        }
+        // to_q in=3, to_k in=4 — the fused qkv cannot share one input dim.
+        let mut host = MismatchHost {
+            q: AdaptableLinear::dense(Array::from_slice(&[0.0f32; 6], &[2, 3]), None),
+            k: AdaptableLinear::dense(Array::from_slice(&[0.0f32; 8], &[2, 4]), None),
+        };
+        let targets = host.bfl_targets();
+        let map = bfl_lycoris_module_map(&targets);
+        let groups: Vec<(String, fn(&[i32]) -> Result<Array>)> = vec![(
+            "diffusion_model.blk.qkv".to_string(),
+            // Never reached — the in_dim guard fires in pass 1, before any reconstruction.
+            (|_: &[i32]| unreachable!("reconstruct must not run when the in_dim guard fires"))
+                as fn(&[i32]) -> Result<Array>,
+        )];
+        let err = install_bfl_lycoris(&mut host, &map, groups, 1.0)
+            .expect_err("mismatched fused in-dims must be a named validation error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("in_dim") && msg.contains("diffusion_model.blk.qkv"),
+            "the error must name the module and the mismatched dims: {msg}"
+        );
+    }
+
+    #[test]
+    #[ignore = "mutates the process-global MLX memory limit; run alone"]
+    #[allow(clippy::type_complexity)]
+    fn bfl_lycoris_over_budget_is_refused() {
+        // F-010 (sc-11129): the BFL fused→split path materializes the whole fused delta with no
+        // deferred form, so it must apply the sc-10678 memory guard like its plain-path twin — refusing
+        // UP FRONT rather than OOMing the worker mid-reconstruct. Drive `install_bfl_lycoris` with a
+        // 1-byte memory limit so any projected materialization is over budget.
+        let mut host = BflHost::new();
+        let targets = host.bfl_targets();
+        let map = bfl_lycoris_module_map(&targets);
+        let groups: Vec<(String, fn(&[i32]) -> Result<Array>)> = vec![(
+            "diffusion_model.double_blocks.0.img_attn.qkv".to_string(),
+            // Never reached — the budget guard fires in pass 1, before any reconstruction.
+            (|_: &[i32]| unreachable!("reconstruct must not run when the budget guard fires"))
+                as fn(&[i32]) -> Result<Array>,
+        )];
+        let prev = mlx_rs::memory::set_memory_limit(1);
+        let result = install_bfl_lycoris(&mut host, &map, groups, 1.0);
+        mlx_rs::memory::set_memory_limit(prev);
+        let err =
+            result.expect_err("a BFL LyCORIS materialization over budget must be refused (F-010)");
+        assert!(
+            err.to_string().contains("budget"),
+            "the refusal must be the actionable budget error: {err}"
+        );
+        // Nothing installed on refusal.
+        for dst in ["to_q", "to_k", "to_v"] {
+            assert!(
+                host.adaptable_mut(&["transformer_blocks", "0", "attn", dst])
+                    .unwrap()
+                    .adapters()
+                    .is_empty(),
+                "a refused BFL install must leave no partial adapter on {dst}"
+            );
+        }
+    }
+
+    #[test]
+    fn bfl_lora_conflicting_alpha_errors() {
+        // F-014 (sc-11129): two `.alpha` spellings mapping to one BFL target must be a hard conflict
+        // error (mirroring `apply_lora_peft`), not a nondeterministic HashMap-order last-wins scale.
+        let a = Array::from_slice(&[0.1f32, 0.2, 0.3], &[1, 3]);
+        let b = Array::from_slice(&[0.4f32, 0.5], &[2, 1]);
+        let alpha4 = Array::from_slice(&[4.0f32], &[1]);
+        let alpha8 = Array::from_slice(&[8.0f32], &[1]);
+        let path = tmp("f014_bfl_alpha_conflict.safetensors");
+        Array::save_safetensors(
+            vec![
+                ("diffusion_model.m.lora_A.weight", &a),
+                ("diffusion_model.m.lora_B.weight", &b),
+                ("diffusion_model.m.alpha", &alpha4),
+                ("diffusion_model.m2.alpha", &alpha8),
+            ],
+            None,
+            &path,
+        )
+        .unwrap();
+        let w = Weights::from_file(&path).unwrap();
+
+        // One target whose two alpha_keys both resolve to it — the conflict shape.
+        let targets = vec![BflTarget {
+            target_path: "attn.to_q".to_string(),
+            up_keys: vec!["diffusion_model.m.lora_B.weight".to_string()],
+            down_keys: vec!["diffusion_model.m.lora_A.weight".to_string()],
+            alpha_keys: vec![
+                "diffusion_model.m.alpha".to_string(),
+                "diffusion_model.m2.alpha".to_string(),
+            ],
+            up_slice: None,
+            down_slice: None,
+        }];
+        let mut host = MultiHost::new(&[("attn.to_q", Array::from_slice(&[0.0f32; 6], &[2, 3]))]);
+        let err = apply_lora_bfl(&mut host, &w, 1.0, &targets)
+            .expect_err("conflicting alphas for one BFL target must error");
+        assert!(
+            err.to_string().contains("alpha conflict"),
+            "expected a named alpha-conflict error, got: {err}"
         );
     }
 }

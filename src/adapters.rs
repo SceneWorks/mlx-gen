@@ -43,6 +43,19 @@ pub fn reconstruct_lokr_delta(
     w2_b: Option<&Array>,
     out_dtype: Dtype,
 ) -> Result<Array> {
+    // Guard the metadata-derived `alpha`/`rank` at the shared seam so EVERY consumer inherits it
+    // (F-141, sc-11129). A file that stamps `rank = 0` (alpha then defaults to rank) makes the scale
+    // `0/0 = NaN`, baked into the reconstructed delta and merged as NaN — NaN-poisoning every
+    // subsequent render while the load reports success. `lora_delta` already rejects rank 0 (sc-5252),
+    // but this middle path was missed; hoisting the guard here retires the class rather than patching
+    // each callsite.
+    if !rank.is_finite() || rank <= 0.0 || !alpha.is_finite() {
+        return Err(format!(
+            "LoKr: invalid metadata scale (rank = {rank}, alpha = {alpha}); rank must be > 0 and \
+             alpha finite — a `rank = 0` / non-finite `alpha` would make the delta NaN"
+        )
+        .into());
+    }
     // The SceneWorks peft path bakes `alpha/rank` as the scale and is always linear (no tucker
     // factor, equal-rank factors) — delegate to the general scaled form, which is then byte-identical.
     reconstruct_lokr_delta_scaled(
@@ -172,6 +185,13 @@ pub fn build_lokr_factors(
     w2_b: Option<&Array>,
     out_dtype: Dtype,
 ) -> Result<Option<LokrFactors>> {
+    // Guard the caller-derived `scale` at the shared seam so the packed/deferred path inherits the
+    // F-141 protection too (sc-11129): the SDXL/Wan callers compute `(alpha/rank)·strength`, so a
+    // `rank = 0` metadata makes `scale = NaN`, which would bake into the structured `w2` and
+    // NaN-poison the deferred residual. Refuse it here rather than silently install a NaN factor.
+    if !scale.is_finite() {
+        return Err(format!("LoKr: non-finite scale ({scale}) — rank = 0 / invalid alpha").into());
+    }
     // Tucker/CP `w2` is a 4-D conv factor with no 2-D matrix form — not deferrable via the vec-trick.
     // (LyCORIS only emits `lokr_t2` for conv layers; the Wan DiT adapter surface is all Linear, so
     // this never fires there, but guard it so a conv LoKr falls back rather than silently mis-applies.)
@@ -839,6 +859,57 @@ mod tests {
     #[test]
     fn lokr_delta_stored_bf16() {
         assert_eq!(lokr_2x2().dtype(), Dtype::Bfloat16);
+    }
+
+    #[test]
+    fn reconstruct_lokr_delta_rejects_zero_rank() {
+        // F-141 (sc-11129): a `rank = 0` metadata (alpha then defaults to rank) makes the scale
+        // `0/0 = NaN`, which would bake into the reconstructed delta and NaN-poison every render. The
+        // shared seam must reject it with a typed error so every consumer (SDXL/Kolors/InstantID/Wan)
+        // inherits the guard, retiring the fixes-don't-travel class.
+        let err = reconstruct_lokr_delta(
+            0.0,
+            0.0,
+            &[2, 2],
+            Some(&Array::from_slice(&[0.5f32, 0.6], &[2, 1])),
+            None,
+            None,
+            Some(&Array::from_slice(&[0.7f32, 0.8], &[1, 2])),
+            None,
+            None,
+            Dtype::Bfloat16,
+        )
+        .expect_err("rank 0 must be rejected, not produce a NaN delta");
+        assert!(
+            matches!(err, crate::Error::Msg(_)),
+            "expected a typed Msg error"
+        );
+        // Regression: a well-formed alpha/rank still reconstructs (the happy path is unaffected).
+        assert!(lokr_2x2().sum(None).unwrap().item::<f32>().is_finite());
+    }
+
+    #[test]
+    fn build_lokr_factors_rejects_non_finite_scale() {
+        // F-141 (sc-11129): the packed/deferred path receives the pre-derived `(alpha/rank)·strength`
+        // scale, so a `rank = 0` yields a NaN scale that would bake into the structured `w2`. The seam
+        // must reject a non-finite scale rather than install a NaN factor. (`LokrFactors` is not Debug,
+        // so match rather than `expect_err`.)
+        let result = build_lokr_factors(
+            f32::NAN,
+            &[2, 2],
+            Some(&Array::from_slice(&[0.5f32, 0.6], &[2, 1])),
+            None,
+            None,
+            Some(&Array::from_slice(&[0.7f32, 0.8], &[1, 2])),
+            None,
+            None,
+            None,
+            Dtype::Bfloat16,
+        );
+        assert!(
+            matches!(result, Err(crate::Error::Msg(_))),
+            "a non-finite scale must be rejected with a typed Msg error"
+        );
     }
 
     #[test]

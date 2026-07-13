@@ -173,6 +173,11 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         kolors.apply_lora(&spec.adapters)?;
     }
     if let Some(q) = spec.quantize {
+        // F-144 (sc-11129): reject a requested-vs-packed tier mismatch before quantizing. `quantize()`
+        // silently no-ops on already-packed weights, so a Q4 request over a pre-quantized Q8 snapshot
+        // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check — the Kolors U-Net is
+        // the SDXL `UNet2DConditionModel` under `unet/`, the representative heavy component.
+        mlx_gen_sdxl::loader::needs_load_time_quant(&root, q.bits(), MODEL_ID)?;
         kolors.quantize(q.bits())?;
     }
 

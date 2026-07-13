@@ -349,6 +349,12 @@ fn load_text_encoders(
     let mut te1 = loader::load_text_encoder_1_dtype(root, DTYPE)?;
     let mut te2 = loader::load_text_encoder_2_dtype(root, DTYPE)?;
     if let Some(q) = quant {
+        // F-144 (sc-11129): reject a requested-vs-packed tier mismatch up front. `quantize()` silently
+        // no-ops on already-packed weights, so a Q4 request over a pre-quantized Q8 turnkey would
+        // otherwise serve Q8 with no diagnostic. `needs_load_time_quant` errors on a mismatch; on a
+        // matching-packed or dense snapshot it returns Ok and the quantize below stands (a no-op on the
+        // already-packed encoders, a real pack on a dense snapshot).
+        loader::needs_load_time_quant(root, q.bits(), descriptor().id)?;
         let bits = q.bits();
         te1.quantize(bits)?;
         te2.quantize(bits)?;
@@ -429,6 +435,12 @@ fn load_heavy(spec: &LoadSpec, root: &Path, load_pid: bool) -> Result<SdxlHeavyO
         // the **VAE stays f32** — its only Linears are the tiny quant/post-quant projections
         // (negligible memory), and a dense decode preserves output quality. Scope verified
         // empirically by the full `load(Q).generate()` gate (sc-2641).
+        //
+        // F-144 (sc-11129): reject a requested-vs-packed U-Net tier mismatch first — `quantize()`
+        // no-ops on an already-packed snapshot, so a Q4 request over a pre-quantized Q8 turnkey would
+        // silently serve Q8. On a matching-packed or dense snapshot this returns Ok and the quantize
+        // below stands (a no-op on the packed U-Net, a real pack on the dense control branches).
+        loader::needs_load_time_quant(root, q.bits(), descriptor().id)?;
         let bits = q.bits();
         unet.quantize(bits)?;
         for cn in &mut controls {
