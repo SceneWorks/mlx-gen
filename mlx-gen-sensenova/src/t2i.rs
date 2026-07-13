@@ -108,6 +108,30 @@ impl<'a> StepReporter<'a> {
     }
 }
 
+/// F-136 residual (sc-11133): `interleave_gen`'s loop is model-driven and can stop before
+/// `max_images` (an `IM_END` / `hit_max` / non-`img_start` next token ends it early). The per-image
+/// folded [`StepReporter`]s pin `total = max_images × num_steps`, so a short run leaves `current`
+/// frozen at `realized_images × num_steps < total` — a bar that never fills. When the realized image
+/// count lands strictly between 1 and `max_images`, emit one terminal `Step { current: total, total
+/// }` so the aggregate bar reaches its (unchanged) total. This only ever raises `current`, keeping
+/// the stream monotone. A 0-image run drew no bar and a full `max_images` run already reached
+/// `total`, so neither emits (a duplicate terminal would violate the strict-increase contract).
+fn fill_interleave_bar(
+    on_progress: &mut dyn FnMut(Progress),
+    realized_images: usize,
+    max_images: usize,
+    num_steps: usize,
+) {
+    if realized_images == 0 || realized_images >= max_images {
+        return;
+    }
+    let grand_total = (max_images * num_steps) as u32;
+    on_progress(Progress::Step {
+        current: grand_total,
+        total: grand_total,
+    });
+}
+
 /// Classifier-free-guidance velocity-blend normalisation (`t2i_generate`'s `cfg_norm`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CfgNorm {
@@ -1346,6 +1370,12 @@ impl T2iModel {
             next = argmax(&cond_next);
         }
 
+        // F-136 residual (sc-11133): the loop above is model-driven and may emit fewer than
+        // `max_images` images, freezing the folded bar below its pinned grand total. Fill it to total
+        // on completion so the aggregate progression finishes instead of hanging (no-op for a 0-image
+        // or full-`max_images` run).
+        fill_interleave_bar(on_progress, images.len(), max_images, opts.num_steps);
+
         Ok(InterleaveOutput { text, images })
     }
 
@@ -1913,6 +1943,73 @@ mod tests {
             events,
             vec![(1, 6), (2, 6), (3, 6), (4, 6), (5, 6), (6, 6)],
             "the aggregate bar must be monotone 1..=6 with a constant total, not two restarting 1..=3 runs"
+        );
+    }
+
+    /// F-136 residual (sc-11133): when `interleave_gen`'s model-driven loop stops early (fewer than
+    /// `max_images` images), the folded bar freezes at `realized × num_steps` below the pinned grand
+    /// total. `fill_interleave_bar` must emit a terminal `Step` so `current` reaches `total`.
+    #[test]
+    fn short_interleave_run_fills_bar_to_total() {
+        let num_steps = 3usize;
+        let max_images = 3usize; // grand total = 9
+        let grand_total = (max_images * num_steps) as u32;
+
+        // Case 1: the model produced only 1 of 3 images — the folded bar reached 3/9 and stalled.
+        // Seed the prior folded steps for the single realized image (1..=3 of the grand total of 9).
+        let mut events: Vec<(u32, u32)> =
+            (1..=num_steps).map(|c| (c as u32, grand_total)).collect();
+        {
+            let mut sink = |p: Progress| {
+                if let Progress::Step { current, total } = p {
+                    events.push((current, total));
+                }
+            };
+            fill_interleave_bar(&mut sink, 1, max_images, num_steps);
+        }
+        assert_eq!(
+            events.last(),
+            Some(&(grand_total, grand_total)),
+            "a short run must fill the bar to its total so it does not freeze below total"
+        );
+        // Monotone, constant total, strictly increasing — matches the testkit progress contract.
+        let mut prev = 0u32;
+        for &(current, total) in &events {
+            assert_eq!(total, grand_total, "total must stay constant");
+            assert!(current > prev, "current must strictly increase");
+            assert!(current <= total, "current must not overrun total");
+            prev = current;
+        }
+
+        // Case 2: a full `max_images` run already reached total — no duplicate terminal (which would
+        // break strict-increase).
+        let mut full_events: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut sink = |p: Progress| {
+                if let Progress::Step { current, total } = p {
+                    full_events.push((current, total));
+                }
+            };
+            fill_interleave_bar(&mut sink, max_images, max_images, num_steps);
+        }
+        assert!(
+            full_events.is_empty(),
+            "a full run already reached total; no terminal fill should be emitted"
+        );
+
+        // Case 3: a 0-image run drew no bar — nothing to fill.
+        let mut zero_events: Vec<(u32, u32)> = Vec::new();
+        {
+            let mut sink = |p: Progress| {
+                if let Progress::Step { current, total } = p {
+                    zero_events.push((current, total));
+                }
+            };
+            fill_interleave_bar(&mut sink, 0, max_images, num_steps);
+        }
+        assert!(
+            zero_events.is_empty(),
+            "a 0-image run drew no bar; no terminal fill should be emitted"
         );
     }
 

@@ -390,6 +390,11 @@ impl LensGenerator {
                         },
                     )?;
                     images.push(image);
+                    // F-030 residual (sc-11133): a `keep == 1` early-stop runs 0 real steps, so the
+                    // per-step callback above never fires — the bar stalls at 0/1 and `Decoding` never
+                    // trips. Synthesize the terminal `Step` + one `Decoding` in that case (no-op for a
+                    // schedule that ran ≥ 1 real step and drove its own terminal above).
+                    emit_terminal_if_no_steps(keep, total, on_progress);
                 }
                 Ok(GenerationOutput::Images(images))
             },
@@ -408,6 +413,41 @@ fn effective_step_total(keep: Option<usize>, steps: u32) -> u32 {
         Some(k) => (k.saturating_sub(1) as u32).max(1),
         None => steps,
     }
+}
+
+/// The number of real denoise transitions a schedule actually runs: `keep - 1` σ steps under a PiD
+/// early-stop (0 when `keep <= 1`), else the full `steps`. Distinct from [`effective_step_total`],
+/// which floors the *bar size* at 1 — a `keep == 1` schedule sizes the bar to 1 yet runs ZERO
+/// transitions, so `run_curated_sampler` never invokes the per-step callback (sc-11133).
+fn real_step_count(keep: Option<usize>, steps: u32) -> u32 {
+    match keep {
+        Some(k) => k.saturating_sub(1) as u32,
+        None => steps,
+    }
+}
+
+/// F-030 residual (sc-11133): a `keep == 1` PiD early-stop truncates the schedule to a single σ
+/// node, so `run_curated_sampler` runs zero transitions and `render`'s per-step callback never
+/// fires — the bar would freeze at `0/total` and the `cur >= total` `Decoding` trigger never trip.
+/// When no real step runs, synthesize the terminal `Step{total,total}` + one `Decoding` so the bar
+/// reaches its total and `Decoding` fires exactly once. A schedule with ≥ 1 real step drives the
+/// bar (and its own `Decoding`) through the per-step callback and needs no synthetic terminal.
+/// Returns whether a terminal was emitted (weight-free unit-testable).
+fn emit_terminal_if_no_steps(
+    keep: Option<usize>,
+    steps: u32,
+    on_progress: &mut dyn FnMut(Progress),
+) -> bool {
+    if real_step_count(keep, steps) != 0 {
+        return false;
+    }
+    let total = effective_step_total(keep, steps);
+    on_progress(Progress::Step {
+        current: total,
+        total,
+    });
+    on_progress(Progress::Decoding);
+    true
 }
 
 /// Capability-driven request validation (unit-testable without loaded weights).
@@ -466,6 +506,61 @@ mod tests {
         // Degenerate: keep=1 (or 0) must still leave a 1-step bar the Decoding trigger can reach.
         assert_eq!(effective_step_total(Some(1), 20), 1);
         assert_eq!(effective_step_total(Some(0), 20), 1);
+    }
+
+    /// F-030 residual (sc-11133): a `keep == 1` schedule runs ZERO real steps (`real_step_count`),
+    /// so `render`'s per-step callback never fires. `emit_terminal_if_no_steps` must synthesize a
+    /// terminal `Step` reaching total plus exactly one `Decoding`, so the bar completes and Decoding
+    /// trips once. A multi-step or full schedule drives its own bar and must emit nothing.
+    #[test]
+    fn zero_step_schedule_fills_bar_and_fires_decoding_once() {
+        // Real transitions actually run: keep-1 (0 for keep<=1), else the full steps.
+        assert_eq!(real_step_count(None, 20), 20);
+        assert_eq!(real_step_count(Some(13), 20), 12);
+        assert_eq!(real_step_count(Some(1), 20), 0, "keep==1 runs 0 real steps");
+        assert_eq!(real_step_count(Some(0), 20), 0);
+
+        // keep == 1 (0-step): synthesize the terminal so the bar reaches total and Decoding fires once.
+        let mut events: Vec<Progress> = Vec::new();
+        let emitted = {
+            let mut sink = |p: Progress| events.push(p);
+            emit_terminal_if_no_steps(Some(1), 20, &mut sink)
+        };
+        assert!(emitted, "a 0-step schedule must synthesize a terminal");
+        let steps: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|p| match p {
+                Progress::Step { current, total } => Some((*current, *total)),
+                _ => None,
+            })
+            .collect();
+        let decodings = events
+            .iter()
+            .filter(|p| matches!(p, Progress::Decoding))
+            .count();
+        assert_eq!(
+            steps,
+            vec![(1, 1)],
+            "the bar must reach its total so it does not freeze at 0/1"
+        );
+        assert_eq!(decodings, 1, "Decoding must fire exactly once");
+
+        // A multi-step (keep=13) schedule drives its own bar — no synthetic terminal.
+        let mut multi: Vec<Progress> = Vec::new();
+        let emitted_multi = {
+            let mut sink = |p: Progress| multi.push(p);
+            emit_terminal_if_no_steps(Some(13), 20, &mut sink)
+        };
+        assert!(!emitted_multi, "a multi-step schedule needs no terminal");
+        assert!(multi.is_empty());
+
+        // A full schedule (keep == None) likewise drives its own bar.
+        let mut full: Vec<Progress> = Vec::new();
+        {
+            let mut sink = |p: Progress| full.push(p);
+            assert!(!emit_terminal_if_no_steps(None, 20, &mut sink));
+        }
+        assert!(full.is_empty());
     }
 
     #[test]
