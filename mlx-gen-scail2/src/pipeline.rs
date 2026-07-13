@@ -155,13 +155,17 @@ impl Scail2 {
         //
         // scail2 supports a "match the driving-video size" convention (`width`/`height == 0` → resolved
         // from the driving frames below), which the floor's size-range check would wrongly reject. So
-        // the full floor runs only when explicit dims are supplied; the finiteness guard (the headline
-        // concern) runs unconditionally so a NaN knob is rejected on the auto-size path too.
-        req.ensure_finite_floats()?;
+        // the full floor always runs; only the size-range check is gated on explicit dims via
+        // `validate_request_skip_size` — count/frame caps, sampler membership, conditioning allowlist,
+        // support gating, and the finiteness guard all fire even on the auto-size path.
         if req.width > 0 && req.height > 0 {
             self.descriptor
                 .capabilities
                 .validate_request(self.descriptor.id, req)?;
+        } else {
+            self.descriptor
+                .capabilities
+                .validate_request_skip_size(self.descriptor.id, req)?;
         }
         let reference = find_conditioning(req, |c| match c {
             Conditioning::Reference { image, .. } => Some(image),
@@ -233,5 +237,65 @@ impl Scail2 {
             &req.cancel,
             on_progress,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A weights-free [`Scail2`] whose [`Scail2::run`] hits the shared floor before any load. Sound only
+    /// because validation runs first: a *passing* request would then try to load `root` and fail. Used
+    /// to prove the floor rejects an out-of-surface request on the auto-size path without weights.
+    fn unloaded() -> Scail2 {
+        Scail2 {
+            descriptor: descriptor(),
+            config: Scail2Config::default(),
+            root: PathBuf::from("/nonexistent-scail2-snapshot"),
+            quant: None,
+            adapters: Vec::new(),
+        }
+    }
+
+    /// F-158: with `width == height == 0` (scail2's "match the driving-video size" sentinel), `run`
+    /// routes through `validate_request_skip_size` — so the whole shared floor except the size-range
+    /// check still fires. An oversized count and an unadvertised sampler are both rejected on the
+    /// auto-size path, before any weight load.
+    #[test]
+    fn floor_fires_on_auto_size_path() {
+        let m = unloaded();
+        let mut noop = |_: Progress| {};
+
+        // Oversized count (max_count == 1) — rejected even though dims are the 0x0 auto sentinel.
+        let bad_count = GenerationRequest {
+            width: 0,
+            height: 0,
+            count: 4,
+            ..Default::default()
+        };
+        let err = m
+            .run(&bad_count, &mut noop)
+            .expect_err("oversized count must be rejected on the auto-size path");
+        assert!(
+            err.to_string().contains("count"),
+            "expected a count-range rejection, got: {err}"
+        );
+
+        // Unadvertised sampler (scail2 advertises only `unipc` / `dpm++`); count == 1 so the sampler is
+        // the failing check.
+        let bad_sampler = GenerationRequest {
+            width: 0,
+            height: 0,
+            count: 1,
+            sampler: Some("euler".into()),
+            ..Default::default()
+        };
+        let err = m
+            .run(&bad_sampler, &mut noop)
+            .expect_err("unadvertised sampler must be rejected on the auto-size path");
+        assert!(
+            err.to_string().contains("sampler"),
+            "expected an unsupported-sampler rejection, got: {err}"
+        );
     }
 }

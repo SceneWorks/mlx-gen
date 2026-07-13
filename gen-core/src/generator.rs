@@ -672,6 +672,29 @@ impl Capabilities {
     /// sampler→solver mapping — are layered on top by each model's own `validate`; this is the shared
     /// floor, not a replacement for them.
     pub fn validate_request(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        self.validate_request_inner(id, req, true)
+    }
+
+    /// The shared floor **minus the size-range check** — for providers with a "match the driving-media
+    /// size" convention (`width`/`height == 0` is a resolve-downstream sentinel, e.g. SCAIL-2 sizing
+    /// from the driving-video frames), where the size range would wrongly reject the sentinel. Every
+    /// other floor check still runs unconditionally: count / steps / frame / fps / duration caps,
+    /// negative-prompt / guidance / true_cfg support gating, finiteness (F-053), sampler / scheduler /
+    /// guidance_method membership, and the conditioning allowlist. A provider that calls this must
+    /// range-check its resolved size itself (F-158).
+    pub fn validate_request_skip_size(&self, id: &str, req: &GenerationRequest) -> Result<()> {
+        self.validate_request_inner(id, req, false)
+    }
+
+    /// Shared implementation of the floor. `check_size` gates only the size-range check so the
+    /// auto-size path ([`validate_request_skip_size`](Self::validate_request_skip_size)) still runs
+    /// every other check; the public [`validate_request`](Self::validate_request) passes `true`.
+    fn validate_request_inner(
+        &self,
+        id: &str,
+        req: &GenerationRequest,
+        check_size: bool,
+    ) -> Result<()> {
         // Footgun guard (F-084): a descriptor that enables a capability but leaves max_count/max_size
         // at the `Default` 0 would reject EVERY request with a confusing "out of range 0..=0". A real
         // model always sets non-zero bounds, so catch the descriptor mistake in debug/test builds.
@@ -733,10 +756,11 @@ impl Capabilities {
                 )));
             }
         }
-        if req.width < self.min_size
-            || req.height < self.min_size
-            || req.width > self.max_size
-            || req.height > self.max_size
+        if check_size
+            && (req.width < self.min_size
+                || req.height < self.min_size
+                || req.width > self.max_size
+                || req.height > self.max_size)
         {
             return Err(Error::Msg(format!(
                 "{id}: size {}x{} outside supported range {}..={}",
@@ -991,6 +1015,63 @@ mod tests {
             assert!(
                 c.validate_request("m", req).is_err(),
                 "case {i} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_request_skip_size_runs_every_non_size_check() {
+        // F-158: the auto-size floor. `validate_request_skip_size` must still enforce the whole floor
+        // *except* the size range — so a sentinel `0x0` size passes, but an out-of-surface count /
+        // sampler / conditioning / non-finite knob is still rejected. Used by providers that resolve
+        // size downstream (SCAIL-2 sizing from the driving video).
+        let c = caps();
+        // Auto-size sentinel (0x0) is accepted where the full floor would reject it for being < min.
+        let auto = GenerationRequest {
+            width: 0,
+            height: 0,
+            ..base_req()
+        };
+        assert!(
+            c.validate_request("m", &auto).is_err(),
+            "size 0x0 is below min for the full floor"
+        );
+        assert!(
+            c.validate_request_skip_size("m", &auto).is_ok(),
+            "skip_size must accept the 0x0 auto-size sentinel"
+        );
+        // Every non-size violation must still fire on the auto-size path.
+        let rejected: Vec<GenerationRequest> = vec![
+            // oversized count
+            GenerationRequest {
+                count: 2,
+                ..auto.clone()
+            },
+            // explicit zero steps
+            GenerationRequest {
+                steps: Some(0),
+                ..auto.clone()
+            },
+            // unadvertised sampler
+            GenerationRequest {
+                sampler: Some("unipc".into()),
+                ..auto.clone()
+            },
+            // disallowed conditioning kind
+            GenerationRequest {
+                conditioning: vec![Conditioning::Depth { image: img(8, 8) }],
+                ..auto.clone()
+            },
+            // non-finite knob (not support-gated) would NaN-poison the run — finiteness still fires
+            GenerationRequest {
+                strength: Some(f32::NAN),
+                ..auto.clone()
+            },
+        ];
+        for (i, req) in rejected.iter().enumerate() {
+            assert!(
+                c.validate_request_skip_size("m", req).is_err(),
+                "skip_size case {i} should have been rejected on the auto-size path"
             );
         }
     }

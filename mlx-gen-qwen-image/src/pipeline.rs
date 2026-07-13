@@ -680,6 +680,59 @@ mod tests {
     }
 
     #[test]
+    fn resolve_run_params_true_cfg_consumption() {
+        // F-103: `true_cfg` and `guidance` name the same real-CFG knob for Qwen, so a caller-supplied
+        // `true_cfg` must reach `RunParams.guidance` (wins), fall back to `guidance` when absent, and
+        // land on `DEFAULT_GUIDANCE` only when both are unset — never silently dropped.
+        let base = GenerationRequest {
+            prompt: "x".into(),
+            ..Default::default()
+        };
+
+        // true_cfg present → wins, even alongside a different `guidance`.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: Some(7.5),
+                guidance: Some(2.0),
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(rp.guidance, 7.5, "true_cfg must win over guidance");
+
+        // true_cfg absent → guidance fallback.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: None,
+                guidance: Some(2.0),
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(
+            rp.guidance, 2.0,
+            "guidance is the fallback when true_cfg is absent"
+        );
+
+        // both absent → default.
+        let rp = resolve_run_params(
+            &GenerationRequest {
+                true_cfg: None,
+                guidance: None,
+                ..base.clone()
+            },
+            1024,
+            1024,
+        );
+        assert_eq!(
+            rp.guidance, DEFAULT_GUIDANCE,
+            "both unset falls back to DEFAULT_GUIDANCE"
+        );
+    }
+
+    #[test]
     fn guided_noise_matches_positive_norm() {
         // when pos == neg, guided == pos (combined == pos, norm ratio == 1).
         let pos = Array::from_slice(&[3.0f32, 4.0, 0.0, 0.0], &[1, 2, 2]);
