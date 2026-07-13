@@ -494,10 +494,26 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Qwen3-VL text/vision encoder under **`mllm/`** (NOT `text_encoder/`, so a name-guessing consumer
+/// would read it as ZERO — the seam exists so the provider reports the real bytes), the DiT
+/// (`transformer/`), and the VAE (`vae/`), summed from the subdirs [`crate::loader`] loads. Shared by
+/// boogu image/turbo/edit.
+///
+/// PRE-WIRING: this split is computed correctly, but boogu is NOT yet in the worker's
+/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until boogu is added
+/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["mllm"], &["transformer"], &["vae"])
+}
+
 mlx_gen::register_generators! {
     descriptor => load,
     descriptor_turbo => load_turbo,
     descriptor_edit => load_edit,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

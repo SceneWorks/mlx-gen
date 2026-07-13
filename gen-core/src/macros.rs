@@ -22,10 +22,40 @@ macro_rules! __register_kind {
 }
 
 /// Register one or more generator descriptors and loaders with the link-time registry.
+///
+/// Two forms:
+/// - `register_generators! { desc => load, … }` — no per-component footprint (`footprint: None`); this
+///   is what **every** existing provider uses and it is unchanged.
+/// - `register_generators! { desc => load, … ; footprint = fp }` — additionally wires the sc-10894
+///   [`PerComponentBytes`](crate::registry::PerComponentBytes) size seam: `fp: fn(&LoadSpec) -> Result<PerComponentBytes>`
+///   is attached to **every** arm of the invocation (the ids of one provider crate share an on-disk
+///   layout). The `;` separator keeps the arm list unambiguous. `fp`'s error bridges via `Into::into`,
+///   exactly like the loader.
 #[macro_export]
 macro_rules! register_generators {
     ( $( $desc:path => $load:path ),+ $(,)? ) => {
-        $crate::__register_kind! { $crate::registry::ModelRegistration, $( $desc => $load ),+ }
+        $(
+            $crate::inventory::submit! {
+                $crate::registry::ModelRegistration {
+                    descriptor: $desc,
+                    load: |spec| $load(spec).map_err(::core::convert::Into::into),
+                    footprint: ::core::option::Option::None,
+                }
+            }
+        )+
+    };
+    ( $( $desc:path => $load:path ),+ $(,)? ; footprint = $fp:path $(,)? ) => {
+        $(
+            $crate::inventory::submit! {
+                $crate::registry::ModelRegistration {
+                    descriptor: $desc,
+                    load: |spec| $load(spec).map_err(::core::convert::Into::into),
+                    footprint: ::core::option::Option::Some(
+                        |spec| $fp(spec).map_err(::core::convert::Into::into)
+                    ),
+                }
+            }
+        )+
     };
 }
 

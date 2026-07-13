@@ -166,7 +166,9 @@ fn stub_load(_spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     Ok(Stub::boxed(STUB_ID, Behavior::good()))
 }
 inventory::submit! {
-    ModelRegistration { descriptor: stub_descriptor, load: stub_load }
+    // `footprint: None` — this stub declares no per-component footprint (sc-10894); the field defaults
+    // to `None` for every registration that does not set it (the `register_generators!` macro likewise).
+    ModelRegistration { descriptor: stub_descriptor, load: stub_load, footprint: None }
 }
 
 fn cheap() -> Profile {

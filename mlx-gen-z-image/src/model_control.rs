@@ -433,7 +433,7 @@ impl Generator for ZImageTurboControl {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl
 // Generator` above stays hand-written because `validate` adds a control-specific check beyond the
 // shared `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! { descriptor => load ; footprint = crate::model::component_footprint }
 
 #[cfg(test)]
 mod tests {

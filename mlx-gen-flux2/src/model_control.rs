@@ -371,7 +371,7 @@ impl Generator for Flux2DevControl {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The `impl Generator`
 // above stays hand-written because `validate` adds a control-conditioning check beyond the shared
 // `validate_request`, so it is not the plain delegation `impl_generator!` expresses.
-mlx_gen::register_generators! { descriptor_dev_control => load_dev_control }
+mlx_gen::register_generators! { descriptor_dev_control => load_dev_control ; footprint = crate::model::component_footprint }
 
 #[cfg(test)]
 mod tests {

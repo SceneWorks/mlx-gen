@@ -871,11 +871,27 @@ fn edit_references(req: &GenerationRequest) -> Result<Vec<&Image>> {
 // here — `krea_2_turbo` (distilled t2i, CFG-free), `krea_2_raw` (undistilled t2i, full-CFG; epic 9992),
 // `krea_2_edit` (the Raw pipeline routed to the Kontext edit entrypoint; epic 10871), and
 // `krea_2_turbo_edit` (that edit surface on the distilled few-step CFG-free schedule; sc-11640).
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Qwen3-VL text/vision encoder (`text_encoder/`), the DiT (`transformer/`), and the Qwen-Image VAE
+/// (`vae/`), summed from the exact snapshot subdirs [`crate::loader`] loads. Shared by every krea_2 id
+/// (turbo/raw/edit/turbo_edit + turbo_control); the control checkpoint is folded by the worker.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
     descriptor => load,
     raw_descriptor => load_raw,
     edit_descriptor => load_edit,
     turbo_edit_descriptor => load_turbo_edit,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

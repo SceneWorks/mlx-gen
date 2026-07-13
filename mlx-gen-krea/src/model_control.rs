@@ -383,7 +383,7 @@ impl Generator for KreaTurboControl {
 // Link-time registration (epic 3720): `krea_2_turbo_control`. The `impl Generator` stays hand-written
 // because `validate` adds the control-present check beyond the shared `validate_request`, so it is not
 // the plain delegation `impl_generator!` expresses (the z-image control precedent).
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! { descriptor => load ; footprint = crate::model::component_footprint }
 
 #[cfg(test)]
 mod tests {

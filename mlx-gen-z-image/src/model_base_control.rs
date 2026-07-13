@@ -319,7 +319,7 @@ impl Generator for ZImageControl {
 // hand-written because `validate` adds a control-specific check beyond the shared `validate_request`,
 // so it is not the plain delegation `impl_generator!` expresses. A distinct id (`z_image_control`) →
 // no clash with the base / turbo / turbo-control submissions in the same crate.
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! { descriptor => load ; footprint = crate::model::component_footprint }
 
 #[cfg(test)]
 mod tests {

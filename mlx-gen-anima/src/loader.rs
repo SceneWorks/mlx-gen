@@ -90,6 +90,29 @@ fn resolve_split_files(source: &WeightsSource) -> Result<PathBuf> {
     }
 }
 
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split. Anima nests
+/// its components under a resolved `split_files/` root ([`resolve_split_files`]), NOT directly under
+/// `spec.weights`: the Qwen3-0.6B text encoder in `text_encoders/`, the Cosmos DiT in
+/// `diffusion_models/`, and the Qwen-Image VAE in `vae/`. A name-guessing consumer would read the
+/// encoder as ZERO (`text_encoders` is not a `text_encoder*` match, and it is a level down inside
+/// `split_files/`); this seam reports the real bytes. Shared by anima base/aesthetic/turbo (they differ
+/// only in the DiT filename inside `diffusion_models/`).
+///
+/// PRE-WIRING: this split is computed correctly, but anima is NOT yet in the worker's
+/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until anima is added
+/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let root = resolve_split_files(&spec.weights)?;
+    Ok(mlx_gen::PerComponentBytes::from_root_subdirs(
+        &root,
+        &["text_encoders"],
+        &["diffusion_models"],
+        &["vae"],
+    ))
+}
+
 /// The assembled Anima components for one variant.
 pub struct AnimaComponents {
     pub dit: CosmosDiT,

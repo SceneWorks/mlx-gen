@@ -946,12 +946,28 @@ pub(crate) fn validate_request(
 
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the text
+/// encoder (`text_encoder/`; klein Qwen3 / dev Mistral-3, with the dev vision tower + projector reading
+/// the same subdir), the DiT (`transformer/`), and the VAE (`vae/`), summed from the subdirs
+/// [`crate::loader`] loads. Shared by every flux2 id (klein/dev, ±edit/control).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
     descriptor_klein_9b => load_klein_9b,
     descriptor_klein_9b_edit => load_klein_9b_edit,
     descriptor_klein_9b_kv_edit => load_klein_9b_kv_edit,
     descriptor_dev => load_dev,
     descriptor_dev_edit => load_dev_edit,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

@@ -284,7 +284,7 @@ impl ZImage {
 // Link-time registration (epic 3720): emits `inventory::submit!` and bridges the rich `Result` into
 // the registry's backend-neutral `gen_core::Result`. A distinct id (`z_image`) → no clash with the
 // turbo / control submissions in the same crate.
-mlx_gen::register_generators! { descriptor => load }
+mlx_gen::register_generators! { descriptor => load ; footprint = crate::model::component_footprint }
 
 #[cfg(test)]
 mod tests {

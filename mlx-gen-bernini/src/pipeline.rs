@@ -114,7 +114,33 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split. Bernini is
+/// a FLAT snapshot — the renderer components are individual root-level FILES, not diffusers subdirs: the
+/// UMT5 text encoder `t5_encoder.safetensors`, the WAN dual experts `low_noise_model.safetensors` +
+/// `high_noise_model.safetensors`, and the z16 VAE `vae.safetensors`. A name-guessing consumer would
+/// read the encoder as ZERO (no `text_encoder/` subdir at all); this seam reports the real file bytes.
+/// The full `bernini` id additionally loads the Qwen2.5-VL planner files; those are not part of the
+/// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
+/// `bernini_renderer`.
+///
+/// PRE-WIRING: this split is computed correctly, but bernini is NOT yet in the worker's
+/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until bernini is added
+/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["t5_encoder.safetensors"],
+        &[
+            "low_noise_model.safetensors",
+            "high_noise_model.safetensors",
+        ],
+        &["vae.safetensors"],
+    )
+}
+
+mlx_gen::register_generators! { descriptor => load ; footprint = component_footprint }
 
 /// One expert (high or low) with its prepared per-expert cross-attention K/V for the cond / empty-neg
 /// text contexts (text embedding is per-expert, so K/V is built per expert).

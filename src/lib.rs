@@ -86,6 +86,7 @@ pub use gen_core::sampling::{
     DiscreteModelSampling, EdmModelSampling, ModelSampling, PredictionType, Scheduler, Solver,
     TimestepConvention, VpCapturePlan,
 };
+pub use gen_core::weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
@@ -93,8 +94,8 @@ pub use generator::{
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{
-    load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
-    TransformRegistration,
+    footprint, load, load_captioner, load_transform, CaptionerRegistration, ModelRegistration,
+    PerComponentBytes, TransformRegistration,
 };
 pub use registry::{load_trainer, TrainerRegistration};
 pub use residency::Residency;

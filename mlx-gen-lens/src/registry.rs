@@ -486,9 +486,26 @@ fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     load_with(spec, BASE_DEFAULTS)
 }
 
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// gpt-oss MoE text encoder (`text_encoder/`), the DiT (`transformer/`), and the Flux.2 VAE (`vae/`),
+/// summed from the exact snapshot subdirs [`crate::pipeline`] loads. The text encoder is the ~38 GB /
+/// 20B-param bulk the `Sequential` schedule drops before the DiT loads, so an accurate split here is
+/// what lets the fit-gate select staged residency for `lens` / `lens_turbo`.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
     descriptor_turbo => load_turbo,
     descriptor_base => load_base,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

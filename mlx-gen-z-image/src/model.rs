@@ -473,7 +473,22 @@ pub(crate) fn validate_request(
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the Qwen
+/// text encoder (`text_encoder/`), the DiT (`transformer/`), and the VAE (`vae/`), summed from the exact
+/// snapshot subdirs [`crate::loader`] loads. Shared by every Z-Image engine id (base/turbo, ±control);
+/// the control variants' separate control checkpoint is folded in by the worker, not here.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
+mlx_gen::register_generators! { descriptor => load ; footprint = component_footprint }
 
 #[cfg(test)]
 mod tests {

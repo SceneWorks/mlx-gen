@@ -9,17 +9,114 @@
 use crate::caption::{Captioner, CaptionerDescriptor};
 use crate::generator::{ConditioningKind, Generator, Modality, ModelDescriptor};
 use crate::image_embed::{ImageEmbedder, ImageEmbedderDescriptor};
-use crate::runtime::LoadSpec;
+use crate::runtime::{LoadSpec, WeightsSource};
 use crate::text_embed::{TextEmbedder, TextEmbedderDescriptor};
 use crate::train::{Trainer, TrainerDescriptor};
 use crate::transform::{Transform, TransformDescriptor};
+use crate::weightsmeta::safetensors_path_bytes;
 use crate::{Error, Result};
 
+use std::path::Path;
+
+/// The per-component on-disk weight footprint (bytes) of a model, the provider-owned staged-residency
+/// signal (sc-10894). Each field is the summed `.safetensors` byte size of one component category:
+///
+/// - `text_encoder` — the phase-A prompt encoder(s) that [`OffloadPolicy::Sequential`](crate::runtime::OffloadPolicy)
+///   drops *before* the heavy render bundle loads (one or more, e.g. SDXL's two CLIPs, SD3's three);
+/// - `dit` — the heavy transformer / U-Net (the "DiT"), the dominant render-phase component;
+/// - `vae` — the autoencoder, co-resident with the DiT through the render.
+///
+/// Why a provider owns this rather than the consumer inferring it: the Sequential/staged peak is
+/// `max(text_encoder, dit + vae)` (the encoder is freed before the renderer materializes — see
+/// [`LoadPhase::Renderer`](crate::runtime::LoadPhase::Renderer)), not the resident sum. A consumer that
+/// guesses the text-encoder size from `text_encoder*` subdir NAMING reads **zero** for any family whose
+/// encoder is not under such a subdir — or has no separable encoder at all (a flat unified checkpoint) —
+/// collapsing the staged peak back to the resident peak so no saving is ever selected. Each provider,
+/// by contrast, computes the split from the exact subdir paths its own loader resolves.
+///
+/// All three are tensor-free on-disk sums ([`safetensors_dir_bytes`]) — **zero** MLX allocation, no
+/// whole-file reads — so this is safe to call from a pre-load admission gate. A component a model does
+/// not have (or cannot separate) is `0`.
+///
+/// **On-disk byte SUMS, not load-exact.** Each field totals *every* `.safetensors` under the named
+/// path(s), which can exceed what a single load materializes: one component dir may ship multiple
+/// interchangeable variant files (anima's `diffusion_models/` holds the base/aesthetic/turbo DiTs, but
+/// a run loads exactly one — so `dit` over-counts by the unused variants), or side-by-side dtype shards
+/// (an SD3 `text_encoder_3/` carrying both f32 and fp16 double-counts). Today the worker consumes only
+/// `text_encoder` plus the true whole-model total; `dit` / `vae` are **informational** for a future
+/// consumer, which must treat them as an upper-bound on-disk footprint, not the resident size of one load.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PerComponentBytes {
+    pub text_encoder: u64,
+    pub dit: u64,
+    pub vae: u64,
+}
+
+impl PerComponentBytes {
+    /// Best-effort footprint for a diffusers-style snapshot: sum the `.safetensors` bytes under each
+    /// named component subdir of the spec's weights DIRECTORY. Each list is the exact subdir(s) the
+    /// caller's own loader resolves — `["text_encoder", "text_encoder_2"]` for the two SDXL CLIPs,
+    /// `["unet"]` / `["transformer"]` for the DiT, `["vae"]` — so the paths are always correct per
+    /// engine. A subdir that is absent contributes `0` ([`safetensors_dir_bytes`]).
+    ///
+    /// Each name may be a component *subdir* OR a flat component *file* ([`safetensors_path_bytes`]),
+    /// so this also covers the bernini / anima flat-file layouts. Errors only when `spec.weights` is a
+    /// single [`WeightsSource::File`]: a one-file checkpoint has no component tree to split (the consumer
+    /// then falls back to whole-file / resident accounting).
+    pub fn from_spec_subdirs(
+        spec: &LoadSpec,
+        text_encoder: &[&str],
+        dit: &[&str],
+        vae: &[&str],
+    ) -> Result<Self> {
+        let root = match &spec.weights {
+            WeightsSource::Dir(p) => p.as_path(),
+            WeightsSource::File(_) => return Err(Error::Msg(
+                "per-component footprint requires a snapshot directory, not a single .safetensors \
+                     file"
+                    .to_owned(),
+            )),
+        };
+        Ok(Self::from_root_subdirs(root, text_encoder, dit, vae))
+    }
+
+    /// Sum each component's `.safetensors` bytes under an already-resolved `root` — for a provider whose
+    /// component tree is NOT directly under `spec.weights` (e.g. anima's `split_files/` nesting resolves
+    /// the root itself, then names `text_encoders` / `diffusion_models` / `vae` under it). Each name is a
+    /// subdir or a flat file ([`safetensors_path_bytes`]); a missing one contributes `0`. Infallible —
+    /// the root is the caller's to validate.
+    pub fn from_root_subdirs(
+        root: &Path,
+        text_encoder: &[&str],
+        dit: &[&str],
+        vae: &[&str],
+    ) -> Self {
+        let sum = |names: &[&str]| -> u64 {
+            names
+                .iter()
+                .map(|n| safetensors_path_bytes(root.join(n)))
+                .sum()
+        };
+        Self {
+            text_encoder: sum(text_encoder),
+            dit: sum(dit),
+            vae: sum(vae),
+        }
+    }
+}
+
 /// A generator provider's registration — `descriptor` for introspection (no weights loaded),
-/// `load` to construct the model. ≈ `services.AddKeyedSingleton<IGenerator>("id", factory)`.
+/// `load` to construct the model, and the optional [`footprint`](Self::footprint) size seam.
+/// ≈ `services.AddKeyedSingleton<IGenerator>("id", factory)`.
 pub struct ModelRegistration {
     pub descriptor: fn() -> ModelDescriptor,
     pub load: fn(&LoadSpec) -> Result<Box<dyn Generator>>,
+    /// Optional per-component on-disk footprint (sc-10894) — `Some` for a provider that has declared its
+    /// [`PerComponentBytes`] split (via `register_generators! { … ; footprint = … }`), `None` otherwise.
+    /// `None` is the default so **every** provider that does not set it registers unchanged; a consumer
+    /// reaching [`footprint`] then gets `Ok(None)` and falls back to its own accounting. Mirrors the
+    /// [`load`](Self::load) fn-pointer shape (a spec in, a `Result` out).
+    pub footprint: Option<fn(&LoadSpec) -> Result<PerComponentBytes>>,
 }
 
 inventory::collect!(ModelRegistration);
@@ -138,6 +235,34 @@ define_load! {
 define_load! {
     /// Load a transform by id.
     pub fn load_transform via transforms as "transform" => dyn Transform
+}
+
+/// The per-component on-disk [`PerComponentBytes`] footprint of generator `id`, if its provider declared
+/// one (sc-10894). Looks the registration up by id (first-wins, like [`load`]) and calls its optional
+/// `footprint` fn:
+///
+/// - `Ok(Some(bytes))` — the provider computed the split (from the paths its own loader resolves);
+/// - `Ok(None)` — the id is registered but declares **no** footprint (the default), so the consumer
+///   falls back to its own accounting (e.g. the worker's `text_encoder*` subdir sum);
+/// - `Err` — no generator is registered for `id`, or the provider's footprint fn itself failed
+///   (e.g. a single-file source with no component tree). A fail-open consumer treats `Err` like `None`.
+///
+/// Tensor-free and weights-free of allocation — the footprint fns read only on-disk sizes — so this is
+/// safe on a pre-load admission path. Sees exactly the registrations the calling binary links (the
+/// sc-4482 dead-strip rule), same as [`load`].
+pub fn footprint(id: &str, spec: &LoadSpec) -> Result<Option<PerComponentBytes>> {
+    let mut matches = generators().filter(|r| (r.descriptor)().id == id);
+    let reg = matches
+        .next()
+        .ok_or_else(|| Error::Msg(format!("no generator registered for id '{id}'")))?;
+    debug_assert!(
+        matches.next().is_none(),
+        "duplicate generator id '{id}' registered (first-wins shadows the rest)"
+    );
+    match reg.footprint {
+        Some(f) => f(spec).map(Some),
+        None => Ok(None),
+    }
 }
 
 define_load! {
@@ -510,6 +635,34 @@ mod tests {
     }
 
     crate::register_generators! { dummy_delegated_descriptor => dummy_delegated_load }
+
+    // A dummy generator that DECLARES a per-component footprint (sc-10894), exercising the
+    // `; footprint = …` macro arm and the [`footprint`] entry point. Its text encoder is under a
+    // non-standard `mllm/` subdir (the real boogu layout) — a naming a `text_encoder*` guesser would
+    // read as ZERO — so the provider-owned split is what finds it.
+    fn dummy_footprint_descriptor() -> ModelDescriptor {
+        ModelDescriptor {
+            id: "dummy_footprint_model",
+            family: "test",
+            backend: "mlx",
+            modality: Modality::Image,
+            capabilities: dummy_caps(),
+        }
+    }
+
+    fn dummy_footprint_load(_spec: &LoadSpec) -> Result<Box<dyn Generator>> {
+        Ok(Box::new(DummyGen {
+            desc: dummy_footprint_descriptor(),
+        }))
+    }
+
+    fn dummy_footprint(spec: &LoadSpec) -> Result<PerComponentBytes> {
+        PerComponentBytes::from_spec_subdirs(spec, &["mllm"], &["transformer"], &["vae"])
+    }
+
+    crate::register_generators! {
+        dummy_footprint_descriptor => dummy_footprint_load ; footprint = dummy_footprint
+    }
 
     struct DummyTrainer {
         desc: TrainerDescriptor,
@@ -936,5 +1089,141 @@ mod tests {
         assert!(model_descriptor_errors(&zeroed)
             .iter()
             .any(|e| e.contains("left at the Default 0")));
+    }
+
+    /// Build a synthetic diffusers-style snapshot with a `bytes`-sized `model.safetensors` under each
+    /// named subdir, returning the root. The caller cleans it up.
+    fn synthetic_snapshot(tag: &str, subdirs: &[(&str, usize)]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "gencore_footprint_{tag}_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        for (sub, bytes) in subdirs {
+            let dir = root.join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.safetensors"), vec![0u8; *bytes]).unwrap();
+        }
+        root
+    }
+
+    /// sc-10894: a provider that declared a footprint returns the per-component on-disk split, resolved
+    /// from the exact subdirs its loader uses — including a text encoder under a NON-`text_encoder`
+    /// subdir (`mllm/`, the boogu layout) that a name-guessing consumer would read as zero.
+    #[test]
+    fn footprint_returns_provider_component_split() {
+        let root = synthetic_snapshot(
+            "split",
+            &[("mllm", 1500), ("transformer", 9000), ("vae", 400)],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+
+        let fp = footprint("dummy_footprint_model", &spec)
+            .expect("registered + declares a footprint")
+            .expect("Some — the provider computed the split");
+        assert_eq!(
+            fp,
+            PerComponentBytes {
+                text_encoder: 1500,
+                dit: 9000,
+                vae: 400,
+            }
+        );
+        // The whole point: the text encoder is NON-zero even though it is not under `text_encoder*`.
+        assert!(fp.text_encoder > 0, "mllm/ text encoder must be measured");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A registered generator that declares NO footprint yields `Ok(None)` (the consumer falls back);
+    /// an unknown id is an `Err`.
+    #[test]
+    fn footprint_is_none_without_declaration_and_errs_on_unknown_id() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        // `dummy_test_model` is registered but declares no footprint.
+        assert_eq!(footprint("dummy_test_model", &spec).unwrap(), None);
+        // Unknown id → Err (a fail-open consumer treats it like None).
+        assert!(footprint("no_such_model", &spec).is_err());
+    }
+
+    /// sc-10894: `from_spec_subdirs` sums each component's subdir(s) (SD3's three text encoders here),
+    /// treats a missing subdir as `0`, and errors on a single-`File` source (no tree to split).
+    #[test]
+    fn per_component_bytes_from_spec_subdirs_and_file_guard() {
+        let root = synthetic_snapshot(
+            "sd3",
+            &[
+                ("text_encoder", 100),
+                ("text_encoder_2", 200),
+                ("text_encoder_3", 4000),
+                ("transformer", 8000),
+                ("vae", 300),
+            ],
+        );
+        let spec = LoadSpec::new(WeightsSource::Dir(root.clone()));
+        let fp = PerComponentBytes::from_spec_subdirs(
+            &spec,
+            &["text_encoder", "text_encoder_2", "text_encoder_3"],
+            &["transformer"],
+            &["vae"],
+        )
+        .unwrap();
+        assert_eq!(fp.text_encoder, 4300); // 100 + 200 + 4000
+        assert_eq!(fp.dit, 8000);
+        assert_eq!(fp.vae, 300);
+
+        // A named-but-absent subdir contributes 0 (does not error).
+        let fp_missing =
+            PerComponentBytes::from_spec_subdirs(&spec, &["nope"], &["transformer"], &["vae"])
+                .unwrap();
+        assert_eq!(fp_missing.text_encoder, 0);
+
+        // A single-file source has no component tree → Err (consumer falls back to whole-file).
+        let file_spec = LoadSpec::new(WeightsSource::File(
+            root.join("transformer/model.safetensors"),
+        ));
+        assert!(
+            PerComponentBytes::from_spec_subdirs(&file_spec, &["te"], &["dit"], &["vae"]).is_err()
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// sc-10894: `from_root_subdirs` sums a component named by a flat FILE (the bernini/anima layout —
+    /// `t5_encoder.safetensors` at the root, not a `text_encoder/` subdir) as well as a subdir, against
+    /// an already-resolved root.
+    #[test]
+    fn per_component_bytes_from_root_subdirs_handles_flat_files() {
+        let root = std::env::temp_dir().join(format!(
+            "gencore_footprint_flat_{}_{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        // bernini-style flat component files at the root.
+        std::fs::write(root.join("t5_encoder.safetensors"), vec![0u8; 2000]).unwrap();
+        std::fs::write(root.join("low_noise_model.safetensors"), vec![0u8; 6000]).unwrap();
+        std::fs::write(root.join("high_noise_model.safetensors"), vec![0u8; 6000]).unwrap();
+        std::fs::write(root.join("vae.safetensors"), vec![0u8; 500]).unwrap();
+
+        let fp = PerComponentBytes::from_root_subdirs(
+            &root,
+            &["t5_encoder.safetensors"],
+            &[
+                "low_noise_model.safetensors",
+                "high_noise_model.safetensors",
+            ],
+            &["vae.safetensors"],
+        );
+        assert_eq!(
+            fp,
+            PerComponentBytes {
+                text_encoder: 2000,
+                dit: 12000,
+                vae: 500,
+            }
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

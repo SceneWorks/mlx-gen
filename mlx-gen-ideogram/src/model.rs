@@ -434,9 +434,25 @@ fn array_to_image(img: &Array) -> Result<Image> {
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The turbo variant
 // (issue #488) registers under `ideogram_4_turbo`.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// Qwen3-VL text encoder (`text_encoder/`), the DiT (`transformer/` + the base id's asymmetric-CFG
+/// `unconditional_transformer/` negative branch), and the VAE (`vae/`), summed from the exact snapshot
+/// subdirs [`crate::loader`] loads. `unconditional_transformer/` is absent for the turbo id (→ 0).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer", "unconditional_transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
     descriptor => load,
     descriptor_turbo => load_turbo,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

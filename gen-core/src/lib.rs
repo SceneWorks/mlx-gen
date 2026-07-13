@@ -49,9 +49,9 @@ pub use json_constraint::JsonState;
 pub use media::{AudioTrack, Image};
 pub use mempolicy::{plan_memory_adaptation, LaneLevers, Lever, MemoryPlan, StagePeaks};
 pub use registry::{
-    load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
-    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, TextEmbedderRegistration,
-    TransformRegistration,
+    footprint, load, load_captioner, load_image_embedder, load_text_embedder, load_transform,
+    CaptionerRegistration, ImageEmbedderRegistration, ModelRegistration, PerComponentBytes,
+    TextEmbedderRegistration, TransformRegistration,
 };
 pub use registry::{load_trainer, TrainerRegistration};
 pub use runtime::{
@@ -60,6 +60,7 @@ pub use runtime::{
 };
 pub use text_embed::{TextEmbedder, TextEmbedderDescriptor};
 pub use tiling::{TilingConfig, VaeTiling};
+pub use weightsmeta::{safetensors_dir_bytes, safetensors_path_bytes};
 
 // The independent LLM-serving library, re-exported at `gen_core::core_llm` (epic 7153, sc-7189). The
 // dependency is INVERTED: gen-core CONSUMES `core-llm` — the same way mlx-gen re-exports gen-core via

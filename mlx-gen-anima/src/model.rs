@@ -201,6 +201,7 @@ mlx_gen::register_generators! {
     descriptor_base => load_base,
     descriptor_aesthetic => load_aesthetic,
     descriptor_turbo => load_turbo,
+    ; footprint = crate::loader::component_footprint
 }
 
 #[cfg(test)]

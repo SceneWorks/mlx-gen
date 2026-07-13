@@ -767,7 +767,17 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
 
 // Link-time registration (epic 3720): the macro emits the `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
-mlx_gen::register_generators! { descriptor => load }
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// ChatGLM3-6B text encoder (`text_encoder/`), the SDXL U-Net (`unet/`), and the VAE (`vae/`), summed
+/// from the exact snapshot subdirs Kolors loads (the IP-adapter / ControlNet checkpoints live in
+/// separate LoadSpec sources, not under `spec.weights`).
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(spec, &["text_encoder"], &["unet"], &["vae"])
+}
+
+mlx_gen::register_generators! { descriptor => load ; footprint = component_footprint }
 
 #[cfg(test)]
 mod tests {

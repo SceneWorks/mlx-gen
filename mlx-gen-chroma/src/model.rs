@@ -590,10 +590,26 @@ impl Chroma {
 
 // Link-time registration (epic 3720): the macro emits each `inventory::submit!` and bridges the
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`.
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate's staged-residency split — the
+/// T5-XXL text encoder (`text_encoder/` — Chroma keeps T5 here, not flux's `text_encoder_2/`), the DiT
+/// (`transformer/`), and the VAE (`vae/`), summed from the exact snapshot subdirs [`crate::loader`]
+/// loads. Shared by chroma hd/base/flash.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    mlx_gen::PerComponentBytes::from_spec_subdirs(
+        spec,
+        &["text_encoder"],
+        &["transformer"],
+        &["vae"],
+    )
+}
+
 mlx_gen::register_generators! {
     descriptor_hd => load_hd,
     descriptor_base => load_base,
     descriptor_flash => load_flash,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]

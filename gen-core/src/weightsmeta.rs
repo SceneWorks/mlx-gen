@@ -169,6 +169,77 @@ impl CheckpointMeta {
     }
 }
 
+/// Sum the on-disk bytes of every `.safetensors` weight file under `dir` (recursively), **without
+/// materializing any tensor** — the tensor-free size primitive behind the provider footprint seam
+/// (sc-10894, [`crate::registry::PerComponentBytes`]).
+///
+/// Chosen over reading each file through [`CheckpointMeta`] on purpose: `CheckpointMeta` buffers the
+/// WHOLE file in host RAM (the F-038 caveat above), so measuring a multi-GB base component that way
+/// would read tens of GB into memory inside a *pre-load* gate. A file-length sum is header-plus-tensor
+/// bytes (the few-KB header overhead is negligible for a memory budget), touches no tensor data, and
+/// makes **zero** MLX allocation.
+///
+/// Symlinks are followed (the HF cache stores each shard as a symlink into `blobs/`, so `metadata()` —
+/// which follows the link — is used for both the kind check and the length). AppleDouble `._*` sidecars
+/// and other hidden entries are skipped ([`is_hidden_file`]) — a `._model.safetensors` masquerades as a
+/// shard and would double-count. Returns `0` when `dir` is missing or holds no weights, so an absent
+/// component contributes nothing. This is the same accounting the worker's whole-model sum uses, so a
+/// component's bytes and the whole-model total stay directly comparable (`rest = total − text_encoder`).
+pub fn safetensors_dir_bytes(dir: impl AsRef<Path>) -> u64 {
+    fn walk(dir: &Path, total: &mut u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `metadata()` follows symlinks (HF blobs); resolve the target kind + length through it.
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                walk(&path, total);
+                continue;
+            }
+            let is_safetensors = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == "safetensors");
+            if is_safetensors && !is_hidden_file(&path) {
+                *total += meta.len();
+            }
+        }
+    }
+    let mut total = 0;
+    walk(dir.as_ref(), &mut total);
+    total
+}
+
+/// On-disk `.safetensors` bytes at `path`, whether it is a **directory** (the recursive
+/// [`safetensors_dir_bytes`] sum) or a **single file** (its length, if a non-hidden `.safetensors`).
+/// The dispatcher behind [`crate::registry::PerComponentBytes::from_root_subdirs`], so a provider can
+/// name either a component *subdir* (`"text_encoder"`, `"transformer"`, `"vae"`) or a flat component
+/// *file* (`"t5_encoder.safetensors"`, `"low_noise_model.safetensors"` — the bernini / anima layouts,
+/// which put components in individual root-level files rather than diffusers subdirs). `0` when `path`
+/// is missing or is not a countable weight.
+pub fn safetensors_path_bytes(path: impl AsRef<Path>) -> u64 {
+    let path = path.as_ref();
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        return safetensors_dir_bytes(path);
+    }
+    let is_safetensors = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e == "safetensors");
+    if is_safetensors && !is_hidden_file(path) {
+        meta.len()
+    } else {
+        0
+    }
+}
+
 // =================================================================================================
 // LoRA / LoKr / LoHa / kohya format parsing (string + metadata only).
 // =================================================================================================
@@ -842,6 +913,61 @@ mod tests {
         assert_eq!(meta.keys().collect::<Vec<_>>(), vec!["blk.weight"]);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// sc-10894: `safetensors_dir_bytes` recurses, counts only `.safetensors`, and skips AppleDouble
+    /// `._*` sidecars + non-weight files — the same accounting the worker's whole-model sum uses so a
+    /// component's bytes stay comparable to the total.
+    #[test]
+    fn safetensors_dir_bytes_recurses_and_skips_sidecars_and_nonweights() {
+        let root = std::env::temp_dir().join(format!("gencore_dirbytes_{}", std::process::id()));
+        let te = root.join("text_encoder");
+        let dit = root.join("transformer");
+        std::fs::create_dir_all(&te).unwrap();
+        std::fs::create_dir_all(&dit).unwrap();
+        std::fs::write(te.join("model.safetensors"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dit.join("diffusion.safetensors"), vec![0u8; 2000]).unwrap();
+        // AppleDouble sidecar + a non-weight file must NOT count.
+        std::fs::write(te.join("._model.safetensors"), vec![0u8; 500]).unwrap();
+        std::fs::write(dit.join("config.json"), vec![0u8; 700]).unwrap();
+
+        assert_eq!(safetensors_dir_bytes(&root), 3000);
+        assert_eq!(safetensors_dir_bytes(root.join("transformer")), 2000);
+        // Missing dir ⇒ 0 (no signal).
+        assert_eq!(safetensors_dir_bytes(root.join("nope")), 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// sc-10894: `safetensors_path_bytes` dispatches on kind — the recursive sum for a DIR, the file
+    /// length for a single non-hidden `.safetensors` FILE (the bernini/anima flat-component layout), and
+    /// `0` for a non-weight file or a `._*` sidecar file.
+    #[test]
+    fn safetensors_path_bytes_handles_file_and_dir() {
+        let root = std::env::temp_dir().join(format!("gencore_pathbytes_{}", std::process::id()));
+        let sub = root.join("vae");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("model.safetensors"), vec![0u8; 800]).unwrap();
+        std::fs::write(root.join("t5_encoder.safetensors"), vec![0u8; 2000]).unwrap();
+        std::fs::write(root.join("._t5_encoder.safetensors"), vec![0u8; 300]).unwrap();
+        std::fs::write(root.join("config.json"), vec![0u8; 400]).unwrap();
+
+        // A flat component file → its length.
+        assert_eq!(
+            safetensors_path_bytes(root.join("t5_encoder.safetensors")),
+            2000
+        );
+        // A subdir → the recursive sum.
+        assert_eq!(safetensors_path_bytes(root.join("vae")), 800);
+        // A sidecar file / non-weight file / missing path → 0.
+        assert_eq!(
+            safetensors_path_bytes(root.join("._t5_encoder.safetensors")),
+            0
+        );
+        assert_eq!(safetensors_path_bytes(root.join("config.json")), 0);
+        assert_eq!(safetensors_path_bytes(root.join("missing.safetensors")), 0);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// A dir holding *only* a sidecar has no shards — the error must say so rather than surfacing a

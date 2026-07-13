@@ -375,9 +375,34 @@ fn image_to_chw01(img: &Image) -> Result<Array> {
 // crate's rich `Result` into the registry's backend-neutral `gen_core::Result`. The 8-step
 // distilled variant (sc-3192) registers under `descriptor_fast`. `impl Generator` stays
 // hand-written because `validate` attributes rejections to the per-variant descriptor id (F-143).
+/// Per-component on-disk footprint (sc-10894) for the MLX fit-gate. SenseNova-U1 (NEO-Unify) is a single
+/// FLAT sharded checkpoint: the text, vision, and generation paths are INTERLEAVED in the same tensors
+/// (the dual-path `_mot_gen` layout — see [`crate::loader`]), so there is NO separable text encoder to
+/// stage. Report the whole checkpoint as the heavy component (`text_encoder = 0`) — an honest
+/// "`Sequential` residency buys nothing here" (staged peak == resident peak) rather than a fabricated
+/// split. sensenova is not in the worker's sequential-capable allowlist, so this only makes that explicit.
+pub(crate) fn component_footprint(
+    spec: &mlx_gen::LoadSpec,
+) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
+    let root = match &spec.weights {
+        mlx_gen::WeightsSource::Dir(p) => p.clone(),
+        mlx_gen::WeightsSource::File(_) => {
+            return Err(mlx_gen::gen_core::Error::Msg(
+                "sensenova footprint requires a snapshot directory".to_owned(),
+            ))
+        }
+    };
+    Ok(mlx_gen::PerComponentBytes {
+        text_encoder: 0,
+        dit: mlx_gen::safetensors_dir_bytes(&root),
+        vae: 0,
+    })
+}
+
 mlx_gen::register_generators! {
     descriptor => load,
     descriptor_fast => load_fast,
+    ; footprint = component_footprint
 }
 
 #[cfg(test)]
