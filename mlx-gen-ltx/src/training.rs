@@ -112,6 +112,9 @@ fn trainer_descriptor() -> TrainerDescriptor {
         supports_lora: true,
         // The reference LTX MLX trainer is LoRA-only; LoKr training is unsupported (see `validate`).
         supports_lokr: false,
+        // No control-branch training path (F-006). The LTX trainer must reject a control request
+        // rather than silently training a plain LoRA (F-055).
+        supports_control: false,
     }
 }
 
@@ -227,6 +230,10 @@ impl Trainer for LtxTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared control-training floor (F-006 / F-055): the LTX trainer has no control branch, so a
+        // request carrying `control_type` / per-item control images is rejected (typed `Unsupported`)
+        // rather than silently training a plain LoRA and reporting success.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         // Single-use enforcement (F-055): `train` frees the Gemma text encoder + tokenizer (~24 GB)
         // after the embed cache, so a second `train` on the same instance can't re-encode. Fail here,
         // up front (validate runs before any progress is emitted), instead of with a late, confusing

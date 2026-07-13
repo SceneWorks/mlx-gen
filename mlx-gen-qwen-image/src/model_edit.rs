@@ -325,7 +325,7 @@ impl Generator for QwenImageEdit {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        validate_request(&self.descriptor.capabilities, req)?;
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req)?;
         validate_reference_images(req).map_err(Into::into)
     }
 
@@ -577,7 +577,7 @@ mod tests {
             ..Default::default()
         };
         // validate_request (size/conditioning) passes, but the edit generator needs a reference.
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(descriptor().id, &caps, &req).is_ok());
         assert!(reference_images(&req).is_empty());
     }
 

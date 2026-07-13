@@ -130,6 +130,23 @@ pub fn check_trainer_validate(t: &dyn Trainer, profile: &TrainerProfile) -> Resu
             ));
         }
     }
+
+    // Negative (F-006): a control-branch request on a trainer that does NOT advertise
+    // `supports_control` must be rejected by `validate()` — not silently trained as a plain adapter
+    // (F-055). The shared `validate_control_request` floor enforces this; assert the trainer routes
+    // through it. (A control-capable trainer is exempt — it should accept a well-formed control
+    // request; there are none shipped today.)
+    if !desc.supports_control {
+        let mut ctrl = ok.clone();
+        ctrl.config.control_type = Some("pose".to_owned());
+        if t.validate(&ctrl).is_ok() {
+            return Err(format!(
+                "validate-honesty[{id}]: a control-branch request (control_type set) was accepted by \
+                 validate() despite supports_control == false — it must be rejected, not silently \
+                 trained as a plain adapter (F-006/F-055)"
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -289,63 +289,34 @@ const SIZE_MULTIPLE: u32 = 16;
 pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<()> {
     let caps = &desc.capabilities;
     let id = desc.id;
+    // Empty-prompt first so it wins over the shared floor for a bare default request.
     if req.prompt.is_empty() {
         return Err(Error::Msg(format!("{id}: prompt must not be empty")));
     }
-    if req.count == 0 || req.count > caps.max_count {
-        return Err(Error::Msg(format!(
-            "count {} out of range 1..={}",
-            req.count, caps.max_count
-        )));
-    }
-    if req.steps == Some(0) {
-        return Err(Error::Msg("steps must be >= 1".into()));
-    }
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(Error::Msg(format!(
-            "{}x{} out of supported range {}..={}",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
+    // The shared capability floor (F-018): count, steps range (0 and the F-004 ceiling),
+    // size range, negative/guidance/true_cfg support gating + the F-053/F-001 finiteness guard,
+    // sampler/scheduler/guidance_method membership, and accepted conditioning kinds. SD3 previously
+    // hand-rolled a subset that missed non-finite guidance (NaN-poisons every step), sampler/scheduler
+    // membership (unknown names silently fell back to the native path), and true_cfg/guidance_method
+    // rejection — sibling SANA already delegates here. `?` keeps the typed `Unsupported` for gaps.
+    caps.validate_request(id, req)?;
+    // SD3-specific extras layered on top of the shared floor:
     if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
         return Err(Error::Msg(format!(
             "{}x{} must be a multiple of {SIZE_MULTIPLE} (VAE 8 × patch 2)",
             req.width, req.height
         )));
     }
-    if req.guidance.is_some() && !caps.supports_guidance {
-        return Err(Error::Msg(format!(
-            "{id}: guidance is not supported on this variant (distilled Turbo bakes guidance in — \
-             CFG off)"
-        )));
-    }
-    if req.negative_prompt.is_some() && !caps.supports_negative_prompt {
-        return Err(Error::Msg(format!(
-            "{id}: negative prompt is not supported on this variant"
-        )));
-    }
     // F-094a: a negative prompt is only honored when CFG is active (guidance != 1.0, which runs the
     // uncond forward). An explicit `guidance <= 1.0` alongside a negative prompt would silently
     // discard the negative — reject the combination with a typed error instead of the silent no-op
-    // (Turbo already rejects `guidance`/`negative_prompt` wholesale via the capability checks above;
-    // this is the true-CFG analogue for a guidance value that disables CFG).
+    // (Turbo already rejects `guidance`/`negative_prompt` wholesale via the shared floor's capability
+    // checks; this is the true-CFG analogue for a guidance value that disables CFG).
     if req.negative_prompt.is_some() && req.guidance.is_some_and(|g| g <= 1.0) {
         return Err(Error::Msg(format!(
             "{id}: a negative prompt requires guidance > 1.0 (guidance <= 1.0 disables CFG, so the \
              negative prompt would be ignored); raise guidance or drop the negative prompt"
         )));
-    }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "{id} does not accept {kind:?} conditioning (txt2img only)"
-            )));
-        }
     }
     Ok(())
 }
@@ -684,8 +655,9 @@ mod tests {
             height: 2048,
             ..Default::default()
         };
+        // F-018: SD3 now delegates the size-range check to the shared floor ("outside supported range").
         let err = validate_request(&d, &too_big).unwrap_err().to_string();
-        assert!(err.contains("out of supported range"), "got: {err}");
+        assert!(err.contains("outside supported range"), "got: {err}");
     }
 
     #[test]

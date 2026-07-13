@@ -283,6 +283,54 @@ pub struct TrainerDescriptor {
     pub modality: Modality,
     pub supports_lora: bool,
     pub supports_lokr: bool,
+    /// Whether this trainer can train a ControlNet-style **control branch** (the sc-10163
+    /// `control_type` / per-item `control_image_path` contract), as opposed to a plain LoRA/LoKr
+    /// adapter. The worker reads this to know whether a control-training plan is serviceable, and the
+    /// shared [`validate_control_request`] floor uses it to decide whether a control request is a
+    /// capability gap (reject typed) or must be checked for per-item control images. `false` for every
+    /// LoRA/LoKr-only trainer shipped today — they must *reject* a control request, not silently train
+    /// a plain adapter (F-006 / F-055).
+    pub supports_control: bool,
+}
+
+/// The shared control-training validation floor (F-006) — the training analog of
+/// [`Capabilities::validate_request`](crate::generator::Capabilities::validate_request). A family
+/// trainer's `validate` calls this so the "control_type set ⇒ every item carries a control image"
+/// invariant (and the "unsupported ⇒ typed reject" rule) lives in one place instead of being
+/// re-implemented per family — the recurring fixes-don't-travel gap sc-10163 opened.
+///
+/// - `control_type` unset ⇒ the plain LoRA/LoKr path: no-op.
+/// - `control_type` set on a trainer that does **not** advertise
+///   [`supports_control`](TrainerDescriptor::supports_control) ⇒ typed [`Error::Unsupported`] (the
+///   LoRA-only trainers must reject a control request, not silently produce a non-control adapter).
+/// - `control_type` set on a control-capable trainer ⇒ every [`TrainingItem`] must carry a
+///   `control_image_path`, else [`Error::Msg`].
+pub fn validate_control_request(
+    desc: &TrainerDescriptor,
+    req: &TrainingRequest,
+) -> crate::Result<()> {
+    let Some(control_type) = req.config.control_type.as_deref() else {
+        return Ok(());
+    };
+    if !desc.supports_control {
+        return Err(crate::Error::Unsupported(format!(
+            "{}: control-branch training (control_type {control_type:?}) is not supported by this \
+             trainer",
+            desc.id
+        )));
+    }
+    if let Some(idx) = req
+        .items
+        .iter()
+        .position(|it| it.control_image_path.is_none())
+    {
+        return Err(crate::Error::Msg(format!(
+            "{}: control_type {control_type:?} requires a control image on every training item \
+             (item {idx} has none)",
+            desc.id
+        )));
+    }
+    Ok(())
 }
 
 /// A LoRA/LoKr trainer for one model family — the training analog of
@@ -331,5 +379,75 @@ mod tests {
         // Additive: LoRA callers building via `..Default::default()` get `control_type: None` and
         // are unaffected; only a control-branch trainer sets it.
         assert_eq!(TrainingConfig::default().control_type, None);
+    }
+
+    fn trainer_desc(supports_control: bool) -> TrainerDescriptor {
+        TrainerDescriptor {
+            id: "fam_trainer",
+            family: "fam",
+            backend: "mlx",
+            modality: Modality::Image,
+            supports_lora: true,
+            supports_lokr: false,
+            supports_control,
+        }
+    }
+
+    fn train_req(control_type: Option<&str>, items: Vec<TrainingItem>) -> TrainingRequest {
+        TrainingRequest {
+            items,
+            config: TrainingConfig {
+                control_type: control_type.map(str::to_owned),
+                ..Default::default()
+            },
+            output_dir: PathBuf::from("/out"),
+            file_name: "a.safetensors".into(),
+            trigger_words: Vec::new(),
+            cancel: CancelFlag::default(),
+        }
+    }
+
+    #[test]
+    fn validate_control_request_floor() {
+        // F-006: the shared control-training floor.
+        let img = PathBuf::from("a.png");
+        let ctrl = PathBuf::from("a.pose.png");
+
+        // control_type unset ⇒ no-op on both trainer kinds.
+        let lora_items = vec![TrainingItem::captioned(img.clone(), "a cat".into())];
+        assert!(validate_control_request(
+            &trainer_desc(false),
+            &train_req(None, lora_items.clone())
+        )
+        .is_ok());
+
+        // control_type set on a NON-control trainer ⇒ typed Unsupported (must reject, not silently
+        // train a plain adapter — the F-055 class).
+        let err = validate_control_request(
+            &trainer_desc(false),
+            &train_req(Some("pose"), lora_items.clone()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::Error::Unsupported(_)),
+            "control on a LoRA-only trainer is a capability gap → Unsupported, got {err:?}"
+        );
+
+        // control_type set on a control-capable trainer, but an item lacks a control image ⇒ Msg.
+        let err =
+            validate_control_request(&trainer_desc(true), &train_req(Some("pose"), lora_items))
+                .unwrap_err();
+        assert!(
+            matches!(&err, crate::Error::Msg(_)) && err.to_string().contains("control image"),
+            "got {err:?}"
+        );
+
+        // control_type set on a control-capable trainer with every item carrying a control image ⇒ ok.
+        let ctrl_items = vec![TrainingItem::with_control(img, "a cat".into(), ctrl)];
+        assert!(validate_control_request(
+            &trainer_desc(true),
+            &train_req(Some("pose"), ctrl_items)
+        )
+        .is_ok());
     }
 }

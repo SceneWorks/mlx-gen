@@ -147,6 +147,22 @@ impl Scail2 {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // Self-validate the shared floor first (F-158). `impl_generator!`'s `generate` does NOT call
+        // `validate`, so a direct `Generator::generate` on scail2 (the only provider that skipped
+        // this) otherwise bypassed count, sampler membership, conditioning allowlist, and the
+        // F-053 finiteness guard — `guidance: Some(NAN)` would NaN-poison a multi-minute render into
+        // garbage-as-success. Every other provider re-validates at the top of its generate impl.
+        //
+        // scail2 supports a "match the driving-video size" convention (`width`/`height == 0` → resolved
+        // from the driving frames below), which the floor's size-range check would wrongly reject. So
+        // the full floor runs only when explicit dims are supplied; the finiteness guard (the headline
+        // concern) runs unconditionally so a NaN knob is rejected on the auto-size path too.
+        req.ensure_finite_floats()?;
+        if req.width > 0 && req.height > 0 {
+            self.descriptor
+                .capabilities
+                .validate_request(self.descriptor.id, req)?;
+        }
         let reference = find_conditioning(req, |c| match c {
             Conditioning::Reference { image, .. } => Some(image),
             _ => None,

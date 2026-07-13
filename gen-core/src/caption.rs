@@ -191,20 +191,27 @@ impl CaptionCapabilities {
                 self.max_prompt_chars
             )));
         }
+        // Capability-gap rejections are typed `Error::Unsupported` (F-002 / F-008): the generator floor
+        // was already fixed to distinguish "this backend can't do that" from a malformed value, and
+        // `error.rs` documents candle gating as depending on the typed variant — the captioner floor
+        // must match. Malformed-value branches (prompt required / too long, name/extra-option limits)
+        // stay `Error::Msg`.
         if !req.options.custom_prompt.trim().is_empty() && !self.supports_custom_prompt {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "{id}: custom prompts are not supported"
             )));
         }
         if req.options.low_vram && !self.supports_low_vram {
-            return Err(Error::Msg(format!("{id}: low_vram is not supported")));
+            return Err(Error::Unsupported(format!(
+                "{id}: low_vram is not supported"
+            )));
         }
         if !self.caption_types.is_empty()
             && !self
                 .caption_types
                 .contains(&req.options.caption_type.as_str())
         {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "{id}: unsupported caption_type {:?} (supported: {:?})",
                 req.options.caption_type, self.caption_types
             )));
@@ -219,7 +226,7 @@ impl CaptionCapabilities {
                 .caption_lengths
                 .contains(&req.options.caption_length.as_str())
         {
-            return Err(Error::Msg(format!(
+            return Err(Error::Unsupported(format!(
                 "{id}: unsupported caption_length {:?} (supported: {:?} or a word count)",
                 req.options.caption_length, self.caption_lengths
             )));
@@ -440,6 +447,68 @@ mod tests {
                 "case {i} should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn capability_gaps_are_typed_unsupported() {
+        // F-002 / F-008: a request asking for a capability this captioner does not advertise is a
+        // capability gap and must be typed `Error::Unsupported` (candle gating depends on the variant),
+        // while a malformed value stays `Error::Msg`. Use a caps that supports NONE of the gated knobs.
+        let restrictive = CaptionCapabilities {
+            caption_types: vec!["Descriptive"],
+            caption_lengths: vec!["long"],
+            supports_custom_prompt: false,
+            supports_low_vram: false,
+            ..caps()
+        };
+        let gap_cases = [
+            CaptionRequest {
+                options: CaptionOptions {
+                    custom_prompt: "override".to_owned(),
+                    ..Default::default()
+                },
+                ..base_req()
+            },
+            CaptionRequest {
+                options: CaptionOptions {
+                    low_vram: true,
+                    ..Default::default()
+                },
+                ..base_req()
+            },
+            CaptionRequest {
+                options: CaptionOptions {
+                    caption_type: "Other".to_owned(),
+                    ..Default::default()
+                },
+                ..base_req()
+            },
+            CaptionRequest {
+                options: CaptionOptions {
+                    caption_length: "novella".to_owned(),
+                    ..Default::default()
+                },
+                ..base_req()
+            },
+        ];
+        for (i, req) in gap_cases.iter().enumerate() {
+            let err = restrictive.validate_request("captioner", req).unwrap_err();
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "gap case {i} must be Unsupported, got {err:?}"
+            );
+        }
+        // A malformed value (empty prompt) stays `Msg`.
+        let malformed = CaptionRequest {
+            prompt: String::new(),
+            ..base_req()
+        };
+        assert!(matches!(
+            restrictive
+                .validate_request("captioner", &malformed)
+                .unwrap_err(),
+            Error::Msg(_)
+        ));
     }
 
     #[test]

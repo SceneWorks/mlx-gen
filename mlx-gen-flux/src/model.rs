@@ -529,6 +529,27 @@ fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) -> Result<(
             desc.id, caps.max_count
         )));
     }
+    // Floor checks the bespoke validator had drifted below (F-105): the base flux1 variant kept a
+    // hand-rolled validate for the IP-Adapter reference carve-out below, so it never absorbed these.
+    // `steps: Some(0)` otherwise silently clamps to 1; a non-finite guidance/true_cfg flows into
+    // `time_text_embed` / survives `.clamp` (Rust clamp returns NaN) and NaN-poisons the render; an
+    // unadvertised `guidance_method` was silently ignored. (Finiteness is centralized on the request
+    // so every `Option<f32>` knob inherits the guard — F-001.)
+    if req.steps == Some(0) {
+        return Err(Error::Msg(format!(
+            "{}: steps must be >= 1 (an explicit 0 renders undenoised noise)",
+            desc.id
+        )));
+    }
+    req.ensure_finite_floats()?;
+    if let Some(m) = &req.guidance_method {
+        if !caps.supported_guidance_methods.contains(&m.as_str()) {
+            return Err(Error::Unsupported(format!(
+                "{}: unsupported guidance_method {m:?} (supported: {:?})",
+                desc.id, caps.supported_guidance_methods
+            )));
+        }
+    }
     // Reference conditioning (XLabs IP-Adapter, epic 3621): exactly one `Reference`. The negative
     // prompt + true_cfg knobs ride the IP-Adapter dev path (real CFG), so they are permitted
     // alongside a reference on a guidance-capable (dev) variant even though base txt2img advertises

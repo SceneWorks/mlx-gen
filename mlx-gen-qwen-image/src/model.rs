@@ -279,7 +279,7 @@ impl QwenImage {
 }
 
 mlx_gen::impl_generator!(QwenImage {
-    validate: |s, req| validate_request(&s.descriptor.capabilities, req),
+    validate: |s, req| validate_request(s.descriptor.id, &s.descriptor.capabilities, req),
     generate: generate_impl,
 });
 
@@ -432,23 +432,17 @@ impl QwenImage {
 }
 
 /// Capability-driven request validation, factored out for unit testing without loaded weights.
-pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> Result<()> {
-    if req.count == 0 || req.count > caps.max_count {
-        return Err(Error::Msg(format!(
-            "count {} out of range 1..={}",
-            req.count, caps.max_count
-        )));
-    }
-    if req.width < caps.min_size
-        || req.height < caps.min_size
-        || req.width > caps.max_size
-        || req.height > caps.max_size
-    {
-        return Err(Error::Msg(format!(
-            "{}x{} out of supported range {}..={}",
-            req.width, req.height, caps.min_size, caps.max_size
-        )));
-    }
+pub(crate) fn validate_request(
+    id: &str,
+    caps: &Capabilities,
+    req: &GenerationRequest,
+) -> Result<()> {
+    // The shared capability floor (F-101): count, steps==0 + the F-004 ceiling, size range,
+    // negative/guidance/true_cfg support gating + the F-053/F-001 finiteness guard, and — the checks
+    // qwen's hand-rolled validator missed — sampler/scheduler/guidance_method membership (an unknown
+    // scheduler silently fell back to the native schedule; guidance_method was silently ignored) and
+    // non-finite guidance/true_cfg (NaN rendered garbage). `?` keeps the typed `Unsupported` for gaps.
+    caps.validate_request(id, req)?;
     // Qwen-Image latents pack 2×2; sizes must be a multiple of 16 per side (VAE/8 then patch/2).
     if !req.width.is_multiple_of(16) || !req.height.is_multiple_of(16) {
         return Err(Error::Msg(format!(
@@ -456,29 +450,11 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             req.width, req.height
         )));
     }
-    for c in &req.conditioning {
-        let kind = c.kind();
-        if !caps.accepts(kind) {
-            return Err(Error::Msg(format!(
-                "qwen_image (T2I) does not accept {kind:?} conditioning"
-            )));
-        }
-    }
-    // Reject an unsupported sampler rather than silently downgrading it. An unset sampler is the
-    // production flow-match path; only the advertised names (`lightning`) are accepted.
-    if let Some(s) = &req.sampler {
-        if !caps.samplers.contains(&s.as_str()) {
-            return Err(Error::Msg(format!(
-                "qwen_image: unsupported sampler {s:?} (supported: {:?}, or unset for the \
-                 production flow-match path)",
-                caps.samplers
-            )));
-        }
-    }
     // The production flow-match schedule needs >= 2 steps: at 1 step `qwen_sigmas`' terminal-sigma
     // rescale divides by zero (`scale == 0`) and produces a `[NaN, 0.0]` schedule that silently
-    // renders garbage (F-113). Lightning's distilled few-step recipe is unaffected, so only guard the
-    // production path; an unset `steps` uses the safe `DEFAULT_STEPS`.
+    // renders garbage (F-113). The floor already rejects an explicit `0`; this catches the production
+    // `1` (lightning's distilled few-step recipe is unaffected, so only guard the production path; an
+    // unset `steps` uses the safe `DEFAULT_STEPS`).
     let is_lightning = req.sampler.as_deref() == Some(LIGHTNING_SAMPLER);
     if !is_lightning {
         if let Some(steps) = req.steps {
@@ -576,28 +552,28 @@ mod tests {
             prompt: "a fox".into(),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
         // The advertised `lightning` sampler is accepted.
         let req = GenerationRequest {
             prompt: "a fox".into(),
             sampler: Some(LIGHTNING_SAMPLER.into()),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
         // A curated sampler (epic 7114) is now accepted — `lcm`/`dpmpp_2m`/… select that integrator.
         let req = GenerationRequest {
             prompt: "a fox".into(),
             sampler: Some("dpmpp_2m".into()),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
         // A name outside the menu is still rejected, not silently downgraded.
         let req = GenerationRequest {
             prompt: "a fox".into(),
             sampler: Some("nonsense".into()),
             ..Default::default()
         };
-        let err = validate_request(&caps, &req)
+        let err = validate_request(MODEL_ID, &caps, &req)
             .expect_err("expected an error")
             .to_string();
         assert!(err.contains("unsupported sampler"), "got: {err}");
@@ -613,14 +589,18 @@ mod tests {
             steps,
             ..Default::default()
         };
-        for s in [Some(0), Some(1)] {
-            let err = validate_request(&caps, &prod(s))
-                .expect_err("expected an error")
-                .to_string();
-            assert!(err.contains("steps must be >= 2"), "steps {s:?} got: {err}");
-        }
-        assert!(validate_request(&caps, &prod(Some(2))).is_ok());
-        assert!(validate_request(&caps, &prod(None)).is_ok());
+        // An explicit `0` is rejected by the shared floor ("steps must be >= 1"); the production `1`
+        // is caught by qwen's own >= 2 guard. Both are rejected — that is the contract.
+        let err0 = validate_request(MODEL_ID, &caps, &prod(Some(0)))
+            .expect_err("steps 0 must be rejected")
+            .to_string();
+        assert!(err0.contains("steps must be >= 1"), "steps 0 got: {err0}");
+        let err1 = validate_request(MODEL_ID, &caps, &prod(Some(1)))
+            .expect_err("production steps 1 must be rejected")
+            .to_string();
+        assert!(err1.contains("steps must be >= 2"), "steps 1 got: {err1}");
+        assert!(validate_request(MODEL_ID, &caps, &prod(Some(2))).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &prod(None)).is_ok());
         // Lightning at 1 step is fine (distilled few-step recipe).
         let lightning = GenerationRequest {
             prompt: "a fox".into(),
@@ -628,7 +608,7 @@ mod tests {
             sampler: Some(LIGHTNING_SAMPLER.into()),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &lightning).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &lightning).is_ok());
     }
 
     #[test]
@@ -640,14 +620,14 @@ mod tests {
             height: 64,
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
         // non-multiple-of-16 size.
         let req = GenerationRequest {
             width: 1000,
             height: 1024,
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
         // T2I accepts no conditioning.
         let req = GenerationRequest {
             conditioning: vec![Conditioning::Depth {
@@ -655,7 +635,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_err());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_err());
         // guidance + negative prompt + valid size passes.
         let req = GenerationRequest {
             prompt: "a fox".into(),
@@ -663,7 +643,7 @@ mod tests {
             guidance: Some(4.0),
             ..Default::default()
         };
-        assert!(validate_request(&caps, &req).is_ok());
+        assert!(validate_request(MODEL_ID, &caps, &req).is_ok());
     }
 
     #[test]

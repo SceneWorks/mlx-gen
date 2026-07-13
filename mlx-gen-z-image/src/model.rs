@@ -451,7 +451,10 @@ pub(crate) fn validate_request(
     caps.validate_request(id, req)?;
 
     // Z-Image-specific checks layered on top of the shared floor:
-    if req.prompt.is_empty() {
+    // F-096: reject a whitespace-only prompt too (`"   "` renders an effectively unconditioned image),
+    // not just the empty string — the boogu F-146 `trim()` fix that didn't travel back to the crate the
+    // empty-prompt class originated from.
+    if req.prompt.trim().is_empty() {
         return Err(mlx_gen::Error::Msg(format!(
             "{id}: prompt must not be empty"
         )));
@@ -496,6 +499,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("empty"), "got: {err}");
+
+        // F-096: a whitespace-only prompt is also rejected (it would otherwise render an effectively
+        // unconditioned image) — the boogu `trim()` fix travelling back to z-image.
+        let ws = GenerationRequest {
+            prompt: "   \t\n".into(),
+            ..Default::default()
+        };
+        let err = validate_request(MODEL_ID, &caps, &ws)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("empty"), "whitespace-only prompt got: {err}");
     }
 
     #[test]

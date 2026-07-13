@@ -545,6 +545,7 @@ mod tests {
             modality: Modality::Image,
             supports_lora: true,
             supports_lokr: false,
+            supports_control: false,
         }
     }
 
@@ -604,6 +605,7 @@ mod tests {
             modality: Modality::Image,
             supports_lora: true,
             supports_lokr: false,
+            supports_control: false,
         }
     }
 
@@ -615,6 +617,7 @@ mod tests {
             modality: Modality::Image,
             supports_lora: true,
             supports_lokr: false,
+            supports_control: false,
         }
     }
 

@@ -105,7 +105,11 @@ pub trait ControlBranch: crate::Generator {
         for c in &req.conditioning {
             if let Conditioning::Control { image, kind, scale } = c {
                 if !accepted.accepts(kind) {
-                    return Err(Error::Msg(self.unsupported_kind_message(kind)));
+                    // Capability gap (this branch supports only certain control kinds) → typed
+                    // `Unsupported` so the worker / candle gating distinguishes it from a malformed
+                    // request (F-002 / F-008); the "single control image" / "missing control" branches
+                    // below are request-shape errors and stay `Msg`.
+                    return Err(Error::Unsupported(self.unsupported_kind_message(kind)));
                 }
                 if found.is_some() {
                     return Err(Error::Msg(format!(
@@ -323,15 +327,19 @@ mod tests {
         let (_, scale) = s.resolve_control(&r).unwrap();
         assert_eq!(scale, 0.7);
 
-        // wrong kind rejected
+        // wrong kind rejected — a capability gap, so it must be typed `Unsupported` (F-002).
         let r = req_with(vec![Conditioning::Control {
             image: img(),
             kind: ControlKind::Canny,
             scale: Some(1.0),
         }]);
-        assert!(s.resolve_control(&r).is_err());
+        let err = s.resolve_control(&r).unwrap_err();
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "an unadmitted control kind is a capability gap → Unsupported, got {err:?}"
+        );
 
-        // duplicate rejected
+        // duplicate rejected — a request-shape error, so it stays `Msg`.
         let r = req_with(vec![
             Conditioning::Control {
                 image: img(),
@@ -344,8 +352,11 @@ mod tests {
                 scale: Some(1.0),
             },
         ]);
-        let err = s.resolve_control(&r).unwrap_err().to_string();
-        assert!(err.contains("single control image"), "got: {err}");
+        let err = s.resolve_control(&r).unwrap_err();
+        assert!(
+            matches!(&err, Error::Msg(_)) && err.to_string().contains("single control image"),
+            "got: {err:?}"
+        );
 
         // missing rejected
         let any = stub(AcceptedControlKinds::Any);

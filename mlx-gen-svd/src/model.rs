@@ -202,6 +202,25 @@ fn validate_output_params(req: &GenerationRequest) -> Result<()> {
             ));
         }
     }
+    // F-160: the SVD float micro-conditioning knobs bake directly into `added_time_ids`; a NaN/±Inf
+    // poisons the VAE image latent and every frame decodes to garbage-as-success (the F-053 class at a
+    // provider-specific knob). Require both finite, and `noise_aug_strength >= 0` (it scales added
+    // Gaussian noise). Finiteness is also enforced centrally by the shared floor, but the checks here
+    // keep `validate_output_params` self-contained/unit-testable without a loaded model.
+    if let Some(m) = req.motion_bucket_id {
+        if !m.is_finite() {
+            return Err(Error::Msg(format!(
+                "svd_xt: motion_bucket_id must be finite (got {m})"
+            )));
+        }
+    }
+    if let Some(n) = req.noise_aug_strength {
+        if !n.is_finite() || n < 0.0 {
+            return Err(Error::Msg(format!(
+                "svd_xt: noise_aug_strength must be finite and >= 0 (got {n})"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -557,6 +576,34 @@ mod tests {
         assert!(validate_output_params(&req(512, 512, Some(0), None)).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(MAX_STEPS + 1))).is_err());
         assert!(validate_output_params(&req(512, 512, None, Some(0))).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_micro_conditioning() {
+        // F-160: `motion_bucket_id` / `noise_aug_strength` bake into `added_time_ids`; a NaN/±Inf
+        // poisons the image latent and every frame decodes to garbage-as-success. Reject non-finite
+        // (and negative `noise_aug_strength`).
+        let mk = |m: Option<f32>, n: Option<f32>| GenerationRequest {
+            width: 512,
+            height: 512,
+            motion_bucket_id: m,
+            noise_aug_strength: n,
+            ..Default::default()
+        };
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let e = validate_output_params(&mk(Some(bad), None))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("motion_bucket_id"), "motion {bad} got: {e}");
+            let e = validate_output_params(&mk(None, Some(bad)))
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("noise_aug_strength"), "noise {bad} got: {e}");
+        }
+        // A negative noise_aug_strength is also rejected.
+        assert!(validate_output_params(&mk(None, Some(-0.1))).is_err());
+        // Finite, in-range values pass.
+        assert!(validate_output_params(&mk(Some(127.0), Some(0.02))).is_ok());
     }
 
     #[test]

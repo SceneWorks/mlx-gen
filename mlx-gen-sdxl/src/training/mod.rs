@@ -200,6 +200,8 @@ fn trainer_descriptor() -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        // LoRA/LoKr only — no control-branch training path (F-006).
+        supports_control: false,
     }
 }
 
@@ -241,6 +243,9 @@ impl Trainer for SdxlTrainer {
     }
 
     fn validate(&self, req: &TrainingRequest) -> gen_core::Result<()> {
+        // Shared control-training floor (F-006): a LoRA-only trainer must reject a control-branch
+        // request (typed `Unsupported`) rather than silently training a plain adapter.
+        gen_core::train::validate_control_request(self.descriptor(), req)?;
         if req.items.is_empty() {
             return Err("sdxl trainer: dataset is empty".into());
         }

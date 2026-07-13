@@ -909,6 +909,36 @@ pub(crate) fn validate_request(caps: &Capabilities, req: &GenerationRequest) -> 
             )));
         }
     }
+    // F-054: range-validate every conditioning strength to [0, 1]. `strength > 1` → a negative denoise
+    // mask (`1 − strength`) → negative per-token σ timesteps and extrapolating blends (silent garbage,
+    // every stage "succeeds"); `< 0` (or NaN — `contains` is false for NaN) is likewise degenerate.
+    // `apply_replacement_mask` clamps a local copy but the same value flows unclamped as the clip
+    // strength, so reject it at the request boundary. The top-level img2img `strength` is also covered
+    // by the shared floor's finiteness guard; the range check here is LTX-specific.
+    let check_strength = |label: &str, s: f32| -> Result<()> {
+        if !(0.0..=1.0).contains(&s) {
+            return Err(Error::Msg(format!(
+                "ltx_2_3: {label} strength must be in [0, 1] (got {s})"
+            )));
+        }
+        Ok(())
+    };
+    if let Some(s) = req.strength {
+        check_strength("img2img", s)?;
+    }
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference {
+                strength: Some(s), ..
+            } => check_strength("reference", *s)?,
+            Conditioning::Keyframe { strength, .. } => check_strength("keyframe", *strength)?,
+            Conditioning::VideoClip { strength, .. } => check_strength("video clip", *strength)?,
+            Conditioning::ControlClip {
+                masking_strength, ..
+            } => check_strength("control clip masking", *masking_strength)?,
+            _ => {}
+        }
+    }
     Ok(())
 }
 

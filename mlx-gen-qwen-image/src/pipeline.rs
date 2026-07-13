@@ -110,7 +110,12 @@ pub fn resolve_run_params(req: &GenerationRequest, width: u32, height: u32) -> R
     RunParams {
         is_lightning,
         steps,
-        guidance: req.guidance.unwrap_or(DEFAULT_GUIDANCE),
+        // Qwen's CFG scale is real classifier-free guidance (an uncond/negative branch runs — see
+        // `negative_or_fallback`), so `true_cfg` and `guidance` name the same knob here. The three
+        // descriptors advertise `supports_true_cfg`, so honor a caller-supplied `true_cfg`, falling
+        // back to `guidance`, then the default — instead of silently dropping `true_cfg` (F-103). The
+        // default path (both unset → `DEFAULT_GUIDANCE`) is unchanged.
+        guidance: req.true_cfg.or(req.guidance).unwrap_or(DEFAULT_GUIDANCE),
         base_seed: req.seed.unwrap_or_else(default_seed),
         sampler_name: req.sampler.clone(),
         sigmas,

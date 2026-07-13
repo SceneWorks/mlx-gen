@@ -56,6 +56,7 @@ fn stub_desc(id: &'static str) -> TrainerDescriptor {
         modality: Modality::Image,
         supports_lora: true,
         supports_lokr: true,
+        supports_control: false,
     }
 }
 
@@ -91,6 +92,8 @@ impl Trainer for StubTrainer {
         if !self.behavior.honest_validate {
             return Ok(());
         }
+        // Route through the shared control-training floor (F-006), like a real family trainer.
+        gen_core::train::validate_control_request(&self.desc, req)?;
         if req.items.is_empty() {
             return Err(Error::Msg("stub trainer: dataset is empty".to_owned()));
         }

@@ -267,6 +267,114 @@ pub struct ControlClipRef<'a> {
 }
 
 impl GenerationRequest {
+    /// The first request-supplied `Option<f32>` knob that is **non-finite** (NaN / ±Inf), returned as
+    /// `(field, value)` — or `None` when every present float is finite. This is the single home of the
+    /// finiteness floor (F-053 / F-001): a NaN/Inf on *any* float knob flows into the guidance /
+    /// scheduler / conditioning math and silently poisons the whole denoise (garbage-as-success, no
+    /// error), so it must be rejected at the contract boundary.
+    ///
+    /// The exhaustive destructuring below (no `..`) is deliberate and load-bearing: adding a field to
+    /// [`GenerationRequest`] fails to compile *here*, forcing the author to decide whether the new knob
+    /// is a float that must join the guard. New `Option<f32>` fields therefore inherit the finiteness
+    /// check **by construction** instead of silently slipping past it — the recurring "the floor lags
+    /// the request surface" regression this method exists to close.
+    pub fn first_nonfinite_float(&self) -> Option<(&'static str, f32)> {
+        let Self {
+            // Non-float fields: explicitly ignored, but named (no `..`) so a newly-added field breaks
+            // the build here and the author must classify it.
+            prompt: _,
+            negative_prompt: _,
+            width: _,
+            height: _,
+            count: _,
+            seed: _,
+            steps: _,
+            timestep_to_start_cfg: _,
+            sampler: _,
+            scheduler: _,
+            guidance_method: _,
+            conditioning,
+            frames: _,
+            fps: _,
+            video_mode: _,
+            trim_first_frames: _,
+            decode_chunk_size: _,
+            conditioning_fps: _,
+            enhance_prompt: _,
+            use_uncensored_enhancer: _,
+            enhance_max_tokens: _,
+            use_pid: _,
+            cancel: _,
+            // Every `Option<f32>` knob the floor owns.
+            guidance,
+            true_cfg,
+            scheduler_shift,
+            guidance_eta,
+            guidance_momentum,
+            guidance_norm_threshold,
+            strength,
+            control_scale,
+            image_guidance,
+            duration,
+            motion_bucket_id,
+            noise_aug_strength,
+            softness,
+            enhance_temperature,
+            pid_capture_sigma,
+        } = self;
+        let floats: [(&'static str, Option<f32>); 15] = [
+            ("guidance", *guidance),
+            ("true_cfg", *true_cfg),
+            ("scheduler_shift", *scheduler_shift),
+            ("guidance_eta", *guidance_eta),
+            ("guidance_momentum", *guidance_momentum),
+            ("guidance_norm_threshold", *guidance_norm_threshold),
+            ("strength", *strength),
+            ("control_scale", *control_scale),
+            ("image_guidance", *image_guidance),
+            ("duration", *duration),
+            ("motion_bucket_id", *motion_bucket_id),
+            ("noise_aug_strength", *noise_aug_strength),
+            ("softness", *softness),
+            ("enhance_temperature", *enhance_temperature),
+            ("pid_capture_sigma", *pid_capture_sigma),
+        ];
+        for (name, v) in floats {
+            if let Some(x) = v {
+                if !x.is_finite() {
+                    return Some((name, x));
+                }
+            }
+        }
+        // Conditioning-carried floats the floor also owns (F-001): the Control-branch scale and the
+        // per-Reference img2img strength both flow into the same denoise/scheduler math.
+        for c in conditioning {
+            match c {
+                Conditioning::Control { scale: Some(s), .. } if !s.is_finite() => {
+                    return Some(("conditioning.control.scale", *s));
+                }
+                Conditioning::Reference {
+                    strength: Some(s), ..
+                } if !s.is_finite() => {
+                    return Some(("conditioning.reference.strength", *s));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Reject the request when any `Option<f32>` knob is non-finite (see
+    /// [`first_nonfinite_float`](Self::first_nonfinite_float)). The shared home of the F-053 / F-001
+    /// finiteness floor: [`Capabilities::validate_request`] calls it, and providers with a bespoke
+    /// `validate` (e.g. flux1's IP-Adapter carve-out) call it directly so they inherit the guard too.
+    pub fn ensure_finite_floats(&self) -> Result<()> {
+        if let Some((field, value)) = self.first_nonfinite_float() {
+            return Err(Error::Msg(format!("{field} must be finite (got {value})")));
+        }
+        Ok(())
+    }
+
     /// All [`Conditioning::Keyframe`] inputs (first_last_frame / multi-keyframe), in request order.
     pub fn keyframes(&self) -> Vec<KeyframeRef<'_>> {
         self.conditioning
@@ -523,6 +631,16 @@ pub struct Capabilities {
     pub supports_sequential_offload: bool,
 }
 
+/// Generous upper sanity caps for the unbounded counter knobs (F-004). Not model limits — each model
+/// layers a tighter, better-messaged bound in its own `validate` (e.g. kolors caps `steps` at its
+/// train-timestep count); these sit ABOVE any real model bound so they only reject a pathological
+/// value (`u32::MAX` steps/frames) that would otherwise launch an effectively-unbounded, cancel-only
+/// run — never preempting a model's own check.
+const MAX_STEPS: u32 = 100_000;
+const MAX_FRAMES: u32 = 1_000_000;
+const MAX_FPS: u32 = 100_000;
+const MAX_DURATION_SECS: f32 = 1_000_000.0;
+
 impl Capabilities {
     /// Whether this model accepts the given conditioning kind.
     pub fn accepts(&self, kind: ConditioningKind) -> bool {
@@ -579,6 +697,42 @@ impl Capabilities {
                 "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
             )));
         }
+        // Upper sanity caps (F-004): the floor enforced `steps >= 1` but no ceiling, so
+        // `steps: Some(u32::MAX)` (and the video frame/counter fields) validated and launched an
+        // effectively-unbounded, cancel-only-recoverable run. These are deliberately generous — far
+        // above any real request (LTX's frame ceiling is 1025, the priciest image trajectories ~50–100
+        // steps) — a footgun guard against a pathological/garbage value, not a model-specific limit
+        // (each model layers its own tighter bound in its `validate`).
+        if let Some(steps) = req.steps {
+            if steps > MAX_STEPS {
+                return Err(Error::Msg(format!(
+                    "{id}: steps {steps} exceeds the sanity cap {MAX_STEPS}"
+                )));
+            }
+        }
+        if let Some(frames) = req.frames {
+            if frames > MAX_FRAMES {
+                return Err(Error::Msg(format!(
+                    "{id}: frames {frames} exceeds the sanity cap {MAX_FRAMES}"
+                )));
+            }
+        }
+        if let Some(fps) = req.fps {
+            if fps > MAX_FPS {
+                return Err(Error::Msg(format!(
+                    "{id}: fps {fps} exceeds the sanity cap {MAX_FPS}"
+                )));
+            }
+        }
+        if let Some(d) = req.duration {
+            // `d` is finiteness-checked below; here only the upper bound (a NaN compares false and is
+            // caught by `ensure_finite_floats`).
+            if d > MAX_DURATION_SECS {
+                return Err(Error::Msg(format!(
+                    "{id}: duration {d}s exceeds the sanity cap {MAX_DURATION_SECS}s"
+                )));
+            }
+        }
         if req.width < self.min_size
             || req.height < self.min_size
             || req.width > self.max_size
@@ -604,22 +758,12 @@ impl Capabilities {
                 "{id}: true_cfg is not supported"
             )));
         }
-        // A non-finite guidance / true_cfg would flow into the CFG combine and NaN-poison the run
-        // (a NaN passes `x > 1.0`-style checks silently); reject it at the boundary (F-053).
-        if let Some(g) = req.guidance {
-            if !g.is_finite() {
-                return Err(Error::Msg(format!(
-                    "{id}: guidance must be finite (got {g})"
-                )));
-            }
-        }
-        if let Some(c) = req.true_cfg {
-            if !c.is_finite() {
-                return Err(Error::Msg(format!(
-                    "{id}: true_cfg must be finite (got {c})"
-                )));
-            }
-        }
+        // A non-finite guidance / true_cfg / eta / momentum / strength / control_scale / … would flow
+        // into the CFG combine, scheduler shift, or conditioning math and NaN-poison the run (a NaN
+        // passes `x > 1.0`-style checks silently). The finiteness guard is centralized on the request
+        // so every `Option<f32>` knob — including ones added after F-053 — inherits it by construction
+        // (F-053 / F-001). `id`-prefixing is dropped from the message here; the field name is enough.
+        req.ensure_finite_floats()?;
         if let Some(s) = &req.sampler {
             if !self.samplers.contains(&s.as_str()) {
                 return Err(Error::Unsupported(format!(
@@ -869,6 +1013,157 @@ mod tests {
                 "m",
                 &GenerationRequest {
                     steps: Some(1),
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn non_finite_extended_float_knobs_are_rejected() {
+        // F-001: the finiteness floor now covers every `Option<f32>` knob added after F-053, not just
+        // guidance/true_cfg. A guidance-capable caps so the support gate never fires; each knob is
+        // exercised with NaN/±Inf and must produce a typed `Msg` naming the field.
+        let c = Capabilities {
+            supports_guidance: true,
+            supports_true_cfg: true,
+            conditioning: vec![ConditioningKind::Reference, ConditioningKind::Control],
+            ..caps()
+        };
+        type Build = fn(f32) -> GenerationRequest;
+        let mk: [(&str, Build); 12] = [
+            ("guidance_eta", |v| GenerationRequest {
+                guidance_eta: Some(v),
+                ..base_req()
+            }),
+            ("guidance_momentum", |v| GenerationRequest {
+                guidance_momentum: Some(v),
+                ..base_req()
+            }),
+            ("guidance_norm_threshold", |v| GenerationRequest {
+                guidance_norm_threshold: Some(v),
+                ..base_req()
+            }),
+            ("strength", |v| GenerationRequest {
+                strength: Some(v),
+                ..base_req()
+            }),
+            ("control_scale", |v| GenerationRequest {
+                control_scale: Some(v),
+                ..base_req()
+            }),
+            ("image_guidance", |v| GenerationRequest {
+                image_guidance: Some(v),
+                ..base_req()
+            }),
+            ("scheduler_shift", |v| GenerationRequest {
+                scheduler_shift: Some(v),
+                ..base_req()
+            }),
+            ("motion_bucket_id", |v| GenerationRequest {
+                motion_bucket_id: Some(v),
+                ..base_req()
+            }),
+            ("noise_aug_strength", |v| GenerationRequest {
+                noise_aug_strength: Some(v),
+                ..base_req()
+            }),
+            ("softness", |v| GenerationRequest {
+                softness: Some(v),
+                ..base_req()
+            }),
+            ("enhance_temperature", |v| GenerationRequest {
+                enhance_temperature: Some(v),
+                ..base_req()
+            }),
+            ("pid_capture_sigma", |v| GenerationRequest {
+                pid_capture_sigma: Some(v),
+                ..base_req()
+            }),
+        ];
+        for (field, build) in mk {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let req = build(bad);
+                let err = c.validate_request("m", &req).unwrap_err();
+                assert!(matches!(err, Error::Msg(_)), "{field} {bad} → Msg");
+                assert!(
+                    err.to_string().contains(field) && err.to_string().contains("must be finite"),
+                    "{field} {bad}: got {err}"
+                );
+            }
+        }
+        // The Control-branch scale carried inside a conditioning entry is guarded too (F-001).
+        let ctrl = GenerationRequest {
+            conditioning: vec![Conditioning::Control {
+                image: img(8, 8),
+                kind: ControlKind::Pose,
+                scale: Some(f32::NAN),
+            }],
+            ..base_req()
+        };
+        let err = c.validate_request("m", &ctrl).unwrap_err();
+        assert!(
+            err.to_string().contains("conditioning.control.scale"),
+            "got {err}"
+        );
+        // A fully-finite request across the extended knobs still passes.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    guidance_eta: Some(1.0),
+                    guidance_momentum: Some(0.0),
+                    strength: Some(0.6),
+                    control_scale: Some(1.0),
+                    ..base_req()
+                }
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn oversized_counters_hit_the_sanity_cap() {
+        // F-004: the floor now rejects a pathological `steps` / video-counter value that would launch
+        // an effectively-unbounded run. Model-realistic values still pass.
+        let c = Capabilities {
+            max_size: 4096,
+            ..caps()
+        };
+        let steps = GenerationRequest {
+            steps: Some(u32::MAX),
+            ..base_req()
+        };
+        assert!(
+            c.validate_request("m", &steps)
+                .unwrap_err()
+                .to_string()
+                .contains("steps"),
+            "u32::MAX steps must be capped"
+        );
+        let frames = GenerationRequest {
+            frames: Some(u32::MAX),
+            ..base_req()
+        };
+        assert!(
+            c.validate_request("m", &frames).is_err(),
+            "u32::MAX frames capped"
+        );
+        let fps = GenerationRequest {
+            fps: Some(u32::MAX),
+            ..base_req()
+        };
+        assert!(
+            c.validate_request("m", &fps).is_err(),
+            "u32::MAX fps capped"
+        );
+        // Realistic values pass.
+        assert!(c
+            .validate_request(
+                "m",
+                &GenerationRequest {
+                    steps: Some(50),
+                    frames: Some(121),
+                    fps: Some(24),
                     ..base_req()
                 }
             )

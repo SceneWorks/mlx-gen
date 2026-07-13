@@ -334,7 +334,7 @@ impl QwenImageControl {
     fn validate_impl(&self, req: &GenerationRequest) -> Result<()> {
         // Shared capability floor, then the shared control-present check (sc-8241's
         // `ControlBranch::require_control_present`, which uses Qwen's "(pose skeleton)" message).
-        validate_request(&self.descriptor.capabilities, req)?;
+        validate_request(self.descriptor.id, &self.descriptor.capabilities, req)?;
         self.require_control_present(req)?;
         Ok(())
     }
