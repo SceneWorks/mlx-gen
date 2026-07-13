@@ -27,6 +27,40 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// The env var if set, else a default resolved from the local HF cache (F-080: no hardcoded personal
+/// `/Users/...` paths). See [`hf_snapshot`].
+fn env_or_hf(key: &str, repo: &str, rel: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| hf_snapshot(repo, rel))
+}
+
+/// Resolve `rel` inside a snapshot of the HF-cache repo `repo`, derived from `$HF_HOME` (or
+/// `$HOME/.cache/huggingface`) rather than a baked-in personal path. Best-effort: if the repo isn't
+/// cached the constructed path simply won't exist and the caller's load errors clearly. HF keeps one
+/// snapshot dir per revision; a fresh pull has exactly one, so any dir is the right one for a smoke.
+fn hf_snapshot(repo: &str, rel: &str) -> String {
+    let snapshots = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface")
+        })
+        .join("hub")
+        .join(repo)
+        .join("snapshots");
+    let snap = std::fs::read_dir(&snapshots)
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+        })
+        .unwrap_or_else(|| snapshots.join("<snapshot>"));
+    if rel.is_empty() {
+        snap.to_string_lossy().into_owned()
+    } else {
+        snap.join(rel).to_string_lossy().into_owned()
+    }
+}
+
 fn load_rgb(path: &str) -> Image {
     let img = image::open(path)
         .unwrap_or_else(|e| panic!("open source image {path}: {e}"))
@@ -54,21 +88,24 @@ fn main() {
     // DiT + the SAME dense Qwen3-VL vision tower Raw carries, so grounding works identically).
     let variant = env_or("KREA_EDIT_VARIANT", "raw");
     let turbo = variant.eq_ignore_ascii_case("turbo");
-    let snapshot = env_or(
-        "KREA_SNAPSHOT",
-        if turbo {
-            "/Users/michael/.cache/huggingface/hub/models--SceneWorks--krea-2-turbo-mlx/snapshots/d009674080cc1bccf2b629d834c34bf5eccdb723/bf16"
-        } else {
-            "/Users/michael/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494"
-        },
-    );
-    let lora = env_or(
+    let snapshot = if turbo {
+        env_or_hf(
+            "KREA_SNAPSHOT",
+            "models--SceneWorks--krea-2-turbo-mlx",
+            "bf16",
+        )
+    } else {
+        env_or_hf("KREA_SNAPSHOT", "models--krea--Krea-2-Raw", "")
+    };
+    let lora = env_or_hf(
         "KREA_EDIT_LORA",
-        "/Users/michael/.cache/huggingface/hub/models--conradlocke--krea2-identity-edit/snapshots/8f3856364fcee7db52116f72558fce0c233eaac4/krea2_identity_edit_v1_1_r128.safetensors",
+        "models--conradlocke--krea2-identity-edit",
+        "krea2_identity_edit_v1_1_r128.safetensors",
     );
-    let source = env_or(
+    let source = env_or_hf(
         "KREA_EDIT_SOURCE",
-        "/Users/michael/.cache/huggingface/hub/models--conradlocke--krea2-identity-edit/snapshots/8f3856364fcee7db52116f72558fce0c233eaac4/showcase/release_1.png",
+        "models--conradlocke--krea2-identity-edit",
+        "showcase/release_1.png",
     );
     let instruction = env_or(
         "KREA_EDIT_INSTRUCTION",

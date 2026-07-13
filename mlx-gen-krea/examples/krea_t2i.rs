@@ -15,6 +15,39 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// The env var if set, else a default resolved from the local HF cache (F-080: no hardcoded personal
+/// `/Users/...` paths). See [`hf_snapshot`].
+fn env_or_hf(key: &str, repo: &str, rel: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| hf_snapshot(repo, rel))
+}
+
+/// Resolve `rel` inside a snapshot of the HF-cache repo `repo`, derived from `$HF_HOME` (or
+/// `$HOME/.cache/huggingface`) rather than a baked-in personal path. Best-effort: if the repo isn't
+/// cached the constructed path simply won't exist and the caller's load errors clearly.
+fn hf_snapshot(repo: &str, rel: &str) -> String {
+    let snapshots = std::env::var_os("HF_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache/huggingface")
+        })
+        .join("hub")
+        .join(repo)
+        .join("snapshots");
+    let snap = std::fs::read_dir(&snapshots)
+        .ok()
+        .and_then(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+        })
+        .unwrap_or_else(|| snapshots.join("<snapshot>"));
+    if rel.is_empty() {
+        snap.to_string_lossy().into_owned()
+    } else {
+        snap.join(rel).to_string_lossy().into_owned()
+    }
+}
+
 fn save_png(img: &Image, path: &str) {
     let buf: image::RgbImage =
         image::ImageBuffer::from_raw(img.width, img.height, img.pixels.clone())
@@ -24,10 +57,7 @@ fn save_png(img: &Image, path: &str) {
 }
 
 fn main() {
-    let snapshot = env_or(
-        "KREA_SNAPSHOT",
-        "/Users/michael/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494",
-    );
+    let snapshot = env_or_hf("KREA_SNAPSHOT", "models--krea--Krea-2-Raw", "");
     let prompt = env_or(
         "KREA_T2I_PROMPT",
         "a photorealistic head-and-shoulders studio portrait of a woman with wavy auburn hair, green \

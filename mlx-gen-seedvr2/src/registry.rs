@@ -130,6 +130,20 @@ mlx_gen::impl_generator!(Seedvr2Generator {
     generate: generate_impl,
 });
 
+/// F-161: the video-upscale branch returns exactly one clip regardless of `req.count`, while the
+/// image branch honors `count` with per-count seeds. Reject `count > 1` on the video path typed
+/// rather than silently dropping the extra requested outputs. Free-standing so the policy is
+/// unit-testable without a loaded pipeline (`validate_impl` delegates here).
+fn reject_video_multi_count(id: &str, has_video: bool, count: u32) -> Result<()> {
+    if has_video && count > 1 {
+        return Err(Error::Unsupported(format!(
+            "{id}: video upscale produces a single clip — count > 1 (got {count}) is not supported \
+             on the video path (it applies to image upscale only)"
+        )));
+    }
+    Ok(())
+}
+
 /// The LR input image carried by the request's `Reference` conditioning.
 fn reference_image(req: &GenerationRequest) -> Option<&Image> {
     req.conditioning.iter().find_map(|c| match c {
@@ -151,6 +165,10 @@ impl Seedvr2Generator {
                 self.descriptor.id
             )));
         }
+        // F-161: `max_count` is advertised and the image branch honors it (per-count seeds), but the
+        // video branch returns exactly one upscaled clip regardless of `count`. Reject `count > 1` on
+        // the video path as a typed error rather than silently dropping the requested extra outputs.
+        reject_video_multi_count(self.descriptor.id, has_video, req.count)?;
         if !req.width.is_multiple_of(VAE_SCALE) || !req.height.is_multiple_of(VAE_SCALE) {
             return Err(Error::Msg(format!(
                 "{}: width/height must be multiples of {VAE_SCALE} (got {}x{})",
@@ -318,5 +336,20 @@ mod tests {
             "the non-empty second clip must be selected"
         );
         assert_eq!(selected.unwrap().len(), 1);
+    }
+
+    /// F-161: `count > 1` on the video path is a typed Unsupported (the video branch returns exactly
+    /// one clip); on the image path (`has_video == false`) count is honored, so it must NOT reject.
+    #[test]
+    fn video_count_gt_one_is_rejected_typed() {
+        // Video path, count > 1 → typed Unsupported.
+        assert!(matches!(
+            reject_video_multi_count(MODEL_ID, true, 4),
+            Err(Error::Unsupported(_))
+        ));
+        // Video path, count == 1 → ok.
+        assert!(reject_video_multi_count(MODEL_ID, true, 1).is_ok());
+        // Image path (no video), any count → ok (the image branch honors count).
+        assert!(reject_video_multi_count(MODEL_ID, false, 8).is_ok());
     }
 }

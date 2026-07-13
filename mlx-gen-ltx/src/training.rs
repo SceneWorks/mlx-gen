@@ -1477,6 +1477,35 @@ mod validate_request_tests {
         r.config.optimizer = "sgd".into();
         assert!(validate_request(&r).is_err()); // unsupported optimizer
     }
+
+    /// F-055: the LTX trainer has no control branch (`TrainerDescriptor::supports_control == false`),
+    /// so a request carrying the sc-10163 control-training fields (`control_type` / a per-item
+    /// `control_image_path`) must be REJECTED typed (via the shared `validate_control_request` floor
+    /// the trainer's `Trainer::validate` calls) rather than silently training a plain LoRA and
+    /// reporting success. This locks the crate-level wiring, not just gen-core's generic floor test.
+    #[test]
+    fn control_training_fields_rejected_typed() {
+        use super::trainer_descriptor;
+        use mlx_gen::gen_core;
+
+        let desc = trainer_descriptor();
+        assert!(
+            !desc.supports_control,
+            "the LTX trainer must not advertise control-branch training"
+        );
+        // A plain (no control) request passes the control floor.
+        assert!(gen_core::train::validate_control_request(&desc, &request(1)).is_ok());
+        // `control_type` set on a trainer that doesn't support control ⇒ typed Unsupported.
+        let mut r = request(1);
+        r.config.control_type = Some("pose".into());
+        assert!(
+            matches!(
+                gen_core::train::validate_control_request(&desc, &r),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "control_type on the LTX (LoRA-only) trainer must be a typed Unsupported"
+        );
+    }
 }
 
 #[cfg(test)]

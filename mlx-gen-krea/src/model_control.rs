@@ -131,6 +131,16 @@ fn validate_control_spec(spec: &LoadSpec) -> Result<()> {
     }
     let _ = require_base_dir(spec, KREA_2_TURBO_CONTROL_ID, "a base snapshot directory")?;
     let _ = require_control(spec, KREA_2_TURBO_CONTROL_ID, "Krea 2 pose control overlay")?;
+    // F-070: the pose-control lane carries no PiD overlay (the seam is intentionally NOT wired — see the
+    // module doc). A `spec.pid` load must surface as a typed error, not sit silently inert, so the
+    // load-spec field can't be dead-on-arrival while `req.use_pid` (rejected in `validate`) is honored
+    // elsewhere. Mirrors the base krea lane's fail-loud posture rather than a silent no-op.
+    if spec.pid.is_some() {
+        return Err(Error::Unsupported(format!(
+            "{KREA_2_TURBO_CONTROL_ID}: a PiD decode overlay (LoadSpec::pid) is not wired on the \
+             pose-control lane; drop it (use the base krea lanes for PiD super-resolution)"
+        )));
+    }
     Ok(())
 }
 
@@ -285,6 +295,16 @@ impl Generator for KreaTurboControl {
         // control-present check (a `Conditioning::Control` must be present).
         crate::model::validate_request(&self.descriptor, req)?;
         self.require_control_present(req)?;
+        // F-070: PiD is intentionally NOT wired on the pose-control lane. `req.use_pid` must surface as
+        // a typed error naming the deferral (the base krea lanes fail loud too) rather than quietly
+        // decoding through the native VAE — a silent super-resolution downgrade the caller can't detect.
+        if req.use_pid {
+            return Err(Error::Unsupported(format!(
+                "{KREA_2_TURBO_CONTROL_ID}: use_pid is not wired on the pose-control lane; PiD \
+                 super-resolution is available on the base krea lanes only"
+            ))
+            .into());
+        }
         Ok(())
     }
 
@@ -446,6 +466,68 @@ mod tests {
                 && !msg.contains("pose control overlay")
                 && !msg.contains("quantization is not supported"),
             "expected an eager-load failure, got an up-front guard: {msg}"
+        );
+    }
+
+    // ── F-070: PiD is intentionally NOT wired on the pose-control lane, so an advertised-but-inert
+    // knob must fail LOUD (typed) rather than silently downgrade.
+
+    #[test]
+    fn load_rejects_spec_pid_typed() {
+        // A `LoadSpec::pid` on the control lane is a typed `Unsupported` at load, not a silent no-op —
+        // the load-spec field must never be dead-on-arrival.
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent-krea".into()))
+            .with_control(WeightsSource::File("/tmp/control.safetensors".into()))
+            .with_pid(
+                WeightsSource::File("/tmp/pid.safetensors".into()),
+                WeightsSource::Dir("/tmp/gemma".into()),
+            );
+        let err = load(&spec).err().expect("expected an error");
+        assert!(
+            matches!(gen_core::Error::from(err), gen_core::Error::Unsupported(_)),
+            "spec.pid on the pose-control lane must be a typed Unsupported"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_use_pid_typed() {
+        // `req.use_pid` on the control lane is a typed `Unsupported` at validate — the base krea lanes
+        // fail loud too; a silent native-VAE decode would be an undetectable super-resolution downgrade.
+        let ctrl = KreaTurboControl {
+            descriptor: descriptor(),
+            // A Sequential residency defers all loads, so we can build the generator weight-free.
+            residency: build_control_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+                .expect("Sequential defers loads"),
+        };
+        let pose = Conditioning::Control {
+            image: mlx_gen::media::Image {
+                width: 512,
+                height: 512,
+                pixels: vec![0u8; 512 * 512 * 3],
+            },
+            kind: ControlKind::Pose,
+            scale: Some(0.6),
+        };
+        let mut req = GenerationRequest {
+            prompt: "a pose".into(),
+            width: 512,
+            height: 512,
+            conditioning: vec![pose],
+            ..Default::default()
+        };
+        req.use_pid = true;
+        assert!(
+            matches!(
+                Generator::validate(&ctrl, &req),
+                Err(gen_core::Error::Unsupported(_))
+            ),
+            "req.use_pid on the pose-control lane must be a typed Unsupported"
+        );
+        // Sanity: the same request WITHOUT use_pid passes the control validate floor.
+        req.use_pid = false;
+        assert!(
+            Generator::validate(&ctrl, &req).is_ok(),
+            "a control request without use_pid must validate"
         );
     }
 }

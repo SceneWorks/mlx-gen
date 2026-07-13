@@ -17,11 +17,11 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
-    WeightsSource,
+    Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant,
+    ReplacementMode, WeightsSource,
 };
 // Referencing the crate forces the linker to include its `inventory::submit!` registration.
-use mlx_gen_scail2::pipeline::MODEL_ID;
+use mlx_gen_scail2::pipeline::{descriptor, MODEL_ID};
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("SCAIL2_SNAPSHOT_DIR")
@@ -94,6 +94,39 @@ fn missing_reference_errors() {
     assert!(
         msg.contains("Reference"),
         "expected a Reference-required error, got: {msg}"
+    );
+}
+
+#[test]
+fn multi_reference_is_not_advertised_and_is_rejected_typed() {
+    // F-159: SCAIL-2's `run()` never reads extra-character (`MultiReference`) conditioning
+    // (`additional` is hardcoded empty — the multi-reference contract awaits sc-5583). Advertising it
+    // let a multi-character job validate, render, and return success with the extras silently dropped.
+    // (1) The descriptor must NOT advertise MultiReference.
+    let caps = descriptor().capabilities;
+    assert!(
+        !caps
+            .conditioning
+            .contains(&ConditioningKind::MultiReference),
+        "MultiReference must not be advertised until sc-5583 wires it through"
+    );
+    // (2) With it off the surface, the shared floor rejects a MultiReference request typed (F-158
+    // self-validate ensures this fires before any weight touch).
+    let req = GenerationRequest {
+        prompt: "two people".into(),
+        width: 256,
+        height: 256,
+        conditioning: vec![Conditioning::MultiReference {
+            images: vec![gradient(32, 32, 0), gradient(32, 32, 1)],
+        }],
+        ..Default::default()
+    };
+    assert!(
+        matches!(
+            caps.validate_request(MODEL_ID, &req),
+            Err(mlx_gen::gen_core::Error::Unsupported(_))
+        ),
+        "a MultiReference request must be a typed Unsupported now that it is unadvertised"
     );
 }
 

@@ -48,13 +48,18 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
-            // characters (MultiReference, experimental); the driving video + its per-frame color masks
-            // map to ControlClip.
+            // Reference character image (Reference) + its color-coded segmentation mask (Mask); the
+            // driving video + its per-frame color masks map to ControlClip.
+            //
+            // F-159: `MultiReference` (extra characters) is NOT advertised. `run()` never reads it
+            // (`additional` is hardcoded empty — the multi-reference request contract awaits sc-5583),
+            // so advertising it let a multi-character job validate, render, and return success with the
+            // extra characters silently dropped. With it off the surface, the shared self-validate floor
+            // (F-158) now rejects a `MultiReference` request typed. Re-add it only when sc-5583 wires the
+            // extra-character conditioning through to `crate::CharacterRef`.
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
-                ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
             // Inference LoRA (the Bias-Aware DPO refinement LoRA + a lightx2v step-distill lightning
