@@ -85,7 +85,7 @@ pub use gen_core::sampling::{
 pub use generator::{
     default_seed, Capabilities, Conditioning, ConditioningKind, ControlClipRef, ControlKind,
     GenerationOutput, GenerationRequest, Generator, KeyframeRef, Modality, ModelDescriptor,
-    ReplacementMode, VideoBundle, VideoClipRef,
+    ReplacementMode, VideoClipRef,
 };
 pub use media::{AudioTrack, Image};
 pub use registry::{

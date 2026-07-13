@@ -152,11 +152,6 @@ fn output_bytes(out: &GenerationOutput) -> Vec<u8> {
             .iter()
             .flat_map(|f| f.pixels.iter().copied())
             .collect(),
-        GenerationOutput::Videos(clips) => clips
-            .iter()
-            .flat_map(|c| c.frames.iter())
-            .flat_map(|f| f.pixels.iter().copied())
-            .collect(),
     }
 }
 

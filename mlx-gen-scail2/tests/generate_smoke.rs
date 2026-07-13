@@ -17,11 +17,11 @@
 use std::path::PathBuf;
 
 use mlx_gen::{
-    Conditioning, ConditioningKind, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant,
-    ReplacementMode, WeightsSource,
+    Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Quant, ReplacementMode,
+    WeightsSource,
 };
 // Referencing the crate forces the linker to include its `inventory::submit!` registration.
-use mlx_gen_scail2::pipeline::{descriptor, MODEL_ID};
+use mlx_gen_scail2::pipeline::MODEL_ID;
 
 fn snapshot_dir() -> PathBuf {
     std::env::var("SCAIL2_SNAPSHOT_DIR")
@@ -94,34 +94,6 @@ fn missing_reference_errors() {
     assert!(
         msg.contains("Reference"),
         "expected a Reference-required error, got: {msg}"
-    );
-}
-
-#[test]
-fn multi_reference_is_advertised_and_accepted() {
-    // F-159: `MultiReference` (extra characters) is advertised and left accepted. Honoring it
-    // end-to-end (wiring the extras through `run()`) is deferred to the multi-reference request
-    // contract (sc-5583); until then the knob is accepted rather than typed-rejected.
-    // (1) The descriptor advertises MultiReference.
-    let caps = descriptor().capabilities;
-    assert!(
-        caps.conditioning
-            .contains(&ConditioningKind::MultiReference),
-        "MultiReference must stay advertised (honoring is deferred to sc-5583, not rejected)"
-    );
-    // (2) A MultiReference request passes the shared capability floor (accepted, not rejected).
-    let req = GenerationRequest {
-        prompt: "two people".into(),
-        width: 256,
-        height: 256,
-        conditioning: vec![Conditioning::MultiReference {
-            images: vec![gradient(32, 32, 0), gradient(32, 32, 1)],
-        }],
-        ..Default::default()
-    };
-    assert!(
-        caps.validate_request(MODEL_ID, &req).is_ok(),
-        "a MultiReference request must be accepted now that it is advertised again"
     );
 }
 

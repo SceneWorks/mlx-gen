@@ -5,9 +5,7 @@
 //! dispatched on the request's conditioning:
 //!   * [`Conditioning::Reference`] — the LR input image → [`GenerationOutput::Images`];
 //!   * [`Conditioning::VideoClip`] — the LR input frame sequence → [`GenerationOutput::Video`]
-//!     (temporal chunking + overlap cross-fade + a memory-budgeted chunk sizer; sc-4814). `count > 1`
-//!     honors per-clip seed variation like the image path, returning [`GenerationOutput::Videos`]
-//!     (one upscaled clip per seed; sc-11131 F-161).
+//!     (temporal chunking + overlap cross-fade + a memory-budgeted chunk sizer; sc-4814).
 //!
 //! `width`/`height` are the target output size (both ÷16). No prompt, no guidance/CFG (1-step), no
 //! LoRA. `spec.weights` is the raw `numz/SeedVR2_comfyUI` checkpoint dir (converted in-memory at
@@ -22,7 +20,7 @@ use mlx_rs::Dtype;
 use mlx_gen::{
     default_seed, Capabilities, Conditioning, ConditioningKind, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    Quant, Result, VideoBundle, WeightsSource,
+    Quant, Result, WeightsSource,
 };
 
 use crate::config::DitConfig;
@@ -132,15 +130,6 @@ mlx_gen::impl_generator!(Seedvr2Generator {
     generate: generate_impl,
 });
 
-/// F-161: the per-index seeds the video-upscale loop uses to honor `req.count` — one upscaled clip
-/// per seed, `base_seed.wrapping_add(i)` for `i in 0..count`, byte-for-byte the scheme the image
-/// branch uses. Free-standing so the loop/seed policy is unit-testable without a loaded pipeline.
-fn video_count_seeds(base_seed: u64, count: u32) -> Vec<u64> {
-    (0..count)
-        .map(|i| base_seed.wrapping_add(i as u64))
-        .collect()
-}
-
 /// The LR input image carried by the request's `Reference` conditioning.
 fn reference_image(req: &GenerationRequest) -> Option<&Image> {
     req.conditioning.iter().find_map(|c| match c {
@@ -186,45 +175,26 @@ impl Seedvr2Generator {
         // take the first clip unconditionally, so `[empty_clip, real_clip]` returned an empty
         // video as success.
         if let Some(clip) = req.video_clips().into_iter().find(|c| !c.frames.is_empty()) {
-            // F-161: honor `req.count` on the video path exactly as the image branch does — one
-            // upscaled clip per seed (`base_seed.wrapping_add(i)`), collected into a `Videos`
-            // output. `count == 1` (the common case) keeps returning the single-clip `Video`
-            // variant so existing consumers are unaffected.
-            let fps = req.fps.unwrap_or(DEFAULT_FPS);
-            let seeds = video_count_seeds(base_seed, req.count);
-            let mut clips = Vec::with_capacity(seeds.len());
-            for seed in seeds {
-                if req.cancel.is_cancelled() {
-                    return Err(Error::Canceled);
-                }
-                // F-099: `generate_video` reports per-chunk `Step{i, n}` progress itself (per-frame on
-                // the fallback paths) — a minutes-long N-chunk run used to surface a single Step{1,1}.
-                let frames = self.pipe.generate_video(
-                    clip.frames,
-                    req.width as i32,
-                    req.height as i32,
-                    seed,
-                    softness,
-                    None,
-                    &req.cancel,
-                    on_progress,
-                )?;
-                on_progress(Progress::Decoding);
-                clips.push(VideoBundle {
-                    frames,
-                    fps,
-                    audio: None,
-                });
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
             }
-            return Ok(if clips.len() == 1 {
-                let only = clips.pop().expect("count >= 1");
-                GenerationOutput::Video {
-                    frames: only.frames,
-                    fps: only.fps,
-                    audio: only.audio,
-                }
-            } else {
-                GenerationOutput::Videos(clips)
+            // F-099: `generate_video` reports per-chunk `Step{i, n}` progress itself (per-frame on
+            // the fallback paths) — a minutes-long N-chunk run used to surface a single Step{1,1}.
+            let frames = self.pipe.generate_video(
+                clip.frames,
+                req.width as i32,
+                req.height as i32,
+                base_seed,
+                softness,
+                None,
+                &req.cancel,
+                on_progress,
+            )?;
+            on_progress(Progress::Decoding);
+            return Ok(GenerationOutput::Video {
+                frames,
+                fps: req.fps.unwrap_or(DEFAULT_FPS),
+                audio: None,
             });
         }
 
@@ -348,72 +318,5 @@ mod tests {
             "the non-empty second clip must be selected"
         );
         assert_eq!(selected.unwrap().len(), 1);
-    }
-
-    /// F-161: the video path HONORS `req.count` (one upscaled clip per seed) instead of rejecting it.
-    /// This pins the per-index seed scheme the video loop uses — byte-for-byte the image branch's
-    /// `base_seed.wrapping_add(i)` (see `generate_impl`), so the two paths vary seeds identically.
-    #[test]
-    fn video_count_seeds_mirror_the_image_branch() {
-        let base = 12_345u64;
-        // count == 1 → exactly the base seed (the single-clip common case).
-        assert_eq!(video_count_seeds(base, 1), vec![base]);
-        // count > 1 → count seeds, each offset by its index (the image branch's exact scheme).
-        assert_eq!(
-            video_count_seeds(base, 4),
-            (0..4).map(|i| base + i).collect::<Vec<_>>()
-        );
-        // The count is honored as-is (no cap/clamp on the loop) — the descriptor's `max_count`
-        // governs the ceiling via the shared validate floor, not the loop.
-        assert_eq!(video_count_seeds(base, 8).len(), 8);
-        // Wrapping matches the image branch (`wrapping_add`) at the u64 boundary.
-        assert_eq!(video_count_seeds(u64::MAX, 2), vec![u64::MAX, 0]);
-    }
-
-    /// F-161: the video path produces `req.count` clips end-to-end. Real-weight coverage (ignored by
-    /// default — needs the SeedVR2 checkpoint + a driving clip); the seed scheme itself is pinned
-    /// weight-free by `video_count_seeds_mirror_the_image_branch`.
-    #[test]
-    #[ignore = "needs the SeedVR2 checkpoint + a driving clip (SEEDVR2_SNAPSHOT_DIR)"]
-    fn video_count_gt_one_yields_count_clips() {
-        let dir = match std::env::var("SEEDVR2_SNAPSHOT_DIR") {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        let spec = LoadSpec {
-            weights: WeightsSource::Dir(dir.into()),
-            quantize: None,
-            precision: Precision::Bf16,
-            control: None,
-            ip_adapter: None,
-            adapters: Vec::new(),
-            extra_controls: Vec::new(),
-            pid: None,
-            identity: None,
-            text_encoder: None,
-            offload_policy: Default::default(),
-        };
-        let gen = load_base(&spec).expect("load seedvr2");
-        let frame = Image {
-            pixels: vec![0u8; 64 * 64 * 3],
-            width: 64,
-            height: 64,
-        };
-        let req = GenerationRequest {
-            width: 128,
-            height: 128,
-            count: 3,
-            conditioning: vec![Conditioning::VideoClip {
-                frames: vec![frame],
-                frame_idx: 0,
-                strength: 0.0,
-            }],
-            ..Default::default()
-        };
-        let out = gen.generate(&req, &mut |_| {}).expect("generate");
-        match out {
-            GenerationOutput::Videos(clips) => assert_eq!(clips.len(), 3, "count clips"),
-            other => panic!("count > 1 on the video path must yield Videos, got {other:?}"),
-        }
     }
 }

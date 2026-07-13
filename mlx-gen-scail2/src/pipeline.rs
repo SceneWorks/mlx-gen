@@ -51,11 +51,6 @@ pub fn descriptor() -> ModelDescriptor {
             // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
             // characters (MultiReference, experimental); the driving video + its per-frame color masks
             // map to ControlClip.
-            //
-            // F-159: `MultiReference` (extra characters) stays advertised. Honoring the extra-character
-            // conditioning end-to-end (wiring it through `run()` — `additional` is currently hardcoded
-            // empty) is tracked as a follow-up under the multi-reference request contract (sc-5583); the
-            // knob is left accepted rather than typed-rejected in the interim.
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
