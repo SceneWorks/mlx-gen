@@ -200,30 +200,39 @@ impl Seedvr2Generator {
 
         let image = reference_image(req).expect("validated");
         let mut out = Vec::with_capacity(req.count as usize);
+        let count = req.count as usize;
         for i in 0..req.count {
-            on_progress(Progress::Step {
-                current: 1,
-                total: 1,
-            });
-            // Honor cancellation at the step boundary — AFTER the progress emit — so a cancel tripped
-            // during this (1-step) upscale returns the typed error before the one-pass `generate`,
-            // which has no inner loop to check (unlike the tiled/video paths). The post-emit position
-            // also catches a cancel that arrives between output images for count > 1 (sc-5551).
+            // Honor a cancel that arrives between output images for count > 1 (sc-5551); the per-tile
+            // and single-pass paths inside `generate_with_progress` check the flag at their own step
+            // boundaries (the tiled loop per tile, the single pass right after its `(1,1)` emit).
             if req.cancel.is_cancelled() {
                 return Err(Error::Canceled);
             }
             let seed = base_seed.wrapping_add(i as u64);
-            let img = self.pipe.generate(
+            // F-162 / F-164 (sc-11133): fold each image's per-tile progress into ONE monotone bar
+            // across the whole count loop. `generate_with_progress` reports `(tile_idx, n_tiles)`
+            // (a lone `(1,1)` on the single-pass path); mapping it to
+            // `current = i·n_tiles + tile_idx`, `total = count·n_tiles` makes both the count axis
+            // (F-162) AND per-tile liveness (F-164) visible without the bar restarting per image or
+            // reporting a bare `Step{1,1}`.
+            let idx = i as usize;
+            let img = self.pipe.generate_with_progress(
                 image,
                 req.width as i32,
                 req.height as i32,
                 seed,
                 softness,
                 &req.cancel,
+                &mut |tile_idx, n_tiles| {
+                    let (current, total) = fold_tile_progress(idx, tile_idx, n_tiles, count);
+                    on_progress(Progress::Step { current, total });
+                },
             )?;
-            on_progress(Progress::Decoding);
             out.push(img);
         }
+        // F-162: emit the terminal decode phase exactly ONCE for the whole batch (the pre-fix code
+        // emitted it per image, violating the Decoding-exactly-once contract).
+        on_progress(Progress::Decoding);
         Ok(GenerationOutput::Images(out))
     }
 }
@@ -247,9 +256,54 @@ mlx_gen::register_generators! {
     descriptor_7b => load_7b,
 }
 
+/// Fold one image's per-tile progress onto the whole-batch bar (F-162 / F-164, sc-11133). Image
+/// `image_idx` (0-based) of `count`, tile `tile_idx` (1-based) of `n_tiles`, maps to an absolute
+/// `(current, total)` where `total = count × n_tiles` and `current = image_idx × n_tiles + tile_idx`
+/// (clamped). A single-pass image reports `n_tiles == 1`, so this reduces to `(image_idx + 1, count)`
+/// — the count axis F-162 wants — while a tiled image contributes per-tile liveness F-164 wants. The
+/// sequence across the loop is monotone non-decreasing and reaches `total` on the final tile.
+fn fold_tile_progress(
+    image_idx: usize,
+    tile_idx: usize,
+    n_tiles: usize,
+    count: usize,
+) -> (u32, u32) {
+    let total = count * n_tiles;
+    let current = (image_idx * n_tiles + tile_idx).min(total);
+    (current as u32, total as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-162 / F-164 (sc-11133): the fold yields one monotone bar reaching `total`, covering both the
+    /// single-pass (`n_tiles == 1` → the count axis) and spatial-tiling (per-tile liveness) shapes.
+    #[test]
+    fn fold_tile_progress_is_monotone_and_reaches_total() {
+        // Single-pass, count = 8: each image is one "tile" → Step{i+1, 8} (the F-162 count axis).
+        let seq: Vec<(u32, u32)> = (0..8).map(|i| fold_tile_progress(i, 1, 1, 8)).collect();
+        assert_eq!(
+            seq,
+            (1..=8).map(|c| (c, 8)).collect::<Vec<_>>(),
+            "single-pass batch must be a monotone 1..=count bar"
+        );
+
+        // count = 2, 3 tiles each: one monotone 1..=6 bar, per-tile liveness within each image.
+        let mut folded = Vec::new();
+        for image_idx in 0..2 {
+            for tile_idx in 1..=3 {
+                folded.push(fold_tile_progress(image_idx, tile_idx, 3, 2));
+            }
+        }
+        assert_eq!(
+            folded,
+            vec![(1, 6), (2, 6), (3, 6), (4, 6), (5, 6), (6, 6)],
+            "tiled multi-image batch must fold to one monotone 1..=6 bar"
+        );
+        // The final tile of the final image reaches total.
+        assert_eq!(folded.last(), Some(&(6, 6)));
+    }
 
     #[test]
     fn descriptor_is_seedvr2() {

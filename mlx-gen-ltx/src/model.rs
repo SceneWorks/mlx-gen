@@ -59,6 +59,7 @@ use crate::gemma::{GemmaConfig, GemmaModel, GemmaQuant};
 use crate::pipeline::{
     decode_audio_track, decode_to_frames, generate_av_latents, generate_av_latents_iclora,
     preprocess_conditioning_clip, preprocess_conditioning_image, StageClip, StageKeyframe,
+    STAGE1_SIGMAS, STAGE2_SIGMAS,
 };
 use crate::positions::{compute_audio_frames, create_audio_position_grid, create_position_grid};
 use crate::text_encoder::LtxTextEncoder;
@@ -131,6 +132,56 @@ const TEMPORAL_SCALE: u32 = 8;
 const MAX_FRAMES: u32 = 1025;
 /// VAE spatial compression (32×); stage-1 additionally halves resolution.
 const SPATIAL_SCALE: u32 = 32;
+/// The folded denoise-step total surfaced as `Progress::Step.total` (F-050): stage-1 (`STAGE1_SIGMAS`,
+/// 8 steps) + stage-2 (`STAGE2_SIGMAS`, 3 steps) of the baked distilled schedule.
+const TOTAL_STEPS: u32 = (STAGE1_SIGMAS.len() + STAGE2_SIGMAS.len() - 2) as u32;
+
+/// Folds the LTX two-stage distilled denoise into one monotone `1..=TOTAL_STEPS` progress bar
+/// (F-050, sc-11133). Each stage forwards a **per-stage** 1-based `current` (the σ-derived value from
+/// `step_gate` on the curated path, or `i+1` on the native path) that restarts at 1 when the next
+/// stage begins; a curated 2nd-order solver (`heun`/`dpmpp_sde`) also forwards the same `current`
+/// twice per step (predictor + corrector). [`observe`](StageProgressFold::observe) maps that raw
+/// stream to an absolute, deduplicated, clamped `current`: it returns `Some(current)` only when the
+/// global bar strictly advances, so the emitted sequence is monotone non-decreasing, reaches `total`,
+/// and never overruns it.
+struct StageProgressFold {
+    total: u32,
+    /// Steps completed in prior stages (added to the current stage's forwarded value).
+    stage_offset: u32,
+    /// The last per-stage value observed (a drop below it signals a new stage).
+    last_fwd: u32,
+    /// The last absolute `current` emitted (dedupe / monotonicity anchor).
+    emitted: u32,
+}
+
+impl StageProgressFold {
+    fn new(total: u32) -> Self {
+        Self {
+            total,
+            stage_offset: 0,
+            last_fwd: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Observe one forwarded per-stage `current`; returns the absolute bar position to emit, or
+    /// `None` if the bar did not advance (a multi-eval repeat).
+    fn observe(&mut self, fwd: u32) -> Option<u32> {
+        if fwd < self.last_fwd {
+            // The forwarded value dropped — the next stage restarted its counter at 1. Fold the
+            // completed stages in so this stage's steps stack on top rather than overwriting.
+            self.stage_offset = self.emitted;
+        }
+        self.last_fwd = fwd;
+        let abs = (self.stage_offset + fwd).min(self.total);
+        if abs > self.emitted {
+            self.emitted = abs;
+            Some(abs)
+        } else {
+            None
+        }
+    }
+}
 /// I2V conditioning strength when neither the `Reference` nor `req.strength` supplies one (reference
 /// CLI `--image-strength` default): `1.0` = full denoise, fully pinning the conditioned frame.
 const DEFAULT_IMAGE_STRENGTH: f32 = 1.0;
@@ -584,13 +635,21 @@ impl Ltx {
             ));
         }
 
-        let mut step = 0usize;
-        let mut on_step = |_: usize| {
-            step += 1;
-            on_progress(Progress::Step {
-                current: step as u32,
-                total: 11,
-            });
+        // F-050 (sc-11133): fold the two-stage (8 + 3 step) distilled schedule into one monotone
+        // `1..=11` bar from the σ-DERIVED `current` each stage forwards — NOT a blind per-call counter.
+        // The curated 2nd-order solvers LTX advertises (`heun`, `dpmpp_sde`) evaluate the model twice
+        // per step, so `on_step` fires twice per step; the old counter reached 22 against `total: 11`
+        // (>100% overrun). `StageProgressFold` detects the per-stage restart, folds prior stages in,
+        // dedupes the multi-eval repeats, and clamps — so the bar stays monotone non-decreasing,
+        // reaches `total`, and never overruns.
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut on_step = |cur: usize| {
+            if let Some(current) = fold.observe(cur as u32) {
+                on_progress(Progress::Step {
+                    current,
+                    total: TOTAL_STEPS,
+                });
+            }
         };
         // extend_clip / video_bridge ride the IC-LoRA keyframe-append path (stage-1 in-context tokens);
         // everything else (T2V / I2V / first_last_frame) is the replace-latent path.
@@ -1044,6 +1103,45 @@ mlx_gen::register_generators! { descriptor => load }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-050 (sc-11133): drive `StageProgressFold` over the exact event stream a curated 2nd-order
+    /// solver produces — each stage's σ-derived `current` forwarded TWICE per step (predictor +
+    /// corrector) — and assert the folded bar is monotone, reaches `TOTAL_STEPS`, and never overruns.
+    /// Before the fix the blind counter reached 22 against `total: 11`.
+    #[test]
+    fn stage_progress_fold_dedupes_multi_eval_and_reaches_total() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        // Stage 1: 8 steps, each forwarded value seen twice (heun predictor+corrector), monotone
+        // per-stage 1..=8. Stage 2: 3 steps, restarts at 1, forwarded 1..=3 twice each.
+        let stage1: Vec<u32> = (1..=8).flat_map(|c| [c, c]).collect();
+        let stage2: Vec<u32> = (1..=3).flat_map(|c| [c, c]).collect();
+        for fwd in stage1.into_iter().chain(stage2) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(
+            emitted,
+            (1..=11).collect::<Vec<_>>(),
+            "the folded bar must be exactly 1..=11 (monotone, complete, no overrun)"
+        );
+    }
+
+    /// The native distilled path forwards `i+1` once per step (no multi-eval); the fold must still
+    /// produce the same clean `1..=11` sequence.
+    #[test]
+    fn stage_progress_fold_handles_single_eval_native_path() {
+        let mut fold = StageProgressFold::new(TOTAL_STEPS);
+        let mut emitted = Vec::new();
+        for fwd in (1..=8).chain(1..=3) {
+            if let Some(cur) = fold.observe(fwd) {
+                emitted.push(cur);
+            }
+        }
+        assert_eq!(emitted, (1..=11).collect::<Vec<_>>());
+        assert_eq!(TOTAL_STEPS, 11);
+    }
 
     #[test]
     fn descriptor_advertises_curated_samplers_no_scheduler() {

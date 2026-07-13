@@ -48,6 +48,12 @@ use mlx_llm::primitives::{KvCache as _, SplitMix64};
 pub struct StepReporter<'a> {
     cancel: &'a CancelFlag,
     on_progress: &'a mut dyn FnMut(Progress),
+    /// Steps completed by prior denoises to fold onto this one's `current` (F-136). `0` for a
+    /// single-image render; `images_so_far × num_steps` for the interleave path.
+    offset: usize,
+    /// When set, overrides the per-denoise `total` with the aggregate grand total so the interleave
+    /// bar is one monotone `1..=(max_images × num_steps)` sweep instead of restarting per image.
+    total_override: Option<usize>,
 }
 
 impl<'a> StepReporter<'a> {
@@ -55,6 +61,25 @@ impl<'a> StepReporter<'a> {
         Self {
             cancel,
             on_progress,
+            offset: 0,
+            total_override: None,
+        }
+    }
+
+    /// A reporter for one image of a multi-image aggregate (F-136, sc-11133): its `current` is
+    /// offset by the steps already completed and its `total` is pinned to the grand total, so a
+    /// sequence of these across the interleave loop yields one monotone, non-restarting bar.
+    pub fn new_folded(
+        cancel: &'a CancelFlag,
+        on_progress: &'a mut dyn FnMut(Progress),
+        offset: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            cancel,
+            on_progress,
+            offset,
+            total_override: Some(total),
         }
     }
 
@@ -72,10 +97,12 @@ impl<'a> StepReporter<'a> {
         self.cancel
     }
 
-    /// Report one completed denoise step (`current` is 1-based).
+    /// Report one completed denoise step (`current` is 1-based). Folds in the aggregate `offset` /
+    /// `total_override` (F-136) so a multi-image run reports one monotone bar rather than restarting.
     fn step(&mut self, current: usize, total: usize) {
+        let total = self.total_override.unwrap_or(total);
         (self.on_progress)(Progress::Step {
-            current: current as u32,
+            current: (self.offset + current).min(total) as u32,
             total: total as u32,
         });
     }
@@ -1285,6 +1312,12 @@ impl T2iModel {
                     opts.seed.wrapping_add(images.len() as u64),
                 )?,
             };
+            // F-136 (sc-11133): fold this image's `1..=num_steps` denoise onto the aggregate bar —
+            // offset by the steps already completed (`images.len() × num_steps`), total pinned to
+            // `max_images × num_steps` — so the interleave path reports one monotone progression
+            // instead of restarting per image.
+            let offset = images.len() * opts.num_steps;
+            let grand_total = max_images * opts.num_steps;
             let traj = self.it2i_denoise(
                 (&mut cache_cond, t_cond + 1),
                 Some((&mut cache_tu, t_tu + 1)),
@@ -1293,7 +1326,12 @@ impl T2iModel {
                 height,
                 &base_noise,
                 opts,
-                Some(StepReporter::new(cancel, on_progress)),
+                Some(StepReporter::new_folded(
+                    cancel,
+                    on_progress,
+                    offset,
+                    grand_total,
+                )),
             )?;
             let image = traj.into_iter().last().expect("at least one step");
 
@@ -1845,6 +1883,37 @@ mod tests {
         assert_eq!(ts, expected);
         assert_eq!(ts.first(), Some(&0.0));
         assert_eq!(ts.last(), Some(&1.0));
+    }
+
+    /// F-136 (sc-11133): a folded `StepReporter` per image produces one monotone, non-restarting bar
+    /// across the interleave loop — `current` offset by prior steps, `total` pinned to the grand total.
+    #[test]
+    fn folded_step_reporter_aggregates_across_images() {
+        let cancel = CancelFlag::default();
+        let mut events: Vec<(u32, u32)> = Vec::new();
+        let num_steps = 3usize;
+        let max_images = 2usize;
+        let grand_total = max_images * num_steps;
+        {
+            let mut sink = |p: Progress| {
+                if let Progress::Step { current, total } = p {
+                    events.push((current, total));
+                }
+            };
+            // Simulate the interleave loop: one folded reporter per image, driving `num_steps` steps.
+            for image_idx in 0..max_images {
+                let offset = image_idx * num_steps;
+                let mut r = StepReporter::new_folded(&cancel, &mut sink, offset, grand_total);
+                for i in 0..num_steps {
+                    r.step(i + 1, num_steps);
+                }
+            }
+        }
+        assert_eq!(
+            events,
+            vec![(1, 6), (2, 6), (3, 6), (4, 6), (5, 6), (6, 6)],
+            "the aggregate bar must be monotone 1..=6 with a constant total, not two restarting 1..=3 runs"
+        );
     }
 
     #[test]

@@ -338,6 +338,13 @@ impl LensGenerator {
                         .resolve_sigmas(latent_h, latent_w, steps, req.scheduler.as_deref());
                 let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
                 let keep = (keep < sigmas.len()).then_some(keep);
+                // F-030 (sc-11133): the PiD `from_ldm` early-stop truncates the descending schedule to
+                // `keep` σ nodes, so `render` (→ `run_curated_sampler`) runs and reports exactly
+                // `sigmas[..keep].len() - 1 == keep - 1` steps — NOT the requested `steps`. Deriving the
+                // emitted `total` from `keep` keeps the bar monotone AND lets it reach its total, so the
+                // `cur >= total` Decoding trigger below fires on the shortened schedule (without this the
+                // job froze at `(keep-1)/steps` and the 4×-SR decode was invisible).
+                let effective_total = effective_step_total(keep, total);
                 let pid_decoder = resolve_pid_decoder_at_sigma(
                     heavy.pid,
                     req,
@@ -371,12 +378,13 @@ impl LensGenerator {
                         &mut |cur| {
                             on_progress(Progress::Step {
                                 current: cur as u32,
-                                total,
+                                total: effective_total,
                             });
                             // F-106: `render` decodes immediately after the final step (it exposes only a step
                             // callback, not a Progress sink), so emit `Decoding` when the last step lands —
-                            // BEFORE the VAE/PiD decode.
-                            if cur as u32 >= total {
+                            // BEFORE the VAE/PiD decode. F-030: gate on `effective_total` so the truncated
+                            // early-stop schedule still trips it exactly once.
+                            if cur as u32 >= effective_total {
                                 on_progress(Progress::Decoding);
                             }
                         },
@@ -386,6 +394,19 @@ impl LensGenerator {
                 Ok(GenerationOutput::Images(images))
             },
         )
+    }
+}
+
+/// The number of denoise steps the sampler actually runs — and therefore the `Progress::Step.total`
+/// and the `Decoding` trigger (F-030, sc-11133). With no PiD early-stop (`keep == None`) it is the
+/// requested `steps`; under a `from_ldm` early-stop that truncates the schedule to `keep` σ nodes,
+/// `run_curated_sampler` reports exactly `sigmas[..keep].len() - 1 == keep - 1` steps, so the bar
+/// must be sized to that (never below 1) or it freezes below its stale `steps` total and never trips
+/// `Decoding`.
+fn effective_step_total(keep: Option<usize>, steps: u32) -> u32 {
+    match keep {
+        Some(k) => (k.saturating_sub(1) as u32).max(1),
+        None => steps,
     }
 }
 
@@ -433,6 +454,19 @@ mlx_gen::register_generators! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-030 (sc-11133): the emitted `total` tracks the (possibly truncated) schedule so the bar
+    /// reaches its total and the `cur >= total` Decoding trigger fires. Full schedule → `steps`;
+    /// PiD early-stop (`keep` σ nodes) → `keep - 1`; degenerate `keep` floors at 1 (never 0).
+    #[test]
+    fn effective_step_total_tracks_pid_early_stop() {
+        assert_eq!(effective_step_total(None, 20), 20, "full schedule = steps");
+        // keep=13 σ nodes → 12 steps run and reported (not the requested 20).
+        assert_eq!(effective_step_total(Some(13), 20), 12);
+        // Degenerate: keep=1 (or 0) must still leave a 1-step bar the Decoding trigger can reach.
+        assert_eq!(effective_step_total(Some(1), 20), 1);
+        assert_eq!(effective_step_total(Some(0), 20), 1);
+    }
 
     #[test]
     fn descriptors_are_lens() {

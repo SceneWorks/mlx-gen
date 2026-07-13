@@ -305,6 +305,96 @@ pub fn check_progress_with(
     Ok(())
 }
 
+/// **Progress contract (the whole-class property, sc-11133 / F-030/F-050/F-136/F-162/F-164).** The
+/// structural invariant every `generate` must satisfy, checked over the *ordered* event stream rather
+/// than just the `Step` values [`check_progress`] inspects:
+///
+/// 1. **Monotone, in-bounds `Step`.** `Step.current` is non-decreasing and never exceeds `Step.total`
+///    (no >100% overrun — the F-050 multi-eval-sampler class), and `Step.total` is constant.
+/// 2. **Reaches `total`.** The final `Step.current` equals `Step.total` — the bar is never frozen
+///    below completion (the F-030 PiD-early-stop class where a truncated schedule never reaches its
+///    advertised total).
+/// 3. **`Decoding` exactly once.** The terminal `Progress::Decoding` phase is emitted once — not zero
+///    times (frozen through the longest stage — F-030) and not once-per-output (the restarting-bar
+///    class — F-136/F-162).
+///
+/// This is deliberately *laxer than* [`check_progress`] on the `Step` axis (non-decreasing with
+/// repeats allowed, rather than exactly `1..=total`) so it fits multi-stage / folded-bar pipelines,
+/// while adding the `Decoding`-cardinality guarantee [`check_progress`] does not express. Providers
+/// that fold N outputs into one bar (`total = N × steps`) satisfy it; providers that restart the bar
+/// per output, overrun it, or skip `Decoding` fail it. Use [`check_progress_contract_with`] for the
+/// image→video / super-resolution / renderer families whose `generate` needs a request the text-only
+/// [`base_request`] cannot express.
+pub fn check_progress_contract(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    check_progress_contract_with(g, &base_request(profile))
+}
+
+/// **Progress contract (request-supplied).** The general form of [`check_progress_contract`] for
+/// providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// (image→video, super-resolution, the renderer families) — the same shape as
+/// [`check_cancellation_with`]. Asserts the same three invariants: monotone in-bounds `Step`, the bar
+/// reaches `total`, and `Progress::Decoding` is emitted exactly once.
+pub fn check_progress_contract_with(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+) -> Result<(), String> {
+    let id = g.descriptor().id;
+    let mut steps: Vec<(u32, u32)> = Vec::new();
+    let mut decoding_count = 0u32;
+    g.generate(req, &mut |p| match p {
+        Progress::Step { current, total } => steps.push((current, total)),
+        Progress::Decoding => decoding_count += 1,
+        Progress::Loading(_) => {}
+    })
+    .map_err(|e| format!("progress-contract[{id}]: generate() failed on the cheap request: {e}"))?;
+
+    if steps.is_empty() {
+        return Err(format!(
+            "progress-contract[{id}]: generate() emitted no Progress::Step events"
+        ));
+    }
+    let total = steps[0].1;
+    if total == 0 {
+        return Err(format!(
+            "progress-contract[{id}]: Progress::Step.total was 0"
+        ));
+    }
+    let mut prev = 0u32;
+    for &(current, t) in &steps {
+        if t != total {
+            return Err(format!(
+                "progress-contract[{id}]: Step.total changed mid-run ({total} then {t} at current={current})"
+            ));
+        }
+        if current > total {
+            return Err(format!(
+                "progress-contract[{id}]: Step.current {current} exceeds total {total} (>100% overrun — \
+                 a multi-eval sampler or wrapped counter must clamp/derive current so it never overruns; F-050)"
+            ));
+        }
+        if current < prev {
+            return Err(format!(
+                "progress-contract[{id}]: Step.current must be monotone non-decreasing; saw {prev} then {current}"
+            ));
+        }
+        prev = current;
+    }
+    if prev != total {
+        return Err(format!(
+            "progress-contract[{id}]: Step.current reached {prev} but total is {total} — the bar must reach \
+             its total by completion (a truncated/early-stopped schedule must report the effective total, not \
+             a stale one; F-030)"
+        ));
+    }
+    if decoding_count != 1 {
+        return Err(format!(
+            "progress-contract[{id}]: Progress::Decoding was emitted {decoding_count} times, expected exactly 1 \
+             (zero = the decode stage is invisible/frozen; >1 = the bar restarts per output — F-030/F-136/F-162)"
+        ));
+    }
+    Ok(())
+}
+
 /// **Cancellation.** Tripping `CancelFlag` at the first step boundary makes `generate` return the
 /// **typed** `Err(Error::Canceled)` (not a stringified `Msg`) within a bounded number of further
 /// steps (≤ 2), and produces no partial output.
@@ -504,9 +594,10 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 5] = [
+    let checks: [Check; 6] = [
         check_validate_honesty,
         check_progress,
+        check_progress_contract,
         check_cancellation,
         check_precancellation,
         check_seed_determinism,

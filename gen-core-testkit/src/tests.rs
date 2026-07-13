@@ -24,6 +24,13 @@ struct Behavior {
     honest_validate: bool,
     /// Emits a `Progress::Step` per denoise iteration.
     emit_progress: bool,
+    /// Number of `Progress::Decoding` events emitted after the step loop (contract requires exactly 1).
+    decoding_events: u32,
+    /// Emit `Step.current` up to `2*total` — the F-050 multi-eval-sampler overrun (>100%).
+    overrun_steps: bool,
+    /// Stop emitting `Step` at `total - 1` while still advertising `total` — the F-030 frozen-below-total
+    /// (PiD early-stop) shape.
+    freeze_below_total: bool,
     /// Checks `CancelFlag` at each step boundary and bails.
     honor_cancel: bool,
     /// On cancel, returns the typed `Error::Canceled` (vs. a stringified `Error::Msg`).
@@ -37,6 +44,9 @@ impl Behavior {
         Self {
             honest_validate: true,
             emit_progress: true,
+            decoding_events: 1,
+            overrun_steps: false,
+            freeze_below_total: false,
             honor_cancel: true,
             typed_cancel: true,
             deterministic: true,
@@ -109,7 +119,16 @@ impl Generator for Stub {
         let total = req.steps.unwrap_or(2);
         let run = self.runs.get();
         self.runs.set(run + 1);
-        for i in 1..=total {
+        // How many Step events actually get emitted: `total` (good), `2*total` (F-050 overrun),
+        // or `total - 1` (F-030 frozen below its advertised total).
+        let emit_max = if self.behavior.overrun_steps {
+            total.saturating_mul(2)
+        } else if self.behavior.freeze_below_total {
+            total.saturating_sub(1)
+        } else {
+            total
+        };
+        for i in 1..=emit_max {
             if self.behavior.honor_cancel && req.cancel.is_cancelled() {
                 return Err(if self.behavior.typed_cancel {
                     Error::Canceled
@@ -120,6 +139,9 @@ impl Generator for Stub {
             if self.behavior.emit_progress {
                 on_progress(Progress::Step { current: i, total });
             }
+        }
+        for _ in 0..self.behavior.decoding_events {
+            on_progress(Progress::Decoding);
         }
         let fill = if self.behavior.deterministic {
             req.seed.unwrap_or(0) as u8
@@ -161,6 +183,7 @@ fn good_stub_passes_every_check_individually() {
     let g = Stub::new(STUB_ID, Behavior::good());
     check_validate_honesty(&g, &cheap()).unwrap();
     check_progress(&g, &cheap()).unwrap();
+    check_progress_contract(&g, &cheap()).unwrap();
     check_cancellation(&g, &cheap()).unwrap();
     check_precancellation(&g, &cheap()).unwrap();
     check_seed_determinism(&g, &cheap()).unwrap();
@@ -218,6 +241,62 @@ fn missing_progress_fails_progress_check() {
         },
     );
     assert!(check_progress(&g, &cheap()).is_err());
+}
+
+#[test]
+fn overrunning_steps_fail_progress_contract() {
+    // The F-050 class: a multi-eval sampler double-counts and reports current up to 2*total.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            overrun_steps: true,
+            ..Behavior::good()
+        },
+    );
+    let err = check_progress_contract(&g, &cheap()).unwrap_err();
+    assert!(err.contains("exceeds total"), "got: {err}");
+}
+
+#[test]
+fn freezing_below_total_fails_progress_contract() {
+    // The F-030 class: an early-stopped schedule never reaches its advertised total.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            freeze_below_total: true,
+            ..Behavior::good()
+        },
+    );
+    let err = check_progress_contract(&g, &cheap()).unwrap_err();
+    assert!(err.contains("must reach"), "got: {err}");
+}
+
+#[test]
+fn missing_decoding_fails_progress_contract() {
+    // The F-030 class: the decode stage is invisible because Decoding is never emitted.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            decoding_events: 0,
+            ..Behavior::good()
+        },
+    );
+    let err = check_progress_contract(&g, &cheap()).unwrap_err();
+    assert!(err.contains("emitted 0 times"), "got: {err}");
+}
+
+#[test]
+fn repeated_decoding_fails_progress_contract() {
+    // The F-136/F-162 restarting-bar class: Decoding (or the bar) restarts per output.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            decoding_events: 3,
+            ..Behavior::good()
+        },
+    );
+    let err = check_progress_contract(&g, &cheap()).unwrap_err();
+    assert!(err.contains("emitted 3 times"), "got: {err}");
 }
 
 #[test]
