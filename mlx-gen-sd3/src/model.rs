@@ -34,11 +34,13 @@
 //! true-CFG recipe (40 steps / guidance 5.0). The struct keeps the historical `Sd3Large` name; it is
 //! variant-parameterized and serves all three variants.
 
+use std::path::Path;
+
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, resolve_flow_schedule, Conditioning, Error, FlowMatchEuler, GenerationOutput,
-    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, Precision, Progress, Result,
-    WeightsSource,
+    GenerationRequest, Generator, Image, LoadSpec, ModelDescriptor, OffloadPolicy, Precision,
+    Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use mlx_gen_sdxl::tokenizer::ClipBpeTokenizer;
@@ -47,7 +49,7 @@ use mlx_gen_z_image::vae::Vae;
 use crate::config::Sd3Variant;
 use crate::loader;
 use crate::pipeline::{self, SCHEDULE_SHIFT};
-use crate::text::Sd3TextEncoders;
+use crate::text::{Sd3Conditioning, Sd3TextEncoders};
 use crate::transformer::Sd3Transformer;
 
 /// Registry id for SD3.5-Large (matches the SceneWorks worker's `payload.model`).
@@ -89,7 +91,23 @@ pub struct Sd3Large {
     /// Per-encoder CLIP pad ids (sc-9581): CLIP-L pads with eos (49407), bigG with `!` (0).
     clip_pad: crate::loader::Sd3ClipPad,
     t5_tokenizer: TextTokenizer,
-    encoders: Sd3TextEncoders,
+    /// Component-residency strategy (epic 10834; the shared seam sc-11125), selected from
+    /// [`LoadSpec::offload_policy`] at [`load_variant`]. `Resident` (default) holds the triple text
+    /// encoder (CLIP-L + CLIP-G + T5-XXL) + MMDiT + VAE warm for the whole job and across jobs;
+    /// `Sequential` holds only the per-phase loader closures and re-loads each per generation in phase
+    /// order (encode → **drop all three encoders** → denoise/decode), bounding peak unified memory to
+    /// `max(triple-TE, MMDiT+VAE)` instead of the sum — the biggest TE-drop win in the group (T5-XXL is
+    /// large). The [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel
+    /// checks, and the error-safe cache flush once for all providers. The tokenizers stay always-warm
+    /// (cheap) on the struct above.
+    residency: Residency<Sd3TextEncoders, Sd3Heavy>,
+}
+
+/// The heavy render-phase components (everything but the triple text encoder): the MMDiT transformer
+/// and the 16-ch VAE. Owned by the `Resident` components (held for the whole job) or by a `Sequential`
+/// generate (loaded after the encoders are dropped, freed when the job ends). SD3 has no PiD/control
+/// overlay, so the heavy bundle is just the transformer + VAE.
+pub(crate) struct Sd3Heavy {
     transformer: Sd3Transformer,
     vae: Vae,
 }
@@ -136,23 +154,87 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
              promotes internally; drop the precision override)"
         )));
     }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{id} expects a snapshot directory (transformer/ text_encoder{{,_2,_3}}/ \
-                 tokenizer{{,_2,_3}}/ vae/), not a single .safetensors file"
-            )))
+    // Resolve the snapshot dir up front — a fail-fast for BOTH residencies (Sequential defers the
+    // heavy component build to each generate, but a single-file source is still wrong here).
+    let root = resolve_root(spec, id)?;
+    // The tokenizers stay always-warm (cheap) on the struct; the heavy component dispatch is the
+    // shared [`build_residency`] seam. F-181: a `Sequential` + `quantize` load re-quantizes the whole
+    // model on EVERY generate (SD3 quantizes dense at load — there is no packed-detection path), so warn
+    // for that combination (the dense transient also shrinks the memory win).
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(id, q.bits());
         }
-    };
+    }
+    let residency = build_residency(spec, variant)?;
+    Ok(Box::new(Sd3Large {
+        variant,
+        descriptor: variant.descriptor(),
+        clip_tokenizer: loader::load_clip_tokenizer(root)?,
+        clip_pad: loader::load_clip_pad_ids(root),
+        t5_tokenizer: loader::load_t5_tokenizer(root)?,
+        residency,
+    }))
+}
+
+/// The policy→[`Residency`] dispatch every SD3 variant shares (sc-11126, F-180), routed through the
+/// single [`Residency::from_policy`] seam so no variant re-derives the `match offload_policy`.
+/// `Resident` eager-loads the triple text encoder + heavy bundle now (byte-identical to the pre-seam
+/// composition — the same per-phase loaders over independent weight files, deterministic RNG-free
+/// quant/adapter merge); `Sequential` captures the two loader closures and loads nothing now, deferring
+/// each to [`Residency::run`]. SD3 has no PiD overlay, so the heavy loader's `use_pid` flag is ignored.
+/// The deferral is weight-free-testable: under `Sequential` this touches no component weights, so a
+/// dispatch that ignored `offload_policy` would eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    variant: Sd3Variant,
+) -> Result<Residency<Sd3TextEncoders, Sd3Heavy>> {
+    let id = variant.id();
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_text_encoders_component(resolve_root(&spec_text, id)?, spec_text.quantize),
+        move |_use_pid| load_heavy(&spec_heavy, resolve_root(&spec_heavy, id)?, variant),
+    )
+}
+
+/// Resolve the snapshot directory from the load spec, rejecting a single-file source (SD3 needs the
+/// diffusers multi-component tree). Shared by [`load_variant`] and the `Sequential` per-phase loaders.
+fn resolve_root<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{id} expects a snapshot directory (transformer/ text_encoder{{,_2,_3}}/ \
+             tokenizer{{,_2,_3}}/ vae/), not a single .safetensors file"
+        ))),
+    }
+}
+
+/// Load the triple text encoder (CLIP-L + CLIP-G + T5-XXL) — the phase-A component dropped first under
+/// `Sequential`. Optional whole-encoder Q4/Q8 (group_size 64) matches the pre-seam load. Factored out
+/// so the `Resident` and `Sequential` paths build byte-identical encoders (the encoders load from their
+/// own weight files, and quantization is deterministic).
+fn load_text_encoders_component(root: &Path, quant: Option<Quant>) -> Result<Sd3TextEncoders> {
+    let mut encoders = loader::load_text_encoders(root)?;
+    if let Some(q) = quant {
+        encoders.quantize(q.bits())?;
+    }
+    Ok(encoders)
+}
+
+/// Load the heavy render-phase components — the MMDiT transformer (+ Q4/Q8 + LoRA/LoKr residuals) and
+/// the VAE (dense) — everything but the triple text encoder. Factored out so the `Sequential` path can
+/// load these AFTER the encoders are dropped (bounding peak to `max(triple-TE, MMDiT+VAE)`), and the
+/// `Resident` path builds the same bundle up front. The quantize-then-adapters order matches the
+/// pre-seam `load_variant`; the components are independent of the text encoders (separate weight files,
+/// deterministic RNG-free quant/merge), so both residencies are byte-identical.
+fn load_heavy(spec: &LoadSpec, root: &Path, variant: Sd3Variant) -> Result<Sd3Heavy> {
     let arch = variant.arch();
     let mut transformer = loader::load_transformer(root, &arch)?;
-    let mut encoders = loader::load_text_encoders(root)?;
     let vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
-        let bits = q.bits();
-        transformer.quantize(bits)?;
-        encoders.quantize(bits)?;
+        transformer.quantize(q.bits())?;
     }
     // T2 (sc-7883) — apply any trained LoRA/LoKr adapters over the (possibly quantized) base. The
     // base is never fused/mutated, so adapters compose with Q4/Q8 for free. The trainer's PEFT save
@@ -161,16 +243,7 @@ pub fn load_variant(spec: &LoadSpec, variant: Sd3Variant) -> Result<Box<dyn Gene
     if !spec.adapters.is_empty() {
         crate::adapters::apply_sd3_adapters(&mut transformer, &spec.adapters)?;
     }
-    Ok(Box::new(Sd3Large {
-        variant,
-        descriptor: variant.descriptor(),
-        clip_tokenizer: loader::load_clip_tokenizer(root)?,
-        clip_pad: loader::load_clip_pad_ids(root),
-        t5_tokenizer: loader::load_t5_tokenizer(root)?,
-        encoders,
-        transformer,
-        vae,
-    }))
+    Ok(Sd3Heavy { transformer, vae })
 }
 
 mlx_gen::impl_generator!(Sd3Large {
@@ -179,6 +252,10 @@ mlx_gen::impl_generator!(Sd3Large {
 });
 
 impl Sd3Large {
+    /// The rich-`Result` body behind [`Generator::generate`]. The staged residency lifecycle (triple-TE
+    /// encode → **drop the three encoders** under `Sequential` → load the MMDiT/VAE → denoise/decode →
+    /// free the heavy bundle) is driven by the shared [`Residency::run`] seam (sc-11125), which owns the
+    /// eval/drop/clear discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -194,91 +271,122 @@ impl Sd3Large {
         let guidance = req
             .guidance
             .unwrap_or_else(|| self.variant.default_guidance());
-
-        // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
-        // prompt (empty string when unset), used only when CFG is active (guidance != 1.0).
-        let cond = pipeline::encode_prompt(
-            &self.encoders,
-            &self.clip_tokenizer,
-            self.clip_pad,
-            &self.t5_tokenizer,
-            &req.prompt,
-        )?;
         let cfg_on = guidance != 1.0;
-        let uncond = if cfg_on {
-            let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(pipeline::encode_prompt(
-                &self.encoders,
-                &self.clip_tokenizer,
-                self.clip_pad,
-                &self.t5_tokenizer,
-                neg,
-            )?)
-        } else {
-            None
-        };
-
-        // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build once. An
-        // unset req.scheduler keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
-        let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
-        let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
-            req.scheduler.as_deref(),
-            SCHEDULE_SHIFT.ln(),
-            steps,
-            &native.sigmas,
-        ))?;
 
         // img2img (epic 8588 slice A4, sc-10189): a single `Conditioning::Reference` seeds the denoise
         // from the VAE-encoded reference at `strength` (the reference's own strength, else the
         // request-level `strength`, else the 0.5 mid default — the full-range slider default the worker
         // sends). Plain txt2img otherwise. All three variants advertise `Reference` (16-ch VAE encoder
         // is loaded), so this routes for Large/Medium (true-CFG) and the distilled Large-Turbo alike.
+        // Seed-independent; resolved above the residency lifecycle.
         let reference = single_reference(req)?;
         let strength = reference
             .and_then(|(_, s)| s.or(req.strength))
             .unwrap_or(0.5);
-
         let sampler_name = req.sampler.as_deref();
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let latents = if let Some((init, _)) = reference {
-                pipeline::denoise_img2img_cfg(
-                    &self.transformer,
-                    &scheduler,
-                    sampler_name,
-                    seed,
-                    &self.vae,
-                    init,
-                    strength,
-                    req.width,
-                    req.height,
+
+        self.residency.run(
+            &req.cancel,
+            // SD3 has no PiD overlay; the heavy loader ignores `use_pid`.
+            false,
+            on_progress,
+            // ── Phase A: triple-TE conditioning. Seed-independent (no RNG) — cond = the prompt; uncond =
+            // the negative prompt (empty string when unset), used only when CFG is active (guidance !=
+            // 1.0). Under `Sequential` the shared seam LOADS all three encoders, encodes, materializes,
+            // then DROPS them + `clear_cache()` before the MMDiT/VAE load — bounding peak to
+            // `max(triple-TE, MMDiT+VAE)`. Under `Resident` it borrows the warm encoders (byte-identical
+            // to the pre-seam `encode_prompt`).
+            |encoders: &Sd3TextEncoders| {
+                let cond = pipeline::encode_prompt(
+                    encoders,
+                    &self.clip_tokenizer,
+                    self.clip_pad,
+                    &self.t5_tokenizer,
+                    &req.prompt,
+                )?;
+                let uncond = if cfg_on {
+                    let neg = req.negative_prompt.as_deref().unwrap_or("");
+                    Some(pipeline::encode_prompt(
+                        encoders,
+                        &self.clip_tokenizer,
+                        self.clip_pad,
+                        &self.t5_tokenizer,
+                        neg,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+            // Materialize the pooled CLIP embeddings + T5 sequence context (and their uncond twins)
+            // while the encoders are still alive (Sequential only) — MLX is lazy, so an un-evaluated
+            // output keeps all three encoders referenced through the graph and the drop would free
+            // nothing. All of `context`/`pooled` (cond + optional uncond) are forced before the drop.
+            |(cond, uncond): &(Sd3Conditioning, Option<Sd3Conditioning>)| {
+                let mut arrays = vec![&cond.context, &cond.pooled];
+                if let Some(uc) = uncond {
+                    arrays.push(&uc.context);
+                    arrays.push(&uc.pooled);
+                }
+                mlx_rs::transforms::eval(arrays)?;
+                Ok(())
+            },
+            // ── Phase B: denoise/decode from the heavy bundle (MMDiT + VAE). Runs identically for both
+            // residencies. `on_progress` is threaded through the seam (F-179) and shadows the outer sink.
+            |heavy: &Sd3Heavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
+                // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build
+                // once. An unset req.scheduler keeps it byte-exact; a curated name re-shapes σ over the
+                // same mu=ln(3).
+                let native = FlowMatchEuler::for_static_shift(steps, SCHEDULE_SHIFT);
+                let scheduler = FlowMatchEuler::from_sigmas(resolve_flow_schedule(
+                    req.scheduler.as_deref(),
+                    SCHEDULE_SHIFT.ln(),
                     steps,
-                    &cond,
-                    uncond.as_ref(),
-                    guidance,
-                    &req.cancel,
-                    on_progress,
-                )?
-            } else {
-                let latents = pipeline::create_noise(seed, req.width, req.height)?;
-                pipeline::denoise_cfg(
-                    &self.transformer,
-                    &scheduler,
-                    sampler_name,
-                    seed,
-                    latents,
-                    &cond,
-                    uncond.as_ref(),
-                    guidance,
-                    &req.cancel,
-                    on_progress,
-                )?
-            };
-            on_progress(Progress::Decoding);
-            images.push(pipeline::decode_to_image(&self.vae, &latents)?);
-        }
-        Ok(GenerationOutput::Images(images))
+                    &native.sigmas,
+                ))?;
+
+                let mut images = Vec::with_capacity(req.count as usize);
+                for i in 0..req.count {
+                    let seed = base_seed.wrapping_add(i as u64);
+                    let latents = if let Some((init, _)) = reference {
+                        pipeline::denoise_img2img_cfg(
+                            &heavy.transformer,
+                            &scheduler,
+                            sampler_name,
+                            seed,
+                            &heavy.vae,
+                            init,
+                            strength,
+                            req.width,
+                            req.height,
+                            steps,
+                            &cond,
+                            uncond.as_ref(),
+                            guidance,
+                            &req.cancel,
+                            on_progress,
+                        )?
+                    } else {
+                        let latents = pipeline::create_noise(seed, req.width, req.height)?;
+                        pipeline::denoise_cfg(
+                            &heavy.transformer,
+                            &scheduler,
+                            sampler_name,
+                            seed,
+                            latents,
+                            &cond,
+                            uncond.as_ref(),
+                            guidance,
+                            &req.cancel,
+                            on_progress,
+                        )?
+                    };
+                    on_progress(Progress::Decoding);
+                    images.push(pipeline::decode_to_image(&heavy.vae, &latents)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -697,6 +805,62 @@ mod tests {
                 .expect("expected an error")
                 .to_string();
             assert!(!err.contains("quantization"), "got: {err}");
+        }
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that SD3's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* (so the up-front single-file guard
+    // passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the triple text encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The `sequential_residency_real_weights.rs` A/B is
+    // `#[ignore]`d (needs a snapshot); this runs by default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/sd3-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        // The default run covers all three variants share the one dispatch — assert on Large.
+        let res = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Sequential),
+            Sd3Variant::Large,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(OffloadPolicy::Resident),
+            Sd3Variant::Large,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file"),
+            "expected an eager-load failure, not the up-front single-file guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn descriptor_advertises_sequential_offload() {
+        // All three SD3 ids honor the shared Residency seam (the descriptor bit consumers read).
+        for d in [descriptor(), turbo_descriptor(), medium_descriptor()] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "{} must advertise supports_sequential_offload",
+                d.id
+            );
         }
     }
 }
