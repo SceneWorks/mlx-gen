@@ -112,20 +112,12 @@ impl CaptionEncoder {
         Ok((ids, mask))
     }
 
-    /// Encode one caption to `[1, 300, 2304]` caption embeddings.
+    /// Encode one caption to `[1, 300, 2304]` caption embeddings — the mask-free variant PiD's
+    /// inference net uses (it discards the caption padding mask). A strict subset of
+    /// [`Self::encode_with_mask`], so it delegates and drops the mask (F-156) — the select-index policy
+    /// then lives in exactly one place, and PiD vs the SANA consumer cannot drift.
     pub fn encode(&self, caption: &str) -> Result<Array> {
-        let (ids, mask) = self.token_ids(caption)?;
-        let max_len = ids.len() as i32;
-        let ids_arr = Array::from_slice(&ids, &[1, max_len]);
-        let mask_arr = Array::from_slice(&mask, &[1, max_len]);
-        let hidden = self.gemma.forward(&ids_arr, Some(&mask_arr))?; // [1, max_len, 2304]
-
-        // select_index = [0] + range(max_len-(300-1), max_len)
-        let mut sel = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
-        sel.push(0);
-        sel.extend((max_len - (MODEL_MAX_LENGTH - 1))..max_len);
-        let sel_arr = Array::from_slice(&sel, &[MODEL_MAX_LENGTH]);
-        Ok(hidden.take_axis(&sel_arr, 1)?) // [1, 300, 2304]
+        Ok(self.encode_with_mask(caption)?.0)
     }
 
     /// Encode one caption to `([1, 300, 2304]` embeddings, `[1, 300]` padding mask`)`. The mask marks

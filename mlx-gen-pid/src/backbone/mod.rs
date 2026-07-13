@@ -13,7 +13,7 @@ mod blocks;
 mod layers;
 mod rope;
 
-use mlx_rs::ops::add;
+use mlx_rs::ops::{add, split_sections};
 use mlx_rs::Array;
 
 use mlx_gen::nn::silu;
@@ -21,6 +21,7 @@ use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
 use crate::config::PidConfig;
+use crate::memo::{memo, TableCache};
 use blocks::{MMDiTBlockT2I, PiTBlock};
 use layers::{
     fold_patches, unfold_patches, FinalLayer, PatchTokenEmbedder, PixelTokenEmbedder,
@@ -54,15 +55,23 @@ pub struct PixDiT {
     pixel_blocks: Vec<PiTBlock>,
     final_layer: FinalLayer,
     cfg: PidConfig,
+    /// Per-decode caches for the step-invariant RoPE tables (F-153). Keyed on the only inputs that vary
+    /// within a decode — the patch grid `(hs, ws)` for the two 2-D image/pixel RoPE tables and the text
+    /// length `ltxt` for the 1-D text RoPE. head_dim / θ / scale / ref-grid are per-decode config
+    /// constants, so `(hs, ws)` / `ltxt` fully key each table. Image and pixel RoPE use different
+    /// head_dims → separate caches (never collide on the shared `(hs, ws)` key).
+    img_rope_cache: TableCache<(i32, i32), (Array, Array)>,
+    pixel_rope_cache: TableCache<(i32, i32), (Array, Array)>,
+    text_rope_cache: TableCache<i32, (Array, Array)>,
 }
 
-/// Slice the `[B, S, …]` axis-1 prefix `[:, :n]` (no-op when `S == n`).
+/// Slice the `[B, S, …]` axis-1 prefix `[:, :n]` (no-op when `S == n`). A zero-copy strided split at
+/// the fixed `n` boundary, vs. an arange `take_axis` gather (F-152).
 fn prefix_axis1(a: &Array, n: i32) -> Result<Array> {
     if a.shape()[1] == n {
         return Ok(a.clone());
     }
-    let idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
-    Ok(a.take_axis(&idx, 1)?)
+    Ok(split_sections(a, &[n], 1)?.swap_remove(0))
 }
 
 impl PixDiT {
@@ -103,6 +112,9 @@ impl PixDiT {
             pixel_blocks,
             final_layer: FinalLayer::from_weights(w, &format!("{prefix}final_layer"))?,
             cfg: cfg.clone(),
+            img_rope_cache: TableCache::default(),
+            pixel_rope_cache: TableCache::default(),
+            text_rope_cache: TableCache::default(),
         })
     }
 
@@ -151,16 +163,23 @@ impl PixDiT {
         let mut y_emb = add(&y_emb, &y_pos)?;
 
         let condition = silu(&t_emb)?;
-        let (cos_img, sin_img) = rope_2d_ntk(
-            cfg.head_dim(),
-            hs,
-            ws,
-            cfg.rope_ref_grid_h(),
-            cfg.rope_ref_grid_w(),
-            ROPE_THETA,
-            ROPE_SCALE,
-        );
-        let (cos_txt, sin_txt) = rope_1d_text(cfg.head_dim(), ltxt, cfg.text_rope_theta);
+        // Step-invariant RoPE tables — memoized per `(hs, ws)` / `ltxt` so the 4 sampler steps (and
+        // same-sized tiles) reuse one host build + H2D upload instead of rebuilding it each forward
+        // (F-153). Byte-identical: the cache returns the exact `rope_*` output for that key.
+        let (cos_img, sin_img) = memo(&self.img_rope_cache, (hs, ws), || {
+            rope_2d_ntk(
+                cfg.head_dim(),
+                hs,
+                ws,
+                cfg.rope_ref_grid_h(),
+                cfg.rope_ref_grid_w(),
+                ROPE_THETA,
+                ROPE_SCALE,
+            )
+        });
+        let (cos_txt, sin_txt) = memo(&self.text_rope_cache, ltxt, || {
+            rope_1d_text(cfg.head_dim(), ltxt, cfg.text_rope_theta)
+        });
 
         let mut s_main = self.s_embedder.forward(&x_patches)?;
         for (i, blk) in self.patch_blocks.iter().enumerate() {
@@ -177,15 +196,17 @@ impl PixDiT {
         let s_cond = s.reshape(&[b * l, cfg.hidden_size])?;
 
         let mut x_pixels = self.pixel_embedder.forward(x, h, w, patch)?;
-        let (cos_pix, sin_pix) = rope_2d_ntk(
-            cfg.pixel_head_dim(),
-            hs,
-            ws,
-            cfg.rope_ref_grid_h(),
-            cfg.rope_ref_grid_w(),
-            ROPE_THETA,
-            ROPE_SCALE,
-        );
+        let (cos_pix, sin_pix) = memo(&self.pixel_rope_cache, (hs, ws), || {
+            rope_2d_ntk(
+                cfg.pixel_head_dim(),
+                hs,
+                ws,
+                cfg.rope_ref_grid_h(),
+                cfg.rope_ref_grid_w(),
+                ROPE_THETA,
+                ROPE_SCALE,
+            )
+        });
         for blk in &self.pixel_blocks {
             x_pixels = blk.forward(&x_pixels, &s_cond, &cos_pix, &sin_pix, b, l)?;
         }
@@ -198,5 +219,32 @@ impl PixDiT {
             .reshape(&[b, l, p2, c_out])?
             .transpose_axes(&[0, 3, 2, 1])?;
         fold_patches(&xp, c_out, hs, ws, patch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::{abs, max, subtract};
+
+    /// F-152: `prefix_axis1`'s strided split is element-identical to the arange `take_axis` gather it
+    /// replaced (for a true prefix), and a no-op clone when `n == S`.
+    #[test]
+    fn prefix_axis1_matches_take_axis_gather() {
+        let a = Array::from_iter(0..(2 * 6 * 3), &[2, 6, 3])
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        let n = 4;
+        let got = prefix_axis1(&a, n).unwrap();
+        let idx = Array::from_slice(&(0..n).collect::<Vec<i32>>(), &[n]);
+        let want = a.take_axis(&idx, 1).unwrap();
+        assert_eq!(got.shape(), want.shape());
+        let d = max(abs(subtract(&got, &want).unwrap()).unwrap(), None)
+            .unwrap()
+            .item::<f32>();
+        assert_eq!(d, 0.0, "prefix split == gather");
+        // Full-length prefix is the identity.
+        let whole = prefix_axis1(&a, 6).unwrap();
+        assert_eq!(whole.shape(), a.shape());
     }
 }

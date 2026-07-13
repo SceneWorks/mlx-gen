@@ -23,13 +23,17 @@ use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{SampleType, SamplerConfig};
 use crate::lq::PidNet;
-use crate::tiling::forward_tiled;
+use crate::tiling::{forward_tiled, FeatherCache};
 
 /// The distilled few-step sampler.
 pub struct Sampler {
     t_list: Vec<f32>,
     timescale: f32,
     sde: bool,
+    /// Per-decode cache of the tiled path's feather-weight tables (F-153) — deterministic across the
+    /// 4 steps, so each tile shape's feather is built once. Lives here (one `Sampler` per decode) so it
+    /// persists across the per-step `forward_tiled` calls without leaking across generations.
+    feather_cache: FeatherCache,
 }
 
 impl Sampler {
@@ -38,6 +42,7 @@ impl Sampler {
             t_list: cfg.student_t_list.clone(),
             timescale: cfg.fm_timescale,
             sde: cfg.sample_type == SampleType::Sde,
+            feather_cache: FeatherCache::default(),
         }
     }
 
@@ -104,7 +109,17 @@ impl Sampler {
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
         self.run_inner(noise, eps, cancel, |x, t_scaled| {
-            forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
+            forward_tiled(
+                net,
+                x,
+                t_scaled,
+                caption,
+                lq_latent,
+                sigma,
+                tile,
+                overlap,
+                &self.feather_cache,
+            )
         })
     }
 
@@ -161,6 +176,28 @@ impl Sampler {
         Ok(clip(&x, (-1.0, 1.0))?)
     }
 
+    /// Draw the seeded initial noise + per-step ε from MLX's PRNG — the single source of truth for the
+    /// RNG stream both [`Self::sample`] and [`Self::sample_tiled`] consume (F-155). The two production
+    /// entries MUST see byte-for-byte the same draw (the tiled-vs-whole A/B invariant, sc-10087), so the
+    /// key-split order lives here once rather than duplicated verbatim in each. Full-resolution
+    /// `[b, 3, h, w]` regardless of tiling (only the *forward* is tiled), so the sequence is unchanged.
+    fn draw_noise_eps(&self, b: i32, h: i32, w: i32, seed: u64) -> Result<(Array, Vec<Array>)> {
+        let (k_noise, mut k_rest) = random::split(&random::key(seed)?, 2)?;
+        let noise = random::normal::<f32>(&[b, 3, h, w], None, None, Some(&k_noise))?;
+        let mut eps = Vec::with_capacity(self.num_eps());
+        for _ in 0..self.num_eps() {
+            let (k_e, k_n) = random::split(&k_rest, 2)?;
+            eps.push(random::normal::<f32>(
+                &[b, 3, h, w],
+                None,
+                None,
+                Some(&k_e),
+            )?);
+            k_rest = k_n;
+        }
+        Ok((noise, eps))
+    }
+
     /// Production entry: draw the initial noise + per-step ε from MLX's PRNG (seeded), then run the
     /// loop. Returns clamped pixels `[B, 3, H, W]`. `cancel` is threaded into [`Self::run`] (F-006).
     #[allow(clippy::too_many_arguments)]
@@ -176,19 +213,7 @@ impl Sampler {
         seed: u64,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
-        let (k_noise, mut k_rest) = random::split(&random::key(seed)?, 2)?;
-        let noise = random::normal::<f32>(&[b, 3, h, w], None, None, Some(&k_noise))?;
-        let mut eps = Vec::with_capacity(self.num_eps());
-        for _ in 0..self.num_eps() {
-            let (k_e, k_n) = random::split(&k_rest, 2)?;
-            eps.push(random::normal::<f32>(
-                &[b, 3, h, w],
-                None,
-                None,
-                Some(&k_e),
-            )?);
-            k_rest = k_n;
-        }
+        let (noise, eps) = self.draw_noise_eps(b, h, w, seed)?;
         self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)
     }
 
@@ -212,19 +237,7 @@ impl Sampler {
         overlap: i32,
         cancel: Option<&CancelFlag>,
     ) -> Result<Array> {
-        let (k_noise, mut k_rest) = random::split(&random::key(seed)?, 2)?;
-        let noise = random::normal::<f32>(&[b, 3, h, w], None, None, Some(&k_noise))?;
-        let mut eps = Vec::with_capacity(self.num_eps());
-        for _ in 0..self.num_eps() {
-            let (k_e, k_n) = random::split(&k_rest, 2)?;
-            eps.push(random::normal::<f32>(
-                &[b, 3, h, w],
-                None,
-                None,
-                Some(&k_e),
-            )?);
-            k_rest = k_n;
-        }
+        let (noise, eps) = self.draw_noise_eps(b, h, w, seed)?;
         self.run_tiled(
             net, &noise, &eps, caption, lq_latent, sigma, tile, overlap, cancel,
         )

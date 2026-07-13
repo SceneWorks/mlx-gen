@@ -129,21 +129,25 @@ impl Ideogram4Transformer {
     ) -> Result<Array> {
         let sh = x.shape();
         let (b, l) = (sh[0], sh[1]);
-        let prep = self.prepare(position_ids, indicator, b, l)?;
+        let prep = self.prepare(llm_features, position_ids, indicator, b, l)?;
         // The general public path honours a non-trivial `segment_ids` (the DiT parity golden may carry
         // one); pass the built additive mask. When all segments match, this mask is identically zero
         // and `Some(zero)` is numerically identical to `None` (`logit + 0 == logit`).
         let mask = segment_mask(segment_ids, b, l)?;
-        self.forward_prepared(llm_features, x, t, &prep, Some(&mask))
+        self.forward_prepared(x, t, &prep, Some(&mask))
     }
 
-    /// Build the step-invariant conditioning tensors from the packed `position_ids`/`indicator`:
-    /// the MRoPE `(cos, sin)` and the role masks (`llm_mask`, `img_mask`, `img_idx`). None of these
-    /// depend on the noise latent `x` or the timestep `t`, so a denoise loop builds them once per
-    /// guidance branch and reuses them across every step (F-029) — the reference rebuilt them (a host
-    /// sync for the role tensors + a fresh MRoPE `cos/sin`) on every one of the ~96 forwards/image.
+    /// Build the step-invariant conditioning tensors from the packed `llm_features`/`position_ids`/
+    /// `indicator`: the MRoPE `(cos, sin)`, the image role mask, the projected+masked LLM conditioning
+    /// stream, and the image-indicator embedding. None depend on the noise latent `x` or the timestep
+    /// `t`, so a denoise loop builds them once per guidance branch and reuses them across every step
+    /// (F-029 hoisted the masks/MRoPE; F-151 hoists the LLM stream too — the largest step-invariant
+    /// compute: `rms_norm(llm_features)` + the full-sequence `llm_cond_proj` matmul, previously rerun on
+    /// every one of the ~96 forwards/image, including the unconditional branch where the mask is
+    /// identically zero so the whole stream is provably zero).
     pub fn prepare(
         &self,
+        llm_features: &Array,
         position_ids: &Array,
         indicator: &Array,
         b: i32,
@@ -151,12 +155,21 @@ impl Ideogram4Transformer {
     ) -> Result<PreparedConditioning> {
         let (llm_mask, img_mask, img_idx) = role_tensors(indicator, b, l)?;
         let (cos, sin) = self.rotary_emb.forward(position_ids)?;
+        // Step-invariant LLM stream: mask → RMSNorm → projection → mask. Computed once here; the
+        // per-step body then only adds it (same op order as before, so bit-identical).
+        let llm = rms_norm(
+            &multiply(llm_features, &llm_mask)?,
+            &self.llm_cond_norm,
+            1e-6,
+        )?;
+        let llm_stream = multiply(&self.llm_cond_proj.forward(&llm)?, &llm_mask)?;
+        let indicator_emb = self.embed_image_indicator.forward(&img_idx)?;
         Ok(PreparedConditioning {
             cos,
             sin,
-            llm_mask,
             img_mask,
-            img_idx,
+            llm_stream,
+            indicator_emb,
         })
     }
 
@@ -165,24 +178,21 @@ impl Ideogram4Transformer {
     /// compute to [`forward`](Self::forward) given the same `prep`/`mask`.
     pub fn forward_prepared(
         &self,
-        llm_features: &Array,
         x: &Array,
         t: &Array,
         prep: &PreparedConditioning,
         mask: Option<&Array>,
     ) -> Result<Array> {
-        let llm_features = multiply(llm_features, &prep.llm_mask)?;
         let x = multiply(x, &prep.img_mask)?;
         let x = multiply(&self.input_proj.forward(&x)?, &prep.img_mask)?;
 
         let t_cond = self.t_embedding(t)?.expand_dims(1)?; // [B,1,emb]
         let adaln_input = silu(&self.adaln_proj.forward(&t_cond)?)?; // [B,1,adaln]
 
-        let llm = rms_norm(&llm_features, &self.llm_cond_norm, 1e-6)?;
-        let llm = multiply(&self.llm_cond_proj.forward(&llm)?, &prep.llm_mask)?;
-
-        let mut h = add(&x, &llm)?;
-        h = add(&h, &self.embed_image_indicator.forward(&prep.img_idx)?)?;
+        // `(x + llm_stream) + indicator_emb` — the exact addition order the pre-hoist body used, now
+        // reading the once-built step-invariant tensors from `prep` (F-151).
+        let mut h = add(&x, &prep.llm_stream)?;
+        h = add(&h, &prep.indicator_emb)?;
 
         for layer in &self.layers {
             h = layer.forward(&h, &prep.cos, &prep.sin, mask, &adaln_input)?;
@@ -199,14 +209,15 @@ impl Ideogram4Transformer {
     }
 }
 
-/// Step-invariant conditioning for one guidance branch: the MRoPE `(cos, sin)` and the role masks
-/// derived from the packed `position_ids`/`indicator`. Built once per denoise (F-029).
+/// Step-invariant conditioning for one guidance branch, built once per denoise (F-029 + F-151): the
+/// MRoPE `(cos, sin)`, the image role `img_mask`, the projected+masked LLM conditioning stream
+/// (`llm_stream`), and the image-indicator embedding (`indicator_emb`). None depend on `x`/`t`.
 pub struct PreparedConditioning {
     cos: Array,
     sin: Array,
-    llm_mask: Array,
     img_mask: Array,
-    img_idx: Array,
+    llm_stream: Array,
+    indicator_emb: Array,
 }
 
 /// Adapter (LoRA) host map for the Ideogram 4 DiT — the key→`AdaptableLinear` resolution the shared

@@ -21,7 +21,7 @@
 
 use std::path::Path;
 
-use mlx_rs::ops::{add, concatenate_axis, divide, multiply, subtract};
+use mlx_rs::ops::{add, concatenate_axis, divide, multiply, split_sections, subtract};
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
@@ -579,7 +579,9 @@ impl Ideogram4Pipeline {
         // Step-invariant conditioning (role masks + MRoPE) built ONCE per branch, not per step (F-029).
         // `segment_ids` are all `1` (a single packed segment), so the additive attention mask is
         // identically zero and is dropped (`None`) rather than built/added every forward.
-        let cond_prep = self.cond.prepare(&position_ids, &indicator, 1, seq)?;
+        let cond_prep = self
+            .cond
+            .prepare(&llm_features, &position_ids, &indicator, 1, seq)?;
         // The unconditional (negative) branch runs over the image-only slice. Built only in quality
         // mode — turbo (`uncond=None`) skips it entirely, avoiding both the second DiT forward and
         // the large `neg_llm` zero tensor (num_img × 53248 f32, ~0.9 GB at 1024²).
@@ -587,8 +589,13 @@ impl Ideogram4Pipeline {
             Some(uncond) => {
                 let neg_position_ids = Array::from_slice(&pack.neg_position_ids, &[1, num_img, 3]);
                 let neg_indicator = Array::from_slice(&pack.neg_indicator, &[1, num_img]);
-                let neg_prep = uncond.prepare(&neg_position_ids, &neg_indicator, 1, num_img)?;
-                Some((uncond, neg_prep, zeros(&[1, num_img, llm_dim])?))
+                // The uncond branch's `indicator` is image-only, so its LLM role mask is identically
+                // zero → the projected LLM stream is provably zero. `prepare` still runs the projection
+                // once (bit-identical, and folded into `neg_prep`), removing it from the per-step loop.
+                let neg_llm = zeros(&[1, num_img, llm_dim])?;
+                let neg_prep =
+                    uncond.prepare(&neg_llm, &neg_position_ids, &neg_indicator, 1, num_img)?;
+                Some((uncond, neg_prep))
             }
             None => None,
         };
@@ -621,7 +628,6 @@ impl Ideogram4Pipeline {
             None => noise.clone(),
         };
         let text_z_padding = zeros(&[1, num_text, ch])?;
-        let img_range = Array::from_slice(&(num_text..seq).collect::<Vec<i32>>(), &[num_img]);
 
         // ── Flow-matching Euler denoise (high → low noise) ──
         // PiD `from_ldm` early-stop (sc-8048): stop at `run_from` instead of `0`, so only the
@@ -638,14 +644,14 @@ impl Ideogram4Pipeline {
             let t = Array::from_slice(&[t_val as f32], &[1]);
 
             let pos_z = concatenate_axis(&[&text_z_padding, &z], 1)?;
-            let pos_out =
-                self.cond
-                    .forward_prepared(&llm_features, &pos_z, &t, &cond_prep, None)?;
-            let pos_v = pos_out.take_axis(&img_range, 1)?; // image-token velocities
+            let pos_out = self.cond.forward_prepared(&pos_z, &t, &cond_prep, None)?;
+            // Image-token velocities = the `[num_text..seq)` suffix — a zero-copy strided split at the
+            // fixed text/image boundary, vs. an arange `take_axis` gather rebuilt every step (F-152).
+            let pos_v = split_sections(&pos_out, &[num_text], 1)?.swap_remove(1);
 
             let v = match &neg {
-                Some((uncond, neg_prep, neg_llm)) => {
-                    let neg_v = uncond.forward_prepared(neg_llm, &z, &t, neg_prep, None)?;
+                Some((uncond, neg_prep)) => {
+                    let neg_v = uncond.forward_prepared(&z, &t, neg_prep, None)?;
                     // Per-step asymmetric CFG: `v = gw·pos_v + (1−gw)·neg_v`. The reference uses a
                     // per-step guidance schedule (DEFAULT_GUIDANCE_SCHEDULE = 7.0 for the main steps,
                     // dropping to 3.0 for the final 3 "polish" steps) — a CONSTANT high guidance

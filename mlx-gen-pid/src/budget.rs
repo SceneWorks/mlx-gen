@@ -166,9 +166,13 @@ pub fn plan_tile_edge(
 /// refused, so this refuses only when even a [`MIN_TILE_EDGE`] tile plus the resident full-res buffers
 /// exceeds `safe_gib` — a machine too small to hold the output-resolution `x`/`noise`/ε at all. `model_id`
 /// only labels the error. Pure (budget injected) so it is unit-testable without a device query.
+///
+/// Prices a **single** decode (`B=1`): every PiD consumer decodes one latent at a time — the minted
+/// decoder is shared across a request's `count` loop, but each `decode` call holds one output-resolution
+/// buffer set — so the concurrent peak never scales with `count` (F-150). Pricing `count` full-resolution
+/// buffer sets falsely refused / needlessly shrank tiles for multi-image requests.
 pub fn guard(
     model_id: &str,
-    count: u32,
     width: u32,
     height: u32,
     scale: i32,
@@ -177,8 +181,7 @@ pub fn guard(
 ) -> Result<()> {
     let tw = (width * scale as u32) as i32;
     let th = (height * scale as u32) as i32;
-    let b = count.max(1) as i32;
-    let floor = tiled_peak_gib(b, th, tw, MIN_TILE_EDGE, cfg.patch_size, cfg.hidden_size);
+    let floor = tiled_peak_gib(1, th, tw, MIN_TILE_EDGE, cfg.patch_size, cfg.hidden_size);
     if floor > safe_gib {
         return Err(Error::Msg(format!(
             "{model_id}: a PiD decode at {tw}×{th} (super-resolved {scale}× from {width}×{height}) \
@@ -269,7 +272,7 @@ mod tests {
         // as long as the resident buffers + a min tile fit.
         let cfg = PidConfig::sr4x();
         assert!(
-            guard("qwenimage", 1, 2048, 2048, 4, &cfg, 14.0).is_ok(),
+            guard("qwenimage", 2048, 2048, 4, &cfg, 14.0).is_ok(),
             "8192² should tile, not refuse, under 14 GiB"
         );
     }
@@ -278,7 +281,7 @@ mod tests {
     fn guard_refuses_when_even_a_min_tile_wont_fit() {
         // A tiny budget that can't even hold the output-res resident buffers + a MIN_TILE_EDGE forward.
         let cfg = PidConfig::sr4x();
-        let err = guard("qwenimage", 1, 2048, 2048, 4, &cfg, 2.0)
+        let err = guard("qwenimage", 2048, 2048, 4, &cfg, 2.0)
             .expect_err("8192² must refuse under a 2 GiB budget");
         let msg = err.to_string();
         assert!(matches!(err, Error::Msg(_)), "typed refusal, got {err:?}");
@@ -286,13 +289,23 @@ mod tests {
     }
 
     #[test]
-    fn guard_counts_the_batch() {
+    fn guard_prices_a_single_decode_not_the_request_count() {
+        // F-150: the guard prices ONE decode (B=1) — every consumer decodes one latent at a time, so a
+        // large `count` must NOT inflate the resident-buffer floor. A budget that admits a 2048²-native
+        // (8192² output) single decode must admit it regardless of how many images the request asks for;
+        // the pre-fix `guard` multiplied the resident floor by `count` and falsely refused.
         let cfg = PidConfig::sr4x();
-        // count multiplies the resident buffers → a batch can bust a budget a single image fits under.
-        assert!(guard("qwenimage", 1, 2048, 2048, 4, &cfg, 8.0).is_ok());
+        // Sits between a 1× floor and a would-be 16× floor: only the per-decode (B=1) pricing admits it.
+        let one = tiled_peak_gib(1, 8192, 8192, MIN_TILE_EDGE, PATCH, HIDDEN);
+        let sixteen = tiled_peak_gib(16, 8192, 8192, MIN_TILE_EDGE, PATCH, HIDDEN);
+        let budget = (one + sixteen) / 2.0;
         assert!(
-            guard("qwenimage", 16, 2048, 2048, 4, &cfg, 8.0).is_err(),
-            "count=16 at 8192² should exceed an 8 GiB budget"
+            one < budget && budget < sixteen,
+            "budget straddles 1× vs 16×"
+        );
+        assert!(
+            guard("qwenimage", 2048, 2048, 4, &cfg, budget).is_ok(),
+            "a single 8192² decode fits {budget:.1} GiB regardless of request count"
         );
     }
 }

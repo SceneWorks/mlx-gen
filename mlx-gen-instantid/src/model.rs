@@ -24,7 +24,7 @@ use mlx_gen::{
     schedule_sigmas, AdapterSpec, AlphaSchedule, CancelFlag, DiscreteModelSampling, Error,
     LatentDecoder, PidWeights, Progress, Result, Scheduler, Solver, WeightsSource,
 };
-use mlx_gen_pid::{PidDecoder, PidEngine};
+use mlx_gen_pid::{mint_planned_decoder, PidDecoder, PidEngine};
 
 use mlx_gen_face::{Face, FaceAnalysis};
 use mlx_gen_sdxl::config::DiffusionConfig;
@@ -296,13 +296,22 @@ impl InstantId {
                     .into(),
             )
         })?;
-        // Thread the request cancel into the PiD decoder so the ~100 s 4-step decode is cancellable
-        // per sampler step (F-006), matching the denoise loop's per-step contract.
-        Ok(Some(
-            engine
-                .decoder(&req.prompt, 0.0, req.seed)?
-                .with_cancel(req.cancel.clone()),
-        ))
+        // Route through the shared PiD mint seam (F-149) so the F-013 budget guard + sc-10087 watchdog
+        // tiling travel here too — InstantID validates only multiple-of-8 dims, so a 1536² request
+        // super-resolves at 6144² and MUST tile or refuse rather than run one whole-image forward into a
+        // Metal watchdog abort / OOM. Clean σ=0 (full denoise, no from_ldm early-stop); the request cancel
+        // is threaded in for the per-step contract (F-006). InstantID shares `mlx_gen::Error`, so the
+        // pid crate's `Result` bridges with a bare `?`.
+        Ok(Some(mint_planned_decoder(
+            engine,
+            "instantid",
+            &req.prompt,
+            req.width,
+            req.height,
+            0.0,
+            req.seed,
+            req.cancel.clone(),
+        )?))
     }
 
     /// Quantize the stack to `bits` (8 or 4) — Q8/Q4 (sc-3116), the same scope as the SDXL provider

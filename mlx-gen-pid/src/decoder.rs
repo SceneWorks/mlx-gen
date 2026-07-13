@@ -124,6 +124,18 @@ impl PidDecoder {
         if std::path::Path::new(&path).exists() {
             return; // capture once
         }
+        // Best-effort (F-154): the dtype casts can fail (an exotic input dtype), so fold them into the
+        // same fallible log path as the save — a capture failure must never `unwrap()`-panic the
+        // production decode this env var is merely observing.
+        match self.try_capture(latents, &path) {
+            Ok(()) => eprintln!("[pid] captured LQ latent + caption to {path}"),
+            Err(e) => eprintln!("[pid] PID_CAPTURE_LATENT capture failed: {e}"),
+        }
+    }
+
+    /// The fallible body of [`Self::maybe_capture`] — casts + save, all through `?` so any failure is
+    /// surfaced to the best-effort log path rather than panicking mid-decode.
+    fn try_capture(&self, latents: &Array, path: &str) -> Result<()> {
         let meta = std::collections::HashMap::from([
             ("sigma".to_string(), self.sigma.to_string()),
             ("scale".to_string(), self.scale.to_string()),
@@ -134,16 +146,11 @@ impl PidDecoder {
             ("seed".to_string(), self.seed.to_string()),
         ]);
         let arrays = [
-            ("latent", latents.as_dtype(Dtype::Float32).unwrap()),
-            (
-                "caption",
-                self.caption_embs.as_dtype(Dtype::Float32).unwrap(),
-            ),
+            ("latent", latents.as_dtype(Dtype::Float32)?),
+            ("caption", self.caption_embs.as_dtype(Dtype::Float32)?),
         ];
-        match Array::save_safetensors(arrays.iter().map(|(k, v)| (*k, v)), &meta, &path) {
-            Ok(()) => eprintln!("[pid] captured LQ latent + caption to {path}"),
-            Err(e) => eprintln!("[pid] PID_CAPTURE_LATENT save failed: {e}"),
-        }
+        Array::save_safetensors(arrays.iter().map(|(k, v)| (*k, v)), &meta, path)?;
+        Ok(())
     }
 
     /// Spatially-tiled decode (sc-10087): same result geometry + seeded noise as [`LatentDecoder::decode`],
@@ -152,6 +159,9 @@ impl PidDecoder {
     /// `overlap` are output-pixel units. Used above a size threshold at the decode seam, and by the A/B
     /// harness to compare tiled vs whole-image on an identical latent.
     pub fn decode_tiled(&self, latents: &Array, tile: i32, overlap: i32) -> Result<Array> {
+        // Capture the LQ latent here too (F-154): the public tiled entry (used by the A/B harness) must
+        // honor `PID_CAPTURE_LATENT` symmetrically with [`LatentDecoder::decode`], not silently skip it.
+        self.maybe_capture(latents);
         let (latents, b, th, tw, sigma) = self.prep(latents)?;
         self.sampler.sample_tiled(
             &self.net,

@@ -29,13 +29,20 @@
 //!   neighbor; accumulate `acc += pad(v_tile·w)`, `wsum += pad(w)`, return `acc/wsum`; `eval` per tile so
 //!   activations don't stack.
 
-use mlx_rs::ops::{add, divide, multiply, pad};
+use mlx_rs::ops::{add, divide, multiply, pad, split_sections};
 use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use mlx_gen::Result;
 
 use crate::lq::PidNet;
+use crate::memo::{memo, TableCache};
+
+/// Per-decode cache of the separable feather-weight tables (F-153), keyed by a tile's
+/// `(th, tw, fade_top, fade_bottom, fade_left, fade_right, overlap)`. The tile plan is deterministic
+/// across the 4 sampler steps, so each distinct tile shape's feather is built once (host loop + H2D)
+/// rather than per tile per step. Holds the raw f32 table; the per-tile dtype cast stays per use.
+pub type FeatherCache = TableCache<(i32, i32, bool, bool, bool, bool, i32), Array>;
 
 /// A spatial tile's pixel-space extent `[y0,y1) × [x0,x1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,10 +138,24 @@ fn feather_weight(
     out
 }
 
-/// Slice `a`'s axis `axis` to `[start, end)`.
+/// Slice `a`'s axis `axis` to `[start, end)` with a zero-copy strided split at the fixed tile
+/// boundaries, vs. an arange `take_axis` gather of a full-res tensor per tile per step (F-152).
 fn slice_axis(a: &Array, axis: i32, start: i32, end: i32) -> Result<Array> {
-    let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
-    Ok(a.take_axis(&idx, axis)?)
+    let len = a.shape()[axis as usize];
+    // Cut only at the boundaries that are interior to the axis; the wanted segment is the one that
+    // begins at `start` — index 1 when there is a leading `[0..start)` piece, else index 0.
+    let mut cuts = Vec::with_capacity(2);
+    if start > 0 {
+        cuts.push(start);
+    }
+    if end < len {
+        cuts.push(end);
+    }
+    if cuts.is_empty() {
+        return Ok(a.clone()); // whole axis
+    }
+    let want = if start > 0 { 1 } else { 0 };
+    Ok(split_sections(a, &cuts, axis)?.swap_remove(want))
 }
 
 /// One tiled **velocity** forward: compute `v = net(x, t, …)` for the whole `[B,3,H,W]` grid by running
@@ -151,6 +172,7 @@ pub fn forward_tiled(
     sigma: &Array,
     tile: i32,
     overlap: i32,
+    feather_cache: &FeatherCache,
 ) -> Result<Array> {
     let sh = x.shape();
     let (h, w) = (sh[2], sh[3]);
@@ -178,8 +200,32 @@ pub fn forward_tiled(
         )?;
         let v_tile = net.forward(&x_tile, t_scaled, caption, &lq_tile, sigma)?; // [B,3,th,tw]
 
-        let wvec = feather_weight(th, tw, tl.y0 > 0, tl.y1 < h, tl.x0 > 0, tl.x1 < w, overlap);
-        let weight = Array::from_slice(&wvec, &[1, 1, th, tw]).as_dtype(v_tile.dtype())?;
+        // Feather table memoized per tile geometry + fade pattern (F-153) — the plan repeats across the
+        // 4 steps, so each shape is built once; the dtype cast stays per use (byte-identical weight).
+        let (fade_top, fade_bottom, fade_left, fade_right) =
+            (tl.y0 > 0, tl.y1 < h, tl.x0 > 0, tl.x1 < w);
+        let key = (
+            th,
+            tw,
+            fade_top,
+            fade_bottom,
+            fade_left,
+            fade_right,
+            overlap,
+        );
+        let weight = memo(feather_cache, key, || {
+            let wvec = feather_weight(
+                th,
+                tw,
+                fade_top,
+                fade_bottom,
+                fade_left,
+                fade_right,
+                overlap,
+            );
+            Array::from_slice(&wvec, &[1, 1, th, tw])
+        })
+        .as_dtype(v_tile.dtype())?;
         let pad_spec = [(0, 0), (0, 0), (tl.y0, h - tl.y1), (tl.x0, w - tl.x1)];
         let wv = pad(&multiply(&v_tile, &weight)?, &pad_spec[..], None, None)?;
         let wp = pad(&weight, &pad_spec[..], None, None)?;
@@ -237,6 +283,38 @@ mod tests {
     #[test]
     fn whole_image_is_one_tile() {
         assert_eq!(plan_tiles(4096, 4096, 8192, 256, 32).len(), 1);
+    }
+
+    /// F-152: the strided-split `slice_axis` is element-for-element identical to the arange `take_axis`
+    /// gather it replaced, for a prefix (`start==0`), an interior slice, a suffix (`end==len`), and the
+    /// whole axis — on every axis of a small tensor.
+    #[test]
+    fn slice_axis_matches_take_axis_gather() {
+        use mlx_rs::ops::{abs, max, subtract};
+        let a = Array::from_iter(0..(2 * 3 * 4 * 5), &[2, 3, 4, 5])
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .unwrap();
+        let gather = |axis: i32, start: i32, end: i32| {
+            let idx = Array::from_slice(&(start..end).collect::<Vec<i32>>(), &[end - start]);
+            a.take_axis(&idx, axis).unwrap()
+        };
+        for (axis, len) in [(0, 2), (1, 3), (2, 4), (3, 5)] {
+            for (start, end) in [(0, len), (0, len - 1), (1, len), (1, len - 1)] {
+                if start >= end {
+                    continue;
+                }
+                let got = slice_axis(&a, axis, start, end).unwrap();
+                let want = gather(axis, start, end);
+                assert_eq!(got.shape(), want.shape(), "axis {axis} [{start},{end})");
+                let d = max(abs(subtract(&got, &want).unwrap()).unwrap(), None)
+                    .unwrap()
+                    .item::<f32>();
+                assert_eq!(
+                    d, 0.0,
+                    "axis {axis} [{start},{end}) element-equal to gather"
+                );
+            }
+        }
     }
 
     #[test]

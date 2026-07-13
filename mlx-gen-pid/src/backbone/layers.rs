@@ -12,6 +12,8 @@ use mlx_gen::nn::{gelu_exact, silu};
 use mlx_gen::weights::Weights;
 use mlx_gen::Result;
 
+use crate::memo::{memo, TableCache};
+
 /// All PixDiT RMSNorms use eps = 1e-6.
 pub const RMS_EPS: f32 = 1e-6;
 
@@ -256,6 +258,10 @@ pub fn fold_patches(x: &Array, c: i32, hs: i32, ws: i32, patch: i32) -> Result<A
 pub struct PixelTokenEmbedder {
     proj: AdaptableLinear,
     dim: i32,
+    /// Per-decode cache of the 2-D sin/cos pixel positional table, keyed `(h, w)` (`self.dim` is a
+    /// per-decode constant). The `~268 MB` host build + H2D upload is otherwise repeated on every
+    /// forward though it is identical across the 4 sampler steps and same-sized tiles (F-153).
+    pos_cache: TableCache<(i32, i32), Array>,
 }
 
 impl PixelTokenEmbedder {
@@ -263,6 +269,7 @@ impl PixelTokenEmbedder {
         Ok(Self {
             proj: lin(w, &format!("{prefix}.proj"))?,
             dim,
+            pos_cache: TableCache::default(),
         })
     }
 
@@ -272,7 +279,9 @@ impl PixelTokenEmbedder {
         // [B,C,H,W] -> [B,H,W,C] -> proj -> [B,H,W,D]
         let xt = x.transpose_axes(&[0, 2, 3, 1])?;
         let xp = self.proj.forward(&xt)?;
-        let pos = sincos_2d_pos(self.dim, h, w)
+        // Memoize the raw f32 pos table per `(h, w)` (F-153); the cheap reshape/dtype cast still runs
+        // per call so the added `pos` is byte-identical to the pre-cache path for the activation dtype.
+        let pos = memo(&self.pos_cache, (h, w), || sincos_2d_pos(self.dim, h, w))
             .reshape(&[1, h, w, self.dim])?
             .as_dtype(xp.dtype())?;
         let xp = mlx_rs::ops::add(&xp, &pos)?;

@@ -31,6 +31,7 @@ pub mod decoder;
 pub mod engine;
 pub mod gemma2;
 pub mod lq;
+pub(crate) mod memo;
 pub mod registry;
 pub mod sampler;
 pub mod tiling;
@@ -40,7 +41,8 @@ pub use caption::CaptionEncoder;
 pub use config::{CaptionConfig, PidConfig, RopeMode, SampleType, SamplerConfig};
 pub use decoder::PidDecoder;
 pub use engine::{
-    flow_capture_for_request, resolve_pid_decoder, resolve_pid_decoder_at_sigma, PidEngine,
+    flow_capture_for_request, mint_planned_decoder, resolve_pid_decoder,
+    resolve_pid_decoder_at_sigma, PidEngine,
 };
 pub use gemma2::{Gemma2, Gemma2Config};
 pub use lq::{LqAdapter, PidNet};

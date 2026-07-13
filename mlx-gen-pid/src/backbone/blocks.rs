@@ -3,7 +3,7 @@
 //! the corresponding classes in `pixeldit_official.py`.
 
 use mlx_rs::fast::scaled_dot_product_attention;
-use mlx_rs::ops::{concatenate_axis, pad, split};
+use mlx_rs::ops::{concatenate_axis, pad, split, split_sections};
 use mlx_rs::Array;
 
 use mlx_gen::adapters::AdaptableLinear;
@@ -54,8 +54,9 @@ fn flash_sdpa(q: &Array, k: &Array, v: &Array, scale: f32) -> Result<Array> {
             let kp = pad(k, &w[..], None, None)?;
             let vp = pad(v, &w[..], None, None)?;
             let o = scaled_dot_product_attention(&qp, &kp, &vp, scale, None, None)?;
-            let idx = Array::from_slice(&(0..hd).collect::<Vec<i32>>(), &[hd]);
-            Ok(o.take_axis(&idx, 3)?)
+            // Drop the zero-pad tail with a zero-copy strided split at the fixed head_dim boundary,
+            // vs. an arange `take_axis` gather run per pixel-stream attention (F-152).
+            Ok(split_sections(&o, &[hd], 3)?.swap_remove(0))
         }
         _ => Ok(scaled_dot_product_attention(q, k, v, scale, None, None)?),
     }
@@ -138,7 +139,6 @@ impl MMDiTJointAttention {
         sin_txt: &Array,
     ) -> Result<(Array, Array)> {
         let ny = y.shape()[1];
-        let nx = x.shape()[1];
 
         let (qx, kx, vx) = split_qkv(&self.qkv_x.forward(x)?, self.heads, self.head_dim)?;
         let qx = rms(&qx, &self.q_norm_x)?;
@@ -159,10 +159,12 @@ impl MMDiTJointAttention {
         let scale = (self.head_dim as f32).powf(-0.5);
         let out = flash_sdpa(&q, &k, &v, scale)?;
 
-        let txt_idx = Array::from_slice(&(0..ny).collect::<Vec<i32>>(), &[ny]);
-        let img_idx = Array::from_slice(&(ny..ny + nx).collect::<Vec<i32>>(), &[nx]);
-        let out_y = merge_heads(&out.take_axis(&txt_idx, 2)?)?;
-        let out_x = merge_heads(&out.take_axis(&img_idx, 2)?)?;
+        // Split the joint `[txt, img]` output back at the fixed `ny` boundary with a zero-copy strided
+        // split (`[0..ny]` = txt, `[ny..ny+nx]` = img), vs. a pair of arange `take_axis` gathers run in
+        // every one of the 14 patch blocks per step (F-152 — the qwen F-114/F-115 fix, now travelled).
+        let mut parts = split_sections(&out, &[ny], 2)?; // [txt (0..ny), img (ny..end)]
+        let out_x = merge_heads(&parts.swap_remove(1))?; // img — remove index 1 before 0 (swap_remove reindexes)
+        let out_y = merge_heads(&parts.swap_remove(0))?; // txt
         Ok((self.proj_x.forward(&out_x)?, self.proj_y.forward(&out_y)?))
     }
 }
@@ -307,5 +309,62 @@ impl PiTBlock {
             .mlp
             .forward(&modulate(&rms(&x, &self.norm2)?, &m[4], &m[3], false)?)?;
         gated(&x, &m[5], &mlp_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::ops::{abs, max, subtract};
+    use mlx_rs::Dtype;
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        max(abs(subtract(a, b).unwrap()).unwrap(), None)
+            .unwrap()
+            .item::<f32>()
+    }
+
+    /// F-152: the strided split that drops `flash_sdpa`'s zero-pad head_dim tail (axis 3) is
+    /// element-identical to the old arange `take_axis` gather.
+    #[test]
+    fn flash_sdpa_headdim_slice_matches_gather() {
+        let o = Array::from_iter(0..(2 * 3 * 8), &[1, 2, 3, 8])
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let hd = 5; // keep [0..5), drop the [5..8) pad
+        let split = split_sections(&o, &[hd], 3).unwrap().swap_remove(0);
+        let idx = Array::from_slice(&(0..hd).collect::<Vec<i32>>(), &[hd]);
+        let gather = o.take_axis(&idx, 3).unwrap();
+        assert_eq!(split.shape(), gather.shape());
+        assert_eq!(
+            max_abs_diff(&split, &gather),
+            0.0,
+            "head_dim slice == gather"
+        );
+    }
+
+    /// F-152: splitting the joint `[txt, img]` attention output (axis 2) at the `ny` boundary is
+    /// element-identical to the two arange `take_axis` gathers it replaced.
+    #[test]
+    fn joint_txt_img_split_matches_gathers() {
+        let (ny, nx) = (3, 4);
+        let out = Array::from_iter(0..(2 * 2 * (ny + nx) * 3), &[2, 2, ny + nx, 3])
+            .as_dtype(Dtype::Float32)
+            .unwrap();
+        let mut parts = split_sections(&out, &[ny], 2).unwrap();
+        let img = parts.swap_remove(1);
+        let txt = parts.swap_remove(0);
+        let txt_idx = Array::from_slice(&(0..ny).collect::<Vec<i32>>(), &[ny]);
+        let img_idx = Array::from_slice(&(ny..ny + nx).collect::<Vec<i32>>(), &[nx]);
+        assert_eq!(
+            max_abs_diff(&txt, &out.take_axis(&txt_idx, 2).unwrap()),
+            0.0,
+            "txt split == gather"
+        );
+        assert_eq!(
+            max_abs_diff(&img, &out.take_axis(&img_idx, 2).unwrap()),
+            0.0,
+            "img split == gather"
+        );
     }
 }
