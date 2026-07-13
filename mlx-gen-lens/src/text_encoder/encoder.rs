@@ -146,10 +146,17 @@ impl LensTextEncoder {
     /// selected layer in selection order (== `LensGptOssEncoder.forward`'s returned list). Runs
     /// `position_ids = arange(L)` and stops after the max selected layer.
     ///
-    /// `cancel` is the cooperative cancellation handle (F-019): checked before each of the ~24 gpt-oss
-    /// MoE decoder layers (the dominant cost on a 4-step turbo run) so a cancel during the encode is
-    /// honored. `routing_weights` already forces a host sync per layer, so the check observes the trip
-    /// promptly. Returns [`Error::Canceled`] on trip.
+    /// `cancel` is the cooperative cancellation handle (F-019/F-029): checked before each of the ~24
+    /// gpt-oss MoE decoder layers (the dominant cost on a 4-step turbo run) so a cancel during the
+    /// encode is honored. Returns [`Error::Canceled`] on trip.
+    ///
+    /// F-029: under lazy MLX execution the per-layer check alone is a *false green* — the original
+    /// premise ("routing forces a host sync per layer") went stale when sc-9500 moved MoE routing
+    /// on-device, so all ~24 checks executed in microseconds during graph *construction* while the
+    /// entire 20B compute ran later in one uninterruptible `eval`. We now force `eval([&hidden])`
+    /// after each layer **when a cancel handle is present**, so the next iteration's check observes
+    /// materialized state and a cancel is honored within one layer's compute rather than the whole
+    /// encode. The eval is skipped entirely when `cancel` is `None` (the graph stays lazy).
     pub fn encode(&self, input_ids: &Array, cancel: Option<&CancelFlag>) -> Result<Vec<Array>> {
         let l = input_ids.shape()[1];
 
@@ -173,6 +180,12 @@ impl LensTextEncoder {
             hidden = layer.forward(&hidden, &self.inv_freq, self.attn_scaling, mask)?;
             if let Some(pos) = self.selected_layers.iter().position(|&s| s == i) {
                 captured[pos] = Some(hidden.clone());
+            }
+            // F-029: materialize this layer's work so the next iteration's cancel check observes real
+            // progress. Without this the loop's checks are graph-time-only (a no-op cancel). Only pay
+            // the per-layer sync when a cancel handle is actually threaded.
+            if cancel.is_some() {
+                mlx_rs::transforms::eval([&hidden])?;
             }
         }
 

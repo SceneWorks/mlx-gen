@@ -162,8 +162,38 @@ fn good_stub_passes_every_check_individually() {
     check_validate_honesty(&g, &cheap()).unwrap();
     check_progress(&g, &cheap()).unwrap();
     check_cancellation(&g, &cheap()).unwrap();
+    check_precancellation(&g, &cheap()).unwrap();
     check_seed_determinism(&g, &cheap()).unwrap();
     check_registry_roundtrip(&g).unwrap();
+}
+
+#[test]
+fn ignoring_cancel_fails_precancellation_check() {
+    // A provider that never consults the flag runs to completion even on an already-cancelled
+    // request — the non-denoise-seam class (sc-11128): it returns Ok instead of typed Canceled.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            honor_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_precancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("returned Ok"), "got: {err}");
+}
+
+#[test]
+fn stringified_cancel_fails_precancellation_check() {
+    // Honors the flag up front but stringifies the error — must still fail the typed contract.
+    let g = Stub::new(
+        STUB_ID,
+        Behavior {
+            typed_cancel: false,
+            ..Behavior::good()
+        },
+    );
+    let err = check_precancellation(&g, &cheap()).unwrap_err();
+    assert!(err.contains("typed Err(Error::Canceled)"), "got: {err}");
 }
 
 #[test]

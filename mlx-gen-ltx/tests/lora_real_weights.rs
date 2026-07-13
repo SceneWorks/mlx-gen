@@ -146,7 +146,7 @@ fn render(dir: &std::path::Path, dit: &LtxDiT, g: &Weights) -> (Array, Array) {
         &mut |_| {},
     )
     .expect("generate_t2v_latents");
-    let frames = decode_to_frames(&vae, &latents).expect("decode");
+    let frames = decode_to_frames(&vae, &latents, &Default::default()).expect("decode");
     (latents, frames)
 }
 

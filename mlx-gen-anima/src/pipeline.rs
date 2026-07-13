@@ -10,7 +10,8 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::media::Image;
 use mlx_gen::runtime::{AdapterSpec, CancelFlag};
 use mlx_gen::{
-    resolve_flow_schedule, run_flow_sampler, Progress, Result, TimestepConvention, WeightsSource,
+    resolve_flow_schedule, run_flow_sampler, Error, Progress, Result, TimestepConvention,
+    WeightsSource,
 };
 
 use crate::conditioner::AnimaTextConditioner;
@@ -440,6 +441,7 @@ pub(crate) fn render_preview(
     edge: u32,
     seed: u64,
     dtype: Dtype,
+    cancel: &CancelFlag,
 ) -> Result<Image> {
     let init = create_noise(seed, edge, edge)?;
     let latent = render_preview_latent(
@@ -453,7 +455,12 @@ pub(crate) fn render_preview(
         guidance,
         seed,
         dtype,
+        cancel,
     )?;
+    // F-117: honor a cancel that arrived during the preview denoise before the (lazy) VAE decode.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     let decoded = vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
     decoded_to_image(&decoded)
 }
@@ -475,6 +482,7 @@ pub(crate) fn render_preview_latent(
     guidance: f32,
     seed: u64,
     dtype: Dtype,
+    cancel: &CancelFlag,
 ) -> Result<Array> {
     // LIVE conditioner forward — reflects the in-training `llm_adapter` adapters (sc-10522).
     let cond = conditioner.forward(source, t5_ids, dtype)?;
@@ -493,6 +501,7 @@ pub(crate) fn render_preview_latent(
         guidance,
         seed,
         dtype,
+        cancel,
     )
 }
 
@@ -510,10 +519,10 @@ pub(crate) fn render_latent_with_enc(
     guidance: f32,
     seed: u64,
     dtype: Dtype,
+    cancel: &CancelFlag,
 ) -> Result<Array> {
     let sigmas = anima_sigmas(steps.max(1));
     let guidance = Array::from_slice(&[guidance], &[1]);
-    let cancel = CancelFlag::default();
     let mut prog = |_p: Progress| {};
     let predict = |x: &Array, sigma: f32| -> Result<Array> {
         let s = Array::from_slice(&[sigma], &[1]);
@@ -534,7 +543,7 @@ pub(crate) fn render_latent_with_enc(
         &sigmas,
         init.clone(),
         seed,
-        &cancel,
+        cancel,
         &mut prog,
         predict,
     )

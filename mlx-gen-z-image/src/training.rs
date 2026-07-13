@@ -610,6 +610,7 @@ impl ZImageTurboTrainer {
                             sample_seed,
                             edge,
                             compute_dtype,
+                            &req.cancel,
                         ) {
                             Ok(image) => on_progress(TrainingProgress::Sample {
                                 step,
@@ -618,6 +619,9 @@ impl ZImageTurboTrainer {
                                 prompt: prompt.clone(),
                                 image,
                             }),
+                            // F-117: a cancelled preview exits the preview loop (outer cancel check
+                            // unwinds the run); other failures skip a single preview.
+                            Err(mlx_gen::Error::Canceled) => break,
                             Err(e) => eprintln!(
                                 "[sc-5637] {MODEL_ID} preview sample failed at step {step} \
                                  (prompt {}): {e} — skipping this preview, training continues",

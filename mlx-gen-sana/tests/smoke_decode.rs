@@ -26,7 +26,9 @@ fn decoder_runs_on_real_weights() {
     let key = mlx_rs::random::key(0).unwrap();
     let latent = normal::<f32>(&[1, 32, 32, 32], None, None, &key).expect("latent");
 
-    let img = decoder.decode(&latent).expect("decode");
+    let img = decoder
+        .decode(&latent, &Default::default())
+        .expect("decode");
 
     assert_eq!(img.shape(), &[1, 1024, 1024, 3], "decoded image shape");
 

@@ -741,6 +741,7 @@ impl AnimaTrainer {
                         edge,
                         sample_seed,
                         compute_dtype,
+                        &req.cancel,
                     ) {
                         Ok(image) => on_progress(TrainingProgress::Sample {
                             step,
@@ -749,6 +750,9 @@ impl AnimaTrainer {
                             prompt: prompt.clone(),
                             image,
                         }),
+                        // F-117: a cancelled preview denoise exits the preview loop (the outer loop's
+                        // cancel check then unwinds the run); other failures skip one preview.
+                        Err(mlx_gen::Error::Canceled) => break,
                         Err(e) => eprintln!(
                             "[sc-10641] anima preview sample failed at step {step} (prompt {}): {e} \
                              — skipping this preview, training continues",
@@ -1859,6 +1863,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         // Same DiT, but a STALE (pre-training) conditioner output — the trap.
@@ -1871,6 +1876,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         // Positive control: feed render_latent_with_enc the LIVE conditioner output → must equal the
@@ -1885,6 +1891,7 @@ mod tests {
             1.0,
             7,
             Dtype::Float32,
+            &Default::default(),
         )
         .unwrap();
         eval([&latent_live, &latent_stale, &latent_ctrl]).unwrap();

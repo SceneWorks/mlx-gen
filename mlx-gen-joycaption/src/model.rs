@@ -184,8 +184,10 @@ impl Captioner for JoyCaption {
             tool_calls: Vec::new(),
         };
 
-        // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it by
-        // mirroring on each streamed token so the provider's next-step cancel check trips promptly.
+        // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it. F-157:
+        // mirror on EVERY stream event (not only `Token`) and once up front, so a cancel arriving
+        // during the SigLIP vision-encode + Llama prefill (the slowest phase, before any token is
+        // streamed) is honored there rather than only at token 1.
         let core_cancel = core_llm::CancelFlag::new();
         let request = TextLlmRequest {
             messages: vec![user],
@@ -210,11 +212,16 @@ impl Captioner for JoyCaption {
 
         let gen_cancel = req.cancel.clone();
         let bridge_cancel = core_cancel;
-        let mut on_event = move |ev: StreamEvent| {
-            if let StreamEvent::Token { .. } = ev {
-                if gen_cancel.is_cancelled() {
-                    bridge_cancel.cancel();
-                }
+        // Mirror once before the provider runs so a cancel requested between the entry check and here
+        // is visible to the provider's first (prefill) cancel poll.
+        if gen_cancel.is_cancelled() {
+            bridge_cancel.cancel();
+        }
+        let mut on_event = move |_ev: StreamEvent| {
+            // Mirror on every event the provider emits (prefill/progress as well as tokens), so a
+            // cancel during vision-encode/prefill trips the provider's flag before token 1.
+            if gen_cancel.is_cancelled() {
+                bridge_cancel.cancel();
             }
         };
         let out = self

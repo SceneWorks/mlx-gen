@@ -128,7 +128,7 @@ fn decode_tiled_matches_reference() {
         "spatial cfg should tile 4×4"
     );
     let sp_got = vae
-        .decode_tiled(sp_in, &sp_cfg)
+        .decode_tiled(sp_in, &sp_cfg, &Default::default())
         .expect("decode_tiled spatial");
     assert_eq!(sp_got.shape(), sp_want.shape(), "spatial tiled shape");
     let sp_pr = peak_rel(&sp_got, sp_want);
@@ -147,7 +147,7 @@ fn decode_tiled_matches_reference() {
         "temporal cfg should tile 3 frames"
     );
     let tp_got = vae
-        .decode_tiled(tp_in, &tp_cfg)
+        .decode_tiled(tp_in, &tp_cfg, &Default::default())
         .expect("decode_tiled temporal");
     assert_eq!(tp_got.shape(), tp_want.shape(), "temporal tiled shape");
     let tp_pr = peak_rel(&tp_got, tp_want);

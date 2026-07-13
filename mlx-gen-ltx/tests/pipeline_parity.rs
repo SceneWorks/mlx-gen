@@ -161,7 +161,7 @@ fn pipeline_matches_reference() {
         latents.shape()
     );
 
-    let frames = decode_to_frames(&vae, &latents).expect("decode_to_frames");
+    let frames = decode_to_frames(&vae, &latents, &Default::default()).expect("decode_to_frames");
     let want_frames = g.require("frames").unwrap();
     assert_eq!(frames.shape(), want_frames.shape(), "frame shape");
     assert_eq!(frames.dtype(), Dtype::Uint8, "frames uint8");

@@ -145,10 +145,15 @@ pub fn denoise_cfg(
 /// DC-AE-decode the final `[1, 32, H/32, W/32]` latent → an RGB8 [`Image`]. diffusers
 /// `SanaPipeline` divides by `vae.config.scaling_factor` before decode; the decoder emits NHWC and
 /// [`decoded_to_image`] expects NCHW, so the result is transposed back before the RGB8 conversion.
-pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Array) -> Result<Image> {
+pub fn decode_to_image(
+    decoder: &DcAeDecoder,
+    cfg: &DcAeConfig,
+    latents: &Array,
+    cancel: &CancelFlag,
+) -> Result<Image> {
     let scale = Array::from_slice(&[cfg.scaling_factor], &[1]);
     let unscaled = divide(latents, &scale)?; // diffusers: latents / scaling_factor
-    let decoded_nhwc = decoder.decode(&unscaled)?; // [1, H, W, 3] NHWC, f32
+    let decoded_nhwc = decoder.decode(&unscaled, cancel)?; // [1, H, W, 3] NHWC, f32
     let decoded_nchw = decoded_nhwc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for decoded_to_image
     decoded_to_image(&decoded_nchw)
 }
@@ -397,9 +402,10 @@ pub fn encode_init_latents(
     image: &Image,
     width: u32,
     height: u32,
+    cancel: &CancelFlag,
 ) -> Result<Array> {
     let image_nchw = preprocess_init_image(image, width, height)?;
-    let raw = encoder.encode(&image_nchw)?; // [1, 32, H/32, W/32], raw (pre-scale)
+    let raw = encoder.encode(&image_nchw, cancel)?; // [1, 32, H/32, W/32], raw (pre-scale)
     Ok(multiply(&raw, arr1(cfg.scaling_factor))?)
 }
 
@@ -529,6 +535,7 @@ impl SanaPipeline {
                 image,
                 req.width,
                 req.height,
+                cancel,
             )?)
         } else {
             None
@@ -564,7 +571,7 @@ impl SanaPipeline {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
     }
 
     /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) generate path (sc-8490). Encodes the
@@ -602,8 +609,14 @@ impl SanaPipeline {
             let image = req
                 .init_image
                 .expect("start_step > 0 implies an init image");
-            let clean =
-                encode_init_latents(&self.encoder, &self.dc_ae_cfg, image, req.width, req.height)?;
+            let clean = encode_init_latents(
+                &self.encoder,
+                &self.dc_ae_cfg,
+                image,
+                req.width,
+                req.height,
+                cancel,
+            )?;
             // x0 in the SCM prior space (σ_data-scaled); noise likewise. TrigFlow renoise to angle t.
             let x0 = multiply(&clean, arr1(sd))?;
             let noise_sd = multiply(&noise, arr1(sd))?;
@@ -630,7 +643,7 @@ impl SanaPipeline {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
     }
 }
 

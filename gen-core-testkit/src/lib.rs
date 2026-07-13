@@ -363,6 +363,57 @@ pub fn check_cancellation_with(g: &dyn Generator, req: &GenerationRequest) -> Re
     }
 }
 
+/// **Pre-generate cancellation (the non-denoise-seam class).** A request whose `CancelFlag` is
+/// **already tripped when `generate` is called** must return the typed `Err(Error::Canceled)` and
+/// produce no output — the provider must consult the flag *before* running its expensive pre-denoise
+/// work (prompt/vision encode, reference VAE encodes, identity tower, sequential component loads),
+/// not only inside the denoise loop.
+///
+/// This complements [`check_cancellation`], which trips the flag *mid-denoise* (at the first emitted
+/// `Progress::Step`) and therefore only exercises the denoise loop. The whole class of "cancellation
+/// regresses at the encode / VAE-decode / identity / load seams the denoise loop doesn't cover"
+/// (the sc-11128 / F-018/F-019/F-029/F-037/F-108/F-142/F-135 family) is what this check mechanically
+/// guards: a provider that runs its full encode→denoise→decode before ever looking at the flag fails
+/// here even though it might pass the mid-denoise check. Mirrors the captioner's pre-inference
+/// cancellation contract ([`check_captioner_cancellation`]).
+///
+/// Note on lazy backends: because this hands an *already*-cancelled request, the provider's up-front
+/// check observes the trip without needing a forced `eval` — the false-green trap (a cancel arriving
+/// *during* a lazily-built encode) is a per-provider concern the provider's own tests must cover by
+/// forcing materialization at the seam; the contract-level guarantee this enforces is that such a
+/// check exists at all.
+pub fn check_precancellation(g: &dyn Generator, profile: &Profile) -> Result<(), String> {
+    check_precancellation_with(g, &base_request(profile))
+}
+
+/// **Pre-generate cancellation (request-supplied).** The general form of [`check_precancellation`]
+/// for providers whose `generate` needs conditioning the text-only [`base_request`] cannot supply
+/// (image→video, super-resolution, the renderer families) — the same shape as
+/// [`check_cancellation_with`]. Trips `req.cancel` up front, then asserts the typed
+/// `Err(Error::Canceled)` with no partial output.
+pub fn check_precancellation_with(
+    g: &dyn Generator,
+    req: &GenerationRequest,
+) -> Result<(), String> {
+    let id = g.descriptor().id;
+    let mut req = req.clone();
+    req.cancel = Default::default();
+    req.cancel.cancel();
+    match g.generate(&req, &mut |_| {}) {
+        Ok(_) => Err(format!(
+            "pre-cancellation[{id}]: generate() returned Ok despite a CancelFlag already tripped at \
+             call time; it must consult req.cancel before its pre-denoise encode/load work and return \
+             Err(Error::Canceled)"
+        )),
+        Err(Error::Canceled) => Ok(()),
+        Err(other) => Err(format!(
+            "pre-cancellation[{id}]: must return the typed Err(Error::Canceled) for an already-cancelled \
+             request, got {other:?} — a provider that only checks cancel inside the denoise loop (or \
+             stringifies the error) fails the non-denoise-seam contract (sc-11128)"
+        )),
+    }
+}
+
 /// **Seed determinism (same backend).** Two runs of the identical request+seed produce
 /// byte-identical output. Cross-backend equality is *not* a goal (RNG algorithms differ); this is
 /// the guarantee that makes the seeded per-step RNG (D6) mandatory.
@@ -453,10 +504,11 @@ pub fn conformance(make: impl Fn() -> Box<dyn Generator>, profile: &Profile) {
     let g: &dyn Generator = g.as_ref();
 
     type Check = fn(&dyn Generator, &Profile) -> Result<(), String>;
-    let checks: [Check; 4] = [
+    let checks: [Check; 5] = [
         check_validate_honesty,
         check_progress,
         check_cancellation,
+        check_precancellation,
         check_seed_determinism,
     ];
 

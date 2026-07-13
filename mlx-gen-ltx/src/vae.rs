@@ -37,7 +37,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{conv3d, silu};
 use mlx_gen::weights::{to_dtype, Weights};
-use mlx_gen::{Error, Result};
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{LtxVaeConfig, VaeBlock};
 use mlx_gen::tiling::{TilingConfig, VaeTiling};
@@ -613,7 +613,17 @@ impl LtxVideoVae {
     /// Decode with **tiling** for memory-bounded large/long-video decode (`cfg`). Splits the latent
     /// into overlapping spatial/temporal tiles, decodes each, and trapezoidally blends them. Falls
     /// back to the single-pass [`decode`](Self::decode) when `cfg` does not fire for these dims.
-    pub fn decode_tiled(&self, latent: &Array, cfg: &TilingConfig) -> Result<Array> {
+    ///
+    /// `cancel` (F-051): checked once per tile. The per-tile `eval` below already materializes the
+    /// accumulators, so the check observes real progress (no lazy-eval false green — the check runs
+    /// after the tile's compute is forced), and a cancel during the minutes-long full-envelope decode
+    /// is honored within one tile rather than the whole video. Returns [`Error::Canceled`] on trip.
+    pub fn decode_tiled(
+        &self,
+        latent: &Array,
+        cfg: &TilingConfig,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
         let sh = latent.shape();
         let (f, h, w) = (sh[2], sh[3], sh[4]);
         if !cfg.needs_tiling(VaeTiling::LTX, f, h, w) {
@@ -629,6 +639,9 @@ impl LtxVideoVae {
         for t in &plan.t {
             for hh in &plan.h {
                 for ww in &plan.w {
+                    if cancel.is_cancelled() {
+                        return Err(Error::Canceled);
+                    }
                     let tile = slice_axis(latent, 2, t.start, t.end)?;
                     let tile = slice_axis(&tile, 3, hh.start, hh.end)?;
                     let tile = slice_axis(&tile, 4, ww.start, ww.end)?;

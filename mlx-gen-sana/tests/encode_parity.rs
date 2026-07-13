@@ -55,7 +55,7 @@ fn encode_matches_diffusers() {
 
     let weights = Weights::from_file(&weights_path).expect("load weights");
     let encoder = DcAeEncoder::from_weights(&weights, DcAeConfig::sana_f32c32()).expect("build");
-    let got = encoder.encode(image).expect("encode"); // [1,32,H/32,W/32] NCHW (raw, pre-scale)
+    let got = encoder.encode(image, &Default::default()).expect("encode"); // [1,32,H/32,W/32] NCHW (raw, pre-scale)
 
     assert_eq!(got.shape(), want.shape(), "shape");
     let peak = peak_rel(&got, want);

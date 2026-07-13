@@ -25,6 +25,7 @@ use mlx_gen::{
     Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
 };
+use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use crate::config::{Flux2Config, FLUX2_DEV_CONTROL_ID};
@@ -228,6 +229,11 @@ impl Flux2DevControl {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // F-037: this control path had zero pre-loop cancel checks — bail before the TE encode +
+        // the control-context / img2img VAE encodes (all pre-denoise).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.config_default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(crate::config::DEFAULT_GUIDANCE_DEV);
@@ -259,6 +265,15 @@ impl Flux2DevControl {
             }
             _ => None,
         };
+        // F-037: force the control-context (and any img2img init) VAE encode so the check observes it,
+        // then honor a cancel arriving during that encode before the denoise loop starts.
+        match &clean_init {
+            Some(ci) => eval([&control_context, ci])?,
+            None => eval([&control_context])?,
+        }
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         // Compiled elementwise glue (sc-2963), shared with the base flux2 path. Scoped + restored on
         // drop by the RAII guard (F-007) instead of leaking the process-global toggle on.

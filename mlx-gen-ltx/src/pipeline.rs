@@ -160,14 +160,19 @@ pub fn renoise(latents: &Array, noise: &Array, noise_scale: f32) -> Result<Array
 /// ×32 spatial, ×8 **causal** temporal ⇒ `out_f = 1 + (T_lat−1)·8`), so an over-budget decode returns
 /// a **catchable** error here instead of SIGKILLing the process inside a single-pass full-video decode.
 /// Small outputs select `None` → the original single-pass `decode` (byte-identical to before).
-pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array) -> Result<Array> {
+pub fn decode_to_frames(vae: &LtxVideoVae, latents: &Array, cancel: &CancelFlag) -> Result<Array> {
     let sh = latents.shape(); // (B, 128, T_lat, H_lat, W_lat)
     let (t_lat, h_lat, w_lat) = (sh[2], sh[3], sh[4]);
     let out_f = 1 + (t_lat - 1) * TEMPORAL_SCALE as i32;
     let out_h = h_lat * SPATIAL_SCALE as i32;
     let out_w = w_lat * SPATIAL_SCALE as i32;
+    // F-051: honor a cancel issued after `Progress::Decoding` but before the (single-pass or tiled)
+    // decode begins; the tiled path additionally checks per tile.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     let decoded = match auto_tiling_budgeted_ltx(out_h, out_w, out_f)? {
-        Some(cfg) => vae.decode_tiled(latents, &cfg)?,
+        Some(cfg) => vae.decode_tiled(latents, &cfg, cancel)?,
         None => vae.decode(latents)?,
     };
     to_uint8_frames(&decoded)
@@ -354,7 +359,7 @@ pub(crate) fn render_sample(
         &CancelFlag::default(),
         &mut |_| {},
     )?;
-    let frames = decode_to_frames(vae, &latents)?; // (F, H, W, 3) uint8
+    let frames = decode_to_frames(vae, &latents, &CancelFlag::default())?; // (F, H, W, 3) uint8
     frame0_to_image(&frames)
 }
 
@@ -589,7 +594,7 @@ pub fn generate_t2v(
         cancel,
         on_step,
     )?;
-    decode_to_frames(vae, &latents)
+    decode_to_frames(vae, &latents, cancel)
 }
 
 // ===================================================================================================
@@ -1111,7 +1116,14 @@ pub fn decode_audio_track(
     vocoder: &LtxVocoder,
     audio_latents: &Array,
     sample_rate: u32,
+    cancel: &CancelFlag,
 ) -> Result<AudioTrack> {
+    // F-051: the audio decode is one monolithic graph (mel decode → vocoder → host readback), so the
+    // only meaningful seam is its entry — honor a cancel issued after the (long) video decode but
+    // before the audio decode begins.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     let mel = decoder.decode(audio_latents)?;
     let wav = vocoder.forward(&mel)?; // (B, channels, samples)
     let sh = wav.shape();

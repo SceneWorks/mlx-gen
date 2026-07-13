@@ -259,7 +259,7 @@ fn run_e2e_gate(dir: &std::path::Path, golden: &str, bf16: bool) {
     )
     .expect("generate_t2v_latents");
     let fmr = mean_rel(&latents, g.require("final_latents").unwrap());
-    let frames = decode_to_frames(&vae, &latents).expect("decode");
+    let frames = decode_to_frames(&vae, &latents, &Default::default()).expect("decode");
     let want_frames = g.require("frames").unwrap();
     assert_eq!(frames.shape(), want_frames.shape(), "frame shape");
     assert_eq!(frames.dtype(), Dtype::Uint8);

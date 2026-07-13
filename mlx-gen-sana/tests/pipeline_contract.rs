@@ -25,7 +25,7 @@ use mlx_rs::Array;
 
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::weights::Weights;
-use mlx_gen::{CancelFlag, FlowMatchEuler, Progress};
+use mlx_gen::{CancelFlag, Error, FlowMatchEuler, Progress};
 
 use mlx_gen_sana::pipeline::{self, SCHEDULE_SHIFT};
 use mlx_gen_sana::{
@@ -357,6 +357,39 @@ fn tiny_dcae_weights(cfg: &DcAeConfig) -> Weights {
     w
 }
 
+/// F-028 (sc-11128): the DC-AE decode is a monolithic graph after the denoise loop's last per-step
+/// cancel check; a cheap entry check honors an already-cancelled request at that seam. This drives
+/// the real (tiny synthetic) decoder — no weights — and asserts the typed `Error::Canceled` when the
+/// flag is pre-tripped, and a clean decode when it isn't. `DcAeEncoder::encode` carries the identical
+/// guard. The pre-tripped assertion would fail against a decode that ignored the flag.
+#[test]
+fn dcae_decode_honors_precancel() {
+    let dcfg = tiny_dcae_config();
+    let decoder = DcAeDecoder::from_weights(&tiny_dcae_weights(&dcfg), dcfg.clone())
+        .expect("build tiny dc-ae");
+    let latent = normal::<f32>(
+        &[1, dcfg.latent_channels, 6, 4],
+        None,
+        None,
+        Some(&key(0).unwrap()),
+    )
+    .unwrap();
+
+    // Not cancelled → a real decode succeeds.
+    let ok = decoder
+        .decode(&latent, &CancelFlag::default())
+        .expect("decode without cancel");
+    assert_eq!(ok.shape()[0], 1, "decoded batch axis");
+
+    // Already cancelled → typed Canceled, no decode work.
+    let cancel = CancelFlag::default();
+    cancel.cancel();
+    match decoder.decode(&latent, &cancel) {
+        Err(Error::Canceled) => {}
+        other => panic!("expected Err(Error::Canceled) on a pre-cancelled decode, got {other:?}"),
+    }
+}
+
 #[test]
 fn pipeline_wires_trunk_scheduler_decode() {
     let tcfg = tiny_trunk_config();
@@ -421,7 +454,8 @@ fn pipeline_wires_trunk_scheduler_decode() {
     );
 
     // Decode through the DC-AE (with the scaling_factor un-scale).
-    let img = pipeline::decode_to_image(&decoder, &dcfg, &denoised).expect("decode");
+    let img =
+        pipeline::decode_to_image(&decoder, &dcfg, &denoised, &Default::default()).expect("decode");
     let exp_w = (latent_w * scale) as u32;
     let exp_h = (latent_h * scale) as u32;
     // NON-SQUARE: width and height differ, so an axis swap in the NHWC→NCHW transpose would land
@@ -439,7 +473,7 @@ fn pipeline_wires_trunk_scheduler_decode() {
     // Finiteness/sanity directly on the decoder tensor (pre-RGB8-quantization).
     let scale_arr = Array::from_slice(&[dcfg.scaling_factor], &[1]);
     let unscaled = mlx_rs::ops::divide(&denoised, &scale_arr).unwrap();
-    let decoded = decoder.decode(&unscaled).unwrap();
+    let decoded = decoder.decode(&unscaled, &Default::default()).unwrap();
     let lo = min_op(&decoded, None).unwrap();
     let hi = max_op(&decoded, None).unwrap();
     eval([&lo, &hi]).unwrap();

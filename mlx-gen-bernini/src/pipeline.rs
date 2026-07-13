@@ -396,6 +396,11 @@ impl BerniniRenderer {
             eval([&context, &context_null])?;
             (context, context_null)
         };
+        // F-135: T5 encode materialized above; honor a cancel before the source VAE encodes and the
+        // two ~28 GB expert loads (all pre-denoise stages sc-9093's loop-only cancel didn't reach).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         // --- Stage 1b: VAE-encode source media → conditioning latents (→ encoder freed) ---
         let (videos, images) = if has_video || has_image {
@@ -427,6 +432,10 @@ impl BerniniRenderer {
         } else {
             (Vec::new(), Vec::new())
         };
+        // F-135: source encodes materialized (if any); honor a cancel before the expert loads.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         // Seeded init noise (spatial, f32). Bit-parity vs torch needs the reference's CPU-MT19937
         // draw injected; the coherence bar uses the MLX RNG.
@@ -447,7 +456,13 @@ impl BerniniRenderer {
         };
         let latents = {
             let low_dit = load_expert("low_noise_model.safetensors")?;
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let high_dit = load_expert("high_noise_model.safetensors")?;
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let low = BExpert::build(&low_dit, &context, &context_null)?;
             let high = BExpert::build(&high_dit, &context, &context_null)?;
             let pf = PackedForward::new(

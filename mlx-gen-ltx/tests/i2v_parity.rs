@@ -223,7 +223,7 @@ fn run_i2v_gate(golden_path: &str, bf16: bool, stat_dt: Dtype) {
         &frame(&latents, frame_idx),
         &frame(g.require("stage2_image_latent").unwrap(), 0),
     );
-    let frames = decode_to_frames(&vae, &latents).expect("decode");
+    let frames = decode_to_frames(&vae, &latents, &Default::default()).expect("decode");
     let want_frames = g.require("frames").unwrap();
     assert_eq!(frames.shape(), want_frames.shape(), "frame shape");
     assert_eq!(frames.dtype(), Dtype::Uint8);

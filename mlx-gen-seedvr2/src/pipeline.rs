@@ -297,7 +297,7 @@ impl Seedvr2Pipeline {
         let processed = self.preprocess_frame(image, width, height, softness)?; // (1,3,1,H,W)
         let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
         Ok(self
-            .frames_from_decoded(&decoded, &processed, 1)?
+            .frames_from_decoded(&decoded, &processed, 1, cancel)?
             .into_iter()
             .next()
             .expect("one tiled frame"))
@@ -386,10 +386,18 @@ impl Seedvr2Pipeline {
         decoded: &Array,
         style: &Array,
         count: i32,
+        cancel: &CancelFlag,
     ) -> Result<Vec<Image>> {
         let style_t = style.shape()[2];
         let mut out = Vec::with_capacity(count as usize);
         for t in 0..count {
+            // F-163: per-frame color correction is single-threaded host math (5-level wavelet + three
+            // full-frame sorts, `as_slice`-materialized), so a whole chunk of it was uncancellable.
+            // Each iteration already forces the prior frame's work to host, making this a genuine
+            // per-frame yield point (no `eval` needed) — bounds cancel latency to one frame.
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let d = decoded.take_axis(Array::from_int(t), 2)?; // (1,3,Hc,Wc)
             let s = style.take_axis(Array::from_int(t.min(style_t - 1)), 2)?;
             let corrected = color::apply_color_correction(
@@ -530,7 +538,7 @@ impl Seedvr2Pipeline {
             let cond = Self::condition(&latent)?;
             let latents = self.denoise(&noise, &cond, &neg, &ts)?;
             let decoded = self.decode_crop_5d(&latents, height, width)?;
-            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len)?);
+            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len, cancel)?);
         }
         Ok(video::assemble_overlap(
             &plan,
@@ -607,7 +615,7 @@ impl Seedvr2Pipeline {
                 .preprocess(f, width, height, softness)?
                 .expand_dims(2)?; // (1,3,1,H,W)
             let decoded = self.run_frame_tiled(&processed, seed, tile, overlap, &neg, cancel)?;
-            let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
+            let imgs = self.frames_from_decoded(&decoded, &processed, 1, cancel)?;
             out.push(imgs.into_iter().next().expect("one frame"));
         }
         Ok(out)

@@ -157,13 +157,14 @@ fn av_lora_e2e_matches_reference() {
 
     let pr_v = peak_rel(&vlat, g.require("video_latents").unwrap());
     let pr_a = peak_rel(&alat, g.require("audio_latents").unwrap());
-    let frames = decode_to_frames(&vae, &vlat).expect("decode video");
+    let frames = decode_to_frames(&vae, &vlat, &Default::default()).expect("decode video");
     let px = px_gt8(&frames, g.require("frames").unwrap());
     let track = decode_audio_track(
         &audio_decoder,
         &vocoder,
         &alat,
         vcfg.final_sample_rate() as u32,
+        &Default::default(),
     )
     .expect("decode audio");
     let wav = g.require("waveform").unwrap();

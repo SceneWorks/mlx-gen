@@ -13,6 +13,7 @@
 //! worker, or this crate's own test binary) links `mlx-gen-kolors`. The core `mlx-gen` crate does
 //! **not** depend on the model crates (by design); there is no root-crate dependency to add.
 
+use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
@@ -273,6 +274,12 @@ impl KolorsGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
+        // F-142: the ChatGLM3-6B prompt encodes (up to two full 6B forwards) plus the VAE init
+        // encodes all run before the first denoise-loop cancel check. Bail up front, and materialize
+        // the encodes below so a cancel arriving during them is honored (no lazy-eval false green).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let cfg = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
@@ -316,11 +323,22 @@ impl KolorsGenerator {
         // time_ids. Routing every mode through those methods keeps a single denoise assembly shared
         // with the struct API + parity gates — only the real cancel/progress differ here (F-146).
         let pos = self.kolors.encode(&req.prompt)?;
+        // F-142: force the ~6B positive forward so the cancel check below observes real progress, then
+        // honor a cancel before the (equally large) negative encode.
+        eval([&pos.0, &pos.1])?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005, sc-9091): the
         // per-mode denoise assemblies build B=1 conditioning for `cfg <= 1.0` and never read the
         // uncond stream, so encoding it would be a large wasted 6B forward.
         let neg = if cfg > 1.0 {
-            Some(self.kolors.encode(negative)?)
+            let neg = self.kolors.encode(negative)?;
+            eval([&neg.0, &neg.1])?;
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            Some(neg)
         } else {
             None
         };
@@ -488,6 +506,11 @@ impl KolorsGenerator {
         // The run-step truncation each denoise method applies (keep nodes ⇒ keep-1 denoise steps).
         let run_steps = vp_plan.map(|p| p.keep - 1);
 
+        // F-142: honor a cancel after the (hoisted, seed-independent) VAE init / PiD-plan encodes,
+        // before entering the per-image denoise loop whose own per-step check takes over.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let mut images = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             let seed = base_seed.wrapping_add(i as u64);

@@ -126,13 +126,14 @@ fn av_e2e_matches_reference() {
     let pr_a = peak_rel(&alat, g.require("audio_latents").unwrap());
     eprintln!("av e2e latents: video peak_rel {pr_v:.3e} | audio peak_rel {pr_a:.3e}");
 
-    let frames = decode_to_frames(&vae, &vlat).expect("decode video");
+    let frames = decode_to_frames(&vae, &vlat, &Default::default()).expect("decode video");
     let px = px_gt8(&frames, g.require("frames").unwrap());
     let track = decode_audio_track(
         &audio_decoder,
         &vocoder,
         &alat,
         vcfg.final_sample_rate() as u32,
+        &Default::default(),
     )
     .expect("decode audio");
     // Interleave the golden waveform (1, C, S) → (S, C) → flat, to match the AudioTrack layout.

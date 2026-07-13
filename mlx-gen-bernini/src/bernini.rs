@@ -650,7 +650,17 @@ impl Bernini {
         let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
 
         // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
+        // F-135: sc-9093 threaded cancel into the MAR loop, both denoise loops, and VAE decode, but
+        // the heavy non-loop stages between them (planner ~15 GB load, per-source ViT/VAE encodes, T5
+        // encode, two sequential ~28 GB expert loads) checked nothing. Each disk load / `eval` below
+        // is materialized, so a check placed right after it is effective without a new eval.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let planner = BerniniPlanner::load(&self.root, self.quant)?;
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         // Preprocess the conditioning: videos first, then images (the conversation / source_id order).
         let mut videos: Vec<SourceVisual> = Vec::new();
@@ -783,6 +793,10 @@ impl Bernini {
             &streams.wotxt_wvit,
             &streams.wotxt_wovit,
         ])?;
+        // F-135: streams (and thus the per-source ViT/VAE encodes feeding them) are now materialized.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
 
         // VAE-encoded source latents carry into the renderer; free the planner before the renderer.
         let bf16 = |a: &Array| a.as_dtype(Dtype::Bfloat16);
@@ -812,6 +826,10 @@ impl Bernini {
             eval([&pos, &neg])?;
             (pos, neg)
         };
+        // F-135: T5 pos/neg materialized above; honor a cancel before the two ~28 GB expert loads.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         // wtxt streams prepend the positive T5; wotxt streams prepend the negative T5. The renderer's
         // `embed_text` consumes a 2-D `[S, text_dim]` context (it pads/reshapes the batch axis itself),
         // so drop the leading batch dim that `concat_with_zero_init` carries.
@@ -869,7 +887,13 @@ impl Bernini {
         };
         let latents = {
             let low_dit = load_expert("low_noise_model.safetensors")?;
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let high_dit = load_expert("high_noise_model.safetensors")?;
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let streams4 = [
                 &pe_wtxt_wvit,
                 &pe_wtxt_wovit,

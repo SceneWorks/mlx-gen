@@ -545,6 +545,7 @@ pub(crate) fn render_batch(
 /// periodic preview. `cap` is the (already dtype-matched) caption conditioning for the sample prompt;
 /// `dtype` is the trainer's compute dtype (bf16/f32) so the noise enters the loop at the same
 /// precision as the cast DiT weights. No progress/cancel plumbing — the caller drives the cadence.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     transformer: &ZImageTransformer,
     vae: &Vae,
@@ -553,10 +554,28 @@ pub(crate) fn render_sample(
     seed: u64,
     edge: u32,
     dtype: Dtype,
+    cancel: &CancelFlag,
 ) -> Result<Image> {
     let _compile_glue = crate::CompileGlueGuard::enable();
     let noise = create_noise(seed, edge, edge)?.as_dtype(dtype)?;
-    let latents = denoise(transformer, scheduler, noise, cap)?;
+    // F-117: thread the training cancel flag through the preview denoise (was a throwaway
+    // `CancelFlag::default()` via the bare `denoise`), so a cancel during a preview's multi-step
+    // denoise is honored at the next step boundary rather than only between previews.
+    let latents = denoise_with_progress(
+        transformer,
+        scheduler,
+        None,
+        0,
+        noise,
+        cap,
+        0,
+        cancel,
+        &mut |_| {},
+    )?;
+    // Honor a cancel that arrived during the denoise before the (lazy) VAE decode.
+    if cancel.is_cancelled() {
+        return Err(Error::Canceled);
+    }
     // [16,1,H,W] -> [1,16,H,W] -> [1,16,1,H,W] for VAE decode (same as render_batch).
     let unpacked = unpack_latents(&latents)?;
     let sh = unpacked.shape();

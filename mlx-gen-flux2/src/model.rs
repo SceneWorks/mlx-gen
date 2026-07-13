@@ -19,12 +19,13 @@ use mlx_gen::array::scalar;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
-    default_seed, run_flow_sampler, Error, GenerationOutput, GenerationRequest, Generator,
-    LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result, TimestepConvention,
-    WeightsSource,
+    default_seed, run_flow_sampler, CancelFlag, Error, GenerationOutput, GenerationRequest,
+    Generator, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
+    TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_rs::ops::{add, concatenate_axis, multiply, pad, subtract};
+use mlx_rs::transforms::eval;
 use mlx_rs::Array;
 
 use crate::caption_upsample;
@@ -351,10 +352,17 @@ impl Flux2 {
         images: &[&mlx_gen::media::Image],
         width: u32,
         height: u32,
+        cancel: &CancelFlag,
     ) -> Result<(Array, Array)> {
         let mut packed: Vec<Array> = Vec::with_capacity(images.len());
         let mut ids: Vec<Array> = Vec::with_capacity(images.len());
         for (i, image) in images.iter().enumerate() {
+            // F-037: honor a cancel between the (up to 8) per-reference VAE encodes. `eval` on the
+            // just-packed latent forces this reference's encode so the next iteration's check observes
+            // real progress (no lazy-eval false green).
+            if cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let pre = preprocess_ref_image(image, width, height)?; // NHWC [1,H,W,3]
             let enc = vae.encode_mean(&pre)?; // NHWC [1,H/8,W/8,32]
             let enc = enc.transpose_axes(&[0, 3, 1, 2])?; // → NCHW for the pipeline helpers
@@ -362,7 +370,9 @@ impl Flux2 {
             let patchified = patchify_latents(&enc)?; // [1,128,h,w]
             let normed = vae.bn_normalize_nchw(&patchified)?;
             let sh = patchified.shape();
-            packed.push(pack_latents(&normed)?); // [1, seq_ref, 128]
+            let packed_ref = pack_latents(&normed)?; // [1, seq_ref, 128]
+            eval([&packed_ref])?;
+            packed.push(packed_ref);
             ids.push(prepare_grid_ids(
                 sh[2] as usize,
                 sh[3] as usize,
@@ -594,6 +604,11 @@ impl Flux2 {
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
         let (tokenizer, te, transformer, vae) = self.parts()?;
+        // F-037: bail before the pre-denoise conditioning stage (up to 8 reference VAE encodes at
+        // 2048², the TE encode, and the img2img init encode — all ahead of the first denoise step).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
         let guidance = req.guidance.unwrap_or(self.variant.default_guidance());
@@ -606,7 +621,7 @@ impl Flux2 {
         // output keeps the leading `target_seq` image tokens.
         let reference = if self.variant.is_edit() {
             let images = self.collect_edit_references(req)?;
-            Some(self.encode_references(vae, &images, req.width, req.height)?)
+            Some(self.encode_references(vae, &images, req.width, req.height, &req.cancel)?)
         } else {
             None
         };

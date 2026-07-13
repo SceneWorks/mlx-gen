@@ -495,6 +495,12 @@ impl Ltx {
         audio_s2: &Array,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // F-051: honor a cancel before the (unbounded) pre-denoise conditioning stage — the Gemma TE
+        // encode plus up-to-N per-keyframe/per-clip VAE encodes all run here, ahead of the first
+        // denoise-loop check.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (ids, mask) = self.tokenizer.encode(&req.prompt, MAX_PROMPT_TOKENS)?;
         let (video_ctx, audio_ctx) = self.text_encoder.encode_av(&ids, &mask)?;
         // Replace-latent conditioning: VAE-encode each keyframe at both stage resolutions (half/full).
@@ -632,7 +638,7 @@ impl Ltx {
         };
 
         on_progress(Progress::Decoding);
-        let frames = decode_to_frames(&self.vae, &video_latents)?;
+        let frames = decode_to_frames(&self.vae, &video_latents, &req.cancel)?;
         let images = frames_to_images(&frames)?;
         // Audio always denoised (it conditions the video); decode it unless `--no-audio`.
         let audio = if Self::no_audio(req) {
@@ -643,6 +649,7 @@ impl Ltx {
                 &self.vocoder,
                 &audio_latents,
                 self.audio_sample_rate,
+                &req.cancel,
             )?)
         };
         Ok(GenerationOutput::Video {
@@ -688,14 +695,20 @@ impl Ltx {
         let lf = Self::latent_dims(req).0 as i32;
         let mut out = Vec::new();
         if let Some((image, strength)) = self.resolve_reference(req)? {
-            out.push((
-                self.encode_conditioning(image, req.height / 2, req.width / 2)?,
-                self.encode_conditioning(image, req.height, req.width)?,
-                IMAGE_FRAME_IDX,
-                strength,
-            ));
+            // F-051: check + materialize before each VAE encode so a cancel during this (unbounded)
+            // conditioning stage is honored between encodes rather than only at the first denoise step.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
+            let s1 = self.encode_conditioning(image, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(image, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, IMAGE_FRAME_IDX, strength));
         }
         for kf in req.keyframes() {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             let idx = if kf.frame_idx < 0 {
                 lf + kf.frame_idx
             } else {
@@ -707,12 +720,10 @@ impl Ltx {
                     kf.frame_idx
                 )));
             }
-            out.push((
-                self.encode_conditioning(kf.image, req.height / 2, req.width / 2)?,
-                self.encode_conditioning(kf.image, req.height, req.width)?,
-                idx,
-                kf.strength,
-            ));
+            let s1 = self.encode_conditioning(kf.image, req.height / 2, req.width / 2)?;
+            let s2 = self.encode_conditioning(kf.image, req.height, req.width)?;
+            mlx_rs::transforms::eval([&s1, &s2])?;
+            out.push((s1, s2, idx, kf.strength));
         }
         Ok(out)
     }
@@ -727,6 +738,10 @@ impl Ltx {
         let lf = Self::latent_dims(req).0 as i32;
         let mut out = Vec::new();
         for clip in req.video_clips() {
+            // F-051: honor a cancel between the (unbounded) per-clip VAE encodes.
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             if clip.frames.is_empty() {
                 return Err(Error::Msg(
                     "ltx_2_3: video conditioning clip is empty".into(),
@@ -744,7 +759,9 @@ impl Ltx {
                 )));
             }
             let video = preprocess_conditioning_clip(clip.frames, req.width / 2, req.height / 2)?;
-            out.push((self.vae.encode(&video)?, idx, clip.strength));
+            let latent = self.vae.encode(&video)?;
+            latent.eval()?;
+            out.push((latent, idx, clip.strength));
         }
         // replace_person: the masked control clip rides the same keyframe-append path. Build the
         // gray-neutralized control frames host-side (port of the worker's `_apply_replacement_mask`),
@@ -753,6 +770,9 @@ impl Ltx {
         // but does not change the math here — the per-frame mask already encodes the region (the native
         // LTX path is region-driven; `replacement_mode` only affects the diffusers WanVACE path).
         if let Some(cc) = req.control_clip() {
+            if req.cancel.is_cancelled() {
+                return Err(Error::Canceled);
+            }
             if cc.frames.is_empty() {
                 return Err(Error::Msg(
                     "ltx_2_3: replace_person control clip is empty".into(),
@@ -783,7 +803,9 @@ impl Ltx {
                 .map(|(f, m)| apply_replacement_mask(f, m, cc.masking_strength))
                 .collect::<Result<_>>()?;
             let video = preprocess_conditioning_clip(&masked, req.width / 2, req.height / 2)?;
-            out.push((self.vae.encode(&video)?, idx, cc.masking_strength));
+            let latent = self.vae.encode(&video)?;
+            latent.eval()?;
+            out.push((latent, idx, cc.masking_strength));
         }
         Ok(out)
     }

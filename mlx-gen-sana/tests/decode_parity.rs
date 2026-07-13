@@ -55,7 +55,7 @@ fn decode_matches_diffusers() {
 
     let weights = Weights::from_file(&weights_path).expect("load weights");
     let decoder = DcAeDecoder::from_weights(&weights, DcAeConfig::sana_f32c32()).expect("build");
-    let got = decoder.decode(latent).expect("decode"); // [1,1024,1024,3] NHWC
+    let got = decoder.decode(latent, &Default::default()).expect("decode"); // [1,1024,1024,3] NHWC
 
     assert_eq!(got.shape(), want.shape(), "shape");
     let peak = peak_rel(&got, &want);

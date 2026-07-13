@@ -24,9 +24,9 @@ use mlx_rs::{Array, Dtype};
 use mlx_gen::media::Image;
 use mlx_gen::weights::Weights;
 use mlx_gen::{
-    curated_sampler_names, curated_scheduler_names, gen_core, Capabilities, Conditioning,
-    ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, IdentityWeights,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
+    curated_sampler_names, curated_scheduler_names, gen_core, CancelFlag, Capabilities,
+    Conditioning, ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator,
+    IdentityWeights, LoadSpec, Modality, ModelDescriptor, Progress, Quant, Result, WeightsSource,
 };
 use mlx_gen_face::FaceAnalysis;
 use mlx_gen_flux::config::FluxVariant;
@@ -142,7 +142,23 @@ impl PulidFlux {
 
     /// Face image (RGB, row-major, `h×w`) → `id_embedding` `[1,32,2048]`. Mirrors PuLID's
     /// `get_id_embedding` (the conditional side; cal_uncond is sc-3075).
-    pub fn compute_id_embedding(&self, pixels: &[u8], h: usize, w: usize) -> Result<Array> {
+    ///
+    /// `cancel` (F-108): the identity tower is the priciest pre-denoise stage (SCRFD + BiSeNet +
+    /// ArcFace, then the 24-block EVA-CLIP tower + IDFormer), and previously ran with zero cancel
+    /// checks. We check between stages. `analyze` / `face_features_image` already materialize to host
+    /// (`Face.embedding` is a `Vec<f32>`), so the check after them is effective as-is; the EVA tower
+    /// output is lazy, so we `eval` it before the check ahead of the IDFormer (no lazy-eval false
+    /// green). Returns [`Error::Canceled`] on trip.
+    pub fn compute_id_embedding(
+        &self,
+        pixels: &[u8],
+        h: usize,
+        w: usize,
+        cancel: &CancelFlag,
+    ) -> Result<Array> {
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let faces = self.face.analyze(pixels, h, w)?;
         let face = faces.first().ok_or_else(|| {
             Error::Msg("pulid_flux: no face detected in the reference image".into())
@@ -151,8 +167,17 @@ impl PulidFlux {
         let arcface = Array::from_slice(&face.embedding, &[1, face.embedding.len() as i32]);
         // face_features_image (512² aligned, bg-whitened gray) → EVA 336² transform → tower.
         let ffi = self.face.face_features_image(pixels, h, w, face)?;
+        // SCRFD/BiSeNet/ArcFace above are host-materialized; honor a cancel before the EVA tower.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let eva_in = transform::eva_transform(&ffi, self.eva_image_size())?;
         let eva_out = self.eva.forward(&eva_in)?;
+        // Force the 24-block EVA tower so the check observes real progress before the IDFormer.
+        mlx_rs::transforms::eval(&eva_out.hidden)?;
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
         let id_cond = concatenate_axis(&[&arcface, &id_cond_vit], 1)?; // [1,1280]
         self.idformer.forward(&id_cond, &eva_out.hidden)
@@ -258,9 +283,19 @@ impl PulidFlux {
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
+        // F-108: the identity stack (face analysis + EVA tower + IDFormer + CA build + the backbone
+        // T5/CLIP encodes) is the priciest pre-denoise work and previously ran with zero cancel
+        // checks. Bail up front, and `compute_id_embedding` checks between its own stages.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let (image, id_weight) = self.reference_face(req)?;
-        let id_embedding =
-            self.compute_id_embedding(&image.pixels, image.height as usize, image.width as usize)?;
+        let id_embedding = self.compute_id_embedding(
+            &image.pixels,
+            image.height as usize,
+            image.width as usize,
+            &req.cancel,
+        )?;
         let mk_ca = |emb: Array| {
             PulidCa::from_weights(
                 &self.pulid,
@@ -279,6 +314,11 @@ impl PulidFlux {
         flux_req.negative_prompt = None;
         flux_req.true_cfg = None; // PuLID drives real-CFG itself; the backbone forbids it
 
+        // The CA-module builds + (for real-CFG) the uncond IDFormer pass still precede the backbone
+        // encodes; honor a cancel that arrived during the identity tower before starting them.
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let true_cfg = req.true_cfg.unwrap_or(1.0);
         if true_cfg > 1.0 + 1e-3 {
             // Real-CFG (sc-3075): positive (id) + negative (uncond id) branches + a negative prompt.

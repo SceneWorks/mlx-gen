@@ -142,7 +142,7 @@ fn ltx_vae_decode_sweep() {
     reset_peak_memory();
     let t = Instant::now();
     let video = match &cfg {
-        Some(c) => vae.decode_tiled(&latent, c).unwrap(),
+        Some(c) => vae.decode_tiled(&latent, c, &Default::default()).unwrap(),
         None => vae.decode(&latent).unwrap(),
     };
     mlx_rs::transforms::eval([&video]).unwrap();

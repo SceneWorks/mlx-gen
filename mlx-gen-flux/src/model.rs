@@ -227,6 +227,11 @@ impl Generator for Flux1 {
         // image (and the black-image CFG branch) is encoded — the deeper `run_denoise` validation
         // would otherwise reject only after that work (L-validate-first).
         self.validate(req)?;
+        // F-108: cheap pre-check so an already-cancelled request bails before the IP-adapter
+        // reference encode + the T5-XXL/CLIP prompt encodes (all pre-denoise, uncancellable today).
+        if req.cancel.is_cancelled() {
+            return Err(Error::Canceled.into());
+        }
         // Reference-image (XLabs IP-Adapter) path, epic 3621. `validate` has confirmed at most one
         // `Reference`; extract it here.
         if let Some((image, strength)) = single_reference(req)? {

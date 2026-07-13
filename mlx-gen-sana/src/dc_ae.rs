@@ -31,7 +31,7 @@ use mlx_rs::{Array, Dtype};
 
 use mlx_gen::nn::{silu, upsample_nearest};
 use mlx_gen::weights::Weights;
-use mlx_gen::Result;
+use mlx_gen::{CancelFlag, Error, Result};
 
 use crate::config::{BlockType, DcAeConfig};
 
@@ -446,7 +446,15 @@ impl DcAeDecoder {
 
     /// Decode a latent `[B, latent_channels, h, w]` (channels-first, diffusers-native; **already
     /// un-scaled** by the caller) into an image `[B, H=32·h, W=32·w, 3]` (channels-last, f32).
-    pub fn decode(&self, latent_nchw: &Array) -> Result<Array> {
+    pub fn decode(&self, latent_nchw: &Array, cancel: &CancelFlag) -> Result<Array> {
+        // F-028: the DC-AE decode is one monolithic lazy graph after the pipeline's last per-step
+        // check. At the ≤1024² envelope (F-032 cap) the window is bounded to seconds, so a cheap
+        // entry check — honoring a cancel that arrived during the final denoise step before this
+        // decode begins — is the warranted guard; per-tile checks would only be needed if the
+        // envelope rises (the graph would then be split into per-tile sub-graphs, each eval'd).
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let latent = latent_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let shortcut = repeat_interleave_last(&latent, self.in_shortcut_repeats)?;
         let mut h = add(&self.conv_in.forward(&latent)?, &shortcut)?;
@@ -594,7 +602,12 @@ impl DcAeEncoder {
     /// `[B, latent_channels, H/32, W/32]` (channels-first) — the diffusers `AutoencoderDC.encode`
     /// output, BEFORE the `scaling_factor` multiply (the caller applies it, mirroring the decode
     /// path's `latents / scaling_factor`).
-    pub fn encode(&self, image_nchw: &Array) -> Result<Array> {
+    pub fn encode(&self, image_nchw: &Array, cancel: &CancelFlag) -> Result<Array> {
+        // F-028: bounded monolithic graph (see `decode`); a cheap entry check honors the
+        // already-cancelled contract at the img2img encode seam.
+        if cancel.is_cancelled() {
+            return Err(Error::Canceled);
+        }
         let x = image_nchw.transpose_axes(&[0, 2, 3, 1])?.as_dtype(F32)?; // → NHWC
         let mut h = self.conv_in.forward(&x)?;
         for stage in &self.stages {
