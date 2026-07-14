@@ -230,8 +230,11 @@ impl Sd3Variant {
                 // consumer must NOT additionally apply the resolution-aware dynamic shift this flag
                 // requests (doing so would double-shift). See model.rs `for_static_shift(steps, 3.0)`.
                 requires_sigma_shift: false,
-                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-                supports_sequential_offload: false,
+                // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload
+                // (F-176). Under `Sequential` the triple text encoder (CLIP-L + CLIP-G + T5-XXL) is
+                // encoded, materialized, then dropped before the MMDiT + VAE load — bounding peak to
+                // `max(triple-TE, MMDiT+VAE)`. T5-XXL alone is the biggest TE-drop in the family.
+                supports_sequential_offload: true,
             },
         }
     }

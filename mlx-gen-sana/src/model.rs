@@ -37,12 +37,15 @@ use mlx_gen::weights::Weights;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec,
-    Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    Modality, ModelDescriptor, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
 use crate::dc_ae::{DcAeDecoder, DcAeEncoder};
-use crate::pipeline::{SanaGenerateRequest, SanaPipeline};
+use crate::pipeline::{
+    encode_conditioning, SanaConditioning, SanaGenerateRequest, SanaHeavy, DEFAULT_GUIDANCE,
+    SPRINT_DEFAULT_GUIDANCE,
+};
 use crate::text_encoder::SanaTextEncoder;
 use crate::transformer::SanaTransformer;
 
@@ -122,8 +125,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_kv_cache: false,
             // Static flow-match shift 3.0, resolution-independent (handled by the unified sampler).
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
+            // Under `Sequential` the Gemma-2 CHI text encoder is encoded, materialized, then dropped
+            // before the Linear-DiT trunk + DC-AE load — bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
+            // The Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -168,16 +174,30 @@ pub fn sprint_descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834); honors Sequential offload (F-176).
+            // Sprint drops the Gemma-2 CHI text encoder before the Sprint Linear-DiT trunk + DC-AE load,
+            // bounding peak to `max(Gemma-TE, DiT+DC-AE)`.
+            supports_sequential_offload: true,
         },
     }
 }
 
-/// A loaded SANA generator: the composed pipeline plus the cached descriptor.
+/// A loaded SANA generator: the component-residency seam plus the cached descriptor and the variant
+/// flag (`sprint`) the encode phase reads to gate the uncond forward / default guidance.
 pub struct Sana {
     descriptor: ModelDescriptor,
-    pipeline: SanaPipeline,
+    /// Component-residency strategy (epic 10834; the shared seam sc-11125), selected from
+    /// [`LoadSpec::offload_policy`] at load. `Resident` (default) holds the Gemma-2 CHI text encoder +
+    /// Linear-DiT trunk + DC-AE warm for the whole job and across jobs; `Sequential` holds only the
+    /// per-phase loader closures and re-loads per generation in phase order (encode → **drop the Gemma
+    /// encoder** → denoise/decode), bounding peak unified memory to `max(Gemma-TE, DiT+DC-AE)` instead
+    /// of the sum — the Gemma encoder is comparable to (often ≥) the DiT, so the drop is a large win.
+    /// The [`Residency`] seam owns the eval/drop/clear discipline, the stage-boundary cancel checks, and
+    /// the error-safe cache flush once for all providers.
+    residency: Residency<SanaTextEncoder, SanaHeavy>,
+    /// `true` for SANA-Sprint (CFG-free SCM few-step) — read at encode time (before the heavy bundle is
+    /// available under `Sequential`) to gate the uncond forward and resolve the default guidance.
+    sprint: bool,
 }
 
 /// Construct a SANA generator from a [`LoadSpec`]. `spec.weights` must be a [`WeightsSource::Dir`]
@@ -185,26 +205,95 @@ pub struct Sana {
 /// a pre-quantized Q4/Q8 tier of the same shape (packed-detected on load, sc-8489). A precision
 /// override or LoRA/LoKr adapters are rejected rather than silently ignored (neither is wired yet).
 pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let descriptor = descriptor();
-    let root = load_components(spec, descriptor.id)?;
-    let pipeline = build_pipeline(root)?;
-    Ok(Box::new(Sana {
-        descriptor,
-        pipeline,
-    }))
+    load_from(spec, descriptor(), false)
 }
 
 /// Construct a **SANA-Sprint** generator (sc-8490) from a [`LoadSpec`]. Identical snapshot contract to
 /// [`load`] (`transformer/ vae/ text_encoder/`), but the transformer is loaded with the Sprint config
 /// (guidance embedder + rms-norm-across-heads) and driven by the CFG-free SCM few-step pipeline.
 pub fn load_sprint(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
-    let descriptor = sprint_descriptor();
-    let root = load_components(spec, descriptor.id)?;
-    let pipeline = build_sprint_pipeline(root)?;
+    load_from(spec, sprint_descriptor(), true)
+}
+
+/// Shared load body for [`load`] / [`load_sprint`]: fail-fast on the unsupported precision / adapter
+/// overrides (via [`load_components`]) up front for BOTH residencies, then build the [`Residency`]
+/// seam. `Resident` (default) builds the Gemma text encoder + heavy bundle now and holds them warm;
+/// `Sequential` keeps only the per-phase loader closures and re-loads per generate in phase order
+/// (encode → drop the Gemma encoder → denoise/decode) to bound peak memory to `max(Gemma-TE, DiT+DC-AE)`.
+fn load_from(
+    spec: &LoadSpec,
+    descriptor: ModelDescriptor,
+    sprint: bool,
+) -> Result<Box<dyn Generator>> {
+    let id = descriptor.id;
+    // Fail-fast on precision / adapter / single-file guards for BOTH residencies (Sequential defers the
+    // component build, but these overrides are still wrong, so reject them here).
+    load_components(spec, id)?;
+    let residency = build_residency(spec, sprint, id)?;
     Ok(Box::new(Sana {
         descriptor,
-        pipeline,
+        residency,
+        sprint,
     }))
+}
+
+/// The policy→[`Residency`] dispatch both SANA ids share (sc-11126, F-180), routed through the single
+/// [`Residency::from_policy`] seam so neither variant re-derives the `match offload_policy`. `Resident`
+/// eager-loads the Gemma text encoder + heavy bundle now (byte-identical to the pre-seam composition —
+/// the same per-phase loaders over independent weight files; SANA's Q4/Q8 tiers are packed-detected on
+/// load, so there is no RNG or load-time re-quantization to diverge); `Sequential` captures the two
+/// loader closures and loads nothing now, deferring each to [`Residency::run`]. SANA has no PiD overlay,
+/// so the heavy loader's `use_pid` flag is ignored. The deferral is weight-free-testable: under
+/// `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy` would
+/// eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    sprint: bool,
+    id: &'static str,
+) -> Result<Residency<SanaTextEncoder, SanaHeavy>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_text_encoder_component(load_components(&spec_text, id)?),
+        move |_use_pid| load_heavy(load_components(&spec_heavy, id)?, sprint),
+    )
+}
+
+/// Load the Gemma-2 CHI text encoder (`text_encoder/`) — the phase-A component dropped first under
+/// `Sequential`. Bundles the gemma weights + `tokenizer.json` (the un-gated mirror, epic 7840).
+fn load_text_encoder_component(root: &Path) -> Result<SanaTextEncoder> {
+    SanaTextEncoder::from_snapshot(root.join("text_encoder"))
+}
+
+/// Load the heavy render-phase components — the Linear-DiT trunk (base or Sprint config) + the DC-AE
+/// encoder/decoder — everything but the Gemma text encoder. Factored so the `Sequential` path loads
+/// these AFTER the encoder is dropped (bounding peak to `max(Gemma-TE, DiT+DC-AE)`), and the `Resident`
+/// path builds the same bundle up front. Components are independent of the text encoder (separate weight
+/// files, packed-detected quant — no RNG), so both residencies are byte-identical. The trunk is loaded
+/// first (mirroring the pre-seam `build_pipeline` order), then the DC-AE from the shared `vae/` source.
+fn load_heavy(root: &Path, sprint: bool) -> Result<SanaHeavy> {
+    let trunk_w = Weights::from_dir(root.join("transformer"))?;
+    let dcfg = DcAeConfig::sana_f32c32();
+    let vae_w = Weights::from_dir(root.join("vae"))?;
+    // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
+    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
+    let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+    if sprint {
+        let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
+        let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
+        let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
+        Ok(SanaHeavy::new_sprint(
+            trunk,
+            encoder,
+            decoder,
+            dcfg,
+            guidance_embeds_scale,
+        ))
+    } else {
+        let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
+        Ok(SanaHeavy::new(trunk, encoder, decoder, dcfg))
+    }
 }
 
 /// Shared load preamble for [`load`] / [`load_sprint`] (F-090): reject the unsupported precision /
@@ -235,51 +324,6 @@ fn load_components<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
              single .safetensors file"
         ))),
     }
-}
-
-/// Assemble the [`SanaPipeline`] from the snapshot tree — factored out so the load path is a single
-/// `?`-threaded body and the snapshot layout lives in one place. `from_dir` is used for the
-/// transformer/VAE subdirs so a sharded checkpoint loads transparently; the text encoder reuses
-/// [`SanaTextEncoder::from_snapshot`] (the bundled gemma weights + `tokenizer.json`).
-fn build_pipeline(root: &Path) -> Result<SanaPipeline> {
-    let trunk_w = Weights::from_dir(root.join("transformer"))?;
-    let trunk = SanaTransformer::from_weights(&trunk_w, SanaTransformerConfig::sana_1600m())?;
-
-    let dcfg = DcAeConfig::sana_f32c32();
-    let vae_w = Weights::from_dir(root.join("vae"))?;
-    // The `vae/` snapshot ships BOTH `encoder.*` and `decoder.*` — build both from the one source.
-    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
-    let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
-
-    let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
-
-    Ok(SanaPipeline::new(te, trunk, encoder, decoder, dcfg))
-}
-
-/// Assemble the **SANA-Sprint** [`SanaPipeline`] from the snapshot tree (sc-8490). Same layout as
-/// [`build_pipeline`], but the transformer loads the Sprint config (so the guidance-embedder +
-/// rms-norm-across-heads weights are required) and the pipeline runs the CFG-free SCM few-step path.
-fn build_sprint_pipeline(root: &Path) -> Result<SanaPipeline> {
-    let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
-    let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
-    let trunk_w = Weights::from_dir(root.join("transformer"))?;
-    let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
-
-    let dcfg = DcAeConfig::sana_f32c32();
-    let vae_w = Weights::from_dir(root.join("vae"))?;
-    let encoder = DcAeEncoder::from_weights(&vae_w, dcfg.clone())?;
-    let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
-
-    let te = SanaTextEncoder::from_snapshot(root.join("text_encoder"))?;
-
-    Ok(SanaPipeline::new_sprint(
-        te,
-        trunk,
-        encoder,
-        decoder,
-        dcfg,
-        guidance_embeds_scale,
-    ))
 }
 
 /// Resolve the optional img2img reference from the request conditioning (sc-10190): at most one
@@ -332,9 +376,12 @@ mlx_gen::impl_generator!(Sana {
 impl Sana {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
     /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
-    /// bridges the tail into [`gen_core::Error`]. Runs the composed [`SanaPipeline`] once per
-    /// requested image, deriving each image's seed from the base seed so a `count > 1` batch is
-    /// reproducible and distinct.
+    /// bridges the tail into [`gen_core::Error`]. The staged residency lifecycle (Gemma encode → **drop
+    /// the Gemma encoder** under `Sequential` → load the trunk/DC-AE → denoise/decode per image → free
+    /// the heavy bundle) is driven by the shared [`Residency::run`] seam (sc-11125): the prompt is
+    /// encoded ONCE (seed-independent, so hoisting it above the per-image loop is byte-identical to the
+    /// pre-seam per-image encode), then each image's seed is derived from the base seed so a `count > 1`
+    /// batch is reproducible and distinct.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -343,8 +390,9 @@ impl Sana {
         validate_request(&self.descriptor, req)?;
 
         // img2img (sc-10190): a single `Reference` conditioning, with a per-reference strength
-        // overriding `req.strength`. Both `SanaPipeline` paths (base flow-match + Sprint SCM) seed the
-        // denoise from the encoded init when an image + positive strength is present.
+        // overriding `req.strength`. Both render paths (base flow-match + Sprint SCM) seed the denoise
+        // from the encoded init when an image + positive strength is present. Seed-independent; resolved
+        // above the residency lifecycle.
         let reference = resolve_reference(req, self.descriptor.id)?;
         let (init_image, strength) = match reference {
             Some((image, strength)) => (Some(image), strength),
@@ -353,28 +401,71 @@ impl Sana {
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.map(|s| s as usize);
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            let seed = base_seed.wrapping_add(n as u64);
-            let sana_req = SanaGenerateRequest {
-                prompt: &req.prompt,
-                negative_prompt: req.negative_prompt.as_deref(),
-                height: req.height,
-                width: req.width,
-                steps,
-                guidance_scale: req.guidance,
-                seed: Some(seed),
-                sampler: req.sampler.as_deref(),
-                scheduler: req.scheduler.as_deref(),
-                init_image,
-                strength,
-            };
-            let img = self
-                .pipeline
-                .generate_with(&sana_req, &req.cancel, on_progress)?;
-            images.push(img);
-        }
-        Ok(GenerationOutput::Images(images))
+        // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
+        // render's denoise agree (base 4.5 true-CFG, Sprint's embedded 4.5).
+        let guidance = req.guidance.unwrap_or(if self.sprint {
+            SPRINT_DEFAULT_GUIDANCE
+        } else {
+            DEFAULT_GUIDANCE
+        });
+
+        self.residency.run(
+            &req.cancel,
+            // SANA has no PiD overlay; the heavy loader ignores `use_pid`.
+            false,
+            on_progress,
+            // ── Phase A: Gemma CHI conditioning. Seed-independent (no RNG) — encodes cond (+ uncond for
+            // base SANA with CFG active; Sprint is CFG-free). Under `Sequential` the shared seam LOADS
+            // the Gemma encoder, encodes, materializes, then DROPS it + `clear_cache()` before the
+            // trunk/DC-AE load. Under `Resident` it borrows the warm encoder (byte-identical to the
+            // pre-seam `encode_with_mask`).
+            |text_encoder: &SanaTextEncoder| {
+                encode_conditioning(
+                    text_encoder,
+                    self.sprint,
+                    &req.prompt,
+                    req.negative_prompt.as_deref(),
+                    guidance,
+                )
+            },
+            // Materialize the CHI embedding + pad mask (and their uncond twins) while the encoder is
+            // still alive (Sequential only) — MLX is lazy, so an un-evaluated output keeps the Gemma
+            // encoder referenced through the graph and the drop would free nothing.
+            |cond: &SanaConditioning| {
+                let mut arrays = vec![&cond.cond, &cond.cond_mask];
+                if let Some((u, um)) = &cond.uncond {
+                    arrays.push(u);
+                    arrays.push(um);
+                }
+                mlx_rs::transforms::eval(arrays)?;
+                Ok(())
+            },
+            // ── Phase B: denoise/decode from the heavy bundle (trunk + DC-AE), one image per seed.
+            // Runs identically for both residencies. `on_progress` is threaded through the seam (F-179).
+            |heavy: &SanaHeavy, cond, on_progress: &mut dyn FnMut(Progress)| {
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let seed = base_seed.wrapping_add(n as u64);
+                    let sana_req = SanaGenerateRequest {
+                        prompt: &req.prompt,
+                        negative_prompt: req.negative_prompt.as_deref(),
+                        height: req.height,
+                        width: req.width,
+                        steps,
+                        guidance_scale: req.guidance,
+                        seed: Some(seed),
+                        sampler: req.sampler.as_deref(),
+                        scheduler: req.scheduler.as_deref(),
+                        init_image,
+                        strength,
+                    };
+                    let img =
+                        heavy.render_one(&cond, &sana_req, guidance, &req.cancel, on_progress)?;
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -630,5 +721,58 @@ mod tests {
             !e.contains("quantization"),
             "quant tier must be accepted, got: {e}"
         );
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that SANA's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* (so the up-front single-file /
+    // precision / adapter guard in `load_components` passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Gemma text encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The `sequential_residency_real_weights.rs` A/B is
+    // `#[ignore]`d (needs a snapshot); this runs by default. Both `sprint` variants share the one
+    // dispatch — asserted on the base here.
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/sana-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            false,
+            MODEL_ID,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            false,
+            MODEL_ID,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn descriptor_advertises_sequential_offload() {
+        // Both SANA ids honor the shared Residency seam (the descriptor bit consumers read).
+        assert!(descriptor().capabilities.supports_sequential_offload);
+        assert!(sprint_descriptor().capabilities.supports_sequential_offload);
     }
 }
