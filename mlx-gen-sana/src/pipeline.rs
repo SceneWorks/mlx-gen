@@ -330,16 +330,55 @@ pub fn denoise_sprint_from(
     Ok(out)
 }
 
-/// The composed SANA text-to-image pipeline: text encoder + trunk + DC-AE decoder, with the DC-AE
-/// config (for the latent `scaling_factor`). A clean `generate` entrypoint mirroring the sibling
-/// flow-match pipelines (`mlx-gen-sd3`).
-///
-/// `sprint` selects the variant: `false` = base SANA-1.6B (true-CFG flow-match Euler); `true` =
-/// SANA-Sprint (CFG-free SCM/TrigFlow few-step, sc-8490). The trunk must be loaded with the matching
-/// config (`SanaTransformerConfig::sana_sprint_1600m()` for Sprint — its guidance embedder +
-/// rms-norm-across-heads are config-gated).
-pub struct SanaPipeline {
-    text_encoder: SanaTextEncoder,
+/// SANA prompt conditioning materialized by [`encode_conditioning`] — the Gemma-2 CHI last-hidden
+/// caption embedding + its pad mask, plus the optional uncond twin (base SANA true-CFG only; `None`
+/// for Sprint / CFG-off). The phase-A output of the shared [`mlx_gen::Residency`] seam: it is
+/// `eval`ed and the text encoder dropped before the trunk/VAE load under `Sequential`.
+pub struct SanaConditioning {
+    /// Positive-prompt CHI embedding `[1, 300, 2304]`.
+    pub cond: Array,
+    /// Positive-prompt caption pad mask (`attn2` cross-attention key mask).
+    pub cond_mask: Array,
+    /// `(uncond, uncond_mask)` — Some only for base SANA with CFG active (`guidance > 1.0`); `None`
+    /// for Sprint (CFG-free) and for a CFG-off base request.
+    pub uncond: Option<(Array, Array)>,
+}
+
+/// Encode the prompt (and, for base SANA with CFG active, the negative prompt) into [`SanaConditioning`]
+/// — the phase-A step of the shared residency seam. Encodes WITH the caption pad mask (SANA's `attn2`
+/// masks PAD keys; dropping it lets padding swamp short-prompt conditioning). `sprint` and the resolved
+/// `guidance` gate the uncond forward: `!sprint && guidance > 1.0` (diffusers'
+/// `do_classifier_free_guidance = guidance_scale > 1.0`); Sprint is CFG-free (embedded scalar), so it
+/// never encodes an uncond. Seed-independent and RNG-free, so hoisting it above the per-image render
+/// loop is byte-identical to the pre-seam per-image encode.
+pub fn encode_conditioning(
+    text_encoder: &SanaTextEncoder,
+    sprint: bool,
+    prompt: &str,
+    negative_prompt: Option<&str>,
+    guidance: f32,
+) -> Result<SanaConditioning> {
+    let (cond, cond_mask) = text_encoder.encode_with_mask(prompt)?;
+    let uncond = if !sprint && guidance > 1.0 {
+        let (u, um) = text_encoder.encode_with_mask(negative_prompt.unwrap_or(""))?;
+        Some((u, um))
+    } else {
+        None
+    };
+    Ok(SanaConditioning {
+        cond,
+        cond_mask,
+        uncond,
+    })
+}
+
+/// The heavy render-phase components (everything but the Gemma text encoder): the Linear-DiT trunk, the
+/// DC-AE encoder (img2img) + decoder, the DC-AE config, and the variant flags. Owned by the `Resident`
+/// components (held for the whole job) or by a `Sequential` generate (loaded after the text encoder is
+/// dropped, freed when the job ends). `sprint` selects the denoise path: `false` = base SANA-1.6B
+/// (true-CFG flow-match Euler); `true` = SANA-Sprint (CFG-free SCM/TrigFlow few-step, sc-8490). SANA has
+/// no PiD/control overlay, so the heavy bundle is just trunk + VAE.
+pub struct SanaHeavy {
     transformer: SanaTransformer,
     /// DC-AE **encoder** — the img2img reference→latent path (sc-10190). Loaded from the SAME
     /// `vae/` snapshot as the decoder (the checkpoint ships both `encoder.*` and `decoder.*` keys).
@@ -348,6 +387,23 @@ pub struct SanaPipeline {
     dc_ae_cfg: DcAeConfig,
     sprint: bool,
     guidance_embeds_scale: f32,
+}
+
+/// The composed SANA text-to-image pipeline: text encoder + heavy render bundle (trunk + DC-AE), with
+/// the DC-AE config (for the latent `scaling_factor`). A clean `generate` entrypoint mirroring the
+/// sibling flow-match pipelines (`mlx-gen-sd3`). The gen-core `Generator` adapter drives the
+/// component-split ([`SanaTextEncoder`] + [`SanaHeavy`]) directly through the shared
+/// [`mlx_gen::Residency`] seam; this composed type is the standalone / real-weight-contract entrypoint
+/// and shares the exact [`encode_conditioning`] + [`SanaHeavy::render_one`] bodies, so both are
+/// byte-identical.
+///
+/// `sprint` selects the variant: `false` = base SANA-1.6B (true-CFG flow-match Euler); `true` =
+/// SANA-Sprint (CFG-free SCM/TrigFlow few-step, sc-8490). The trunk must be loaded with the matching
+/// config (`SanaTransformerConfig::sana_sprint_1600m()` for Sprint — its guidance embedder +
+/// rms-norm-across-heads are config-gated).
+pub struct SanaPipeline {
+    text_encoder: SanaTextEncoder,
+    heavy: SanaHeavy,
 }
 
 /// One text-to-image request for [`SanaPipeline::generate`]. `None` fields fall back to the diffusers
@@ -409,18 +465,16 @@ pub fn encode_init_latents(
     Ok(multiply(&raw, arr1(cfg.scaling_factor))?)
 }
 
-impl SanaPipeline {
-    /// Compose the **base SANA-1.6B** pipeline (true-CFG flow-match) from its three already-constructed
+impl SanaHeavy {
+    /// Compose the **base SANA-1.6B** heavy bundle (true-CFG flow-match) from its render-phase
     /// components plus the DC-AE config (used for the latent `scaling_factor`).
     pub fn new(
-        text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
         encoder: DcAeEncoder,
         decoder: DcAeDecoder,
         dc_ae_cfg: DcAeConfig,
     ) -> Self {
         Self {
-            text_encoder,
             transformer,
             encoder,
             decoder,
@@ -430,13 +484,12 @@ impl SanaPipeline {
         }
     }
 
-    /// Compose the **SANA-Sprint** pipeline (CFG-free SCM/TrigFlow few-step, sc-8490). The
+    /// Compose the **SANA-Sprint** heavy bundle (CFG-free SCM/TrigFlow few-step, sc-8490). The
     /// `transformer` MUST be loaded with [`crate::SanaTransformerConfig::sana_sprint_1600m`] (its
     /// guidance embedder + rms-norm-across-heads are required for the embedded-guidance forward).
     /// `guidance_embeds_scale` is the trunk config's `guidance_embeds_scale` (`0.1`), pre-multiplied
     /// into the guidance scalar before the embedder.
     pub fn new_sprint(
-        text_encoder: SanaTextEncoder,
         transformer: SanaTransformer,
         encoder: DcAeEncoder,
         decoder: DcAeDecoder,
@@ -444,7 +497,6 @@ impl SanaPipeline {
         guidance_embeds_scale: f32,
     ) -> Self {
         Self {
-            text_encoder,
             transformer,
             encoder,
             decoder,
@@ -454,59 +506,53 @@ impl SanaPipeline {
         }
     }
 
-    /// Whether this is a SANA-Sprint (CFG-free few-step) pipeline.
+    /// Whether this heavy bundle drives the SANA-Sprint (CFG-free few-step) path.
     pub fn is_sprint(&self) -> bool {
         self.sprint
     }
 
-    /// Run the full prompt→image pipeline. Encodes the prompt (and the negative prompt when CFG is
-    /// active) ONCE, seeds the DC-AE latent, runs the flow-match Euler denoise over the SANA trunk
-    /// with true CFG, then DC-AE-decodes to an RGB8 [`Image`].
-    pub fn generate(&self, req: &SanaGenerateRequest<'_>) -> Result<Image> {
-        let cancel = CancelFlag::default();
-        let mut noop = |_: Progress| {};
-        self.generate_with(req, &cancel, &mut noop)
+    /// The resolved default guidance for this variant (base 4.5, Sprint's embedded 4.5) — used by the
+    /// caller to resolve `req.guidance_scale` consistently for BOTH the encode's uncond decision and
+    /// the render's denoise, so the two never disagree.
+    pub fn default_guidance(&self) -> f32 {
+        if self.sprint {
+            SPRINT_DEFAULT_GUIDANCE
+        } else {
+            DEFAULT_GUIDANCE
+        }
     }
 
-    /// [`SanaPipeline::generate`] with caller-supplied cancellation + progress (the seam Phase B's
-    /// worker `Generator` adapter wires into the gen-core contract).
-    pub fn generate_with(
+    /// Render ONE image from pre-encoded [`SanaConditioning`] + a per-image request. `guidance` is the
+    /// already-resolved guidance scale (the caller resolved it against [`Self::default_guidance`] so the
+    /// encode's uncond decision and this render agree). Branches on `sprint`. Byte-identical to the tail
+    /// of the pre-seam `generate_with` / `generate_sprint` (the encode is hoisted out; everything below
+    /// is unchanged). Seed-carrying via `req.seed`.
+    pub fn render_one(
         &self,
+        cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
+        guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        // F-091: `create_noise` derives the latent grid via `dim / SPATIAL_SCALE` integer division, so
-        // a width/height not a multiple of 32 silently truncates the latent (and the output image) to
-        // the floor multiple instead of honoring the request. Reject it up front (both the CFG and the
-        // Sprint path funnel through here) rather than returning a quietly-smaller image.
-        if !req.width.is_multiple_of(SPATIAL_SCALE) || !req.height.is_multiple_of(SPATIAL_SCALE) {
-            return Err(Error::Msg(format!(
-                "sana: width and height must be multiples of {SPATIAL_SCALE}, got {}x{}",
-                req.width, req.height
-            )));
-        }
         if self.sprint {
-            return self.generate_sprint(req, cancel, on_progress);
-        }
-        let steps = req.steps.unwrap_or(DEFAULT_STEPS);
-        let guidance = req.guidance_scale.unwrap_or(DEFAULT_GUIDANCE);
-        let seed = req.seed.unwrap_or(0);
-
-        // Conditioning is seed-independent — encode once. Cond = the prompt; uncond = the negative
-        // prompt (empty string when unset), used only when CFG is active. diffusers gates CFG on
-        // `do_classifier_free_guidance = guidance_scale > 1.0`.
-        // Encode WITH the caption padding mask — SANA's attn2 cross-attention masks PAD keys (diffusers
-        // `encoder_attention_mask`); dropping it lets padding swamp short-prompt conditioning.
-        let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
-        let cfg_on = guidance > 1.0;
-        let (uncond, uncond_mask) = if cfg_on {
-            let neg = req.negative_prompt.unwrap_or("");
-            let (u, um) = self.text_encoder.encode_with_mask(neg)?;
-            (Some(u), Some(um))
+            self.render_sprint(cond, req, guidance, cancel, on_progress)
         } else {
-            (None, None)
-        };
+            self.render_cfg(cond, req, guidance, cancel, on_progress)
+        }
+    }
+
+    /// The base SANA-1.6B true-CFG flow-match render for one image (the pre-seam `generate_with` tail).
+    fn render_cfg(
+        &self,
+        cond: &SanaConditioning,
+        req: &SanaGenerateRequest<'_>,
+        guidance: f32,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS);
+        let seed = req.seed.unwrap_or(0);
 
         // Static shift=3.0 schedule (scheduler_config.json), resolution-independent — build once. An
         // unset scheduler keeps it byte-exact; a curated name re-shapes σ over the same mu=ln(3).
@@ -555,6 +601,9 @@ impl SanaPipeline {
             }
             None => noise,
         };
+        // The uncond twin is present only for base SANA with CFG active (`encode_conditioning`).
+        let uncond = cond.uncond.as_ref().map(|(u, _)| u);
+        let uncond_mask = cond.uncond.as_ref().map(|(_, um)| um);
         let latents = denoise_cfg(
             &self.transformer,
             &scheduler,
@@ -562,10 +611,10 @@ impl SanaPipeline {
             start_step,
             seed,
             latents,
-            &cond,
-            Some(&cond_mask),
-            uncond.as_ref(),
-            uncond_mask.as_ref(),
+            &cond.cond,
+            Some(&cond.cond_mask),
+            uncond,
+            uncond_mask,
             guidance,
             cancel,
             on_progress,
@@ -574,27 +623,26 @@ impl SanaPipeline {
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
     }
 
-    /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) generate path (sc-8490). Encodes the
-    /// prompt ONCE (no uncond — Sprint is CFG-free), seeds the latent, runs the SCM loop over an
-    /// [`ScmScheduler`] (default 2 steps, embedded guidance 4.5), then DC-AE-decodes. The negative
-    /// prompt / curated sampler+scheduler knobs are inapplicable to the SCM loop and ignored.
+    /// The **SANA-Sprint** (CFG-free SCM/TrigFlow few-step) render for one image (the pre-seam
+    /// `generate_sprint` tail). The negative prompt / curated sampler+scheduler knobs are inapplicable
+    /// to the SCM loop and ignored; `cond.uncond` is always `None` for Sprint.
     ///
     /// **img2img (sc-10190):** a reference image + positive strength starts the SCM loop at angle
     /// index `start = init_time_step(n, strength)`, seeding `latents` by TrigFlow-renoising the
     /// DC-AE-encoded init to that angle: `x_t = cos(t)·x0 + sin(t)·noise·σ_data` with `x0 =
     /// encode·scaling_factor·σ_data` and `t = timesteps[start]`. Distilled/consistency, so the strength
     /// window is narrow — validate the band on-device. `start = 0` is the byte-identical txt2img path.
-    fn generate_sprint(
+    fn render_sprint(
         &self,
+        cond: &SanaConditioning,
         req: &SanaGenerateRequest<'_>,
+        guidance: f32,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
-        let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
         let seed = req.seed.unwrap_or(0);
 
-        let (cond, cond_mask) = self.text_encoder.encode_with_mask(req.prompt)?;
         let scheduler = ScmScheduler::new(steps);
         let n = scheduler.num_steps();
         let sd = scheduler.sigma_data;
@@ -635,8 +683,8 @@ impl SanaPipeline {
             start_step,
             seed,
             latents,
-            &cond,
-            Some(&cond_mask),
+            &cond.cond,
+            Some(&cond.cond_mask),
             guidance,
             self.guidance_embeds_scale,
             cancel,
@@ -644,6 +692,96 @@ impl SanaPipeline {
         )?;
         on_progress(Progress::Decoding);
         decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents, cancel)
+    }
+}
+
+impl SanaPipeline {
+    /// Compose the **base SANA-1.6B** pipeline (true-CFG flow-match) from its four already-constructed
+    /// components plus the DC-AE config (used for the latent `scaling_factor`).
+    pub fn new(
+        text_encoder: SanaTextEncoder,
+        transformer: SanaTransformer,
+        encoder: DcAeEncoder,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+    ) -> Self {
+        Self {
+            text_encoder,
+            heavy: SanaHeavy::new(transformer, encoder, decoder, dc_ae_cfg),
+        }
+    }
+
+    /// Compose the **SANA-Sprint** pipeline (CFG-free SCM/TrigFlow few-step, sc-8490). The
+    /// `transformer` MUST be loaded with [`crate::SanaTransformerConfig::sana_sprint_1600m`] (its
+    /// guidance embedder + rms-norm-across-heads are required for the embedded-guidance forward).
+    /// `guidance_embeds_scale` is the trunk config's `guidance_embeds_scale` (`0.1`), pre-multiplied
+    /// into the guidance scalar before the embedder.
+    pub fn new_sprint(
+        text_encoder: SanaTextEncoder,
+        transformer: SanaTransformer,
+        encoder: DcAeEncoder,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            text_encoder,
+            heavy: SanaHeavy::new_sprint(
+                transformer,
+                encoder,
+                decoder,
+                dc_ae_cfg,
+                guidance_embeds_scale,
+            ),
+        }
+    }
+
+    /// Whether this is a SANA-Sprint (CFG-free few-step) pipeline.
+    pub fn is_sprint(&self) -> bool {
+        self.heavy.is_sprint()
+    }
+
+    /// Run the full prompt→image pipeline. Encodes the prompt (and the negative prompt when CFG is
+    /// active) ONCE, seeds the DC-AE latent, runs the flow-match Euler denoise over the SANA trunk
+    /// with true CFG, then DC-AE-decodes to an RGB8 [`Image`].
+    pub fn generate(&self, req: &SanaGenerateRequest<'_>) -> Result<Image> {
+        let cancel = CancelFlag::default();
+        let mut noop = |_: Progress| {};
+        self.generate_with(req, &cancel, &mut noop)
+    }
+
+    /// [`SanaPipeline::generate`] with caller-supplied cancellation + progress (the seam Phase B's
+    /// worker `Generator` adapter wires into the gen-core contract). Shares the exact
+    /// [`encode_conditioning`] + [`SanaHeavy::render_one`] bodies the gen-core adapter's residency seam
+    /// uses, so the composed and split paths are byte-identical.
+    pub fn generate_with(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        // F-091: `create_noise` derives the latent grid via `dim / SPATIAL_SCALE` integer division, so
+        // a width/height not a multiple of 32 silently truncates the latent (and the output image) to
+        // the floor multiple instead of honoring the request. Reject it up front (both the CFG and the
+        // Sprint path funnel through here) rather than returning a quietly-smaller image.
+        if !req.width.is_multiple_of(SPATIAL_SCALE) || !req.height.is_multiple_of(SPATIAL_SCALE) {
+            return Err(Error::Msg(format!(
+                "sana: width and height must be multiples of {SPATIAL_SCALE}, got {}x{}",
+                req.width, req.height
+            )));
+        }
+        // Resolve guidance against the variant default ONCE so the encode's uncond decision and the
+        // render's denoise agree.
+        let guidance = req.guidance_scale.unwrap_or(self.heavy.default_guidance());
+        let cond = encode_conditioning(
+            &self.text_encoder,
+            self.heavy.is_sprint(),
+            req.prompt,
+            req.negative_prompt,
+            guidance,
+        )?;
+        self.heavy
+            .render_one(&cond, req, guidance, cancel, on_progress)
     }
 }
 
