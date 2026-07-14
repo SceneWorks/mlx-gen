@@ -59,8 +59,9 @@ fn ensure_snapshot() -> PathBuf {
 #[test]
 #[ignore = "real weights: assembles + loads the ~56 GB full Bernini snapshot, runs a staged denoise"]
 fn staged_peak_bounds_below_whole_model_sum() {
+    let snapshot = ensure_snapshot();
     let model =
-        mlx_gen_bernini::bernini::load(&LoadSpec::new(WeightsSource::Dir(ensure_snapshot())))
+        mlx_gen_bernini::bernini::load(&LoadSpec::new(WeightsSource::Dir(snapshot.clone())))
             .expect("load bernini");
     // Tiny t2i (1 frame, 256², 4 steps) — the whole staged stack: planner load + MAR loop + drop +
     // clear_cache → T5 encode + drop + clear_cache → two experts + APG denoise → VAE decode.
@@ -96,20 +97,40 @@ fn staged_peak_bounds_below_whole_model_sum() {
         "decoded image must not be uniformly black/white"
     );
 
-    // Bernini bf16 whole-model resident sum ≈ planner(~15) + T5(~11) + 2 experts(~56) + VAE ≈ 80+ GiB.
-    // The staged peak is dominated by the two-expert phase (~56 GiB bf16) because the encoders freed
-    // (+ clear_cache) before the experts loaded, so it must sit well under the naive sum. A generous
-    // 72 GiB ceiling makes this a regression tripwire (a lost drop/flush would blow past it), not a
-    // tight fit. Prints the measured peak for the record.
+    // Self-calibrating tripwire (sc-10840). The old fixed 72 GiB ceiling sat BETWEEN the ~56 GiB clean
+    // staged peak and the ~80 GiB whole-model sum, so losing ONE of the two `clear_cache()` flushes —
+    // which re-admits the ~11 GiB T5 into the expert phase (~67 GiB) — still passed (false-green). Derive
+    // the bound from the real on-disk expert bytes instead: a clean run peaks at the two co-resident bf16
+    // experts (+ z16 VAE) because BOTH encoders (planner Qwen2.5-VL ~15 GiB, UMT5-XXL T5 ~11 GiB) are
+    // dropped + `clear_cache()`d before the experts load. A lost flush lingers ~11-15 GiB of encoder into
+    // that phase and blows past `experts + VAE + HEADROOM`, which sits well below a single-flush loss.
+    let file_gib = |name: &str| {
+        std::fs::metadata(snapshot.join(name))
+            .map(|m| m.len() as f64 / GIB)
+            .unwrap_or(0.0)
+    };
+    let expert_phase_gib = file_gib("low_noise_model.safetensors")
+        + file_gib("high_noise_model.safetensors")
+        + file_gib("vae.safetensors");
+    // Denoise activations for the tiny 256² × 1-frame × 4-step run are well under this headroom; the
+    // point is to sit below `expert_phase + smaller_encoder (T5 ~11 GiB)` so a single lost flush trips.
+    const HEADROOM_GIB: f64 = 6.0;
+    let ceiling = expert_phase_gib + HEADROOM_GIB;
     println!(
-        "Bernini full t2i 256² @ 4 steps: staged peak = {:.3} GiB",
+        "Bernini full t2i 256² @ 4 steps: staged peak = {:.3} GiB (ceiling {:.3} GiB = experts+VAE \
+         {:.3} + {:.1} headroom)",
         peak as f64 / GIB,
+        ceiling,
+        expert_phase_gib,
+        HEADROOM_GIB,
     );
     assert!(
-        (peak as f64 / GIB) < 72.0,
-        "staged peak {:.3} GiB approached the whole-model resident sum — an encoder drop / \
-         clear_cache regressed",
+        (peak as f64 / GIB) < ceiling,
+        "staged peak {:.3} GiB exceeded experts+VAE + {:.0} GiB headroom ({:.3} GiB) — an encoder drop \
+         / clear_cache regressed and a freed encoder lingered into the expert phase",
         peak as f64 / GIB,
+        HEADROOM_GIB,
+        ceiling,
     );
     drop(model);
     clear_cache();

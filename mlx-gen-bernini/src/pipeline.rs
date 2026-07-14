@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use mlx_rs::memory::clear_cache;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array};
 
@@ -66,8 +67,16 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // The renderer is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds
+            // NO component weights on the generator and loads per generate in phase order — UMT5-XXL T5
+            // → drop → (source-VAE encoder for i2i/v2v/r2v) → drop → the two co-resident MoE experts +
+            // z16 VAE — dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified
+            // memory is already bounded to the dominant expert phase. The shared per-component footprint
+            // reports the two experts as the DiT phase (the peak), so the fit-gate's staged estimate is
+            // sound. `OffloadPolicy` is not consumed — there is no Resident-warm mode to toggle. (This id
+            // is `Modality::Video`; the worker's image fit-gate does not gate on it, so advertising the
+            // flag is honest discovery parity + memory hygiene, not a behavior change.)
+            supports_sequential_offload: true,
         },
     }
 }
@@ -123,9 +132,12 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
 /// TE/DiT/VAE render split (they are still in the worker's whole-model total). Shared by `bernini` +
 /// `bernini_renderer`.
 ///
-/// PRE-WIRING: this split is computed correctly, but bernini is NOT yet in the worker's
-/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until bernini is added
-/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+/// Both ids now advertise `supports_sequential_offload` (sc-10840) — each is structurally always-staged
+/// (the encoders are dropped + `clear_cache()`d before the two co-resident experts load), and this split
+/// is the staged peak the fit-gate should bound (`max(encoders, DiT+VAE)`, dominated by the experts).
+/// Adding bernini to the worker's `SEQUENTIAL_CAPABLE_ENGINES` allowlist so the fit-gate consumes this
+/// split is the downstream worker-repo step of the fan-out (this crate reports the bytes; the worker
+/// decides to use them).
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -422,6 +434,13 @@ impl BerniniRenderer {
             eval([&context, &context_null])?;
             (context, context_null)
         };
+        // Residency discipline (epic 10834, sc-10840): the UMT5-XXL text encoder + its `Weights` are
+        // dropped at the block close above and `context`/`context_null` are materialized — flush the
+        // freed encoder pages back to the OS NOW, before the source-VAE encode and the two ~28 GB expert
+        // loads, so they do not linger in MLX's buffer cache and inflate the resident set. The live
+        // conditioning arrays are untouched, so this is byte-identical (a pure memory hint). Mirrors the
+        // `bernini` id's two encoder-drop flushes (bernini.rs).
+        clear_cache();
         // F-135: T5 encode materialized above; honor a cancel before the source VAE encodes and the
         // two ~28 GB expert loads (all pre-denoise stages sc-9093's loop-only cancel didn't reach).
         if req.cancel.is_cancelled() {
@@ -458,6 +477,12 @@ impl BerniniRenderer {
         } else {
             (Vec::new(), Vec::new())
         };
+        // Residency discipline (sc-10840): the Stage-1b source-VAE encoder + its `Weights` are dropped at
+        // the block close above and the `videos`/`images` conditioning latents are materialized — flush
+        // the freed VAE-encoder pages before the two ~28 GB expert loads (a fresh VAE is reloaded for the
+        // Stage-3 decode). Live latents untouched, byte-identical — the second of the two encoder-drop
+        // boundaries, matching the `bernini` id.
+        clear_cache();
         // F-135: source encodes materialized (if any); honor a cancel before the expert loads.
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -561,6 +586,19 @@ impl BerniniRenderer {
 mod tests {
     use super::*;
     use mlx_rs::ops::multiply;
+
+    /// Component residency (epic 10834, sc-10840): the renderer advertises `supports_sequential_offload`
+    /// because it is structurally always-staged — `generate_impl` drops the UMT5 text encoder and the
+    /// source-VAE encoder (each + `clear_cache()`) before loading the two co-resident MoE experts, so
+    /// peak unified memory is already bounded to the dominant expert phase (the footprint's DiT split).
+    #[test]
+    fn advertises_sequential_offload() {
+        assert!(
+            descriptor().capabilities.supports_sequential_offload,
+            "bernini_renderer is always-staged (UMT5 + source-VAE dropped before the experts); it must \
+             advertise supports_sequential_offload so the fit-gate consumes the staged footprint"
+        );
+    }
 
     fn tiny_cfg() -> WanModelConfig {
         let mut c = WanModelConfig::wan21_t2v_1_3b();
