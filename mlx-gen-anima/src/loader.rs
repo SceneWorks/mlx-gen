@@ -124,33 +124,13 @@ pub struct AnimaComponents {
 
 impl AnimaComponents {
     /// Load all components for `variant` from a weights source (a `split_files/` dir or a DiT file).
+    /// Composes the same two per-phase loaders the sequential-residency seam uses
+    /// ([`load_heavy_phase`] + [`load_text_phase`], sc-10840) so the resident struct-API assembly and
+    /// the staged-residency generator build byte-identical components (loading is RNG-free, so the
+    /// heavy-then-text order here is equivalent to the historical per-file order).
     pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
-        let root = resolve_split_files(source)?;
-        let dit_path = root.join("diffusion_models").join(variant.dit_filename());
-        if !dit_path.is_file() {
-            return Err(Error::Msg(format!(
-                "anima: DiT file not found: {}",
-                dit_path.display()
-            )));
-        }
-
-        // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
-        // `net` (base) or `model.diffusion_model` (turbo/aesthetic) — detect it.
-        let dit_weights = Weights::from_file(&dit_path)?;
-        let prefix = detect_dit_prefix(&dit_weights)?;
-        let dit = CosmosDiT::from_weights(&dit_weights, &prefix, DitConfig::anima())?;
-        let conditioner = AnimaTextConditioner::from_weights(
-            &dit_weights,
-            &format!("{prefix}.llm_adapter"),
-            ConditionerConfig::anima(),
-        )?;
-
-        let te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
-        let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &Qwen3Config::anima())?;
-
-        let vae = load_vae(root.join(VAE_FILE))?;
-        let tokenizers = AnimaTokenizers::load()?;
-
+        let (dit, conditioner, vae) = load_heavy_phase(source, variant)?;
+        let (text_encoder, tokenizers) = load_text_phase(source, variant)?;
         Ok(Self {
             dit,
             conditioner,
@@ -159,6 +139,62 @@ impl AnimaComponents {
             tokenizers,
         })
     }
+}
+
+/// Load the phase-A **text-encode** components (sc-10840): the Qwen3-0.6B text encoder
+/// (`text_encoders/`) + the tokenizers. This is the component dropped first under
+/// [`OffloadPolicy::Sequential`](mlx_gen::OffloadPolicy) — encode → **drop the Qwen3 TE** → run the
+/// conditioner + DiT + VAE, bounding peak unified memory to `max(Qwen3-TE, DiT+conditioner+VAE)`. The
+/// bundled `AnimaTextConditioner` is NOT here: it is `net.llm_adapter.*` inside the DiT file (part of
+/// the checkpoint the adapters strict-apply over), so it rides the heavy phase with the DiT
+/// ([`load_heavy_phase`]). The TE file is variant-independent; `variant` only resolves the
+/// `split_files/` root uniformly with the heavy loader.
+pub fn load_text_phase(
+    source: &WeightsSource,
+    _variant: Variant,
+) -> Result<(AnimaQwen3, AnimaTokenizers)> {
+    let root = resolve_split_files(source)?;
+    let te_weights = Weights::from_file(root.join(TEXT_ENCODER_FILE))?;
+    let text_encoder = AnimaQwen3::from_weights(&te_weights, "model", &Qwen3Config::anima())?;
+    let tokenizers = AnimaTokenizers::load()?;
+    Ok((text_encoder, tokenizers))
+}
+
+/// Load the phase-B **heavy render** components (sc-10840): the Cosmos DiT + the bundled
+/// `AnimaTextConditioner` (both from the one `diffusion_models/` file — `net.*` DiT + `net.llm_adapter.*`
+/// conditioner) + the Qwen-Image VAE (`vae/`). Held after the Qwen3 TE is dropped under `Sequential`;
+/// independent of the TE (separate files, RNG-free), so the `Sequential` path rebuilds a byte-identical
+/// bundle. Keeping the conditioner here (not in the text phase) is what lets [`apply_anima_adapters`]
+/// strict-apply the whole spec — DiT (`blocks.*`) AND conditioner (`llm_adapter.*`) — in one pass, so a
+/// LoRA that spans both never loads at partial strength (sc-10274 / sc-10521).
+///
+/// [`apply_anima_adapters`]: crate::adapters::apply_anima_adapters
+pub fn load_heavy_phase(
+    source: &WeightsSource,
+    variant: Variant,
+) -> Result<(CosmosDiT, AnimaTextConditioner, QwenVae)> {
+    let root = resolve_split_files(source)?;
+    let dit_path = root.join("diffusion_models").join(variant.dit_filename());
+    if !dit_path.is_file() {
+        return Err(Error::Msg(format!(
+            "anima: DiT file not found: {}",
+            dit_path.display()
+        )));
+    }
+
+    // The DiT file carries both the Cosmos DiT and the bundled conditioner. The root prefix is
+    // `net` (base) or `model.diffusion_model` (turbo/aesthetic) — detect it.
+    let dit_weights = Weights::from_file(&dit_path)?;
+    let prefix = detect_dit_prefix(&dit_weights)?;
+    let dit = CosmosDiT::from_weights(&dit_weights, &prefix, DitConfig::anima())?;
+    let conditioner = AnimaTextConditioner::from_weights(
+        &dit_weights,
+        &format!("{prefix}.llm_adapter"),
+        ConditionerConfig::anima(),
+    )?;
+
+    let vae = load_vae(root.join(VAE_FILE))?;
+    Ok((dit, conditioner, vae))
 }
 
 /// Build a `Weights` holding an fp-cast copy of ONLY the keys containing `marker` (avoids

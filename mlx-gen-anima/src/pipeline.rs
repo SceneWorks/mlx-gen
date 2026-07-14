@@ -16,8 +16,9 @@ use mlx_gen::{
 
 use crate::conditioner::AnimaTextConditioner;
 use crate::config::{Variant, SIGMA_SHIFT, VAE_CHANNELS, VAE_COMPRESSION};
-use crate::loader::AnimaComponents;
+use crate::loader::{load_heavy_phase, load_text_phase, AnimaComponents};
 use crate::text_encoder::AnimaQwen3;
+use crate::tokenizer::AnimaTokenizers;
 use crate::transformer::CosmosDiT;
 use crate::vae::QwenVae;
 
@@ -221,7 +222,8 @@ impl AnimaPipeline {
         } else {
             None
         };
-        self.denoise_loop(
+        denoise_loop(
+            &self.components.dit,
             init,
             &cond,
             uncond.as_ref(),
@@ -233,55 +235,6 @@ impl AnimaPipeline {
             dtype,
             cancel,
             on_progress,
-        )
-    }
-
-    /// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling): run
-    /// `sampler` over [`anima_sigmas`] from `init`, evaluating the DiT in `dit_dtype`, with CFG when
-    /// `uncond` is `Some`. Split out of [`denoise`](Self::denoise) so a caller can inject bf16 or fp32
-    /// conditioning into the IDENTICAL DiT trajectory — the isolation measurement for the
-    /// bf16-conditioning parity offset.
-    #[allow(clippy::too_many_arguments)]
-    fn denoise_loop(
-        &self,
-        init: &Array,
-        cond: &Array,
-        uncond: Option<&Array>,
-        steps: usize,
-        guidance: f32,
-        sampler: &str,
-        scheduler: Option<&str>,
-        seed: u64,
-        dit_dtype: Dtype,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Array> {
-        let sigmas = anima_schedule(scheduler, steps);
-        let guidance = Array::from_slice(&[guidance], &[1]);
-        let dit = &self.components.dit;
-        let predict = |x: &Array, sigma: f32| -> Result<Array> {
-            let s = Array::from_slice(&[sigma], &[1]);
-            let v_cond = dit.forward(x, &s, cond, dit_dtype)?;
-            let v = match uncond {
-                // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
-                Some(u) => {
-                    let v_u = dit.forward(x, &s, u, dit_dtype)?;
-                    add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
-                }
-                None => v_cond,
-            };
-            // Integrate in f32 (the reference keeps latents f32).
-            Ok(v.as_dtype(Dtype::Float32)?)
-        };
-        run_flow_sampler(
-            Some(sampler),
-            TimestepConvention::Sigma,
-            &sigmas,
-            init.clone(),
-            seed,
-            cancel,
-            on_progress,
-            predict,
         )
     }
 
@@ -305,8 +258,19 @@ impl AnimaPipeline {
         let cancel = CancelFlag::default();
         let mut prog = |_p: Progress| {};
         // Parity hook: native schedule (scheduler = None) so the injected-init trajectory is byte-exact.
-        self.denoise_loop(
-            init, cond, uncond, steps, guidance, sampler, None, 0, dit_dtype, &cancel, &mut prog,
+        denoise_loop(
+            &self.components.dit,
+            init,
+            cond,
+            uncond,
+            steps,
+            guidance,
+            sampler,
+            None,
+            0,
+            dit_dtype,
+            &cancel,
+            &mut prog,
         )
     }
 
@@ -404,6 +368,223 @@ impl AnimaPipeline {
             predict,
         )?;
         Ok((final_latent, captures.into_inner()))
+    }
+}
+
+/// The core flow-denoise loop given ALREADY-COMPUTED conditioning (sc-10577 decoupling; hoisted to a
+/// free fn over the DiT in sc-10840 so the resident struct API AND the staged-residency generator share
+/// one integrator): run `sampler` over [`anima_schedule`] from `init`, evaluating `dit` in `dit_dtype`,
+/// with CFG when `uncond` is `Some`. Byte-identical to the pre-hoist method — it took `&self` only to
+/// reach `self.components.dit`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn denoise_loop(
+    dit: &CosmosDiT,
+    init: &Array,
+    cond: &Array,
+    uncond: Option<&Array>,
+    steps: usize,
+    guidance: f32,
+    sampler: &str,
+    scheduler: Option<&str>,
+    seed: u64,
+    dit_dtype: Dtype,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Array> {
+    let sigmas = anima_schedule(scheduler, steps);
+    let guidance = Array::from_slice(&[guidance], &[1]);
+    let predict = |x: &Array, sigma: f32| -> Result<Array> {
+        let s = Array::from_slice(&[sigma], &[1]);
+        let v_cond = dit.forward(x, &s, cond, dit_dtype)?;
+        let v = match uncond {
+            // CFG: v = v_uncond + guidance·(v_cond − v_uncond).
+            Some(u) => {
+                let v_u = dit.forward(x, &s, u, dit_dtype)?;
+                add(&v_u, &multiply(&subtract(&v_cond, &v_u)?, &guidance)?)?
+            }
+            None => v_cond,
+        };
+        // Integrate in f32 (the reference keeps latents f32).
+        Ok(v.as_dtype(Dtype::Float32)?)
+    };
+    run_flow_sampler(
+        Some(sampler),
+        TimestepConvention::Sigma,
+        &sigmas,
+        init.clone(),
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
+}
+
+// ==================================================================================================
+// Component-residency phases (epic 10834, sc-10840)
+// ==================================================================================================
+//
+// The staged split for `OffloadPolicy::Sequential` (the shared `mlx_gen::Residency` seam): the Qwen3
+// text encoder is the phase-A component dropped first, and the DiT + bundled conditioner + VAE are the
+// heavy render bundle. The seam between them is the conditioner's INPUTS — the masked Qwen3 states +
+// the T5 query ids/weights — exactly the seam the trainer already caches to keep the conditioner
+// adapters live (`render_preview`). The two free helpers below ([`encode_conditioner_inputs`] +
+// [`conditioner_forward`]) ARE the two halves of [`AnimaPipeline::encode_prompt_with`], so the resident
+// struct API and the staged generator produce byte-identical conditioning.
+
+/// Phase A of the encode (sc-10840): tokenize + Qwen3 forward + mask-multiply → the conditioner's
+/// INPUTS. This is the first half of [`AnimaPipeline::encode_prompt_with`] — everything the Qwen3 TE
+/// touches — so it can run while the TE is alive, its output materialized, and the TE dropped before
+/// the conditioner (heavy phase) consumes it. The T5 ids/weights come from the tokenizers (also
+/// phase-A), not the TE.
+fn encode_conditioner_inputs(
+    te: &AnimaQwen3,
+    tokenizers: &AnimaTokenizers,
+    prompt: &str,
+) -> Result<AnimaCondInputs> {
+    // Qwen is weight-blind: strip the emphasis syntax to plain text before tokenizing (a no-op for an
+    // unweighted prompt). This mirrors ComfyUI forcing the Qwen token weights to 1.0.
+    let qwen_text = crate::prompt_weight::strip_prompt_weights(prompt);
+    let (qwen_ids, qwen_mask) = tokenizers.encode_qwen(&qwen_text)?;
+    let source = te.forward(&qwen_ids, &qwen_mask)?; // [1, S, 1024] in te.compute_dtype
+                                                     // Mask-multiply BEFORE the conditioner (the flagged trap): zero padded/uncond tokens.
+    let mask = qwen_mask.as_dtype(source.dtype())?.expand_dims(2)?; // [1, S, 1]
+    let source = multiply(&source, &mask)?;
+    // T5 carries the per-token weights (all 1.0 ⇒ strict no-op equal to the unweighted path).
+    let (t5_ids, t5_weights) = tokenizers.encode_t5_weighted(prompt)?;
+    Ok(AnimaCondInputs {
+        source,
+        t5_ids,
+        t5_weights,
+    })
+}
+
+/// Phase B of the encode (sc-10840): the `AnimaTextConditioner` forward over the phase-A inputs →
+/// `encoder_hidden_states` `[1, 512, 1024]`. The second half of
+/// [`AnimaPipeline::encode_prompt_with`]; the conditioner runs in the inputs' own `source` dtype
+/// (bf16 production / fp32 reference), so this is byte-identical to the pre-split path.
+fn conditioner_forward(cond: &AnimaTextConditioner, inp: &AnimaCondInputs) -> Result<Array> {
+    cond.forward_weighted(
+        &inp.source,
+        &inp.t5_ids,
+        Some(&inp.t5_weights),
+        inp.source.dtype(),
+    )
+}
+
+/// The conditioner's INPUTS produced by phase A (sc-10840) — materializable before the Qwen3 TE is
+/// dropped under `Sequential`: the masked Qwen3 `source` states `[1, S, 1024]`, the T5 query ids
+/// `[1, St]`, and the per-token T5 weights (host data). The heavy phase's [`conditioner_forward`]
+/// consumes these.
+pub struct AnimaCondInputs {
+    /// Masked Qwen3 states `[1, S, 1024]`, in the TE's compute dtype (bf16 production).
+    pub source: Array,
+    /// T5 query token ids `[1, St]` (int32).
+    pub t5_ids: Array,
+    /// Per-T5-token ComfyUI weights (all `1.0` for an unweighted prompt); host data, no eval needed.
+    pub t5_weights: Vec<f32>,
+}
+
+/// The phase-A **text-encode** component (sc-10840): the Qwen3-0.6B TE + tokenizers, dropped first
+/// under `OffloadPolicy::Sequential`. Encodes to the conditioner INPUTS; the conditioner itself lives
+/// on [`AnimaHeavy`] (it is bundled in the DiT checkpoint), so dropping this frees the Qwen3 tower
+/// before the DiT loads.
+pub struct AnimaText {
+    text_encoder: AnimaQwen3,
+    tokenizers: AnimaTokenizers,
+}
+
+impl AnimaText {
+    /// Load the Qwen3 TE + tokenizers (the `text_encoders/` file), via the shared
+    /// [`load_text_phase`] the resident `AnimaComponents::load` also uses.
+    pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
+        let (text_encoder, tokenizers) = load_text_phase(source, variant)?;
+        Ok(Self {
+            text_encoder,
+            tokenizers,
+        })
+    }
+
+    /// Encode one prompt to the conditioner's INPUTS (phase A). Deterministic (draws no RNG), so
+    /// hoisting it out of the per-image count loop is byte-identical to the pre-sc-10840 per-image
+    /// re-encode.
+    pub fn encode_inputs(&self, prompt: &str) -> Result<AnimaCondInputs> {
+        encode_conditioner_inputs(&self.text_encoder, &self.tokenizers, prompt)
+    }
+}
+
+/// The phase-B **heavy render** bundle (sc-10840): the Cosmos DiT, the bundled `AnimaTextConditioner`,
+/// and the Qwen-Image VAE. Held after the Qwen3 TE is dropped under `Sequential`; the identical
+/// [`render_one`](AnimaHeavy::render_one) body runs for both residencies, so a `Sequential` job is
+/// byte-identical to `Resident`. Keeping the conditioner here (checkpoint-bundled with the DiT) lets
+/// [`apply_adapters`](AnimaHeavy::apply_adapters) strict-apply DiT and conditioner targets in one pass.
+pub struct AnimaHeavy {
+    dit: CosmosDiT,
+    conditioner: AnimaTextConditioner,
+    vae: QwenVae,
+}
+
+impl AnimaHeavy {
+    /// Load the DiT + bundled conditioner (`diffusion_models/`) + VAE (`vae/`), via the shared
+    /// [`load_heavy_phase`] the resident `AnimaComponents::load` also uses.
+    pub fn load(source: &WeightsSource, variant: Variant) -> Result<Self> {
+        let (dit, conditioner, vae) = load_heavy_phase(source, variant)?;
+        Ok(Self {
+            dit,
+            conditioner,
+            vae,
+        })
+    }
+
+    /// Bake LoRA/LoKr adapters onto the DiT **and** the bundled conditioner in one strict pass
+    /// (sc-10521 / sc-10274). Both live on this bundle, so the whole spec — `blocks.*` (DiT) +
+    /// `llm_adapter.*` (conditioner) — is validated together and a span-both LoRA can't load partial.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<ApplyReport> {
+        crate::adapters::apply_anima_adapters(&mut self.dit, &mut self.conditioner, specs)
+    }
+
+    /// Run the conditioner forward over the phase-A inputs → `encoder_hidden_states` `[1, 512, 1024]`.
+    /// Seed-independent, so the generator runs it once (per cond/uncond) before the count loop.
+    pub fn conditioner_forward(&self, inp: &AnimaCondInputs) -> Result<Array> {
+        conditioner_forward(&self.conditioner, inp)
+    }
+
+    /// Render one image from PRE-COMPUTED conditioner outputs (sc-10840): seed → noise → flow denoise
+    /// (`dit`, bf16) → VAE decode → RGB. The single render body shared by both residencies — the same
+    /// [`denoise_loop`] + decode the resident `AnimaPipeline::generate` runs, so a `Sequential` job
+    /// (Qwen3 TE already dropped) is byte-identical to `Resident`. `cond`/`uncond` are the conditioner
+    /// outputs (not inputs); `uncond` is `Some` only for CFG variants.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_one(
+        &self,
+        cond: &Array,
+        uncond: Option<&Array>,
+        width: u32,
+        height: u32,
+        steps: usize,
+        guidance: f32,
+        sampler: &str,
+        scheduler: Option<&str>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let noise = create_noise(seed, width, height)?;
+        let latent = denoise_loop(
+            &self.dit,
+            &noise,
+            cond,
+            uncond,
+            steps,
+            guidance,
+            sampler,
+            scheduler,
+            seed,
+            Dtype::Bfloat16,
+            cancel,
+            on_progress,
+        )?;
+        let decoded = self.vae.decode(&latent)?; // [1, 3, 1, H, W] f32 in [-1, 1]
+        decoded_to_image(&decoded)
     }
 }
 
