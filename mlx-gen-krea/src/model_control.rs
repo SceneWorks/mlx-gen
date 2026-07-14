@@ -305,15 +305,22 @@ impl KreaTurboControl {
             // identically for both residencies.
             |heavy_owned, context, on_progress| {
                 let heavy = heavy_owned.as_ref();
+                let safe_gib = mlx_gen::memory::safe_budget_gib();
 
-                // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
-                // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
-                // exceeds this machine's `safe_budget_gib()`, size the largest tile that fits — else run
-                // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
-                // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
-                // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
-                let decode_tiling = crate::memory::plan_control_decode_tiling(
-                    mlx_gen::memory::safe_budget_gib(),
+                // Resolution lever (sc-11749) — the LAST-RESORT rung of the sc-11750 escalation ladder,
+                // the only one that costs image quality, so it engages only after the cheaper levers are
+                // spent: Sequential residency was already selected at load (the worker fit-gate, epic
+                // 10834 — `text_co_resident` reflects it), the pose branch was already packed-or-not at
+                // load (sc-11748 — `branch_tier`), and decode tiling engages just below (sc-11747). If the
+                // un-tileable DENOISE activation peak (candle #480's ~11 GiB @ 1024²) STILL exceeds this
+                // machine's `safe_budget_gib()` at the requested size, drop to the largest 16-aligned
+                // resolution that fits; a machine with headroom keeps the requested size (zero cost). The
+                // pose skeleton is re-preprocessed to these dims by `prepare_control` below (it resizes the
+                // control image to the render size), so the control latent stays consistent. Count-
+                // invariant (shape + tiers only) → decided ONCE. An infeasible render surfaces here as a
+                // catchable error, before the render, rather than an OOM mid-run.
+                let (render_width, render_height) = crate::memory::plan_control_resolution(
+                    safe_gib,
                     &heavy_owned.cfg,
                     heavy.branch.num_blocks(),
                     heavy_owned.base_tier,
@@ -322,20 +329,50 @@ impl KreaTurboControl {
                     req.height,
                     text_co_resident,
                 )?;
+                if (render_width, render_height) != (req.width, req.height) {
+                    // Never a SILENT capability drop (the epic 8459 phantom-de-list lesson): announce the
+                    // last-resort reduction to stderr, like the residency re-quantize advisory.
+                    eprintln!(
+                        "{KREA_2_TURBO_CONTROL_ID}: reduced render resolution {}×{} → \
+                         {render_width}×{render_height} to fit the ~{safe_gib:.0} GiB unified-memory \
+                         budget (last-resort lever, after text offload + decode tiling + pose-branch \
+                         packing). A Mac with more memory renders at the requested size.",
+                        req.width, req.height
+                    );
+                }
+
+                // Budget-gated decode tiling (sc-11747): estimate the Qwen-VAE decode peak from this
+                // render's shape + the resident-weight footprint (base tier + pose branch tier) and, if it
+                // exceeds this machine's `safe_budget_gib()`, size the largest tile that fits — else run
+                // single-pass (a machine with headroom pays zero tiling overhead). Count-invariant (shape
+                // + tiers only), so it is decided ONCE here and reused for every seed. An infeasible
+                // decode surfaces here as a catchable error, before the render, rather than an OOM mid-run.
+                let decode_tiling = crate::memory::plan_control_decode_tiling(
+                    safe_gib,
+                    &heavy_owned.cfg,
+                    heavy.branch.num_blocks(),
+                    heavy_owned.base_tier,
+                    heavy_owned.branch_tier,
+                    render_width,
+                    render_height,
+                    text_co_resident,
+                )?;
 
                 // Hoist the count-invariant pose VAE encode + text prep OUT of the per-image loop
                 // (F-073): both depend only on the (shared) context + pose + geometry, not the per-seed
                 // noise. Build the plan ONCE; each seed reuses it via `render_control_from`.
-                let plan =
-                    heavy
-                        .heavy
-                        .prepare_control(&context, control_image, req.width, req.height)?;
+                let plan = heavy.heavy.prepare_control(
+                    &context,
+                    control_image,
+                    render_width,
+                    render_height,
+                )?;
 
                 let mut images = Vec::with_capacity(req.count as usize);
                 for n in 0..req.count {
                     let opts = TurboOptions {
-                        width: req.width,
-                        height: req.height,
+                        width: render_width,
+                        height: render_height,
                         steps,
                         seed: base_seed.wrapping_add(n as u64),
                         sampler: req.sampler.clone(),

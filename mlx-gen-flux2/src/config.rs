@@ -204,8 +204,12 @@ impl Flux2Variant {
                 supports_kv_cache: self.is_kv(),
                 // FLUX.2 uses the empirical-mu shifted flow-match schedule.
                 requires_sigma_shift: true,
-                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-                supports_sequential_offload: false,
+                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
+                // text encoder (Qwen3 / dev Mistral-3 + its Pixtral vision tower + projector) drops
+                // after the prompt encode (and any dev caption upsample), then the DiT + VAE load,
+                // bounding peak to `max(TE, DiT+VAE)`. The edit variants' reference conditioning that
+                // must persist through denoise is VAE-encoded in the heavy phase (after the TE drop).
+                supports_sequential_offload: true,
             },
         }
     }
