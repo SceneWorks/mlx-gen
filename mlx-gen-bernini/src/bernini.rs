@@ -36,6 +36,7 @@
 use std::path::{Path, PathBuf};
 
 use image::RgbImage;
+use mlx_rs::memory::clear_cache;
 use mlx_rs::ops::concatenate_axis;
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
@@ -544,8 +545,16 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: true,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Bernini is structurally always-staged (epic 10834, sc-10840): `generate_impl` holds NO
+            // component weights on the generator and loads per generate in phase order — planner
+            // (Qwen2.5-VL-7B) → drop → UMT5-XXL T5 → drop → the two co-resident MoE experts + z16 VAE —
+            // dropping BOTH encoders (+ `clear_cache()`) before the experts, so peak unified memory is
+            // already bounded to the dominant expert phase. The per-component footprint reports the two
+            // experts as the DiT phase (the peak; the planner is a smaller, earlier, dropped phase), so
+            // the fit-gate's staged estimate is sound. `OffloadPolicy` is not consumed — there is no
+            // Resident-warm mode to toggle. The one thing NOT split is the two experts, which the
+            // MoE-by-timestep denoise loop holds co-resident (see the BLOCKERS note in the PR).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -807,6 +816,13 @@ impl Bernini {
         let src_videos: Vec<Array> = videos.iter().map(|s| s.vae_latent.clone()).collect();
         let src_images: Vec<Array> = images.iter().map(|s| s.vae_latent.clone()).collect();
         drop(planner);
+        // Component-residency discipline (epic 10834, sc-10840; the shared `Residency` seam's F-174/
+        // F-175): the planner (Qwen2.5-VL-7B ~15 GB bf16 / ~7.5 GB Q8 + vision/connector/clip_diff) is
+        // already dropped above — return its freed unified-memory pages to the OS NOW, before the T5
+        // encode and the two ~28 GB expert loads, so the freed encoder does not linger in MLX's buffer
+        // cache and inflate the resident set. The materialized `s_*` streams + `src_*` latents are live
+        // arrays, untouched by `clear_cache`, so this is byte-identical (a pure memory hint).
+        clear_cache();
 
         // --- Stage 2: T5 prompt encode + concat_with_zero_init for the 4 renderer streams ---
         let tokenizer = load_tokenizer(self.root.join("tokenizer.json"), cfg.text_len)?;
@@ -826,6 +842,10 @@ impl Bernini {
             eval([&pos, &neg])?;
             (pos, neg)
         };
+        // Residency discipline (sc-10840): the UMT5-XXL text encoder is now dropped (end of the block)
+        // and `t5_pos`/`t5_neg` are materialized — flush its freed pages before the two ~28 GB expert
+        // loads, the same F-174/F-175 seam discipline applied at the planner drop above. Byte-identical.
+        clear_cache();
         // F-135: T5 pos/neg materialized above; honor a cancel before the two ~28 GB expert loads.
         if req.cancel.is_cancelled() {
             return Err(Error::Canceled);
@@ -1061,6 +1081,19 @@ fn seeded_step_noise(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Component residency (epic 10834, sc-10840): Bernini advertises `supports_sequential_offload`
+    /// because it is structurally always-staged — `generate_impl` drops the planner and the T5 encoder
+    /// (each + `clear_cache()`) before loading the two co-resident MoE experts, so peak unified memory
+    /// is already bounded to the dominant expert phase (which the footprint reports as the DiT split).
+    #[test]
+    fn advertises_sequential_offload() {
+        assert!(
+            descriptor().capabilities.supports_sequential_offload,
+            "bernini is always-staged (planner + T5 dropped before the experts); it must advertise \
+             supports_sequential_offload so the fit-gate consumes the staged footprint"
+        );
+    }
 
     /// Guidance-mode resolution: an explicit guidance-mode name wins, then a task-type name, then the
     /// conditioning/output defaults (t2i/t2v → vae_txt_vit_wapg; video src → v2v_apg; refs→video and
