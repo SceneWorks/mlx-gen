@@ -6,13 +6,14 @@ use mlx_gen::image::decoded_to_image;
 use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     default_seed, run_flow_sampler, Conditioning, Error, GenerationOutput, GenerationRequest,
-    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, Precision, Progress, Result,
-    TimestepConvention, WeightsSource,
+    Generator, Image, LatentDecoder, LoadSpec, ModelDescriptor, OffloadPolicy, Precision, Progress,
+    Residency, Result, TimestepConvention, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 use mlx_gen_z_image::vae::Vae;
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::{Array, Dtype};
+use std::path::Path;
 
 use crate::config::{FluxVariant, DEFAULT_SAMPLER, HYPER_SAMPLER};
 use crate::image_encoder::FluxIpImageEncoder;
@@ -61,45 +62,27 @@ fn load_variant(variant: FluxVariant, spec: &LoadSpec) -> Result<Box<dyn Generat
 /// Load a fully-weighted [`Flux1`] (the concrete type, not boxed) — the entry point the PuLID-FLUX
 /// provider (`mlx-gen-pulid`, sc-3074) wraps so it can drive the denoise through
 /// [`Flux1::generate_with_injector`].
+///
+/// Honors [`LoadSpec::offload_policy`] (sc-10840): `Resident` (default) builds the T5 + CLIP text
+/// encoders, the DiT, and the VAE now and holds them warm; `Sequential` keeps only the per-phase
+/// loader closures and re-loads per generate in phase order (encode → drop the T5 + CLIP encoders →
+/// denoise/decode) to bound peak unified memory to `max(T5+CLIP, DiT+VAE)`. The XLabs IP-Adapter (a
+/// small CLIP-ViT image encoder + adapter modules) stays warm-resident either way: it participates
+/// only on the reference path, is small relative to the T5-XXL win, and its presence is checked
+/// up front in `generate` before any residency work.
 pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
-    if spec.precision != Precision::Bf16 {
-        return Err(Error::Msg(format!(
-            "{}: only dense bf16 is wired for the FLUX.1 port plan",
-            variant.id()
-        )));
-    }
-    let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
-        WeightsSource::File(_) => {
-            return Err(Error::Msg(format!(
-                "{} expects a FLUX.1 snapshot directory (tokenizer/ tokenizer_2/ text_encoder/ \
-                 text_encoder_2/ transformer/ vae/), not a single .safetensors file",
-                variant.id()
-            )))
-        }
-    };
-
-    let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
-    let clip_tokenizer = loader::load_clip_tokenizer()?;
-    let mut text_encoders = FluxTextEncoders {
-        t5: loader::load_t5_encoder(root)?,
-        clip: loader::load_clip_encoder(root)?,
-    };
-    let mut transformer = loader::load_transformer(root, variant)?;
-    let mut vae = loader::load_vae(root)?;
+    // Precision + snapshot-dir guard up front for BOTH policies (fail fast).
+    resolve_root(variant, spec)?;
+    // F-181: a `Sequential` + `spec.quantize` load over a *dense* snapshot re-quantizes the whole
+    // model on every generate; `Resident` quantizes once. Warn for that combination only.
     if let Some(q) = spec.quantize {
-        let bits = q.bits();
-        text_encoders.quantize(bits)?;
-        transformer.quantize(bits)?;
-        vae.quantize(bits)?;
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(variant.id(), q.bits());
+        }
     }
-    // Install LoRA/LoKr adapters AFTER quantization (the fork merges/applies post-quantize too; a
-    // forward-time residual over the now-quantized base, never a fused merge). No-op when empty; a
-    // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
-    crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
 
-    // Optional XLabs IP-Adapter (epic 3621), loaded from `LoadSpec::ip_adapter`. The plain txt2img
-    // path is unaffected when absent.
+    // Optional XLabs IP-Adapter (epic 3621), loaded from `LoadSpec::ip_adapter`, held warm-resident.
+    // The plain txt2img path is unaffected when absent.
     let ip_adapter = match &spec.ip_adapter {
         Some(WeightsSource::Dir(p)) => Some(loader::load_flux_ip_adapter(p)?),
         Some(WeightsSource::File(_)) => {
@@ -111,44 +94,159 @@ pub fn load_flux1(variant: FluxVariant, spec: &LoadSpec) -> Result<Flux1> {
         None => None,
     };
 
-    // Optional PiD decoder overlay (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a PiD
-    // student, so the final decode can route through `mlx_gen_pid` when `req.use_pid` is set. Loaded
-    // only when the spec carries `pid`; the plain txt2img/IP-Adapter paths are unaffected when absent.
-    let pid = spec
-        .pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()?;
-
     Ok(Flux1 {
         descriptor: descriptor_for(variant),
         variant,
-        t5_tokenizer: Some(t5_tokenizer),
-        clip_tokenizer: Some(clip_tokenizer),
-        text_encoders: Some(text_encoders),
-        transformer: Some(transformer),
-        vae: Some(vae),
+        residency: build_residency(variant, spec)?,
         ip_adapter,
+    })
+}
+
+/// The phase-A text components (T5 + CLIP tokenizers + the T5-XXL / CLIP-L text encoders) dropped
+/// first under `Sequential`. Shared by the base [`Flux1`] and the control variant
+/// ([`crate::model_control::Flux1DevControl`]), whose text path is identical.
+pub(crate) struct FluxTextOwned {
+    pub(crate) t5_tokenizer: TextTokenizer,
+    pub(crate) clip_tokenizer: TextTokenizer,
+    pub(crate) text_encoders: FluxTextEncoders,
+}
+
+impl FluxTextOwned {
+    /// Tokenize + T5/CLIP-encode a prompt into `(prompt_embeds, pooled_prompt_embeds)`.
+    pub(crate) fn encode(&self, prompt: &str) -> Result<(Array, Array)> {
+        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&self.t5_tokenizer.tokenize(prompt)?);
+        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&self.clip_tokenizer.tokenize(prompt)?);
+        self.text_encoders.encode(&t5_ids, &clip_ids)
+    }
+}
+
+/// The heavy render-phase components (the DiT transformer, the VAE, and the optional PiD decoder) —
+/// everything but the text encoders and the (small, warm-resident) IP-Adapter. Owned by the
+/// `Resident` components or by a `Sequential` generate.
+pub(crate) struct FluxHeavyOwned {
+    transformer: FluxTransformer,
+    vae: Vae,
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
+    /// `LoadSpec` carried `pid` AND this generate uses it (`req.use_pid`); swaps the native FLUX.1
+    /// VAE for a 4× PiD decode at the `run_denoise` decode call site.
+    pid: Option<PidEngine>,
+}
+
+/// Precision guard (only dense bf16 is wired) + snapshot-dir resolution (rejecting a single-file
+/// source), shared by [`load_flux1`] and [`build_residency`]'s per-phase loaders.
+pub(crate) fn resolve_root(variant: FluxVariant, spec: &LoadSpec) -> Result<&Path> {
+    if spec.precision != Precision::Bf16 {
+        return Err(Error::Msg(format!(
+            "{}: only dense bf16 is wired for the FLUX.1 port plan",
+            variant.id()
+        )));
+    }
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{} expects a FLUX.1 snapshot directory (tokenizer/ tokenizer_2/ text_encoder/ \
+             text_encoder_2/ transformer/ vae/), not a single .safetensors file",
+            variant.id()
+        ))),
+    }
+}
+
+/// Load the T5 + CLIP tokenizers and the T5-XXL / CLIP-L text encoders (+ optional whole-encoder
+/// Q4/Q8) — the phase-A components dropped first under `Sequential`. Factored so the `Resident` and
+/// `Sequential` paths build byte-identical encoders.
+pub(crate) fn load_flux_text(variant: FluxVariant, spec: &LoadSpec) -> Result<FluxTextOwned> {
+    let root = resolve_root(variant, spec)?;
+    let t5_tokenizer = loader::load_t5_tokenizer(root, variant)?;
+    let clip_tokenizer = loader::load_clip_tokenizer()?;
+    let mut text_encoders = FluxTextEncoders {
+        t5: loader::load_t5_encoder(root)?,
+        clip: loader::load_clip_encoder(root)?,
+    };
+    if let Some(q) = spec.quantize {
+        text_encoders.quantize(q.bits())?;
+    }
+    Ok(FluxTextOwned {
+        t5_tokenizer,
+        clip_tokenizer,
+        text_encoders,
+    })
+}
+
+/// Load the heavy render-phase components — the DiT transformer (+ Q4/Q8 + LoRA/LoKr residuals), the
+/// VAE (+ Q4/Q8), and the optional PiD overlay — everything but the text encoders. Factored so the
+/// `Sequential` path loads these AFTER the encoders are dropped (bounding peak to
+/// `max(T5+CLIP, DiT+VAE)`). Quantize-then-adapters order matches the pre-seam composition; the
+/// components are independent of the text encoders (separate weight files, deterministic RNG-free
+/// quant), so the `Resident` composition is byte-identical.
+fn load_flux_heavy(
+    variant: FluxVariant,
+    spec: &LoadSpec,
+    load_pid: bool,
+) -> Result<FluxHeavyOwned> {
+    let root = resolve_root(variant, spec)?;
+    let mut transformer = loader::load_transformer(root, variant)?;
+    let mut vae = loader::load_vae(root)?;
+    if let Some(q) = spec.quantize {
+        let bits = q.bits();
+        transformer.quantize(bits)?;
+        vae.quantize(bits)?;
+    }
+    // Install LoRA/LoKr adapters AFTER quantization (the fork merges/applies post-quantize too; a
+    // forward-time residual over the now-quantized base, never a fused merge). No-op when empty; a
+    // non-empty spec list that matches nothing — or any unmatched target — errors loudly (sc-2534).
+    crate::adapters::apply_flux_adapters(&mut transformer, &spec.adapters)?;
+    // Optional PiD decoder overlay (epic 7840, sc-7846): the FLUX.1 16-ch VAE latent space has a PiD
+    // student, so the final decode can route through `mlx_gen_pid` when `req.use_pid` is set. Loaded
+    // only when the spec carries `pid` AND this generate uses it (`load_pid`, F-177): the Resident path
+    // passes `true` (loaded once, reused), the Sequential path passes `req.use_pid` so a non-PiD
+    // generate skips the student + its caption encoder entirely.
+    let pid = if load_pid {
+        spec.pid
+            .as_ref()
+            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(FluxHeavyOwned {
+        transformer,
+        vae,
         pid,
     })
+}
+
+/// The policy→[`Residency`] dispatch the FLUX.1 base variants share (sc-10840), routed through the
+/// single [`Residency::from_policy`] seam. `Resident` eager-loads the text encoders + heavy bundle now
+/// (any PiD overlay loaded once, reused); `Sequential` captures the two per-phase loaders and loads
+/// nothing now, deferring each to [`Residency::run`]. Both use the same [`load_flux_text`] /
+/// [`load_flux_heavy`], so the `Resident` composition is byte-identical to the pre-seam one.
+fn build_residency(
+    variant: FluxVariant,
+    spec: &LoadSpec,
+) -> Result<Residency<FluxTextOwned, FluxHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_flux_text(variant, &spec_text),
+        move |use_pid| load_flux_heavy(variant, &spec_heavy, use_pid),
+    )
 }
 
 pub struct Flux1 {
     descriptor: ModelDescriptor,
     variant: FluxVariant,
-    t5_tokenizer: Option<TextTokenizer>,
-    clip_tokenizer: Option<TextTokenizer>,
-    text_encoders: Option<FluxTextEncoders>,
-    transformer: Option<FluxTransformer>,
-    vae: Option<Vae>,
+    /// Component-residency strategy (sc-10840), selected from [`LoadSpec::offload_policy`]. `Resident`
+    /// (default) holds the T5 + CLIP text encoders + DiT + VAE warm; `Sequential` holds only the
+    /// per-phase loader closures and re-loads per generation in phase order (encode → **drop the T5 +
+    /// CLIP encoders** → denoise/decode). The [`Residency`] seam owns the eval/drop/clear discipline,
+    /// the stage-boundary cancel checks, and the error-safe cache flush.
+    residency: Residency<FluxTextOwned, FluxHeavyOwned>,
     /// XLabs IP-Adapter (epic 3621): the CLIP-ViT-L/14 image encoder (sc-3622) + the adapter modules
-    /// (sc-3623). `Some` only when a `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference`
-    /// request errors loudly when this is `None`.
+    /// (sc-3623), held warm-resident (small; used only on the reference path). `Some` only when a
+    /// `LoadSpec::ip_adapter` was supplied. A `Conditioning::Reference` request errors loudly when
+    /// this is `None` — checked up front in `generate`, before any residency work.
     ip_adapter: Option<(FluxIpImageEncoder, FluxIpAdapter)>,
-    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
-    /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid`, swapping the native FLUX.1
-    /// VAE for a 4× PiD decode at the `run_denoise` decode call site.
-    pid: Option<PidEngine>,
 }
 
 impl Flux1 {
@@ -156,56 +254,23 @@ impl Flux1 {
         Self {
             descriptor: descriptor_for(variant),
             variant,
-            t5_tokenizer: None,
-            clip_tokenizer: None,
-            text_encoders: None,
-            transformer: None,
-            vae: None,
+            // Weightless: loader closures that error if invoked. The validation tests never `run` the
+            // residency; the `generate_reference_without_ip_adapter_errors` test hits the up-front
+            // IP-adapter check in `generate` before the residency, so this is never driven either.
+            residency: Residency::sequential(
+                || {
+                    Err(Error::Msg(
+                        "flux1: text encoder not loadable in a test-only instance".into(),
+                    ))
+                },
+                |_use_pid| {
+                    Err(Error::Msg(
+                        "flux1: heavy bundle not loadable in a test-only instance".into(),
+                    ))
+                },
+            ),
             ip_adapter: None,
-            pid: None,
         }
-    }
-
-    pub fn encode_prompt(&self, prompt: &str) -> Result<(mlx_rs::Array, mlx_rs::Array)> {
-        let t5_tokenizer = self.t5_tokenizer.as_ref().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: T5 tokenizer is not loaded in this test-only instance",
-                self.descriptor.id
-            ))
-        })?;
-        let clip_tokenizer = self.clip_tokenizer.as_ref().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: CLIP tokenizer is not loaded in this test-only instance",
-                self.descriptor.id
-            ))
-        })?;
-        let text_encoders = self.text_encoders.as_ref().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: text encoders are not loaded in this test-only instance",
-                self.descriptor.id
-            ))
-        })?;
-        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&t5_tokenizer.tokenize(prompt)?);
-        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&clip_tokenizer.tokenize(prompt)?);
-        text_encoders.encode(&t5_ids, &clip_ids)
-    }
-
-    fn transformer(&self) -> Result<&FluxTransformer> {
-        self.transformer.as_ref().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: transformer is not loaded in this test-only instance",
-                self.descriptor.id
-            ))
-        })
-    }
-
-    fn vae(&self) -> Result<&Vae> {
-        self.vae.as_ref().ok_or_else(|| {
-            Error::Msg(format!(
-                "{}: VAE is not loaded in this test-only instance",
-                self.descriptor.id
-            ))
-        })
     }
 }
 
@@ -301,20 +366,44 @@ impl Flux1 {
         injector: Option<&dyn crate::transformer::DitImageInjector>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let transformer = self.transformer()?;
-        let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
-        self.run_denoise(req, on_progress, |x_in, _t, timestep, guidance| {
-            transformer.forward_injected(
-                x_in,
-                &prompt_embeds,
-                &pooled_prompt_embeds,
-                timestep,
-                guidance,
-                req.width,
-                req.height,
-                injector,
-            )
-        })
+        self.validate(req)?;
+        // Staged residency lifecycle (sc-10840): under `Sequential` the seam loads the T5 + CLIP
+        // encoders, encodes the prompt, materializes, then DROPS them + `clear_cache()` before the
+        // DiT/VAE load — the peak-bounding win. Under `Resident` it borrows the warm encoders and runs
+        // the identical encode/denoise/decode with no eval/clear.
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text: &FluxTextOwned| text.encode(&req.prompt),
+            // Materialize the embeds while the encoders are still alive (Sequential only) — MLX is lazy,
+            // so an un-evaluated embed keeps the encoders referenced and the drop would free nothing.
+            |(prompt_embeds, pooled_prompt_embeds)| {
+                mlx_rs::transforms::eval([prompt_embeds, pooled_prompt_embeds])?;
+                Ok(())
+            },
+            |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
+                let transformer = &heavy.transformer;
+                self.run_denoise_with(
+                    req,
+                    &heavy.vae,
+                    heavy.pid.as_ref(),
+                    on_progress,
+                    |x_in, _t, timestep, guidance| {
+                        transformer.forward_injected(
+                            x_in,
+                            &prompt_embeds,
+                            &pooled_prompt_embeds,
+                            timestep,
+                            guidance,
+                            req.width,
+                            req.height,
+                            injector,
+                        )
+                    },
+                )
+            },
+        )
     }
 
     /// Dual-branch real-CFG denoise — the seam PuLID-FLUX `true_cfg > 1.0` (sc-3075) uses. Each step
@@ -334,40 +423,63 @@ impl Flux1 {
         timestep_to_start_cfg: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
-        let transformer = self.transformer()?;
-        let (pos_embeds, pos_pooled) = self.encode_prompt(&req.prompt)?;
-        let (neg_embeds, neg_pooled) = self.encode_prompt(neg_prompt)?;
-        self.run_denoise(req, on_progress, |x_in, t, timestep, guidance| {
-            let pos = transformer.forward_injected(
-                x_in,
-                &pos_embeds,
-                &pos_pooled,
-                timestep,
-                guidance,
-                req.width,
-                req.height,
-                Some(pos_injector),
-            )?;
-            if t >= timestep_to_start_cfg {
-                let neg = transformer.forward_injected(
-                    x_in,
-                    &neg_embeds,
-                    &neg_pooled,
-                    timestep,
-                    guidance,
-                    req.width,
-                    req.height,
-                    Some(neg_injector),
-                )?;
-                // neg + true_cfg · (pos − neg)
-                Ok(add(
-                    &neg,
-                    &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?,
-                )?)
-            } else {
-                Ok(pos)
-            }
-        })
+        self.validate(req)?;
+        // Staged residency lifecycle (sc-10840): the phase-A encode covers BOTH the positive and
+        // negative prompts, so both text encoders drop together before the DiT load under `Sequential`.
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |text: &FluxTextOwned| {
+                let (pos_embeds, pos_pooled) = text.encode(&req.prompt)?;
+                let (neg_embeds, neg_pooled) = text.encode(neg_prompt)?;
+                Ok((pos_embeds, pos_pooled, neg_embeds, neg_pooled))
+            },
+            |(pos_embeds, pos_pooled, neg_embeds, neg_pooled)| {
+                mlx_rs::transforms::eval([pos_embeds, pos_pooled, neg_embeds, neg_pooled])?;
+                Ok(())
+            },
+            |heavy, (pos_embeds, pos_pooled, neg_embeds, neg_pooled), on_progress| {
+                let transformer = &heavy.transformer;
+                self.run_denoise_with(
+                    req,
+                    &heavy.vae,
+                    heavy.pid.as_ref(),
+                    on_progress,
+                    |x_in, t, timestep, guidance| {
+                        let pos = transformer.forward_injected(
+                            x_in,
+                            &pos_embeds,
+                            &pos_pooled,
+                            timestep,
+                            guidance,
+                            req.width,
+                            req.height,
+                            Some(pos_injector),
+                        )?;
+                        if t >= timestep_to_start_cfg {
+                            let neg = transformer.forward_injected(
+                                x_in,
+                                &neg_embeds,
+                                &neg_pooled,
+                                timestep,
+                                guidance,
+                                req.width,
+                                req.height,
+                                Some(neg_injector),
+                            )?;
+                            // neg + true_cfg · (pos − neg)
+                            Ok(add(
+                                &neg,
+                                &multiply(&subtract(&pos, &neg)?, scalar(true_cfg))?,
+                            )?)
+                        } else {
+                            Ok(pos)
+                        }
+                    },
+                )
+            },
+        )
     }
 
     /// Shared denoise scaffold for the injector generators (F-108): resolve seed / sampler / steps /
@@ -376,14 +488,19 @@ impl Flux1 {
     /// progress → unpack/decode). `velocity_fn(x_in, step_idx, timestep, guidance)` returns the step's
     /// velocity — the only thing that differs between the single-branch and CFG paths. Bit-identical
     /// to the prior inline loops (the base render stays e2e-parity-exact).
-    fn run_denoise(
+    ///
+    /// Takes the heavy render components (`vae`, `pid`) explicitly, so the shared [`Residency`] seam's
+    /// render closure passes either the warm-resident bundle or the just-loaded `Sequential` one
+    /// (sc-10840). `validate` is done by the public callers before the residency seam runs, so it is
+    /// not re-checked here.
+    fn run_denoise_with(
         &self,
         req: &GenerationRequest,
+        vae: &Vae,
+        pid: Option<&PidEngine>,
         on_progress: &mut dyn FnMut(Progress),
         mut velocity_fn: impl FnMut(&Array, usize, f32, f32) -> Result<Array>,
     ) -> Result<GenerationOutput> {
-        self.validate(req)?;
-        let vae = self.vae()?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         // Sampler selection (sc-2908). FLUX is flow-match: the base render and the few-step `hyper`
         // profile share the SAME flow-match schedule (mflux's `LinearScheduler`) — `hyper` only
@@ -422,13 +539,8 @@ impl Flux1 {
         // per-image variation comes from the per-seed denoised latent. (flux is txt2img here — no
         // img2img blend in this path — so `start_step = 0`.)
         let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            self.descriptor.id,
-            capture_sigma,
-        )?;
+        let pid_decoder =
+            resolve_pid_decoder_at_sigma(pid, req, base_seed, self.descriptor.id, capture_sigma)?;
         let decoder: &dyn LatentDecoder = match &pid_decoder {
             Some(d) => d,
             None => vae,
@@ -893,6 +1005,48 @@ mod tests {
                 FluxVariant::Schnell.default_steps(),
                 crate::config::DEFAULT_GUIDANCE
             )
+        );
+    }
+
+    // ── sc-10840: weight-free, default-run proof that FLUX.1's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* (so the up-front precision/
+    // single-file guard passes) and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the T5 + CLIP encoders from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weight A/B is deferred (weights not on disk).
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux1-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(
+            FluxVariant::Dev,
+            &missing_snapshot_spec(OffloadPolicy::Sequential),
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            FluxVariant::Dev,
+            &missing_snapshot_spec(OffloadPolicy::Resident),
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file") && !msg.contains("port plan"),
+            "expected an eager-load failure, not the up-front guard: {msg}"
         );
     }
 }

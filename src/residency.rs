@@ -115,6 +115,20 @@ impl<Text, Heavy> Residency<Text, Heavy> {
         matches!(self.inner, Inner::Sequential(_))
     }
 
+    /// Borrow the warm-resident components `(text, heavy)`, or `None` under `Sequential` (which holds
+    /// no components between generations). Providers whose public surface reaches the components
+    /// *outside* the staged [`run`](Self::run) lifecycle — a concrete-typed parity/test accessor such
+    /// as Chroma's `denoise` / `*_ref` real-weight helpers, which drive the default `Resident` policy —
+    /// use this to reach the warm components. It exposes only a shared borrow, so it changes no
+    /// behavior; the staged `Sequential` drop discipline is unaffected (it holds no components to
+    /// borrow, hence `None`).
+    pub fn resident_parts(&self) -> Option<(&Text, &Heavy)> {
+        match &self.inner {
+            Inner::Resident(pair) => Some((&pair.text, &pair.heavy)),
+            Inner::Sequential(_) => None,
+        }
+    }
+
     /// The single dispatch every wired provider shares (sc-11126, F-180): map an
     /// [`OffloadPolicy`] to a [`Residency`] built from the two per-phase loader closures, so no
     /// provider re-derives the `match policy { … }` (the earlier per-crate copies is exactly what let
@@ -705,6 +719,30 @@ mod tests {
             *heavy_calls.lock().unwrap(),
             1,
             "Resident loads the heavy bundle once, eagerly"
+        );
+    }
+
+    #[test]
+    fn resident_parts_borrows_under_resident_and_is_none_under_sequential() {
+        // The read-only accessor providers use to reach warm components outside `run` (Chroma's
+        // `*_ref`/`denoise` real-weight helpers): `Some((text, heavy))` under `Resident`, `None`
+        // under `Sequential` (which holds no components between generates).
+        let log: Log = new_log();
+        let resident = Residency::resident(
+            FakeText { log: log.clone() },
+            FakeHeavy {
+                log: log.clone(),
+                with_pid: true,
+            },
+        );
+        assert!(
+            resident.resident_parts().is_some(),
+            "Resident must expose its warm components"
+        );
+        let sequential = seq_residency(&log);
+        assert!(
+            sequential.resident_parts().is_none(),
+            "Sequential holds no warm components to borrow"
         );
     }
 
