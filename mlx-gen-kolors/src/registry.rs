@@ -16,12 +16,14 @@
 use mlx_rs::transforms::eval;
 use mlx_rs::{random, Array, Dtype};
 
+use std::path::Path;
+
 use mlx_gen::gen_core::sampling::{vp_capture_plan, VpCapturePlan};
 use mlx_gen::{
     curated_scheduler_names, default_seed, schedule_sigmas, AlphaSchedule, Capabilities,
     Conditioning, ConditioningKind, ControlKind, DiscreteModelSampling, Error, GenerationOutput,
     GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality, ModelDescriptor,
-    Progress, Quant, Result, Scheduler, Solver, WeightsSource,
+    OffloadPolicy, Progress, Quant, Residency, Result, Scheduler, Solver, WeightsSource,
 };
 
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -30,9 +32,8 @@ use mlx_gen_sdxl::{
 };
 
 use crate::ip_adapter::load_kolors_ip_adapter;
-use crate::model::{DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
+use crate::model::{KolorsHeavy, KolorsText, DEFAULT_IMG2IMG_STRENGTH, SPATIAL_SCALE};
 use crate::sampler::{KolorsEulerSampler, BETA_END, BETA_START, NUM_TRAIN_TIMESTEPS};
-use crate::Kolors;
 
 /// Registry id — the SceneWorks worker's `payload.model` for the Kolors family.
 pub const MODEL_ID: &str = "kolors";
@@ -110,29 +111,50 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            // NOT yet wired onto the shared `Residency` seam (F-148/F-176): the monolithic `Kolors`
-            // struct fuses the ChatGLM3 encoder with the U-Net/VAE and hosts every `denoise_*_latents`
-            // method, so splitting the encoder into a droppable phase-A component is a dedicated
-            // decomposition, tracked as its own wiring story (sc-11670, epic 11120) matching the
-            // per-family wiring stories sc-11000/sc-11030/sc-11101. Advertise `false` until then so a
-            // fit-gate does not over-trust a `Sequential` request that would silently stay `Resident`.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
+            // (F-176). The monolithic `Kolors` was split into a droppable `KolorsText` (6B ChatGLM3 +
+            // tokenizer) phase and a `KolorsHeavy` (SDXL U-Net + VAE) phase (`crate::model`): under
+            // `Sequential` the ChatGLM3 encoder — the dominant footprint — is encoded, materialized,
+            // then dropped before the U-Net + VAE (+ ControlNet / IP-Adapter / PiD) load, bounding
+            // peak unified memory to `max(ChatGLM3, U-Net+VAE)`. Kolors quantizes the U-Net + ChatGLM3
+            // DENSE at load, so a `Sequential` + `quantize` load re-quantizes each generate (F-181
+            // advisory in `load`).
+            supports_sequential_offload: true,
         },
     }
 }
 
-/// A loaded, dispatchable Kolors generator: the [`Kolors`] pipeline plus the optionally-loaded
-/// ControlNet branch and IP-Adapter image-token encoder (the decoupled-attn K/V pairs are already
-/// installed into the U-Net at load).
+/// A loaded, dispatchable Kolors generator: the component-residency strategy (epic 10834, sc-10840)
+/// plus the load-time presence flags the validator reads. Holds ONLY the [`Residency`] (no direct
+/// component fields — a retained component would defeat the `Sequential` drop): `Resident` (default)
+/// holds the ChatGLM3 encoder + U-Net + VAE (+ ControlNet / IP-Adapter / PiD) warm; `Sequential` holds
+/// only the per-phase loader closures and re-loads each per generation in phase order (encode →
+/// **drop the ChatGLM3 encoder** → U-Net/VAE/ControlNet/IP/PiD), bounding peak to
+/// `max(ChatGLM3, U-Net+VAE)`.
 pub struct KolorsGenerator {
     descriptor: ModelDescriptor,
-    kolors: Kolors,
+    /// Whether a ControlNet was requested (`spec.control`). Known at load without loading weights, so
+    /// the validator's mode-combination guards work even under `Sequential` (the ControlNet itself is
+    /// loaded lazily in the heavy phase).
+    has_control: bool,
+    /// Whether an IP-Adapter was requested (`spec.ip_adapter` is a dir). Same rationale as
+    /// [`has_control`](Self::has_control).
+    has_ip: bool,
+    residency: Residency<KolorsText, KolorsHeavyOwned>,
+}
+
+/// The heavy render-phase components owned by a `Resident` build or a `Sequential` generate (mirrors
+/// lens's `LensHeavyOwned`): the SDXL U-Net + VAE ([`KolorsHeavy`]) plus the optionally-loaded
+/// ControlNet branch, IP-Adapter image-token encoder (its decoupled-attn K/V pairs already installed
+/// into the U-Net), and PiD overlay.
+pub(crate) struct KolorsHeavyOwned {
+    heavy: KolorsHeavy,
     control: Option<ControlNet>,
     ip_encoder: Option<IpImageEncoder>,
-    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): loaded when the spec
-    /// carries [`LoadSpec::pid`]. Kolors shares the SDXL VAE latent space, so it reuses the `sdxl`
-    /// PiD student (via [`PID_BACKBONE`]). `Some` ⇒ a `req.use_pid` generation decodes the final
-    /// latent 4× through PiD instead of the VAE; `None` ⇒ the default byte-exact VAE decode.
+    /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7848): loaded when the spec carries
+    /// [`LoadSpec::pid`] AND this generate uses it (F-177). Kolors shares the SDXL VAE latent space, so
+    /// it reuses the `sdxl` PiD student (via [`PID_BACKBONE`]). `Some` ⇒ a `req.use_pid` generation
+    /// decodes the final latent 4× through PiD instead of the VAE; `None` ⇒ the byte-exact VAE decode.
     pid: Option<PidEngine>,
 }
 
@@ -156,29 +178,95 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
+    // Fail-fast the single-file source (and a File ip_adapter) up front for BOTH policies. Sequential
+    // defers the component build, but these are still wrong regardless of policy.
+    resolve_root(spec)?;
+    if matches!(&spec.ip_adapter, Some(WeightsSource::File(_))) {
+        return Err(Error::Msg(
+            "kolors ip_adapter expects a Kolors-IP-Adapter-Plus snapshot directory, not a file"
+                .into(),
+        ));
+    }
+    // F-181: Kolors quantizes the U-Net + ChatGLM3 DENSE at load, so a `Sequential` + `quantize` load
+    // re-quantizes each generate (repeated compute; the dense transient shrinks the memory win).
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(MODEL_ID, q.bits());
+        }
+    }
+    Ok(Box::new(KolorsGenerator {
+        descriptor: descriptor(),
+        has_control: spec.control.is_some(),
+        has_ip: matches!(&spec.ip_adapter, Some(WeightsSource::Dir(_))),
+        residency: build_residency(spec)?,
+    }))
+}
+
+/// Resolve the snapshot dir (rejecting a single-file source). Shared by the entry-point fail-fast and
+/// the `Sequential` per-phase loaders.
+fn resolve_root(spec: &LoadSpec) -> Result<std::path::PathBuf> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p.clone()),
+        WeightsSource::File(_) => Err(Error::Msg(
+            "kolors expects a Kolors-diffusers snapshot directory (text_encoder/ tokenizer/ \
+             unet/ vae/), not a single .safetensors file"
+                .into(),
+        )),
+    }
+}
+
+/// The policy→[`Residency`] dispatch (sc-10840), routed through the single [`Residency::from_policy`]
+/// seam (F-180). `Resident` eager-loads the ChatGLM3 text phase + heavy bundle now (the heavy loader
+/// with `use_pid = true`, loading any PiD overlay once and reusing it); `Sequential` captures the two
+/// per-phase loaders and loads nothing now, deferring each to [`Residency::run`]. Both use the same
+/// [`KolorsText::load`] / [`load_heavy_owned`], so the `Resident` composition is byte-identical to the
+/// pre-seam whole-model load (independent snapshot subdirs, deterministic RNG-free LoRA-merge → quant
+/// → IP-install). Weight-free-testable: under `Sequential` this touches no component weights.
+pub(crate) fn build_residency(spec: &LoadSpec) -> Result<Residency<KolorsText, KolorsHeavyOwned>> {
     let dtype = Dtype::Float16;
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p.clone(),
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "kolors expects a Kolors-diffusers snapshot directory (text_encoder/ tokenizer/ \
-                 unet/ vae/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
-    // Load the dense base, merge any LoRA/LoKr adapters into the dense U-Net, then quantize — the
-    // SDXL ordering (sc-4733): the f32 delta lands in the dense weights, which are then packed.
-    let mut kolors = Kolors::load(&root, dtype)?;
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let root = resolve_root(&spec_text)?;
+            let mut text = KolorsText::load(&root, dtype)?;
+            // Q4/Q8 quantizes the 6B ChatGLM3 encoder in place after the dense load (the U-Net
+            // quantizes in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
+            if let Some(q) = spec_text.quantize {
+                text.quantize(q.bits())?;
+            }
+            Ok(text)
+        },
+        move |use_pid| {
+            let root = resolve_root(&spec_heavy)?;
+            load_heavy_owned(&spec_heavy, &root, dtype, use_pid)
+        },
+    )
+}
+
+/// Load the heavy render bundle — the SDXL U-Net + VAE (+ optional ControlNet / IP-Adapter / PiD),
+/// everything but the ChatGLM3 encoder. Merges any LoRA/LoKr into the dense U-Net, then quantizes it
+/// (the SDXL ordering, sc-4733), then loads the ControlNet + installs the IP-Adapter K/V pairs into
+/// the (possibly quantized) U-Net. The PiD student is loaded only when `use_pid` (F-177) — Resident
+/// passes `true` (loaded once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips it.
+fn load_heavy_owned(
+    spec: &LoadSpec,
+    root: &Path,
+    dtype: Dtype,
+    use_pid: bool,
+) -> Result<KolorsHeavyOwned> {
+    let mut heavy = KolorsHeavy::load(root, dtype)?;
     if !spec.adapters.is_empty() {
-        kolors.apply_lora(&spec.adapters)?;
+        heavy.apply_lora(&spec.adapters)?;
     }
     if let Some(q) = spec.quantize {
         // F-144 (sc-11129): reject a requested-vs-packed tier mismatch before quantizing. `quantize()`
         // silently no-ops on already-packed weights, so a Q4 request over a pre-quantized Q8 snapshot
         // would serve Q8 with no diagnostic. Reuses the SDXL-family marker check — the Kolors U-Net is
         // the SDXL `UNet2DConditionModel` under `unet/`, the representative heavy component.
-        mlx_gen_sdxl::loader::needs_load_time_quant(&root, q.bits(), MODEL_ID)?;
-        kolors.quantize(q.bits())?;
+        mlx_gen_sdxl::loader::needs_load_time_quant(root, q.bits(), MODEL_ID)?;
+        heavy.quantize_unet(q.bits())?;
     }
 
     let control = match &spec.control {
@@ -186,35 +274,34 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         None => None,
     };
 
-    let ip_encoder =
-        match &spec.ip_adapter {
-            Some(WeightsSource::Dir(p)) => {
-                let (enc, pairs) = load_kolors_ip_adapter(p, dtype)?;
-                kolors.install_ip_adapter(pairs)?;
-                Some(enc)
-            }
-            Some(WeightsSource::File(_)) => return Err(Error::Msg(
-                "kolors ip_adapter expects a Kolors-IP-Adapter-Plus snapshot directory, not a file"
-                    .into(),
-            )),
-            None => None,
-        };
+    let ip_encoder = match &spec.ip_adapter {
+        Some(WeightsSource::Dir(p)) => {
+            let (enc, pairs) = load_kolors_ip_adapter(p, dtype)?;
+            heavy.install_ip_adapter(pairs)?;
+            Some(enc)
+        }
+        // A File ip_adapter was rejected up front in `load`.
+        Some(WeightsSource::File(_)) => None,
+        None => None,
+    };
 
     // PiD decoder overlay (epic 7840, sc-7848): load the `sdxl` student + Gemma caption encoder once
-    // when the spec carries it (Kolors = SDXL VAE latent space → reuses the `sdxl` PiD student).
-    let pid = spec
-        .pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()?;
+    // when the spec carries it AND this generate uses it (Kolors = SDXL VAE latent space).
+    let pid = if use_pid {
+        spec.pid
+            .as_ref()
+            .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+            .transpose()?
+    } else {
+        None
+    };
 
-    Ok(Box::new(KolorsGenerator {
-        descriptor: descriptor(),
-        kolors,
+    Ok(KolorsHeavyOwned {
+        heavy,
         control,
         ip_encoder,
         pid,
-    }))
+    })
 }
 
 mlx_gen::impl_generator!(KolorsGenerator {
@@ -240,7 +327,7 @@ impl KolorsGenerator {
             .conditioning
             .iter()
             .any(|c| matches!(c, Conditioning::Control { .. }));
-        if has_ctrl && self.control.is_none() {
+        if has_ctrl && !self.has_control {
             return Err(Error::Msg(
                 "kolors: a Control conditioning was passed but the model was loaded without a \
                  ControlNet (set LoadSpec::control)"
@@ -250,7 +337,7 @@ impl KolorsGenerator {
         // Control + Reference is the combined pose tier — allowed ONLY when an IP-Adapter is also
         // loaded (the Reference is the IP identity + img2img init). Plain Control + img2img (a
         // Reference with no IP-Adapter) is not a wired Kolors path.
-        if has_ctrl && has_ref && self.ip_encoder.is_none() {
+        if has_ctrl && has_ref && !self.has_ip {
             return Err(Error::Msg(
                 "kolors: combining ControlNet (Control) with a Reference requires an IP-Adapter (the \
                  combined pose tier — load LoadSpec::ip_adapter); plain Control + img2img is not \
@@ -260,7 +347,7 @@ impl KolorsGenerator {
         }
         // A loaded IP-Adapter + Control with no Reference can't run: the combined pass needs the
         // reference as the IP identity (and the IP image prompt is required in IP mode anyway).
-        if has_ctrl && self.ip_encoder.is_some() && !has_ref {
+        if has_ctrl && self.has_ip && !has_ref {
             return Err(Error::Msg(
                 "kolors: the combined ControlNet + IP-Adapter pass requires a Reference image (the \
                  IP-Adapter identity)"
@@ -273,25 +360,25 @@ impl KolorsGenerator {
     /// The rich-`Result` body behind [`Generator::generate`]. Kept on the crate's own
     /// [`mlx_gen::Error`] so the `?` operator lifts both `mlx_rs` device exceptions and the family
     /// helpers transparently; the trait wrapper bridges the tail into [`gen_core::Error`] (epic 3720).
+    /// The staged residency lifecycle (ChatGLM3 encode pos+neg → **drop the encoder** under
+    /// `Sequential` → load the U-Net/VAE/ControlNet/IP/PiD → per-mode denoise/decode → free the heavy
+    /// bundle) is driven by the shared [`Residency::run`] seam (sc-10840). The per-mode denoise
+    /// dispatch (curated + the five bespoke assemblies) + the PiD `from_ldm` plan run inside the render
+    /// closure, byte-identical for both policies (the only global-RNG draw per image is the noise,
+    /// after `random::seed(seed)` — hoisting the seed-independent encode/VAE-init out cannot perturb it).
     fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         self.validate(req)?;
-        // F-142: the ChatGLM3-6B prompt encodes (up to two full 6B forwards) plus the VAE init
-        // encodes all run before the first denoise-loop cancel check. Bail up front, and materialize
-        // the encodes below so a cancel arriving during them is honored (no lazy-eval false green).
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
 
         let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
         let cfg = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let (h, w) = (req.height as i32, req.width as i32);
-        let ip_mode = self.ip_encoder.is_some();
+        let ip_mode = self.has_ip;
 
         let reference = self.resolve_reference(req)?;
         let control = self.resolve_control(req)?;
@@ -305,12 +392,10 @@ impl KolorsGenerator {
 
         // Curated unified-sampler path (epic 7114, sc-7121 + sc-7297): a curated solver name (≠ the
         // native `euler_discrete`) OR a non-`discrete` scheduler routes through the additive k-diffusion
-        // `Kolors::denoise_curated_latents`. This now covers EVERY mode — txt2img / img2img AND the
-        // conditioned sub-providers (ControlNet-pose, IP-Adapter, the combined pose tier sc-5012): the
-        // engine `denoise_curated` already threads ControlNet residuals + the IP-Adapter decoupled-attn
-        // tokens (it is the InstantID dual-conditioning path), so the conditioned modes ride the same
-        // solver rather than being sampler-locked. The native `euler_discrete` default stays byte-exact
-        // — the legacy `denoise_*_latents` assemblies are entered only when no curated knob is set (N1).
+        // `KolorsHeavy::denoise_curated_latents`. This covers EVERY mode — txt2img / img2img AND the
+        // conditioned sub-providers (ControlNet-pose, IP-Adapter, the combined pose tier sc-5012). The
+        // native `euler_discrete` default stays byte-exact — the legacy `denoise_*_latents` assemblies
+        // are entered only when no curated knob is set (N1). Resolved from `req` (no weights).
         let scheduler_curated = req
             .scheduler
             .as_deref()
@@ -323,369 +408,344 @@ impl KolorsGenerator {
             .unwrap_or(false);
         let use_curated = scheduler_curated || sampler_curated;
 
-        // Conditioning is seed-independent — encode the prompts once and hand the (context, pooled)
-        // tuples to the per-mode `Kolors::denoise_*_latents` methods, which assemble the CFG batch +
-        // time_ids. Routing every mode through those methods keeps a single denoise assembly shared
-        // with the struct API + parity gates — only the real cancel/progress differ here (F-146).
-        let pos = self.kolors.encode(&req.prompt)?;
-        // F-142: force the ~6B positive forward so the cancel check below observes real progress, then
-        // honor a cancel before the (equally large) negative encode.
-        eval([&pos.0, &pos.1])?;
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005, sc-9091): the
-        // per-mode denoise assemblies build B=1 conditioning for `cfg <= 1.0` and never read the
-        // uncond stream, so encoding it would be a large wasted 6B forward.
-        let neg = if cfg > 1.0 {
-            let neg = self.kolors.encode(negative)?;
-            eval([&neg.0, &neg.1])?;
-            if req.cancel.is_cancelled() {
-                return Err(Error::Canceled);
-            }
-            Some(neg)
-        } else {
-            None
-        };
-
-        // IP-Adapter image tokens are seed-independent — encode the reference once (the
-        // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
-        let ip = match (ip_mode, reference) {
-            (true, Some((image, strength))) => {
-                let tokens = self.ip_encoder.as_ref().unwrap().tokens(image)?;
-                Some((tokens, strength.unwrap_or(IP_DEFAULT_SCALE)))
-            }
-            _ => None,
-        };
-        // img2img only when a Reference is present AND we're not in IP mode.
-        let img2img = match (ip_mode, reference) {
-            (false, Some((image, strength))) => Some((
-                image,
-                strength
-                    .or(req.strength)
-                    .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
-            )),
-            _ => None,
-        };
-
-        let (lh, lw) = (h / SPATIAL_SCALE, w / SPATIAL_SCALE);
-
-        // F-083: the curated-path init latent (`encode_init_latents`) is seed-INDEPENDENT (the VAE
-        // encode draws no RNG — confirmed by the per-image RNG-order note below), so it is identical
-        // across the count loop (only the noise varies per seed). Hoist it above the loop instead of
-        // re-encoding the same reference image every iteration (sdxl F-068 precedent).
-        let curated_init: Option<(Option<Array>, f32)> = if use_curated {
-            let (init_opt, strength) = if control.is_some() && ip_mode {
-                let (reference_image, _) = reference.expect("ip mode requires a reference");
-                (
-                    Some(encode_init_latents(
-                        self.kolors.vae(),
-                        reference_image,
-                        w as u32,
-                        h as u32,
-                    )?),
-                    req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
-                )
-            } else if let Some((image, strength)) = img2img {
-                (
-                    Some(encode_init_latents(
-                        self.kolors.vae(),
-                        image,
-                        w as u32,
-                        h as u32,
-                    )?),
-                    strength,
-                )
-            } else {
-                (None, 0.0)
-            };
-            Some((init_opt, strength))
-        } else {
-            None
-        };
-
-        // F-083: the legacy (native `euler_discrete`) dispatch's init latents are seed-INDEPENDENT for
-        // the same reason (`encode_init_latents` → `vae.encode_mean` draws no RNG), so hoist them above
-        // the loop too instead of re-encoding the same reference every iteration. Two sites mirror the
-        // two per-mode branch arms below: the combined strict-pose tier (Control + IP-Adapter, seeded
-        // from the reference == IP image) and plain img2img (seeded from its reference). Both are `None`
-        // on the curated path (which uses `curated_init`) and on the non-img2img modes.
-        let legacy_pose_init: Option<Array> = if !use_curated && control.is_some() && ip.is_some() {
-            let (reference_image, _) = reference.expect("ip mode requires a reference");
-            Some(encode_init_latents(
-                self.kolors.vae(),
-                reference_image,
-                w as u32,
-                h as u32,
-            )?)
-        } else {
-            None
-        };
-        let legacy_img2img_init: Option<Array> =
-            match (use_curated, control.is_none(), &ip, img2img) {
-                (false, true, None, Some((image, _))) => Some(encode_init_latents(
-                    self.kolors.vae(),
-                    image,
-                    w as u32,
-                    h as u32,
-                )?),
-                _ => None,
-            };
-
-        // PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). Kolors is a
-        // **variance-preserving** PiD student on the shared SDXL backbone, but — unlike SDXL's ancestral
-        // path — EVERY Kolors path stores RAW variance-exploding latents `x0 + σ·ε` (the leading-Euler
-        // `step` is plain k-diffusion `x + eps·dt`; `add_noise` returns raw `x0 + noise·σ`; the curated
-        // path integrates the same VE k-diffusion `run_sigmas`). So `from_ldm` is uniform here: truncate
-        // the schedule to the VP-capture `keep` nodes and map the captured VE latent into the student's
-        // VP frame with the plan's `rescale` (`1/√(1+σ_edm²)`) before decode — at BOTH the curated and
-        // bespoke decode sites. Everything stays 0.13025-scaled, so no extra normalization.
-        //
-        // The plan is image-independent (the σ schedule is fixed by steps / scheduler / strength), so
-        // resolve it once here, against the EXACT schedule the active mode denoises, and mint the decoder
-        // at the achieved degrade σ. This deterministic host math runs BEFORE the per-image
-        // `random::seed`/noise draws below, so it does not perturb the noise stream. `pid_capture_sigma`
-        // unset ⇒ `vp_plan = None` ⇒ full schedule + no rescale ⇒ byte-identical to the clean σ=0 decode.
-        // Kolors has no few-step accel or inpaint/mask mode (Mask is not an accepted conditioning), so —
-        // unlike SDXL — every dispatch path supports from_ldm and no guard is needed.
-        let vp_plan: Option<VpCapturePlan> = if req.use_pid && req.pid_capture_sigma.is_some() {
-            // Build the σ schedule of the ACTIVE path. The curated path denoises the k-diffusion
-            // `schedule_sigmas` (Normal/Karras/…), NOT the native leading-Euler schedule, so its plan is
-            // resolved against that exact `run_sigmas` (mirroring the SDXL curated anchor); the bespoke
-            // paths use the native `KolorsEulerSampler` schedule via `edm_sigmas()`. The strength each
-            // mode passes to its denoise method is matched here so `keep` agrees with the truncated run.
-            let edm_sigmas: Vec<f32> = if use_curated {
-                let sched = AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
-                let ms = DiscreteModelSampling::sdxl(&sched);
-                let scheduler = req
-                    .scheduler
-                    .as_deref()
-                    .and_then(Scheduler::from_name)
-                    .unwrap_or(Scheduler::Normal);
-                let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
-                // Curated init mirrors `curated_init` above: combined-pose + img2img are strength-sliced;
-                // txt2img runs the full schedule.
-                let strength = if control.is_some() && ip_mode {
-                    Some(req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH))
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            // ── Phase A: encode the positive (+ negative when CFG is on) ChatGLM3 conditioning.
+            // Seed-independent; under `Sequential` the shared seam materializes these + DROPS the 6B
+            // ChatGLM3 encoder before the U-Net/VAE load — bounding peak to `max(ChatGLM3, U-Net+VAE)`.
+            // The negative encode is skipped when guidance is off (F-005, sc-9091): the per-mode
+            // assemblies build B=1 conditioning for `cfg <= 1.0` and never read the uncond stream.
+            |text: &KolorsText| {
+                let pos = text.encode(&req.prompt)?;
+                let neg = if cfg > 1.0 {
+                    Some(text.encode(negative)?)
                 } else {
-                    img2img.map(|(_, s)| s)
+                    None
                 };
-                match strength {
-                    Some(strength) => {
-                        let strength = strength.clamp(0.0, 1.0);
-                        let eff = (steps as f32 * strength) as usize;
-                        let run_start = full_sigmas.len().saturating_sub(1).saturating_sub(eff);
-                        full_sigmas[run_start..].to_vec()
-                    }
-                    None => full_sigmas,
+                Ok((pos, neg))
+            },
+            // Materialize the (context, pooled) tuples while the encoder is still alive (Sequential
+            // only) — MLX is lazy, so un-evaluated outputs keep the 6B encoder referenced and the drop
+            // would free nothing.
+            |(pos, neg): &((Array, Array), Option<(Array, Array)>)| {
+                let mut arrays = vec![&pos.0, &pos.1];
+                if let Some(n) = neg {
+                    arrays.push(&n.0);
+                    arrays.push(&n.1);
                 }
-            } else if control.is_some() && ip_mode {
-                // Combined strict-pose tier: img2img at POSE_IMG2IMG_STRENGTH (or `req.strength`).
-                let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
-                KolorsEulerSampler::kolors_img2img(steps, strength, self.kolors.dtype())?
-                    .edm_sigmas()
-                    .to_vec()
-            } else if let Some((_, strength)) = img2img {
-                KolorsEulerSampler::kolors_img2img(steps, strength, self.kolors.dtype())?
-                    .edm_sigmas()
-                    .to_vec()
-            } else {
-                // txt2img / controlnet-only / ip-only: the full native leading-Euler schedule.
-                KolorsEulerSampler::kolors(steps, self.kolors.dtype())?
-                    .edm_sigmas()
-                    .to_vec()
-            };
-            vp_capture_plan(&edm_sigmas, req.pid_capture_sigma)
-        } else {
-            None
-        };
-        let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            self.descriptor.id,
-            capture_sigma,
-        )?;
-        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-        // The run-step truncation each denoise method applies (keep nodes ⇒ keep-1 denoise steps).
-        let run_steps = vp_plan.map(|p| p.keep - 1);
+                eval(arrays)?;
+                Ok(())
+            },
+            // ── Phase B: the IP-token/VAE-init/PiD-plan setup + the per-image denoise/decode count
+            // loop. Identical body for both residencies.
+            |heavy_owned: &KolorsHeavyOwned, (pos, neg), on_progress: &mut dyn FnMut(Progress)| {
+                let heavy = &heavy_owned.heavy;
 
-        // F-142: honor a cancel after the (hoisted, seed-independent) VAE init / PiD-plan encodes,
-        // before entering the per-image denoise loop whose own per-step check takes over.
-        if req.cancel.is_cancelled() {
-            return Err(Error::Canceled);
-        }
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            random::seed(seed)?;
-
-            // Draw this image's initial noise, then dispatch to the matching denoise assembly. Only
-            // one global-RNG draw happens per image (the noise); the img2img VAE-encode below draws
-            // none, so the per-image output stays byte-identical to the struct API's RNG order.
-            let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-
-            // Curated unified path (every mode): k-diffusion VE-σ sampling over the Kolors
-            // `DiscreteModelSampling`, additive alongside the native leading-Euler default. Threads the
-            // SAME conditioning the bespoke dispatch builds — ControlNet residuals, IP-Adapter tokens,
-            // and the combined pose tier's img2img init — through `denoise_curated` (sc-7297).
-            if use_curated {
-                // ControlNet branch (Some when a Control image was provided + a ControlNet loaded — both
-                // validated above) and the IP-Adapter tokens (Some in IP mode), passed straight through.
-                let control_arg = control.map(|(image, scale)| {
-                    (
-                        self.control.as_ref().expect("validated above"),
-                        image,
-                        scale,
-                    )
-                });
-                let ip_arg = ip.as_ref().map(|(tokens, scale)| (tokens, *scale));
-
-                // Init mirrors the bespoke dispatch's per-mode choice: the combined pose tier seeds
-                // img2img from the reference (== the IP image) at the strict-pose strength; plain
-                // img2img seeds from its reference; ControlNet-only / IP-only / txt2img seed raw
-                // `ε·σ_max` (no init). Hoisted above the loop (F-083: seed-independent VAE encode).
-                let (init_opt, strength) = curated_init
-                    .clone()
-                    .expect("curated_init is Some iff use_curated (computed above)");
-
-                let latents = self.kolors.denoise_curated_latents(
-                    req.sampler.as_deref(),
-                    req.scheduler.as_deref(),
-                    init_opt.as_ref(),
-                    &noise,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    strength,
-                    cfg,
-                    seed,
-                    h,
-                    w,
-                    control_arg,
-                    ip_arg,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?;
-                // PiD from_ldm (sc-8049): map the raw VE latent into the VP frame before decode. `None`
-                // ⇒ byte-identical. Kolors is uniformly VE, so this applies on the curated path too.
-                let latents = match &vp_plan {
-                    Some(p) => mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?,
-                    None => latents,
+                // IP-Adapter image tokens are seed-independent — encode the reference once (the
+                // `denoise_ip_latents` method CFG-batches them per image). Carries the resolved scale.
+                let ip = match (ip_mode, reference) {
+                    (true, Some((image, strength))) => {
+                        let tokens = heavy_owned.ip_encoder.as_ref().unwrap().tokens(image)?;
+                        Some((tokens, strength.unwrap_or(IP_DEFAULT_SCALE)))
+                    }
+                    _ => None,
                 };
-                on_progress(Progress::Decoding);
-                images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
-                continue;
-            }
+                // img2img only when a Reference is present AND we're not in IP mode.
+                let img2img = match (ip_mode, reference) {
+                    (false, Some((image, strength))) => Some((
+                        image,
+                        strength
+                            .or(req.strength)
+                            .unwrap_or(DEFAULT_IMG2IMG_STRENGTH),
+                    )),
+                    _ => None,
+                };
 
-            let latents = if let (Some((skeleton, control_scale)), Some((tokens, ip_scale))) =
-                (control, &ip)
-            {
-                // Combined strict-pose tier (sc-5012): the pose ControlNet (skeleton) + the
-                // IP-Adapter identity, on an img2img init from the SAME reference. `ip_mode` ⇒ a
-                // Reference is present (validated), and it is both the IP image prompt and the init.
-                // The init latents were hoisted above the loop (F-083: seed-independent VAE encode).
-                let init_latents = legacy_pose_init
-                    .as_ref()
-                    .expect("legacy_pose_init is Some in the non-curated combined-pose mode");
-                let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
-                self.kolors.denoise_controlnet_ip_latents(
-                    self.control.as_ref().expect("validated above"),
-                    tokens,
-                    init_latents,
-                    &noise,
-                    skeleton,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    strength,
-                    cfg,
-                    control_scale,
-                    *ip_scale,
-                    h,
-                    w,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?
-            } else if let Some((image, scale)) = control {
-                self.kolors.denoise_controlnet_latents(
-                    self.control.as_ref().expect("validated above"),
-                    &noise,
-                    image,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    cfg,
-                    scale,
-                    h,
-                    w,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?
-            } else if let Some((tokens, scale)) = &ip {
-                self.kolors.denoise_ip_latents(
-                    tokens,
-                    &noise,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    cfg,
-                    *scale,
-                    h,
-                    w,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?
-            } else if let Some((_image, strength)) = img2img {
-                // Init latents hoisted above the loop (F-083: seed-independent VAE encode).
-                let x0 = legacy_img2img_init
-                    .as_ref()
-                    .expect("legacy_img2img_init is Some in the non-curated img2img mode");
-                self.kolors.denoise_img2img_latents(
-                    x0,
-                    &noise,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    strength,
-                    cfg,
-                    h,
-                    w,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?
-            } else {
-                self.kolors.denoise_latents(
-                    &noise,
-                    &pos,
-                    neg.as_ref(),
-                    steps,
-                    cfg,
-                    h,
-                    w,
-                    run_steps,
-                    &req.cancel,
-                    on_progress,
-                )?
-            };
+                let (lh, lw) = (h / SPATIAL_SCALE, w / SPATIAL_SCALE);
 
-            // PiD from_ldm (sc-8049): map the raw VE latent into the VP frame before decode. `None` ⇒
-            // byte-identical. Every bespoke Kolors path stores raw VE, so this rescale is unconditional
-            // across the branches above.
-            let latents = match &vp_plan {
-                Some(p) => mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?,
-                None => latents,
-            };
-            on_progress(Progress::Decoding);
-            images.push(decode_image(self.kolors.vae(), &latents, pid_ref)?);
-        }
-        Ok(GenerationOutput::Images(images))
+                // F-083: the curated-path init latent (`encode_init_latents`) is seed-INDEPENDENT (the
+                // VAE encode draws no RNG), so it is identical across the count loop (only the noise
+                // varies per seed). Hoist it above the loop instead of re-encoding every iteration.
+                let curated_init: Option<(Option<Array>, f32)> = if use_curated {
+                    let (init_opt, strength) = if control.is_some() && ip_mode {
+                        let (reference_image, _) = reference.expect("ip mode requires a reference");
+                        (
+                            Some(encode_init_latents(
+                                heavy.vae(),
+                                reference_image,
+                                w as u32,
+                                h as u32,
+                            )?),
+                            req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH),
+                        )
+                    } else if let Some((image, strength)) = img2img {
+                        (
+                            Some(encode_init_latents(heavy.vae(), image, w as u32, h as u32)?),
+                            strength,
+                        )
+                    } else {
+                        (None, 0.0)
+                    };
+                    Some((init_opt, strength))
+                } else {
+                    None
+                };
+
+                // F-083: the legacy (native `euler_discrete`) dispatch's init latents are likewise
+                // seed-INDEPENDENT, so hoist them above the loop too. Two sites mirror the two per-mode
+                // branch arms below: the combined strict-pose tier (Control + IP-Adapter, seeded from
+                // the reference == IP image) and plain img2img (seeded from its reference).
+                let legacy_pose_init: Option<Array> =
+                    if !use_curated && control.is_some() && ip.is_some() {
+                        let (reference_image, _) = reference.expect("ip mode requires a reference");
+                        Some(encode_init_latents(
+                            heavy.vae(),
+                            reference_image,
+                            w as u32,
+                            h as u32,
+                        )?)
+                    } else {
+                        None
+                    };
+                let legacy_img2img_init: Option<Array> =
+                    match (use_curated, control.is_none(), &ip, img2img) {
+                        (false, true, None, Some((image, _))) => {
+                            Some(encode_init_latents(heavy.vae(), image, w as u32, h as u32)?)
+                        }
+                        _ => None,
+                    };
+
+                // PiD decode overlay (epic 7840, sc-7848) + `from_ldm` early-stop (sc-8049). Kolors is a
+                // **variance-preserving** PiD student on the shared SDXL backbone, but EVERY Kolors path
+                // stores RAW variance-exploding latents `x0 + σ·ε`. So `from_ldm` is uniform: truncate
+                // the schedule to the VP-capture `keep` nodes and map the captured VE latent into the
+                // student's VP frame with the plan's `rescale` (`1/√(1+σ_edm²)`) before decode. The plan
+                // is image-independent, so resolve it once here, against the EXACT schedule the active
+                // mode denoises, BEFORE the per-image `random::seed`/noise draws (does not perturb the
+                // noise stream). `pid_capture_sigma` unset ⇒ `vp_plan = None` ⇒ byte-identical clean decode.
+                let vp_plan: Option<VpCapturePlan> = if req.use_pid
+                    && req.pid_capture_sigma.is_some()
+                {
+                    let edm_sigmas: Vec<f32> = if use_curated {
+                        let sched =
+                            AlphaSchedule::scaled_linear(NUM_TRAIN_TIMESTEPS, BETA_START, BETA_END);
+                        let ms = DiscreteModelSampling::sdxl(&sched);
+                        let scheduler = req
+                            .scheduler
+                            .as_deref()
+                            .and_then(Scheduler::from_name)
+                            .unwrap_or(Scheduler::Normal);
+                        let full_sigmas = schedule_sigmas(scheduler, &ms, steps);
+                        // Curated init mirrors `curated_init`: combined-pose + img2img are
+                        // strength-sliced; txt2img runs the full schedule.
+                        let strength = if control.is_some() && ip_mode {
+                            Some(req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH))
+                        } else {
+                            img2img.map(|(_, s)| s)
+                        };
+                        match strength {
+                            Some(strength) => {
+                                let strength = strength.clamp(0.0, 1.0);
+                                let eff = (steps as f32 * strength) as usize;
+                                let run_start =
+                                    full_sigmas.len().saturating_sub(1).saturating_sub(eff);
+                                full_sigmas[run_start..].to_vec()
+                            }
+                            None => full_sigmas,
+                        }
+                    } else if control.is_some() && ip_mode {
+                        // Combined strict-pose tier: img2img at POSE_IMG2IMG_STRENGTH (or `req.strength`).
+                        let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
+                        KolorsEulerSampler::kolors_img2img(steps, strength, heavy.dtype())?
+                            .edm_sigmas()
+                            .to_vec()
+                    } else if let Some((_, strength)) = img2img {
+                        KolorsEulerSampler::kolors_img2img(steps, strength, heavy.dtype())?
+                            .edm_sigmas()
+                            .to_vec()
+                    } else {
+                        // txt2img / controlnet-only / ip-only: the full native leading-Euler schedule.
+                        KolorsEulerSampler::kolors(steps, heavy.dtype())?
+                            .edm_sigmas()
+                            .to_vec()
+                    };
+                    vp_capture_plan(&edm_sigmas, req.pid_capture_sigma)
+                } else {
+                    None
+                };
+                let capture_sigma = vp_plan.map(|p| p.sigma).unwrap_or(0.0);
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    heavy_owned.pid.as_ref(),
+                    req,
+                    base_seed,
+                    self.descriptor.id,
+                    capture_sigma,
+                )?;
+                let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                // The run-step truncation each denoise method applies (keep nodes ⇒ keep-1 denoise steps).
+                let run_steps = vp_plan.map(|p| p.keep - 1);
+
+                let mut images = Vec::with_capacity(req.count as usize);
+                for i in 0..req.count {
+                    let seed = base_seed.wrapping_add(i as u64);
+                    random::seed(seed)?;
+
+                    // Draw this image's initial noise, then dispatch to the matching denoise assembly.
+                    // Only one global-RNG draw happens per image (the noise); the img2img VAE-encode
+                    // above draws none, so the per-image output stays byte-identical to the struct API.
+                    let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+
+                    if use_curated {
+                        let control_arg = control.map(|(image, scale)| {
+                            (
+                                heavy_owned.control.as_ref().expect("validated above"),
+                                image,
+                                scale,
+                            )
+                        });
+                        let ip_arg = ip.as_ref().map(|(tokens, scale)| (tokens, *scale));
+
+                        let (init_opt, strength) = curated_init
+                            .clone()
+                            .expect("curated_init is Some iff use_curated (computed above)");
+
+                        let latents = heavy.denoise_curated_latents(
+                            req.sampler.as_deref(),
+                            req.scheduler.as_deref(),
+                            init_opt.as_ref(),
+                            &noise,
+                            &pos,
+                            neg.as_ref(),
+                            steps,
+                            strength,
+                            cfg,
+                            seed,
+                            h,
+                            w,
+                            control_arg,
+                            ip_arg,
+                            run_steps,
+                            &req.cancel,
+                            on_progress,
+                        )?;
+                        let latents = match &vp_plan {
+                            Some(p) => {
+                                mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?
+                            }
+                            None => latents,
+                        };
+                        on_progress(Progress::Decoding);
+                        images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                        continue;
+                    }
+
+                    let latents =
+                        if let (Some((skeleton, control_scale)), Some((tokens, ip_scale))) =
+                            (control, &ip)
+                        {
+                            // Combined strict-pose tier (sc-5012): pose ControlNet + IP-Adapter identity,
+                            // on an img2img init from the SAME reference (the IP image).
+                            let init_latents = legacy_pose_init.as_ref().expect(
+                                "legacy_pose_init is Some in the non-curated combined-pose mode",
+                            );
+                            let strength = req.strength.unwrap_or(POSE_IMG2IMG_STRENGTH);
+                            heavy.denoise_controlnet_ip_latents(
+                                heavy_owned.control.as_ref().expect("validated above"),
+                                tokens,
+                                init_latents,
+                                &noise,
+                                skeleton,
+                                &pos,
+                                neg.as_ref(),
+                                steps,
+                                strength,
+                                cfg,
+                                control_scale,
+                                *ip_scale,
+                                h,
+                                w,
+                                run_steps,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        } else if let Some((image, scale)) = control {
+                            heavy.denoise_controlnet_latents(
+                                heavy_owned.control.as_ref().expect("validated above"),
+                                &noise,
+                                image,
+                                &pos,
+                                neg.as_ref(),
+                                steps,
+                                cfg,
+                                scale,
+                                h,
+                                w,
+                                run_steps,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        } else if let Some((tokens, scale)) = &ip {
+                            heavy.denoise_ip_latents(
+                                tokens,
+                                &noise,
+                                &pos,
+                                neg.as_ref(),
+                                steps,
+                                cfg,
+                                *scale,
+                                h,
+                                w,
+                                run_steps,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        } else if let Some((_image, strength)) = img2img {
+                            let x0 = legacy_img2img_init.as_ref().expect(
+                                "legacy_img2img_init is Some in the non-curated img2img mode",
+                            );
+                            heavy.denoise_img2img_latents(
+                                x0,
+                                &noise,
+                                &pos,
+                                neg.as_ref(),
+                                steps,
+                                strength,
+                                cfg,
+                                h,
+                                w,
+                                run_steps,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        } else {
+                            heavy.denoise_latents(
+                                &noise,
+                                &pos,
+                                neg.as_ref(),
+                                steps,
+                                cfg,
+                                h,
+                                w,
+                                run_steps,
+                                &req.cancel,
+                                on_progress,
+                            )?
+                        };
+
+                    let latents = match &vp_plan {
+                        Some(p) => {
+                            mlx_rs::ops::multiply(&latents, mlx_gen::array::scalar(p.rescale))?
+                        }
+                        None => latents,
+                    };
+                    on_progress(Progress::Decoding);
+                    images.push(decode_image(heavy.vae(), &latents, pid_ref)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 
     /// The single img2img / IP reference image + its strength (the per-reference strength wins). One
@@ -995,5 +1055,47 @@ mod tests {
         // advertises both (the real-weight merge + scale=0≡base parity is `tests/lora_parity.rs`).
         assert!(descriptor().capabilities.supports_lora);
         assert!(descriptor().capabilities.supports_lokr);
+    }
+
+    #[test]
+    fn advertises_sequential_offload() {
+        // Kolors now honors the shared Residency seam (epic 10834, sc-10840).
+        assert!(descriptor().capabilities.supports_sequential_offload);
+    }
+
+    // ── Sequential residency (epic 10834, sc-10840): weight-free proof the dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot dir; the discriminator is
+    // deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the ChatGLM3 encoder from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weights A/B is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/kolors-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file"),
+            "expected an eager-load failure, not the up-front single-file guard: {msg}"
+        );
     }
 }
