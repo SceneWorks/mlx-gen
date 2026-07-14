@@ -7,6 +7,17 @@
 //! (latents / 0.13025). `time_ids` = `(H, W, 0, 0, H, W)` (the SDXL `_get_add_time_ids`).
 //!
 //! The whole pipeline is dtype-parametric; the parity gate (`tests/t2i_parity.rs`) runs f32.
+//!
+//! ## Component-residency split (epic 10834, sc-10840)
+//!
+//! For `OffloadPolicy::Sequential` (the shared `mlx_gen::Residency` seam) the 6B ChatGLM3 encoder is
+//! the phase-A component dropped first: it is the dominant footprint, so encode → **drop** →
+//! denoise/decode bounds peak unified memory to `max(ChatGLM3, U-Net+VAE)`. This module splits the
+//! monolithic pipeline into a [`KolorsText`] (ChatGLM3 + tokenizer) phase and a [`KolorsHeavy`] (SDXL
+//! U-Net + VAE) phase, both of which the composing [`Kolors`] struct holds and delegates to — so the
+//! resident struct API (which the parity tests + trainer call) is byte-identical, while the registry
+//! generator ([`crate::registry`]) holds the two phases separately in a `Residency` so it can drop the
+//! encoder mid-job.
 
 use mlx_rs::{random, Array, Dtype};
 
@@ -48,14 +59,31 @@ fn validate_dims(height: i32, width: i32) -> Result<()> {
 /// diffusers `KolorsImg2ImgPipeline` default `strength` (how much of the schedule to re-noise/denoise).
 pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.3;
 
-/// A loaded Kolors model: ChatGLM3 text encoder + tokenizer + SDXL-family U-Net (with the ChatGLM
-/// context projection) + SDXL VAE.
-pub struct Kolors {
+/// The phase-A **text-encode** component (sc-10840): the 6B ChatGLM3 encoder + tokenizer. The
+/// dominant Kolors footprint, so it is the one dropped first under `OffloadPolicy::Sequential`: encode
+/// → **drop** → denoise/decode bounds peak unified memory to `max(ChatGLM3, U-Net+VAE)`.
+pub struct KolorsText {
     chatglm: ChatGlmModel,
     tokenizer: KolorsTokenizer,
+}
+
+/// The phase-B **heavy render** component (sc-10840): the SDXL-family U-Net (with the ChatGLM context
+/// projection) + the SDXL VAE, plus every `denoise_*_latents` assembly + the decode. Held after the
+/// ChatGLM3 encoder is dropped under `Sequential`; both residencies run the identical denoise/decode
+/// bodies, so a `Sequential` job is byte-identical to `Resident`.
+pub struct KolorsHeavy {
     unet: UNet2DConditionModel,
     vae: Autoencoder,
     dtype: Dtype,
+}
+
+/// A loaded Kolors model: the [`KolorsText`] (ChatGLM3 + tokenizer) + [`KolorsHeavy`] (SDXL-family
+/// U-Net + VAE) phases (sc-10840 split) held together, delegating the full struct API. This is the
+/// direct API the parity tests + trainer call; the registry generator ([`crate::registry`]) holds the
+/// two phases separately in a `Residency` so it can drop the encoder mid-job for `Sequential`.
+pub struct Kolors {
+    text: KolorsText,
+    heavy: KolorsHeavy,
 }
 
 /// The SDXL-style micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row (the diffusers
@@ -153,10 +181,10 @@ fn cfg_batch_ip_tokens(ip_tokens: &Array, cfg: f32) -> Result<Array> {
 
 /// Render one preview sample (sc-5637) from the **in-progress training adapter** already installed
 /// on `unet`: seeded prior → leading-Euler CFG denoise → VAE decode → [`Image`]. A stripped
-/// [`Kolors::denoise_latents`] + [`Kolors::decode`] for the trainer (which holds the raw components,
-/// not a `Kolors`). `context`/`pooled` are the pre-encoded **CFG batch** (`[2, …]` = positive then
-/// empty-negative); `dtype` is the trainer compute dtype (the sampler scales the initial noise in it).
-/// No progress/cancel plumbing — the caller drives the cadence.
+/// [`KolorsHeavy::denoise_latents`] + [`KolorsHeavy::decode`] for the trainer (which holds the raw
+/// components, not a `Kolors`). `context`/`pooled` are the pre-encoded **CFG batch** (`[2, …]` =
+/// positive then empty-negative); `dtype` is the trainer compute dtype (the sampler scales the initial
+/// noise in it). No progress/cancel plumbing — the caller drives the cadence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_sample(
     unet: &UNet2DConditionModel,
@@ -196,55 +224,21 @@ pub(crate) fn render_sample(
     decode_image(vae, &latents, None)
 }
 
-impl Kolors {
-    /// Load every Kolors component from the `Kwai-Kolors/Kolors-diffusers` snapshot at `dtype`.
-    /// `tokenizer/tokenizer.json` must already be materialized (`tools/build_kolors_tokenizer.py`).
+impl KolorsText {
+    /// Load the phase-A ChatGLM3 encoder + tokenizer from the `Kwai-Kolors/Kolors-diffusers` snapshot
+    /// at `dtype`. `tokenizer/tokenizer.json` must already be materialized
+    /// (`tools/build_kolors_tokenizer.py`). This is the component dropped first under `Sequential`.
     pub fn load(snapshot: &std::path::Path, dtype: Dtype) -> Result<Self> {
         let te_w = Weights::from_dir(snapshot.join("text_encoder"))?;
         let chatglm = ChatGlmModel::from_weights(&te_w, ChatGlmConfig::chatglm3_6b(), None, dtype)?;
         let tokenizer = KolorsTokenizer::from_dir(snapshot.join("tokenizer"))?;
-        let unet = load_unet_kolors_dtype(snapshot, dtype)?;
-        let vae = load_vae(snapshot)?; // SDXL VAE (sdxl-vae-fp16-fix), f32
-        Ok(Self {
-            chatglm,
-            tokenizer,
-            unet,
-            vae,
-            dtype,
-        })
+        Ok(Self { chatglm, tokenizer })
     }
 
-    /// Load every Kolors component, then **load-time quantize** the memory drivers to `bits` (4 or 8)
-    /// — the mlx-gen-sdxl sc-2641 path: the dense fp16 snapshot is loaded and packed in-memory (there
-    /// is no pre-quantized Kolors snapshot). Quantizes the 6B ChatGLM3 encoder (the dominant footprint)
-    /// **and** the SDXL-family U-Net (reusing its own `quantize`); the VAE stays f32 (it overflows in
-    /// low precision — the SDXL-family convention). `bits` ∈ {4, 8}.
-    pub fn load_quantized(snapshot: &std::path::Path, dtype: Dtype, bits: i32) -> Result<Self> {
-        let mut m = Self::load(snapshot, dtype)?;
-        m.quantize(bits)?;
-        Ok(m)
-    }
-
-    /// Load-time quantize the memory drivers to `bits` (4 or 8) — the 6B ChatGLM3 encoder **and** the
-    /// SDXL-family U-Net (the VAE stays f32; the SDXL-family convention). Split out of
-    /// [`load_quantized`](Self::load_quantized) so the registry can **merge LoRA/LoKr into the dense
-    /// base first, then quantize** (the SDXL ordering — the f32 delta merges into the dense weights,
-    /// which are then packed). Idempotent per component.
+    /// Load-time quantize the 6B ChatGLM3 encoder to `bits` (4 or 8) — the dominant footprint. The
+    /// U-Net quantizes in the phase-B [`KolorsHeavy::quantize_unet`]; the VAE stays f32.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.chatglm.quantize(bits)?;
-        self.unet.quantize(bits)?;
-        Ok(())
-    }
-
-    /// Merge LoRA / LoKr adapters into the dense U-Net weights at load (sc-4733). The Kolors U-Net is
-    /// the SDXL `UNet2DConditionModel`, so this delegates to the SDXL adapter merge
-    /// ([`apply_sdxl_adapters_with`]) at **Complete** coverage — the down/mid/up attention surface the
-    /// Kolors trainer (sc-4568) targets and the diffusers PEFT suffix-match selects (LoKr specs ignore
-    /// coverage and use the vendored down/up surface). Merging (not a forward-time residual) keeps the
-    /// denoise loop unchanged. Out-of-surface keys are surfaced in the returned report, not dropped.
-    /// Must run **before** [`quantize`](Self::quantize) so the f32 delta lands in the dense base.
-    pub fn apply_lora(&mut self, adapters: &[AdapterSpec]) -> Result<SdxlLoraReport> {
-        apply_sdxl_adapters_with(&mut self.unet, adapters, LoraCoverage::Complete)
+        self.chatglm.quantize(bits)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])`, threading the tokenizer's
@@ -255,6 +249,38 @@ impl Kolors {
         self.chatglm
             .encode_prompt(&t.input_ids, &t.attention_mask, Some(&t.position_ids))
     }
+}
+
+impl KolorsHeavy {
+    /// Load the phase-B SDXL-family U-Net + VAE from the `Kwai-Kolors/Kolors-diffusers` snapshot at
+    /// `dtype`. The VAE always runs f32 (`sdxl-vae-fp16-fix`). Held after the ChatGLM3 encoder is
+    /// dropped under `Sequential`.
+    pub fn load(snapshot: &std::path::Path, dtype: Dtype) -> Result<Self> {
+        let unet = load_unet_kolors_dtype(snapshot, dtype)?;
+        let vae = load_vae(snapshot)?; // SDXL VAE (sdxl-vae-fp16-fix), f32
+        Ok(Self { unet, vae, dtype })
+    }
+
+    /// Load-time quantize the SDXL-family U-Net to `bits` (4 or 8). The 6B ChatGLM3 encoder quantizes
+    /// in the phase-A [`KolorsText::quantize`]; the VAE stays f32 (it overflows in low precision — the
+    /// SDXL-family convention). Split so the registry can merge LoRA/LoKr into the dense base first,
+    /// then quantize (the SDXL ordering — the f32 delta merges into the dense weights, then packed).
+    pub fn quantize_unet(&mut self, bits: i32) -> Result<()> {
+        self.unet.quantize(bits)
+    }
+
+    /// Merge LoRA / LoKr adapters into the dense U-Net weights at load (sc-4733) — the SDXL adapter
+    /// merge ([`apply_sdxl_adapters_with`]) at **Complete** coverage. Must run **before**
+    /// [`quantize_unet`](Self::quantize_unet) so the f32 delta lands in the dense base.
+    pub fn apply_lora(&mut self, adapters: &[AdapterSpec]) -> Result<SdxlLoraReport> {
+        apply_sdxl_adapters_with(&mut self.unet, adapters, LoraCoverage::Complete)
+    }
+
+    /// Install the IP-Adapter decoupled cross-attention K/V pairs into the U-Net's cross-attention
+    /// layers (sc-3098). One-time setup; non-destructive to plain T2I.
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+        self.unet.install_ip_adapter(pairs)
+    }
 
     /// Decode latents `[1, h, w, 4]` → an RGB [`Image`] (`vae.decode(latents / 0.13025)`). The
     /// lower-level struct API always uses the native VAE; the dispatchable `KolorsGenerator`
@@ -263,16 +289,12 @@ impl Kolors {
         decode_image(&self.vae, latents, None)
     }
 
-    /// Crate-internal VAE accessor for the registry [`Generator`](crate::registry) wrapper, which
-    /// VAE-encodes the img2img init and decodes the final latents around the per-mode denoise
-    /// methods it now drives directly (F-146).
+    /// The loaded VAE (the registry VAE-encodes img2img inits + decodes around the per-mode denoise).
     pub(crate) fn vae(&self) -> &Autoencoder {
         &self.vae
     }
 
-    /// Crate-internal compute-dtype accessor for the registry wrapper. Used by the PiD `from_ldm`
-    /// early-stop (sc-8049) to build the throwaway [`KolorsEulerSampler`] whose `edm_sigmas()` the
-    /// VP-capture plan resolves against — the same dtype the active denoise method passes.
+    /// Compute dtype (used by the PiD `from_ldm` early-stop, sc-8049, to build the throwaway sampler).
     pub(crate) fn dtype(&self) -> Dtype {
         self.dtype
     }
@@ -281,7 +303,7 @@ impl Kolors {
     /// `[1, h, w, 4]`. The single denoise assembly for plain T2I: the parity gate feeds diffusers'
     /// exact noise with a no-op `cancel`/`on_progress`, and the registry's production count loop
     /// drives it with the real request `CancelFlag` + progress sink — so the two surfaces can't drift
-    /// (F-146). `pos`/`neg` are the `(context, pooled)` from [`encode`](Self::encode). Returns the
+    /// (F-146). `pos`/`neg` are the `(context, pooled)` from [`KolorsText::encode`]. Returns the
     /// final latents `[1, h, w, 4]`.
     #[allow(clippy::too_many_arguments)]
     pub fn denoise_latents(
@@ -321,46 +343,6 @@ impl Kolors {
             cancel,
             on_progress,
         )
-    }
-
-    /// Full T2I: seed the RNG, draw the initial noise, encode the prompt + negative prompt, denoise,
-    /// and VAE-decode. `height`/`width` are pixels (multiples of 8). `cfg` ≤ 1 disables guidance.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate(
-        &self,
-        prompt: &str,
-        negative: &str,
-        num_steps: usize,
-        cfg: f32,
-        seed: u64,
-        height: i32,
-        width: i32,
-    ) -> Result<Image> {
-        validate_dims(height, width)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005) — the uncond row
-        // is never used, so encoding it would be a large wasted forward.
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_latents(
-            &init_noise,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            cfg,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
-        self.decode(&latents)
     }
 
     /// Run the img2img CFG denoise loop from pre-encoded init latents + a supplied noise tensor —
@@ -538,54 +520,6 @@ impl Kolors {
         )
     }
 
-    /// Full img2img: VAE-encode `image` (resized to `height`×`width`) → seed at the strength-derived
-    /// start → encode the prompts → denoise the remaining steps → VAE-decode. Mirrors diffusers
-    /// `KolorsImg2ImgPipeline` (using the VAE encoder **mean** as the init, consistent with the rest
-    /// of mlx-gen-sdxl's img2img — the production fork convention; the diffusers default samples the
-    /// latent dist, which is not reproducible cross-backend). `cfg` ≤ 1 disables guidance.
-    #[allow(clippy::too_many_arguments)]
-    pub fn img2img(
-        &self,
-        image: &Image,
-        prompt: &str,
-        negative: &str,
-        num_steps: usize,
-        strength: f32,
-        cfg: f32,
-        seed: u64,
-        height: i32,
-        width: i32,
-    ) -> Result<Image> {
-        validate_dims(height, width)?;
-        // VAE-encode the init (no RNG: mean, not a sample) so the first global-RNG draw is the
-        // add_noise noise — matching the reference's `prepare_latents` order.
-        let init_latents = encode_init_latents(&self.vae, image, width as u32, height as u32)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_img2img_latents(
-            &init_latents,
-            &noise,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            strength,
-            cfg,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
-        self.decode(&latents)
-    }
-
     /// Run the CFG denoise loop with a Kolors **ControlNet** branch injecting residuals each step
     /// (sc-3097) — split out (like [`denoise_latents`](Self::denoise_latents)) so the parity gate can
     /// feed diffusers' exact noise. The `controlnet` is loaded via `mlx_gen_sdxl::load_controlnet`
@@ -648,59 +582,6 @@ impl Kolors {
             on_progress,
             &cc,
         )
-    }
-
-    /// Full ControlNet T2I: seed the noise, encode the prompts, denoise with the `controlnet` branch
-    /// injecting `control_image`-conditioned residuals (`control_scale`), and VAE-decode. The
-    /// `control_image` is preprocessed (LANCZOS resize → `[0,1]` NHWC) by the SDXL primitive.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_controlnet(
-        &self,
-        controlnet: &ControlNet,
-        control_image: &Image,
-        prompt: &str,
-        negative: &str,
-        num_steps: usize,
-        cfg: f32,
-        control_scale: f32,
-        seed: u64,
-        height: i32,
-        width: i32,
-    ) -> Result<Image> {
-        validate_dims(height, width)?;
-        random::seed(seed)?;
-        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
-        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
-        let pos = self.encode(prompt)?;
-        let neg = if cfg > 1.0 {
-            Some(self.encode(negative)?)
-        } else {
-            None
-        };
-        let latents = self.denoise_controlnet_latents(
-            controlnet,
-            &init_noise,
-            control_image,
-            &pos,
-            neg.as_ref(),
-            num_steps,
-            cfg,
-            control_scale,
-            height,
-            width,
-            None,
-            &CancelFlag::new(),
-            &mut |_p| {},
-        )?;
-        self.decode(&latents)
-    }
-
-    /// Install the IP-Adapter decoupled cross-attention K/V pairs (from
-    /// [`crate::ip_adapter::load_kolors_ip_adapter`]) into the U-Net's cross-attention layers
-    /// (sc-3098). One-time setup; non-destructive to plain T2I (the [`denoise`] path never reads the
-    /// IP projections — only [`denoise_ip`] does). 70 pairs for the SDXL-family U-Net.
-    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
-        self.unet.install_ip_adapter(pairs)
     }
 
     /// Run the CFG denoise loop with IP-Adapter image tokens injected into every cross-attention at
@@ -844,6 +725,416 @@ impl Kolors {
             ip_scale,
         )
     }
+}
+
+impl Kolors {
+    /// Load every Kolors component from the `Kwai-Kolors/Kolors-diffusers` snapshot at `dtype`.
+    /// Composes the two per-phase loaders the sequential-residency seam uses ([`KolorsText::load`] +
+    /// [`KolorsHeavy::load`], sc-10840), so the resident struct API and the staged generator build
+    /// byte-identical components. `tokenizer/tokenizer.json` must already be materialized.
+    pub fn load(snapshot: &std::path::Path, dtype: Dtype) -> Result<Self> {
+        Ok(Self {
+            text: KolorsText::load(snapshot, dtype)?,
+            heavy: KolorsHeavy::load(snapshot, dtype)?,
+        })
+    }
+
+    /// Load every Kolors component, then **load-time quantize** the memory drivers to `bits` (4 or 8)
+    /// — the mlx-gen-sdxl sc-2641 path. Quantizes the 6B ChatGLM3 encoder (the dominant footprint)
+    /// **and** the SDXL-family U-Net; the VAE stays f32. `bits` ∈ {4, 8}.
+    pub fn load_quantized(snapshot: &std::path::Path, dtype: Dtype, bits: i32) -> Result<Self> {
+        let mut m = Self::load(snapshot, dtype)?;
+        m.quantize(bits)?;
+        Ok(m)
+    }
+
+    /// Load-time quantize the memory drivers to `bits` (4 or 8) — the 6B ChatGLM3 encoder (phase A)
+    /// **and** the SDXL-family U-Net (phase B); the VAE stays f32. Split out of
+    /// [`load_quantized`](Self::load_quantized) so the registry can **merge LoRA/LoKr into the dense
+    /// base first, then quantize** (the SDXL ordering). Idempotent per component.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.text.quantize(bits)?;
+        self.heavy.quantize_unet(bits)?;
+        Ok(())
+    }
+
+    /// Merge LoRA / LoKr adapters into the dense U-Net weights at load (sc-4733). Delegates to
+    /// [`KolorsHeavy::apply_lora`]. Must run **before** [`quantize`](Self::quantize).
+    pub fn apply_lora(&mut self, adapters: &[AdapterSpec]) -> Result<SdxlLoraReport> {
+        self.heavy.apply_lora(adapters)
+    }
+
+    /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])`. Delegates to
+    /// [`KolorsText::encode`].
+    pub fn encode(&self, prompt: &str) -> Result<(Array, Array)> {
+        self.text.encode(prompt)
+    }
+
+    /// Decode latents `[1, h, w, 4]` → an RGB [`Image`]. Delegates to [`KolorsHeavy::decode`].
+    pub fn decode(&self, latents: &Array) -> Result<Image> {
+        self.heavy.decode(latents)
+    }
+
+    /// Crate-internal VAE accessor for the registry [`Generator`](crate::registry) wrapper.
+    pub(crate) fn vae(&self) -> &Autoencoder {
+        self.heavy.vae()
+    }
+
+    /// Install the IP-Adapter decoupled cross-attention K/V pairs (sc-3098). Delegates to
+    /// [`KolorsHeavy::install_ip_adapter`].
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Array, Array)>) -> Result<()> {
+        self.heavy.install_ip_adapter(pairs)
+    }
+
+    /// Plain-T2I CFG denoise. Delegates to [`KolorsHeavy::denoise_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_latents(
+        &self,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_latents(
+            init_noise,
+            pos,
+            neg,
+            num_steps,
+            cfg,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// img2img CFG denoise. Delegates to [`KolorsHeavy::denoise_img2img_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_img2img_latents(
+        &self,
+        init_latents: &Array,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_img2img_latents(
+            init_latents,
+            noise,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Curated unified-sampler denoise. Delegates to [`KolorsHeavy::denoise_curated_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_curated_latents(
+        &self,
+        sampler_name: Option<&str>,
+        scheduler_name: Option<&str>,
+        init_latents: Option<&Array>,
+        noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+        control: Option<(&ControlNet, &Image, f32)>,
+        ip_tokens: Option<(&Array, f32)>,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_curated_latents(
+            sampler_name,
+            scheduler_name,
+            init_latents,
+            noise,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            seed,
+            height,
+            width,
+            control,
+            ip_tokens,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// ControlNet CFG denoise. Delegates to [`KolorsHeavy::denoise_controlnet_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_latents(
+        &self,
+        controlnet: &ControlNet,
+        init_noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        control_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_controlnet_latents(
+            controlnet,
+            init_noise,
+            control_image,
+            pos,
+            neg,
+            num_steps,
+            cfg,
+            control_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// IP-Adapter CFG denoise. Delegates to [`KolorsHeavy::denoise_ip_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_ip_latents(
+        &self,
+        ip_tokens: &Array,
+        init_noise: &Array,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        cfg: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_ip_latents(
+            ip_tokens,
+            init_noise,
+            pos,
+            neg,
+            num_steps,
+            cfg,
+            ip_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Combined ControlNet-pose + IP-Adapter img2img CFG denoise. Delegates to
+    /// [`KolorsHeavy::denoise_controlnet_ip_latents`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise_controlnet_ip_latents(
+        &self,
+        controlnet: &ControlNet,
+        ip_tokens: &Array,
+        init_latents: &Array,
+        noise: &Array,
+        control_image: &Image,
+        pos: &(Array, Array),
+        neg: Option<&(Array, Array)>,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        control_scale: f32,
+        ip_scale: f32,
+        height: i32,
+        width: i32,
+        run_steps: Option<usize>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        self.heavy.denoise_controlnet_ip_latents(
+            controlnet,
+            ip_tokens,
+            init_latents,
+            noise,
+            control_image,
+            pos,
+            neg,
+            num_steps,
+            strength,
+            cfg,
+            control_scale,
+            ip_scale,
+            height,
+            width,
+            run_steps,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Full T2I: seed the RNG, draw the initial noise, encode the prompt + negative prompt, denoise,
+    /// and VAE-decode. `height`/`width` are pixels (multiples of 8). `cfg` ≤ 1 disables guidance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate(
+        &self,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        validate_dims(height, width)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        // Skip the ChatGLM3-6B negative encode entirely when guidance is off (F-005) — the uncond row
+        // is never used, so encoding it would be a large wasted forward.
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
+        let latents = self.denoise_latents(
+            &init_noise,
+            &pos,
+            neg.as_ref(),
+            num_steps,
+            cfg,
+            height,
+            width,
+            None,
+            &CancelFlag::new(),
+            &mut |_p| {},
+        )?;
+        self.decode(&latents)
+    }
+
+    /// Full img2img: VAE-encode `image` (resized to `height`×`width`) → seed at the strength-derived
+    /// start → encode the prompts → denoise the remaining steps → VAE-decode. Mirrors diffusers
+    /// `KolorsImg2ImgPipeline` (using the VAE encoder **mean** as the init, consistent with the rest
+    /// of mlx-gen-sdxl's img2img — the production fork convention; the diffusers default samples the
+    /// latent dist, which is not reproducible cross-backend). `cfg` ≤ 1 disables guidance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn img2img(
+        &self,
+        image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        strength: f32,
+        cfg: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        validate_dims(height, width)?;
+        // VAE-encode the init (no RNG: mean, not a sample) so the first global-RNG draw is the
+        // add_noise noise — matching the reference's `prepare_latents` order.
+        let init_latents = encode_init_latents(self.vae(), image, width as u32, height as u32)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
+        let latents = self.denoise_img2img_latents(
+            &init_latents,
+            &noise,
+            &pos,
+            neg.as_ref(),
+            num_steps,
+            strength,
+            cfg,
+            height,
+            width,
+            None,
+            &CancelFlag::new(),
+            &mut |_p| {},
+        )?;
+        self.decode(&latents)
+    }
+
+    /// Full ControlNet T2I: seed the noise, encode the prompts, denoise with the `controlnet` branch
+    /// injecting `control_image`-conditioned residuals (`control_scale`), and VAE-decode. The
+    /// `control_image` is preprocessed (LANCZOS resize → `[0,1]` NHWC) by the SDXL primitive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_controlnet(
+        &self,
+        controlnet: &ControlNet,
+        control_image: &Image,
+        prompt: &str,
+        negative: &str,
+        num_steps: usize,
+        cfg: f32,
+        control_scale: f32,
+        seed: u64,
+        height: i32,
+        width: i32,
+    ) -> Result<Image> {
+        validate_dims(height, width)?;
+        random::seed(seed)?;
+        let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
+        let init_noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
+        let pos = self.encode(prompt)?;
+        let neg = if cfg > 1.0 {
+            Some(self.encode(negative)?)
+        } else {
+            None
+        };
+        let latents = self.denoise_controlnet_latents(
+            controlnet,
+            &init_noise,
+            control_image,
+            &pos,
+            neg.as_ref(),
+            num_steps,
+            cfg,
+            control_scale,
+            height,
+            width,
+            None,
+            &CancelFlag::new(),
+            &mut |_p| {},
+        )?;
+        self.decode(&latents)
+    }
 
     /// Full combined ControlNet-pose + IP-Adapter img2img (sc-5012): encode the `reference_image` →
     /// IP image tokens + VAE init, seed the noise, encode the prompts, run the combined denoise, and
@@ -872,7 +1163,7 @@ impl Kolors {
         let ip_tokens = ip_encoder.tokens(reference_image)?;
         // VAE-encode the init (no RNG: mean) so the first global-RNG draw is the add_noise noise.
         let init_latents =
-            encode_init_latents(&self.vae, reference_image, width as u32, height as u32)?;
+            encode_init_latents(self.vae(), reference_image, width as u32, height as u32)?;
         random::seed(seed)?;
         let (lh, lw) = (height / SPATIAL_SCALE, width / SPATIAL_SCALE);
         let noise = random::normal::<f32>(&[1, lh, lw, 4], None, None, None)?;
