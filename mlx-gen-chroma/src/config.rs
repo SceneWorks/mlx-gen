@@ -133,8 +133,10 @@ impl ChromaVariant {
                 supports_kv_cache: false,
                 // FLUX-style flow-match sigma shift (calculate_shift) is applied in the generate path.
                 requires_sigma_shift: true,
-                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-                supports_sequential_offload: false,
+                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
+                // drops the T5-XXL encoder after the prompt encode so peak unified memory is bounded
+                // to `max(T5, DiT+VAE)` instead of their sum.
+                supports_sequential_offload: true,
             },
         }
     }

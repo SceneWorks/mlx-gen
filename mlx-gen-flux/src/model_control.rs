@@ -29,20 +29,20 @@
 use mlx_gen::gen_core;
 use mlx_gen::image::decoded_to_image;
 use mlx_gen::img2img::preprocess_init_image;
-use mlx_gen::tokenizer::TextTokenizer;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, require_base_dir,
     require_control, run_flow_sampler, AcceptedControlKinds, Capabilities, ConditioningKind,
     ControlBranch, ControlKind, Error, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, TimestepConvention,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
+    Result, TimestepConvention,
 };
 use mlx_rs::{Array, Dtype};
 
 use crate::config::{FLUX1_DEV_CONTROL_ID, HYPER_SAMPLER};
 use crate::control_transformer::FluxControlTransformer;
 use crate::loader;
+use crate::model::{load_flux_text, FluxTextOwned};
 use crate::pipeline::{build_sigmas_with, create_noise, pack_latents, unpack_latents};
-use crate::text_encoder::FluxTextEncoders;
 use crate::transformer::DitImageInjector;
 use mlx_gen_z_image::vae::Vae;
 
@@ -97,25 +97,35 @@ pub fn descriptor_dev_control() -> ModelDescriptor {
             mac_only: true,
             supports_kv_cache: false,
             requires_sigma_shift: FluxVariant::Dev.requires_sigma_shift(),
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload — the
+            // T5-XXL + CLIP-L text encoders drop after the prompt encode, then the DiT (with the
+            // control branch) + VAE load, bounding peak to `max(T5+CLIP, DiT+control+VAE)`.
+            supports_sequential_offload: true,
         },
     }
 }
 
-/// A loaded control generator: the dev base components + the control transformer assembled from the dev
-/// snapshot and the Shakker Fun-Controlnet-Union overlay.
-pub struct Flux1DevControl {
-    descriptor: ModelDescriptor,
-    t5_tokenizer: TextTokenizer,
-    clip_tokenizer: TextTokenizer,
-    text_encoders: FluxTextEncoders,
+/// The heavy render-phase components for the control variant — the control transformer (the dev DiT
+/// plus the Shakker control branch, loaded together) and the VAE. No PiD overlay (the control path
+/// stays on the native VAE — mirroring the Z-Image Fun-ControlNet PiD scoping decision). Owned by the
+/// `Resident` components or by a `Sequential` generate.
+pub(crate) struct FluxControlHeavyOwned {
     transformer: FluxControlTransformer,
     vae: Vae,
 }
 
+/// A loaded control generator: the dev base text encoders + the control transformer + VAE, held via
+/// the shared [`Residency`] seam (sc-10840). `Resident` (default) keeps every component warm;
+/// `Sequential` drops the T5-XXL + CLIP-L text encoders after the prompt encode, then loads the
+/// control transformer (base DiT + control branch) + VAE, bounding peak to
+/// `max(T5+CLIP, DiT+control+VAE)`.
+pub struct Flux1DevControl {
+    descriptor: ModelDescriptor,
+    residency: Residency<FluxTextOwned, FluxControlHeavyOwned>,
+}
+
 /// FLUX.1-dev Fun-Controlnet-Union (sc-8238): load the dev snapshot + the Shakker control checkpoint and
-/// assemble the [`Flux1DevControl`] generator.
+/// assemble the [`Flux1DevControl`] generator, honoring [`LoadSpec::offload_policy`] (sc-10840).
 ///
 /// `spec.weights` must be the dev snapshot directory (tokenizer/ tokenizer_2/ text_encoder/
 /// text_encoder_2/ transformer/ vae/); `spec.control` (required) the
@@ -128,7 +138,54 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         )));
     }
     // Shared load boilerplate (sc-8241): the base must be a snapshot dir, the control checkpoint is
-    // required. The model id + labels keep the messages aligned with the other control ports.
+    // required — checked up front (fail fast, before any residency work) so a missing control
+    // checkpoint errors before component loads.
+    require_base_dir(
+        spec,
+        FLUX1_DEV_CONTROL_ID,
+        "a FLUX.1-dev snapshot directory",
+    )?;
+    require_control(
+        spec,
+        FLUX1_DEV_CONTROL_ID,
+        "FLUX.1-dev-ControlNet-Union-Pro-2.0",
+    )?;
+    // F-181: a `Sequential` + `spec.quantize` load over a dense snapshot re-quantizes every generate.
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(FLUX1_DEV_CONTROL_ID, q.bits());
+        }
+    }
+
+    Ok(Box::new(Flux1DevControl {
+        descriptor: descriptor_dev_control(),
+        residency: build_control_residency(spec)?,
+    }))
+}
+
+/// The policy→[`Residency`] dispatch for the control variant (sc-10840). `Resident` eager-loads the
+/// text encoders + control heavy bundle now; `Sequential` captures the two per-phase loaders and loads
+/// nothing now. The text phase reuses the base FLUX.1-dev [`load_flux_text`] (byte-identical encoders);
+/// the heavy loader builds the control transformer (base + control branch) + VAE.
+fn build_control_residency(
+    spec: &LoadSpec,
+) -> Result<Residency<FluxTextOwned, FluxControlHeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || load_flux_text(FluxVariant::Dev, &spec_text),
+        // The control variant has no PiD overlay, so the heavy loader ignores `use_pid`.
+        move |_use_pid| load_control_heavy(&spec_heavy),
+    )
+}
+
+/// Load the control heavy bundle — the control transformer (dev DiT + the Shakker control branch, from
+/// `spec.control`) and the VAE (+ Q4/Q8 + LoRA/LoKr residuals on the base DiT) — everything but the
+/// text encoders. Factored so the `Sequential` path loads these AFTER the encoders are dropped. The
+/// control branch loads here with the DiT (the heavy phase), not the text-encoder phase. Byte-identical
+/// to the pre-seam composition (same loaders + quantize-then-adapters order over independent files).
+fn load_control_heavy(spec: &LoadSpec) -> Result<FluxControlHeavyOwned> {
     let root = require_base_dir(
         spec,
         FLUX1_DEV_CONTROL_ID,
@@ -139,51 +196,27 @@ pub fn load_dev_control(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
         FLUX1_DEV_CONTROL_ID,
         "FLUX.1-dev-ControlNet-Union-Pro-2.0",
     )?;
-
-    let t5_tokenizer = loader::load_t5_tokenizer(root, FluxVariant::Dev)?;
-    let clip_tokenizer = loader::load_clip_tokenizer()?;
-    let mut text_encoders = FluxTextEncoders {
-        t5: loader::load_t5_encoder(root)?,
-        clip: loader::load_clip_encoder(root)?,
-    };
     let mut transformer = loader::load_control_transformer_dev(root, control)?;
     let mut vae = loader::load_vae(root)?;
     if let Some(q) = spec.quantize {
         let bits = q.bits();
-        text_encoders.quantize(bits)?;
         transformer.quantize(bits)?;
         vae.quantize(bits)?;
     }
     // LoRA/LoKr (sc-2657): applied to the base DiT (the control branch is never an adapter target),
     // after quantization, as forward-time residuals. No-op when empty.
     crate::adapters::apply_flux_adapters(transformer.base_mut(), &spec.adapters)?;
-
-    Ok(Box::new(Flux1DevControl {
-        descriptor: descriptor_dev_control(),
-        t5_tokenizer,
-        clip_tokenizer,
-        text_encoders,
-        transformer,
-        vae,
-    }))
+    Ok(FluxControlHeavyOwned { transformer, vae })
 }
 
 impl Flux1DevControl {
-    /// Tokenize + encode the prompt into `(prompt_embeds, pooled_prompt_embeds)` (the dev T5 + CLIP
-    /// path; same as [`crate::model::Flux1::encode_prompt`]).
-    fn encode_prompt(&self, prompt: &str) -> Result<(Array, Array)> {
-        let (t5_ids, _) = mlx_gen::tokenizer::to_arrays(&self.t5_tokenizer.tokenize(prompt)?);
-        let (clip_ids, _) = mlx_gen::tokenizer::to_arrays(&self.clip_tokenizer.tokenize(prompt)?);
-        self.text_encoders.encode(&t5_ids, &clip_ids)
-    }
-
     /// VAE-encode + pack the control hint into the packed control latent `[1, seq, 64]` (constant
     /// across steps + the batch). The Shakker FLUX.1 ControlNet encodes the control image with the same
     /// VAE and 2×2 pack as the noise latents (diffusers `prepare_image` → `vae.encode` →
     /// `_pack_latents`), so the control latent aligns 1:1 with the base image tokens.
-    fn encode_control_latent(&self, image: &Image, width: u32, height: u32) -> Result<Array> {
+    fn encode_control_latent(vae: &Vae, image: &Image, width: u32, height: u32) -> Result<Array> {
         let image_nchw = preprocess_init_image(image, width, height)?;
-        let encoded = self.vae.encode(&image_nchw)?; // [1, 16, H/8, W/8]
+        let encoded = vae.encode(&image_nchw)?; // [1, 16, H/8, W/8]
         pack_latents(&encoded, width, height)
     }
 
@@ -191,6 +224,11 @@ impl Flux1DevControl {
     /// IP-Adapter) into every control-denoise step — the **compose-ready** seam (constraint 2). With
     /// `injector = None` this is the plain control path; `Some(..)` stacks identity + control in one
     /// denoise (the seam a follow-on epic uses). `injector = None` IS [`Generator::generate`]'s path.
+    ///
+    /// Driven by the shared [`Residency`] seam (sc-10840): under `Sequential` the T5 + CLIP encoders
+    /// load, the prompt encodes + materializes, then they DROP + `clear_cache()` before the control
+    /// transformer + VAE load — the control-latent VAE-encode + denoise + decode all run in the heavy
+    /// phase, byte-identical to the `Resident` order (the encode is seed- and heavy-independent).
     pub fn generate_with_injector(
         &self,
         req: &GenerationRequest,
@@ -200,11 +238,9 @@ impl Flux1DevControl {
         self.validate(req)?;
         // `resolve_control` resolves an unset (`None`) scale to `default_control_scale()` (the Shakker
         // `DEFAULT_CONTROL_SCALE`); an explicit `Some(0.0)` now flows through as a deliberately inert
-        // branch (F-085 — the `Option<f32>` field distinguishes it from unset, so no 0.0 reject).
+        // branch (F-085 — the `Option<f32>` field distinguishes it from unset, so no 0.0 reject). It is
+        // cheap (reads `req.conditioning`), so resolve it before the residency seam runs.
         let (control_image, control_scale) = self.resolve_control(req)?;
-
-        let (prompt_embeds, pooled_prompt_embeds) = self.encode_prompt(&req.prompt)?;
-        let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
 
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let sampler_name = req
@@ -227,43 +263,61 @@ impl Flux1DevControl {
             req.scheduler.as_deref(),
         )?;
 
-        // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped + restored on
-        // drop by the RAII guard (F-007).
-        let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+        self.residency.run(
+            &req.cancel,
+            // The control variant has no PiD overlay; `use_pid` is inert for the heavy loader.
+            req.use_pid,
+            on_progress,
+            |text: &FluxTextOwned| text.encode(&req.prompt),
+            |(prompt_embeds, pooled_prompt_embeds)| {
+                mlx_rs::transforms::eval([prompt_embeds, pooled_prompt_embeds])?;
+                Ok(())
+            },
+            |heavy, (prompt_embeds, pooled_prompt_embeds), on_progress| {
+                // The control latent is seed-independent (image + dims only), so encode it once here —
+                // after the encoders were dropped and the VAE loaded under `Sequential`.
+                let control_latent =
+                    Self::encode_control_latent(&heavy.vae, control_image, req.width, req.height)?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
-            let seed = base_seed.wrapping_add(i as u64);
-            let latents = create_noise(seed, req.width, req.height)?;
-            let final_latents = run_flow_sampler(
-                Some(sampler_name),
-                TimestepConvention::Sigma,
-                &sigmas,
-                latents,
-                seed,
-                &req.cancel,
-                on_progress,
-                |x_in, timestep| {
-                    self.transformer.forward_composed(
-                        x_in,
-                        &control_latent,
-                        &prompt_embeds,
-                        &pooled_prompt_embeds,
-                        timestep,
-                        guidance,
-                        req.width,
-                        req.height,
-                        control_scale,
-                        injector,
-                    )
-                },
-            )?;
-            on_progress(Progress::Decoding);
-            let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
-            let decoded = self.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
-            images.push(decoded_to_image(&decoded)?);
-        }
-        Ok(GenerationOutput::Images(images))
+                // Compiled elementwise glue (sc-2963), shared with the base flux1 path. Scoped +
+                // restored on drop by the RAII guard (F-007).
+                let _compile_glue = crate::transformer::CompileGlueGuard::enable();
+
+                let mut images = Vec::with_capacity(req.count as usize);
+                for i in 0..req.count {
+                    let seed = base_seed.wrapping_add(i as u64);
+                    let latents = create_noise(seed, req.width, req.height)?;
+                    let final_latents = run_flow_sampler(
+                        Some(sampler_name),
+                        TimestepConvention::Sigma,
+                        &sigmas,
+                        latents,
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                        |x_in, timestep| {
+                            heavy.transformer.forward_composed(
+                                x_in,
+                                &control_latent,
+                                &prompt_embeds,
+                                &pooled_prompt_embeds,
+                                timestep,
+                                guidance,
+                                req.width,
+                                req.height,
+                                control_scale,
+                                injector,
+                            )
+                        },
+                    )?;
+                    on_progress(Progress::Decoding);
+                    let unpacked = unpack_latents(&final_latents, req.width, req.height)?;
+                    let decoded = heavy.vae.decode(&unpacked)?.as_dtype(Dtype::Float32)?;
+                    images.push(decoded_to_image(&decoded)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 
     fn generate_impl(
@@ -507,5 +561,41 @@ mod tests {
             .expect("expected error")
             .to_string();
         assert!(err.contains("snapshot directory"), "got: {err}");
+    }
+
+    // ── sc-10840: weight-free, default-run proof that the FLUX.1 control dispatch HONORS
+    // `offload_policy`. `build_control_residency` at a non-existent snapshot *directory* + a control
+    // checkpoint: `Sequential` defers (captures both loaders, no weights → `is_sequential`); `Resident`
+    // eager-loads the text encoders from the missing dir → `Err`. The real-weight A/B is deferred.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/flux1-control-residency-test-snapshot".into(),
+        ))
+        .with_control(WeightsSource::File(
+            "/nonexistent/control.safetensors".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let res = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Sequential))
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_control_residency(&missing_snapshot_spec(OffloadPolicy::Resident))
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        // An eager-load failure, not the up-front snapshot/control guard (those live in load_dev_control).
+        assert!(
+            !err.to_string().contains("single .safetensors file"),
+            "expected an eager-load failure: {err}"
+        );
     }
 }
