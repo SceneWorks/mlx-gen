@@ -7,11 +7,11 @@
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Error,
     GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality, ModelDescriptor, Precision,
-    Progress, Quant, Result,
+    Progress, Quant, Residency, Result,
 };
 
 use crate::config::{Variant, RES_MULTIPLE};
-use crate::pipeline::{AnimaPipeline, GenOptions};
+use crate::pipeline::{AnimaCondInputs, AnimaHeavy, AnimaText};
 
 const MAX_COUNT: u32 = 8;
 const RES_MIN: u32 = 512;
@@ -55,8 +55,12 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: true,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
+            // (F-176). Under `Sequential` the Qwen3-0.6B text encoder is encoded, materialized, then
+            // dropped before the DiT + bundled conditioner + VAE load — bounding peak unified memory to
+            // `max(Qwen3-TE, DiT+conditioner+VAE)`. Q4/Q8 are packed convert-at-install tiers (no
+            // load-time re-quant), so no F-181 dense-requant advisory is needed (mirrors SANA).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -71,11 +75,17 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     descriptor_for(Variant::Turbo)
 }
 
-/// A loaded Anima generator: the cached descriptor + variant + the assembled pipeline.
+/// A loaded Anima generator: the cached descriptor + variant + the component-residency strategy
+/// (epic 10834, sc-10840). Holds ONLY the [`Residency`] (no direct encoder/DiT/VAE fields — a retained
+/// component would defeat the `Sequential` drop): `Resident` (default) holds the Qwen3 TE + DiT +
+/// bundled conditioner + VAE warm for the whole job and across jobs; `Sequential` holds only the
+/// per-phase loader closures and re-loads each per generation in phase order (encode → **drop the
+/// Qwen3 TE** → conditioner/DiT/VAE), bounding peak unified memory to
+/// `max(Qwen3-TE, DiT+conditioner+VAE)`.
 pub struct Anima {
     descriptor: ModelDescriptor,
     variant: Variant,
-    pipeline: AnimaPipeline,
+    residency: Residency<AnimaText, AnimaHeavy>,
 }
 
 pub fn load_base(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
@@ -112,18 +122,41 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> Result<Box<dyn Generator>>
     // (A LoHa has no deferred form, so it falls back to the materialized delta there — correct, but
     // memory-hungry. Whether a packed base should refuse that is sc-10678, not a load-gate concern.)
     let _ = spec.quantize;
-    let mut pipeline = AnimaPipeline::from_source(&spec.weights, variant)?;
-    // Bake any LoRA/LoKr adapters onto the still-mutable model (DiT + bundled conditioner), stacked
-    // and mixed, strictly (an unmatched target errors rather than loading a partial distillation —
-    // sc-10521 / sc-10274). No-op when `spec.adapters` is empty.
-    if !spec.adapters.is_empty() {
-        pipeline.apply_adapters(&spec.adapters)?;
-    }
     Ok(Box::new(Anima {
         descriptor: descriptor_for(variant),
         variant,
-        pipeline,
+        residency: build_residency(spec, variant)?,
     }))
+}
+
+/// The policy→[`Residency`] dispatch every Anima variant shares (sc-10840), routed through the single
+/// [`Residency::from_policy`] seam (F-180) so no variant re-derives the `match offload_policy`.
+/// `Resident` eager-loads the Qwen3 TE phase + heavy bundle now; `Sequential` captures the two loader
+/// closures and loads nothing now, deferring each to [`Residency::run`]. Both use the same
+/// [`AnimaText::load`] / [`AnimaHeavy::load`], so the `Resident` composition is byte-identical to the
+/// pre-seam `AnimaComponents` (independent files, RNG-free load + adapter merge). Anima has no PiD
+/// overlay, so the heavy loader's `use_pid` flag is ignored. Adapters are baked in the heavy loader
+/// (the DiT + bundled conditioner both live there), stacked/mixed and strict — an unmatched target
+/// errors rather than loading a partial distillation (sc-10521 / sc-10274). The deferral is
+/// weight-free-testable: under `Sequential` this touches no component weights, so a dispatch that
+/// ignored `offload_policy` would eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    variant: Variant,
+) -> Result<Residency<AnimaText, AnimaHeavy>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || AnimaText::load(&spec_text.weights, variant),
+        move |_use_pid| {
+            let mut heavy = AnimaHeavy::load(&spec_heavy.weights, variant)?;
+            if !spec_heavy.adapters.is_empty() {
+                heavy.apply_adapters(&spec_heavy.adapters)?;
+            }
+            Ok(heavy)
+        },
+    )
 }
 
 mlx_gen::impl_generator!(Anima {
@@ -132,6 +165,10 @@ mlx_gen::impl_generator!(Anima {
 });
 
 impl Anima {
+    /// The staged residency lifecycle (encode the Qwen3 conditioner inputs → **drop the Qwen3 TE**
+    /// under `Sequential` → conditioner forward + DiT denoise + VAE decode → free the heavy bundle) is
+    /// driven by the shared [`Residency::run`] seam (sc-10840), which owns the eval/drop/clear
+    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -140,42 +177,85 @@ impl Anima {
         validate_request(&self.descriptor, req)?;
         let base_seed = req.seed.unwrap_or_else(default_seed);
         let steps = req.steps.unwrap_or(self.variant.default_steps()) as usize;
-        let guidance = if self.variant.uses_cfg() {
-            req.guidance.unwrap_or(self.variant.default_guidance())
+        let variant = self.variant;
+        let guidance = if variant.uses_cfg() {
+            req.guidance.unwrap_or(variant.default_guidance())
         } else {
             1.0
         };
         let negative = req.negative_prompt.clone().unwrap_or_default();
+        // Epic 7114 sampler/scheduler axis: `None` ⇒ the native er_sde default / native σ schedule.
+        let sampler = req
+            .sampler
+            .clone()
+            .unwrap_or_else(|| crate::pipeline::DEFAULT_SAMPLER.to_string());
+        let scheduler = req.scheduler.clone();
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            // Release the MLX cache between images so a batch doesn't accumulate to a SIGKILL (sc-5567).
-            if n > 0 {
-                mlx_rs::memory::clear_cache();
-            }
-            let opts = GenOptions {
-                width: req.width,
-                height: req.height,
-                steps,
-                guidance,
-                seed: base_seed.wrapping_add(n as u64),
-                sampler: req.sampler.clone(),
-                // Epic 7114 scheduler axis (sc-11123 / F-115): honor the advertised curated schedulers
-                // instead of ignoring req.scheduler. The shared floor already validated the name against
-                // curated_scheduler_names(); anima_schedule resolves it → σ (None ⇒ native schedule).
-                scheduler: req.scheduler.clone(),
-            };
-            let img = self.pipeline.generate(
-                &req.prompt,
-                &negative,
-                self.variant,
-                &opts,
-                &req.cancel,
-                on_progress,
-            )?;
-            images.push(img);
-        }
-        Ok(GenerationOutput::Images(images))
+        self.residency.run(
+            &req.cancel,
+            // Anima has no PiD overlay; the heavy loader ignores `use_pid`.
+            false,
+            on_progress,
+            // ── Phase A: encode the conditioner INPUTS (Qwen3 forward + mask-multiply). Seed-independent
+            // (no RNG). `uncond` is encoded iff the variant uses CFG (NOT gated on the guidance value —
+            // preserving the pre-seam behavior of running the uncond forward even at guidance 1.0). Under
+            // `Sequential` the shared seam materializes these + DROPS the Qwen3 TE before the heavy load.
+            |text: &AnimaText| {
+                let cond = text.encode_inputs(&req.prompt)?;
+                let uncond = if variant.uses_cfg() {
+                    Some(text.encode_inputs(&negative)?)
+                } else {
+                    None
+                };
+                Ok((cond, uncond))
+            },
+            // Materialize the masked Qwen3 states + T5 ids (cond + optional uncond) while the TE is still
+            // alive (Sequential only) — MLX is lazy, so an un-evaluated `source` keeps the TE referenced
+            // and dropping it would free nothing. The T5 weights are host data (no eval).
+            |(cond, uncond): &(AnimaCondInputs, Option<AnimaCondInputs>)| {
+                let mut arrays = vec![&cond.source, &cond.t5_ids];
+                if let Some(u) = uncond {
+                    arrays.push(&u.source);
+                    arrays.push(&u.t5_ids);
+                }
+                mlx_rs::transforms::eval(arrays)?;
+                Ok(())
+            },
+            // ── Phase B: conditioner forward (once per cond/uncond — seed-independent) then the count
+            // loop of denoise/decode. Identical body for both residencies, so a Sequential job is
+            // byte-identical to Resident.
+            |heavy: &AnimaHeavy, (cond, uncond), on_progress: &mut dyn FnMut(Progress)| {
+                let cond_enc = heavy.conditioner_forward(&cond)?;
+                let uncond_enc = match &uncond {
+                    Some(u) => Some(heavy.conditioner_forward(u)?),
+                    None => None,
+                };
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    // Release the MLX cache between images so a batch doesn't accumulate to a SIGKILL
+                    // (sc-5567).
+                    if n > 0 {
+                        mlx_rs::memory::clear_cache();
+                    }
+                    let seed = base_seed.wrapping_add(n as u64);
+                    let img = heavy.render_one(
+                        &cond_enc,
+                        uncond_enc.as_ref(),
+                        req.width,
+                        req.height,
+                        steps,
+                        guidance,
+                        &sampler,
+                        scheduler.as_deref(),
+                        seed,
+                        &req.cancel,
+                        on_progress,
+                    )?;
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -323,6 +403,66 @@ mod tests {
             assert!(
                 !e.contains("sc-10578") && !e.contains("not supported"),
                 "packed tier + adapter must NOT be rejected as unsupported, got: {e}"
+            );
+        }
+    }
+
+    // ── Sequential residency (epic 10834, sc-10840): weight-free proof the dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot dir; the discriminator is
+    // deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen3 TE from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weights A/B is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/anima-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        // All three variants share the one dispatch — assert on Base.
+        let res = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            Variant::Base,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            Variant::Base,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        // An eager-load failure (missing split_files / TE file), not a policy/precision rejection.
+        assert!(
+            !msg.contains("precision override"),
+            "expected an eager-load failure, not the up-front precision guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn descriptors_advertise_sequential_offload() {
+        // All three anima ids honor the shared Residency seam (the descriptor bit consumers read).
+        for d in [
+            descriptor_base(),
+            descriptor_aesthetic(),
+            descriptor_turbo(),
+        ] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "{} must advertise supports_sequential_offload",
+                d.id
             );
         }
     }
