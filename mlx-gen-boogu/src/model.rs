@@ -4,25 +4,32 @@
 //! `"boogu_image_turbo"` (DMD few-step, CFG-free), and `"boogu_image_edit"` (instruction
 //! image-edit). Linking this crate is all the worker needs to resolve a model by id.
 //!
-//! All three variants share one architecture/loader ([`crate::pipeline::BooguPipeline`]); they
-//! differ only in which snapshot they load (Base / Turbo / Edit checkpoint) and which sampler
+//! All three variants share one architecture/loader (the [`crate::pipeline`] `BooguEncoders` +
+//! `BooguHeavy` bundles, staged onto the shared [`mlx_gen::Residency`] seam); they differ only in which
+//! snapshot they load (Base / Turbo / Edit checkpoint) and which sampler
 //! [`Boogu::generate`] runs. `spec.quantize` (Q4/Q8) quantizes the dense base in place after the
 //! load — a **no-op** when the snapshot is already a packed Q8/Q4 turnkey (the turnkey's default),
 //! so pointing at a pre-quantized snapshot skips the dense transient. A precision override and LoRA
 //! adapters are rejected rather than silently ignored.
 
+use std::path::Path;
+
+use mlx_rs::Array;
+
 use mlx_gen::img2img::init_time_step;
 use mlx_gen::{
     curated_sampler_names, curated_scheduler_names, default_seed, Capabilities, Conditioning,
     ConditioningKind, Error, GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder,
-    LoadSpec, Modality, ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency,
+    Result, WeightsSource,
 };
 use mlx_gen_pid::{flow_capture_for_request, resolve_pid_decoder_at_sigma, PidEngine};
 
 use crate::pipeline::{
-    base_flow_schedule, resolve_reference, BooguPipeline, EditOptions, GenerateOptions,
-    TurboOptions,
+    base_flow_schedule, resolve_reference, BooguBaseCond, BooguEncoders, BooguHeavy, EditOptions,
+    GenerateOptions, TurboOptions,
 };
+use crate::tokenizer::BooguTokenizer;
 
 /// Registry id for the Base text-to-image variant (true-CFG). Matches the SceneWorks worker's
 /// `payload.model`.
@@ -95,8 +102,11 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834, sc-10840): under Sequential the
+            // ~17.5 GB Qwen3-VL `mllm/` encoder is dropped after conditioning + `clear_cache()` before
+            // the ~20.6 GB DiT + VAE load, bounding peak unified memory to `max(mllm, DiT+VAE)`. Cloned
+            // onto Turbo/Edit below. The small PiD overlay + tokenizer stay resident on the generator.
+            supports_sequential_offload: true,
         },
     }
 }
@@ -145,14 +155,28 @@ pub fn descriptor_edit() -> ModelDescriptor {
     d
 }
 
-/// A loaded Boogu generator: the assembled pipeline plus the cached descriptor (which selects the
-/// sampler path in [`Boogu::generate`]).
+/// A loaded Boogu generator: the always-warm tokenizer + PiD overlay, the cached descriptor (which
+/// selects the sampler path), and the component-residency strategy.
 pub struct Boogu {
     descriptor: ModelDescriptor,
-    pipeline: BooguPipeline,
+    /// The tiny BPE-ish tokenizer stays always-warm on the generator (cheap); the heavy mllm↔DiT
+    /// dispatch is the shared [`Residency`] seam.
+    tokenizer: BooguTokenizer,
+    /// Component-residency strategy (epic 10834, sc-10840; the shared seam sc-11125), selected from
+    /// [`LoadSpec::offload_policy`] at [`load_with`]. `Resident` (default) holds the Qwen3-VL `mllm/`
+    /// encoder (+ lazy vision tower) and the DiT + VAE warm for the whole job and across jobs;
+    /// `Sequential` holds only the per-phase loader closures and re-loads each per generation in phase
+    /// order (encode → **drop the mllm** → denoise/decode), bounding peak unified memory to
+    /// `max(mllm, DiT+VAE)` instead of the sum (the ~17.5 GB Qwen3-VL encoder is comparable to the
+    /// ~20.6 GB DiT). The seam owns the eval/drop/clear discipline, the stage-boundary cancel checks,
+    /// and the error-safe cache flush.
+    residency: Residency<BooguEncoders, BooguHeavy>,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7846). `Some` only when the
     /// `LoadSpec` carried `pid`; selected per-generation by `req.use_pid` and threaded into the
-    /// pipeline's decode tail. Shared across all three Boogu variants (FLUX.1 VAE latent space).
+    /// render phase's decode tail. Shared across all three Boogu variants (FLUX.1 VAE latent space).
+    /// The overlay is small (a student decoder + caption encoder) and, unlike the mllm/DiT, stays
+    /// resident on the generator (loaded once at [`load_with`], like the tokenizer) — the peak-bounding
+    /// win is the mllm↔DiT drop, so the overlay is not re-loaded per generate.
     pid: Option<PidEngine>,
 }
 
@@ -161,6 +185,12 @@ pub struct Boogu {
 /// auto-detects a packed Q8/Q4 turnkey (the shipped default) vs a dense bf16 snapshot; `spec.quantize`
 /// then quantizes the dense base in place (a no-op on an already-packed snapshot). A precision
 /// override and LoRA/LoKr adapters are rejected rather than silently ignored.
+///
+/// Component residency (epic 10834, sc-10840; the shared [`Residency::from_policy`] seam sc-11126):
+/// `Resident` (default) builds the mllm encoder + heavy DiT/VAE now via [`build_residency`] and holds
+/// them warm; `Sequential` keeps only the per-phase loader closures and re-loads per generate in phase
+/// order (encode → drop the mllm → denoise/decode) to bound peak memory to `max(mllm, DiT+VAE)`. Both
+/// use the same per-phase loaders, so the components are byte-identical.
 fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Generator>> {
     let id = descriptor.id;
     if spec.precision != Precision::Bf16 {
@@ -173,8 +203,10 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
             "{id}: LoRA/LoKr adapters are not supported"
         )));
     }
+    // Resolve the snapshot dir up front — a fail-fast for BOTH residencies (Sequential defers the heavy
+    // component build to each generate, but a single-file source is still wrong here).
     let root = match &spec.weights {
-        WeightsSource::Dir(p) => p,
+        WeightsSource::Dir(p) => p.clone(),
         WeightsSource::File(_) => {
             return Err(Error::Msg(format!(
                 "{id} expects a snapshot directory (mllm/ transformer/ vae/), not a single \
@@ -182,12 +214,18 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
             )))
         }
     };
-    let mut pipeline = BooguPipeline::from_snapshot(root)?;
-    // No-op when the snapshot is already packed (the turnkey default); quantizes the dense bf16
-    // build otherwise (`AdaptableLinear::quantize` skips already-quantized bases).
+    // F-181: a `Sequential` + `quantize` load re-quantizes over the dense snapshot on EVERY generate
+    // (repeated compute + the dense per-phase transient). Boogu's per-phase `quantize` is a no-op on an
+    // already-packed turnkey (the shipped default), so this is conservative for that common case — but
+    // Boogu has no cheap packed-vs-dense detector at the dir level (the auto-detect happens inside the
+    // component load), so warn on the combination and let a packed snapshot no-op the quant.
     if let Some(q) = spec.quantize {
-        pipeline.quantize(q.bits())?;
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(id, q.bits());
+        }
     }
+    let tokenizer = BooguTokenizer::from_snapshot(&root)?;
+    let residency = build_residency(spec, &root)?;
     // Optional PiD decoder overlay (epic 7840, sc-7846): Boogu's FLUX.1 16-ch VAE latent space has a
     // PiD student (the `flux` backbone), so the final decode can route through `mlx_gen_pid` when
     // `req.use_pid` is set. Loaded only when the spec carries `pid`; native VAE decode otherwise.
@@ -198,9 +236,47 @@ fn load_with(spec: &LoadSpec, descriptor: ModelDescriptor) -> Result<Box<dyn Gen
         .transpose()?;
     Ok(Box::new(Boogu {
         descriptor,
-        pipeline,
+        tokenizer,
+        residency,
         pid,
     }))
+}
+
+/// The policy→[`Residency`] dispatch every Boogu variant shares (sc-11126, F-180), routed through the
+/// single [`Residency::from_policy`] seam so no variant re-derives the `match offload_policy`.
+/// `Resident` eager-loads the mllm encoder + heavy DiT/VAE now (byte-identical to the pre-seam
+/// `BooguPipeline::from_snapshot` composition — the same per-phase loaders over independent weight
+/// files, deterministic RNG-free quant); `Sequential` captures the two loader closures and loads
+/// nothing now, deferring each to [`Residency::run`]. The heavy loader's `use_pid` is ignored (Boogu's
+/// PiD overlay is held on the generator, not the heavy bundle). The deferral is weight-free-testable:
+/// under `Sequential` this touches no component weights, so a dispatch that ignored `offload_policy`
+/// would eager-load and fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    root: &Path,
+) -> Result<Residency<BooguEncoders, BooguHeavy>> {
+    let quant = spec.quantize;
+    let root_text = root.to_path_buf();
+    let root_heavy = root.to_path_buf();
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let mut enc = BooguEncoders::load(&root_text)?;
+            // No-op when the snapshot is already packed (the turnkey default); quantizes the dense
+            // Qwen3-VL text tower otherwise (`AdaptableLinear::quantize` skips already-quantized bases).
+            if let Some(q) = quant {
+                enc.quantize(q.bits())?;
+            }
+            Ok(enc)
+        },
+        move |_use_pid| {
+            let mut heavy = BooguHeavy::load(&root_heavy)?;
+            if let Some(q) = quant {
+                heavy.quantize(q.bits())?;
+            }
+            Ok(heavy)
+        },
+    )
 }
 
 /// Construct a Boogu **Base** generator (true-CFG text-to-image) from a [`LoadSpec`].
@@ -227,193 +303,285 @@ impl Boogu {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
     /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
     /// bridges the tail into [`gen_core::Error`].
+    ///
+    /// Dispatches to the per-variant residency lifecycle. Each variant drives the shared
+    /// [`Residency::run`] seam (encode the mllm conditioning → **drop the mllm** under `Sequential` →
+    /// load the DiT/VAE → denoise/decode → free the heavy bundle); the seam owns the eval/drop/clear
+    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<GenerationOutput> {
         validate_request(&self.descriptor, req)?;
-
         let base_seed = req.seed.unwrap_or_else(default_seed);
-        let mut images = Vec::with_capacity(req.count as usize);
-
-        // PiD decode overlay (epic 7840, sc-7846) + `from_ldm` early-stop (sc-8048): resolve the decoder
-        // once per variant, `Some` only when `use_pid` is set AND a PiD overlay was loaded (errors loudly
-        // if requested without one), else `None` → the native VAE. Shared across the `count` loop (same
-        // prompt → same caption). The Base/Edit variants are true-flow-match (`vp_frame=false`), so the
-        // schedule σ *is* the degrade σ: when `pid_capture_sigma` asks for an early exit, `flow_capture_
-        // for_request` folds the σ ceiling + schedule into `(capture_sigma, keep)` — mint the decoder at
-        // `capture_sigma` and truncate the denoise to `keep`; the clean path yields `(0.0, sigmas.len())`
-        // → full schedule, σ=0, byte-identical. Boogu starts from pure noise (`start_step = 0`). The Turbo
-        // few-step DMD path does NOT support the early-stop (its loop yields clean x0 estimates, not a
-        // σ>0 latent, and it is decode-bound) — it rejects `pid_capture_sigma` and decodes at σ=0.
         if self.descriptor.id == BOOGU_IMAGE_TURBO_ID {
-            // The Turbo few-step DMD loop predicts a CLEAN x0 estimate each step (`x += (1−σ)·v`) and
-            // re-noises to the next level; there is no "noisy x_k at σ>0" to hand PiD. Stopping early
-            // would leave a ~clean latent while the decoder was minted at `capture_sigma > 0` — a σ
-            // mismatch that produces wrong output. Turbo is also decode-bound (sc-7993), so the
-            // `from_ldm` early-stop has no benefit here. Reject `pid_capture_sigma` loudly rather than
-            // silently degrade; the Base variant is the supported path for from_ldm (sc-8048).
-            if req.use_pid && req.pid_capture_sigma.is_some() {
-                return Err(Error::Msg(format!(
-                    "{}: pid_capture_sigma (from_ldm early-stop) is not supported on the Boogu Turbo \
-                     few-step DMD path — it is decode-bound with no early-stop benefit and the DMD \
-                     loop produces clean x0 estimates, not a σ>0 latent; use the Base variant for \
-                     from_ldm (sc-8048)",
-                    self.descriptor.id
-                )));
-            }
-            let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
-            // No early-stop on Turbo: the PiD decoder (when `use_pid`) is minted at the clean terminal
-            // σ=0 (the DMD loop's final x0 estimate), matching the full-loop latent it decodes.
-            let pid_decoder = resolve_pid_decoder_at_sigma(
-                self.pid.as_ref(),
-                req,
-                base_seed,
-                self.descriptor.id,
-                0.0,
-            )?;
-            // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise
-            // from the VAE-encoded reference at a strength-derived start step; no reference (or a
-            // strength that resolves to start 0) → pure t2i.
-            let reference = resolve_reference(req, self.descriptor.id)?;
-            let start_step = reference
-                .map(|(_, strength)| init_time_step(steps, strength))
-                .unwrap_or(0);
-            for n in 0..req.count {
-                let opts = TurboOptions {
-                    height: req.height,
-                    width: req.width,
-                    steps,
-                    seed: base_seed.wrapping_add(n as u64),
-                    conditioning_sigma: DEFAULT_TURBO_SIGMA,
-                    sampler: req.sampler.clone(),
-                    scheduler: req.scheduler.clone(),
-                };
-                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-                let img = match reference {
-                    Some((image, _)) if start_step > 0 => {
-                        self.pipeline.generate_turbo_img2img_with_progress(
-                            &req.prompt,
-                            image,
-                            start_step,
-                            &opts,
-                            decoder,
-                            &req.cancel,
-                            on_progress,
-                        )?
-                    }
-                    _ => self.pipeline.generate_turbo_with_progress(
-                        &req.prompt,
-                        &opts,
-                        decoder,
-                        &req.cancel,
-                        on_progress,
-                    )?,
-                };
-                images.push(img);
-            }
+            self.generate_turbo(req, base_seed, on_progress)
         } else if self.descriptor.id == BOOGU_IMAGE_EDIT_ID {
-            // Source images arrive as `Reference` / `MultiReference` (1..=MAX_EDIT_REFS); the prompt is
-            // the edit instruction. Clone once into an owned slice for the pipeline (cheap next to the
-            // multi-step DiT denoise).
-            let references: Vec<Image> =
-                resolve_edit_references(req)?.into_iter().cloned().collect();
-            let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-            let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-            let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
-            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
-            let pid_decoder = resolve_pid_decoder_at_sigma(
-                self.pid.as_ref(),
-                req,
-                base_seed,
-                self.descriptor.id,
-                capture_sigma,
-            )?;
-            let denoise_sigmas = &sigmas[..keep];
-            for n in 0..req.count {
-                let opts = EditOptions {
-                    height: req.height,
-                    width: req.width,
-                    steps,
-                    text_guidance_scale: guidance,
-                    seed: base_seed.wrapping_add(n as u64),
-                    condition_on_image: true,
-                    use_input_images_4_neg_instruct: false,
-                    sampler: req.sampler.clone(),
-                    scheduler: req.scheduler.clone(),
-                };
-                let img = self.pipeline.generate_edit_multi_with_progress(
-                    &references,
-                    &req.prompt,
-                    &opts,
-                    denoise_sigmas,
-                    pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
-                    &req.cancel,
-                    on_progress,
-                )?;
-                images.push(img);
-            }
+            self.generate_edit(req, base_seed, on_progress)
         } else {
-            let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
-            let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-            // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from
-            // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
-            let reference = resolve_reference(req, self.descriptor.id)?;
-            let start_step = reference
-                .map(|(_, strength)| init_time_step(steps, strength))
-                .unwrap_or(0);
-            let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
-            // The img2img start offsets the schedule; `flow_capture_for_request` folds any PiD `from_ldm`
-            // σ ceiling against the *start-offset* schedule so the two compose (`keep > start_step`,
-            // mirroring Z-Image). No reference → `start_step = 0`, byte-identical to before.
-            let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
-            let pid_decoder = resolve_pid_decoder_at_sigma(
-                self.pid.as_ref(),
-                req,
-                base_seed,
-                self.descriptor.id,
-                capture_sigma,
-            )?;
-            let denoise_sigmas = &sigmas[..keep];
-            for n in 0..req.count {
-                let opts = GenerateOptions {
-                    height: req.height,
-                    width: req.width,
-                    steps,
-                    text_guidance_scale: guidance,
-                    seed: base_seed.wrapping_add(n as u64),
-                    sampler: req.sampler.clone(),
-                    scheduler: req.scheduler.clone(),
-                };
-                let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
-                let img = match reference {
+            self.generate_base(req, base_seed, on_progress)
+        }
+    }
+
+    /// Base (true-CFG text-to-image, with a single-`Reference` img2img latent-init). Phase A encodes
+    /// the positive instruction + (guidance > 1) the empty/drop CFG-negative; phase B resolves the PiD
+    /// decoder + `from_ldm` truncation, VAE-encodes any img2img reference ONCE (seed-independent), and
+    /// runs the true-CFG denoise/decode over the `count` loop.
+    fn generate_base(
+        &self,
+        req: &GenerationRequest,
+        base_seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let id = self.descriptor.id;
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the true-CFG denoise from the
+        // VAE-encoded reference at a strength-derived start step; no reference → pure t2i (start 0).
+        // Seed-independent — resolved above the residency lifecycle.
+        let reference = resolve_reference(req, id)?;
+        let start_step = reference
+            .map(|(_, strength)| init_time_step(steps, strength))
+            .unwrap_or(0);
+        let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+
+        self.residency.run(
+            &req.cancel,
+            // Boogu's PiD overlay is held on the generator, not the heavy bundle; the loader ignores it.
+            req.use_pid,
+            on_progress,
+            // ── Phase A: true-CFG mllm conditioning (Sequential loads the mllm, encodes, materializes,
+            // drops it + clear_cache before the DiT/VAE load; Resident borrows the warm encoder).
+            |enc: &BooguEncoders| enc.encode_base(&self.tokenizer, &req.prompt, guidance),
+            |c: &BooguBaseCond| c.materialize(),
+            // ── Phase B: denoise/decode from the heavy DiT/VAE bundle over the count loop.
+            |heavy: &BooguHeavy, c, on_progress| {
+                // PiD decode overlay (sc-7846) + `from_ldm` early-stop (sc-8048): the img2img start
+                // offsets the schedule; `flow_capture_for_request` folds any PiD σ ceiling against the
+                // *start-offset* schedule so the two compose. No reference → `start_step = 0`,
+                // byte-identical to a plain txt2img.
+                let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, start_step);
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    self.pid.as_ref(),
+                    req,
+                    base_seed,
+                    id,
+                    capture_sigma,
+                )?;
+                let denoise_sigmas = &sigmas[..keep];
+                // VAE-encode the img2img reference ONCE (seed-independent) — hoisted out of the count
+                // loop (the qwen-image F-118 fix). `None` for pure txt2img.
+                let clean = match reference {
                     Some((image, _)) if start_step > 0 => {
-                        self.pipeline.generate_base_img2img_with_progress(
-                            &req.prompt,
-                            image,
+                        Some(heavy.encode_init_clean(image, req.width, req.height)?)
+                    }
+                    _ => None,
+                };
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let opts = GenerateOptions {
+                        height: req.height,
+                        width: req.width,
+                        steps,
+                        text_guidance_scale: guidance,
+                        seed: base_seed.wrapping_add(n as u64),
+                        sampler: req.sampler.clone(),
+                        scheduler: req.scheduler.clone(),
+                    };
+                    let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                    let img = match &clean {
+                        Some(clean) => heavy.render_base_img2img(
+                            &c,
+                            clean,
                             start_step,
                             &opts,
                             denoise_sigmas,
                             decoder,
                             &req.cancel,
                             on_progress,
-                        )?
-                    }
-                    _ => self.pipeline.generate_with_progress(
-                        &req.prompt,
+                        )?,
+                        None => heavy.render_base_t2i(
+                            &c,
+                            &opts,
+                            denoise_sigmas,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?,
+                    };
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
+    }
+
+    /// Instruction-Edit (true-CFG, 1..=`MAX_EDIT_REFS` source references packed into the DiT sequence).
+    /// Phase A encodes the (optionally image-conditioned) instruction; phase B VAE-encodes the reference
+    /// spatial latents ONCE and runs the true-CFG denoise/decode over the `count` loop.
+    fn generate_edit(
+        &self,
+        req: &GenerationRequest,
+        base_seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let id = self.descriptor.id;
+        // Source images arrive as `Reference` / `MultiReference` (1..=MAX_EDIT_REFS); the prompt is the
+        // edit instruction. Clone once into an owned slice (cheap next to the multi-step DiT denoise).
+        let references: Vec<Image> = resolve_edit_references(req)?.into_iter().cloned().collect();
+        let steps = req.steps.unwrap_or(DEFAULT_STEPS) as usize;
+        let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
+        let sigmas = base_flow_schedule(steps, req.scheduler.as_deref());
+        // The faithful edit runs each reference through the vision tower (image-conditioned) and the
+        // CFG-negative is the text-only empty/drop instruction — the reference defaults.
+        let edit_opts = EditOptions {
+            height: req.height,
+            width: req.width,
+            steps,
+            text_guidance_scale: guidance,
+            seed: base_seed,
+            condition_on_image: true,
+            use_input_images_4_neg_instruct: false,
+            sampler: req.sampler.clone(),
+            scheduler: req.scheduler.clone(),
+        };
+
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |enc: &BooguEncoders| {
+                enc.encode_edit(&self.tokenizer, &references, &req.prompt, &edit_opts)
+            },
+            |c: &BooguBaseCond| c.materialize(),
+            |heavy: &BooguHeavy, c, on_progress| {
+                // Edit always starts the output from pure noise (the references shape the DiT sequence,
+                // not the init latent), so there is no img2img start-step; `flow_capture_for_request`
+                // folds any PiD σ ceiling against the full schedule (`start_step = 0`).
+                let (capture_sigma, keep) = flow_capture_for_request(req, &sigmas, 0);
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    self.pid.as_ref(),
+                    req,
+                    base_seed,
+                    id,
+                    capture_sigma,
+                )?;
+                let denoise_sigmas = &sigmas[..keep];
+                // VAE-encode the reference spatial latents ONCE (seed-independent) — hoisted out of the
+                // count loop (the qwen-image F-118 fix).
+                let ref_latents = heavy.encode_ref_latents(&references)?;
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let opts = EditOptions {
+                        seed: base_seed.wrapping_add(n as u64),
+                        ..edit_opts.clone()
+                    };
+                    let img = heavy.render_edit(
+                        &c,
+                        &ref_latents,
                         &opts,
                         denoise_sigmas,
-                        decoder,
+                        pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder),
                         &req.cancel,
                         on_progress,
-                    )?,
-                };
-                images.push(img);
-            }
-        }
+                    )?;
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
+    }
 
-        Ok(GenerationOutput::Images(images))
+    /// Turbo (DMD few-step, CFG-free, with a single-`Reference` img2img latent-init). Phase A encodes
+    /// the positive instruction only (no unconditional branch); phase B runs the few-step DMD
+    /// denoise/decode. The `from_ldm` early-stop is rejected (the DMD loop yields clean x0 estimates,
+    /// not a σ>0 latent, and is decode-bound); the PiD decoder is minted at the clean terminal σ=0.
+    fn generate_turbo(
+        &self,
+        req: &GenerationRequest,
+        base_seed: u64,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<GenerationOutput> {
+        let id = self.descriptor.id;
+        // The Turbo few-step DMD loop predicts a CLEAN x0 estimate each step and re-noises; there is no
+        // "noisy x_k at σ>0" to hand PiD, and Turbo is decode-bound (sc-7993), so the `from_ldm`
+        // early-stop has no benefit. Reject `pid_capture_sigma` loudly; the Base variant is the
+        // supported path for from_ldm (sc-8048). Resolved before the residency (validation-shaped).
+        if req.use_pid && req.pid_capture_sigma.is_some() {
+            return Err(Error::Msg(format!(
+                "{id}: pid_capture_sigma (from_ldm early-stop) is not supported on the Boogu Turbo \
+                 few-step DMD path — it is decode-bound with no early-stop benefit and the DMD loop \
+                 produces clean x0 estimates, not a σ>0 latent; use the Base variant for from_ldm \
+                 (sc-8048)"
+            )));
+        }
+        let steps = req.steps.unwrap_or(DEFAULT_TURBO_STEPS) as usize;
+        // img2img (epic 8588 A4.3, sc-10191): a single `Reference` seeds the few-step DMD denoise from
+        // the VAE-encoded reference at a strength-derived start step; no reference → pure t2i.
+        let reference = resolve_reference(req, id)?;
+        let start_step = reference
+            .map(|(_, strength)| init_time_step(steps, strength))
+            .unwrap_or(0);
+
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            |enc: &BooguEncoders| enc.encode_turbo(&self.tokenizer, &req.prompt),
+            |(cond, mask): &(Array, Array)| {
+                mlx_rs::transforms::eval([cond, mask])?;
+                Ok(())
+            },
+            |heavy: &BooguHeavy, (cond, mask), on_progress| {
+                // No early-stop on Turbo: the PiD decoder (when `use_pid`) is minted at the clean
+                // terminal σ=0 (the DMD loop's final x0 estimate), matching the full-loop latent.
+                let pid_decoder =
+                    resolve_pid_decoder_at_sigma(self.pid.as_ref(), req, base_seed, id, 0.0)?;
+                // VAE-encode the img2img reference ONCE (seed-independent) — hoisted out of the loop.
+                let clean = match reference {
+                    Some((image, _)) if start_step > 0 => {
+                        Some(heavy.encode_init_clean(image, req.width, req.height)?)
+                    }
+                    _ => None,
+                };
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let opts = TurboOptions {
+                        height: req.height,
+                        width: req.width,
+                        steps,
+                        seed: base_seed.wrapping_add(n as u64),
+                        conditioning_sigma: DEFAULT_TURBO_SIGMA,
+                        sampler: req.sampler.clone(),
+                        scheduler: req.scheduler.clone(),
+                    };
+                    let decoder = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                    let img = match &clean {
+                        Some(clean) => heavy.render_turbo_img2img(
+                            &cond,
+                            &mask,
+                            clean,
+                            start_step,
+                            &opts,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?,
+                        None => heavy.render_turbo_t2i(
+                            &cond,
+                            &mask,
+                            &opts,
+                            decoder,
+                            &req.cancel,
+                            on_progress,
+                        )?,
+                    };
+                    images.push(img);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -500,9 +668,10 @@ pub(crate) fn validate_request(desc: &ModelDescriptor, req: &GenerationRequest) 
 /// (`transformer/`), and the VAE (`vae/`), summed from the subdirs [`crate::loader`] loads. Shared by
 /// boogu image/turbo/edit.
 ///
-/// PRE-WIRING: this split is computed correctly, but boogu is NOT yet in the worker's
-/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist, so the fit-gate does not consume it until boogu is added
-/// there in the fan-out (sc-10840). Until then it is inert (the worker uses its whole-model total).
+/// The engine now advertises `supports_sequential_offload` (sc-10840) and this split is the staged
+/// peak the shared `Residency` seam bounds (`max(mllm, DiT+VAE)`). Adding boogu to the worker's
+/// `SEQUENTIAL_CAPABLE_ENGINES` allowlist so the fit-gate consumes this split is the downstream
+/// worker-repo step of the fan-out (this crate reports the bytes; the worker decides to use them).
 pub(crate) fn component_footprint(
     spec: &mlx_gen::LoadSpec,
 ) -> mlx_gen::gen_core::Result<mlx_gen::PerComponentBytes> {
@@ -829,5 +998,72 @@ mod tests {
                 "id {id} not resolved: {e}"
             );
         }
+    }
+
+    // ── Component residency (epic 10834, sc-10840) -----------------------------------------------
+
+    #[test]
+    fn all_three_advertise_sequential_offload() {
+        // Every Boogu id honors the shared `Residency` seam (the descriptor bit the worker fit-gate
+        // reads to consume the TE/DiT/VAE footprint split).
+        for d in [descriptor(), descriptor_turbo(), descriptor_edit()] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "{} must advertise supports_sequential_offload",
+                d.id
+            );
+        }
+    }
+
+    // ── F-180 (sc-11126): weight-free, default-run proof that Boogu's dispatch HONORS `offload_policy`.
+    // `build_residency` points at a non-existent snapshot *directory* and the discriminator is deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen3-VL mllm from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weight A/B is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/boogu-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        let spec = missing_snapshot_spec(OffloadPolicy::Sequential);
+        let root = match &spec.weights {
+            WeightsSource::Dir(p) => p.clone(),
+            WeightsSource::File(_) => unreachable!(),
+        };
+        let res = build_residency(&spec, &root)
+            .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let spec = missing_snapshot_spec(OffloadPolicy::Resident);
+        let root = match &spec.weights {
+            WeightsSource::Dir(p) => p.clone(),
+            WeightsSource::File(_) => unreachable!(),
+        };
+        let err = build_residency(&spec, &root)
+            .err()
+            .expect("Resident must eager-load and fail on a missing snapshot dir");
+        // An eager-load failure (missing weights), not a policy/dispatch guard.
+        assert!(
+            res_is_load_failure(&err.to_string()),
+            "expected an eager-load failure on the missing snapshot: {err}"
+        );
+    }
+
+    /// The eager-load failure surfaces as a weights/file error, not one of the up-front guards.
+    fn res_is_load_failure(msg: &str) -> bool {
+        !msg.contains("single .safetensors file")
+            && !msg.contains("precision override")
+            && !msg.contains("not supported")
     }
 }
