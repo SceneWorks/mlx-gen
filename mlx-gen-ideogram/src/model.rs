@@ -10,10 +10,12 @@
 //! `Progress`. `spec.quantize` (Q4/Q8) quantizes the whole model in place after the dense load
 //! (sc-5989); a precision override and LoRA adapters are rejected rather than silently ignored.
 
+use std::path::Path;
+
 use mlx_gen::{
     default_seed, AdapterKind, AdapterSpec, Capabilities, Conditioning, ConditioningKind, Error,
     GenerationOutput, GenerationRequest, Generator, Image, LatentDecoder, LoadSpec, Modality,
-    ModelDescriptor, Precision, Progress, Quant, Result, WeightsSource,
+    ModelDescriptor, OffloadPolicy, Precision, Progress, Quant, Residency, Result, WeightsSource,
 };
 use mlx_gen_flux2::model::PID_BACKBONE;
 use mlx_gen_pid::{resolve_pid_decoder_at_sigma, PidEngine};
@@ -24,7 +26,7 @@ use crate::config::{
     DEFAULT_TURBO_STEPS, IDEOGRAM_4_ID, IDEOGRAM_4_TURBO_ID, RES_MAX, RES_MIN, RES_MULTIPLE,
     TURBO_LORA_FILE, TURBO_LORA_SCALE,
 };
-use crate::pipeline::Ideogram4Pipeline;
+use crate::pipeline::{Ideogram4Heavy, Ideogram4Text};
 
 /// Registry id (matches the SceneWorks worker's `payload.model`).
 pub const MODEL_ID: &str = IDEOGRAM_4_ID;
@@ -78,8 +80,12 @@ pub fn descriptor() -> ModelDescriptor {
             supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-            supports_sequential_offload: false,
+            // Wired onto the shared `Residency` seam (epic 10834, sc-10840); honors Sequential offload
+            // (F-176). Under `Sequential` the Qwen3-VL text encoder is encoded, materialized, then
+            // dropped before the two DiTs + VAE load — bounding peak unified memory to
+            // `max(TE, DiTs+VAE)`. Ideogram Q4/Q8 quantize the whole model DENSE at load, so a
+            // `Sequential` + `quantize` load re-quantizes each generate (F-181 advisory in `load`).
+            supports_sequential_offload: true,
         },
     }
 }
@@ -96,13 +102,29 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     d
 }
 
-/// A loaded Ideogram 4 generator: the assembled pipeline plus the cached descriptor.
+/// A loaded Ideogram 4 generator: the cached descriptor + the turbo flag + the component-residency
+/// strategy (epic 10834, sc-10840). Holds ONLY the [`Residency`] (no direct encoder/DiT/VAE/PiD
+/// fields — a retained component would defeat the `Sequential` drop): `Resident` (default) holds the
+/// Qwen3-VL TE + two DiTs + VAE (+ any PiD overlay) warm for the whole job and across jobs;
+/// `Sequential` holds only the per-phase loader closures and re-loads each per generation in phase
+/// order (encode → **drop the TE** → the DiTs/VAE/PiD), bounding peak unified memory to
+/// `max(TE, DiTs+VAE)`.
 pub struct Ideogram4 {
     descriptor: ModelDescriptor,
-    pipeline: Ideogram4Pipeline,
+    /// `true` for `ideogram_4_turbo` (CFG-free single DiT) — selects the few-step default and the
+    /// turbo heavy-load path (single DiT + bundled TurboTime LoRA). Known without loading weights.
+    turbo: bool,
+    residency: Residency<Ideogram4Text, Ideogram4HeavyOwned>,
+}
+
+/// The heavy render-phase components owned by a `Resident` build or a `Sequential` generate (mirrors
+/// lens's `LensHeavyOwned`): the two DiTs + VAE ([`Ideogram4Heavy`]) plus the optional PiD overlay.
+pub(crate) struct Ideogram4HeavyOwned {
+    heavy: Ideogram4Heavy,
     /// Optional PiD super-resolving decoder overlay (epic 7840, sc-7847): loaded when the spec carries
-    /// `LoadSpec::pid`. `Some` → a `req.use_pid` generation decodes through the `flux2` student (4× SR;
-    /// Ideogram is the FLUX.2 VAE latent space). `None` → the byte-exact native VAE path.
+    /// `LoadSpec::pid` AND this generate uses it (F-177). `Some` → a `req.use_pid` generation decodes
+    /// through the `flux2` student (4× SR; Ideogram is the FLUX.2 VAE latent space). `None` → the
+    /// byte-exact native VAE path.
     pid: Option<PidEngine>,
 }
 
@@ -122,46 +144,23 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             "ideogram_4: LoRA/LoKr adapters are not supported".into(),
         ));
     }
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p,
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "ideogram_4 expects a snapshot directory (transformer/ unconditional_transformer/ \
-                 text_encoder/ vae/ tokenizer/), not a single .safetensors file"
-                    .into(),
-            )),
-        };
-    // Q4/Q8 quantizes the whole model (both DiTs + TE + VAE) in place after the dense bf16 load.
-    // NOTE: peak footprint is the *dense* bf16 transient (~53 GB) — pre-quantized-on-disk weights
-    // avoid it for smaller Macs (the SCAIL-2 lesson; tracked in this story).
-    let mut pipeline = Ideogram4Pipeline::load(root)?;
-    if let Some(q) = spec.quantize {
-        pipeline.quantize(q.bits())?;
-    }
-    let pid = load_pid(spec)?;
+    // Fail-fast the single-file source up front for BOTH policies (Sequential defers the component
+    // build, but a single-file source is still wrong).
+    snapshot_dir(spec, IDEOGRAM_4_ID)?;
+    warn_if_sequential_requantize(spec, IDEOGRAM_4_ID);
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor(),
-        pipeline,
-        pid,
+        turbo: false,
+        residency: build_residency(spec, false)?,
     }))
-}
-
-/// Resolve the optional PiD decoder overlay (epic 7840, sc-7847) from `spec.pid`: load the shared
-/// `flux2` student + Gemma caption encoder once. Ideogram 4 is the FLUX.2 VAE latent space, so it
-/// reuses the same student as flux2/lens. `None` (the default) when the spec carries no PiD weights.
-fn load_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
-    spec.pid
-        .as_ref()
-        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
-        .transpose()
 }
 
 /// Construct an [`Ideogram4`] **turbo** generator (issue #488) from a [`LoadSpec`]. `spec.weights`
 /// must be a [`WeightsSource::Dir`] pointing at a turbo snapshot — the conditional `transformer/`,
 /// `text_encoder/`, `vae/`, `tokenizer/`, plus the bundled [`TURBO_LORA_FILE`]; the unconditional
-/// DiT is not loaded. Loads the single DiT, quantizes (Q4/Q8) if requested, then installs the
-/// TurboTime LoRA at scale 1.0 — the CFG-free few-step path. A precision override or **user**
-/// LoRA/LoKr adapters are rejected (the TurboTime LoRA is part of the snapshot, not user-supplied).
+/// DiT is not loaded. The heavy loader loads the single DiT, quantizes (Q4/Q8) if requested, then
+/// installs the TurboTime LoRA at scale 1.0 — the CFG-free few-step path. A precision override or
+/// **user** LoRA/LoKr adapters are rejected (the TurboTime LoRA is part of the snapshot).
 pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
     if spec.precision != Precision::Bf16 {
         return Err(Error::Msg(
@@ -175,15 +174,8 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
                 .into(),
         ));
     }
-    let root =
-        match &spec.weights {
-            WeightsSource::Dir(p) => p,
-            WeightsSource::File(_) => return Err(Error::Msg(
-                "ideogram_4_turbo expects a snapshot directory (transformer/ text_encoder/ vae/ \
-                 tokenizer/ + turbo_lora.safetensors), not a single .safetensors file"
-                    .into(),
-            )),
-        };
+    let root = snapshot_dir(spec, IDEOGRAM_4_TURBO_ID)?;
+    // Fail-fast the missing bundled LoRA up front (the model-defining component) for both policies.
     let lora_path = root.join(TURBO_LORA_FILE);
     if !lora_path.exists() {
         return Err(Error::Msg(format!(
@@ -192,26 +184,116 @@ pub fn load_turbo(spec: &LoadSpec) -> Result<Box<dyn Generator>> {
             lora_path.display()
         )));
     }
-    // Single conditional DiT (no unconditional branch) + TE + VAE + tokenizer.
-    let mut pipeline = Ideogram4Pipeline::load_turbo(root)?;
-    // Quantize the base first (Q4/Q8), then install the LoRA residual on top — fork-faithful order
-    // (matches the flux2 family): the residual is computed and added over the possibly quantized base.
-    if let Some(q) = spec.quantize {
-        pipeline.quantize(q.bits())?;
-    }
-    pipeline.apply_adapters(&[AdapterSpec {
-        path: lora_path,
-        scale: TURBO_LORA_SCALE,
-        kind: AdapterKind::Lora,
-        pass_scales: None,
-        moe_expert: None,
-    }])?;
-    let pid = load_pid(spec)?;
+    warn_if_sequential_requantize(spec, IDEOGRAM_4_TURBO_ID);
     Ok(Box::new(Ideogram4 {
         descriptor: descriptor_turbo(),
-        pipeline,
-        pid,
+        turbo: true,
+        residency: build_residency(spec, true)?,
     }))
+}
+
+/// Resolve the snapshot directory from the load spec, rejecting a single-file source. Shared by the
+/// entry points' fail-fast and the `Sequential` per-phase loaders.
+fn snapshot_dir<'a>(spec: &'a LoadSpec, id: &str) -> Result<&'a Path> {
+    match &spec.weights {
+        WeightsSource::Dir(p) => Ok(p),
+        WeightsSource::File(_) => Err(Error::Msg(format!(
+            "{id} expects a snapshot directory (transformer/ unconditional_transformer/ \
+             text_encoder/ vae/ tokenizer/), not a single .safetensors file"
+        ))),
+    }
+}
+
+/// F-181: Ideogram quantizes the whole model DENSE at load, so a `Sequential` + `quantize` load
+/// re-quantizes it on EVERY generate (repeated compute; the dense transient shrinks the memory win).
+/// Warn for that combination (no-op for `Resident` or an unquantized load).
+fn warn_if_sequential_requantize(spec: &LoadSpec, id: &str) {
+    if let Some(q) = spec.quantize {
+        if matches!(spec.offload_policy, OffloadPolicy::Sequential) {
+            mlx_gen::residency::warn_sequential_requantize(id, q.bits());
+        }
+    }
+}
+
+/// The policy→[`Residency`] dispatch both Ideogram ids share (sc-10840), routed through the single
+/// [`Residency::from_policy`] seam (F-180). `Resident` eager-loads the Qwen3-VL TE phase + heavy
+/// bundle now (the heavy loader with `use_pid = true`, loading any PiD overlay once and reusing it);
+/// `Sequential` captures the two per-phase loaders and loads nothing now, deferring each to
+/// [`Residency::run`]. Both use the same [`Ideogram4Text::load`] / [`load_heavy_owned`], so the
+/// `Resident` composition is byte-identical to the pre-seam whole-model load (independent weight
+/// files, deterministic RNG-free quant + LoRA merge). Weight-free-testable: under `Sequential` this
+/// touches no component weights, so a dispatch that ignored `offload_policy` would eager-load and
+/// fail the "Sequential defers" unit test.
+pub(crate) fn build_residency(
+    spec: &LoadSpec,
+    turbo: bool,
+) -> Result<Residency<Ideogram4Text, Ideogram4HeavyOwned>> {
+    let spec_text = spec.clone();
+    let spec_heavy = spec.clone();
+    let id = if turbo {
+        IDEOGRAM_4_TURBO_ID
+    } else {
+        IDEOGRAM_4_ID
+    };
+    Residency::from_policy(
+        spec.offload_policy,
+        move || {
+            let root = snapshot_dir(&spec_text, id)?;
+            let mut text = Ideogram4Text::load(root)?;
+            // Q4/Q8 quantizes the Qwen3-VL encoder in place after the dense load (the heavy DiTs + VAE
+            // quantize in `load_heavy_owned`). Deterministic, so byte-identical across residencies.
+            if let Some(q) = spec_text.quantize {
+                text.quantize(q.bits())?;
+            }
+            Ok(text)
+        },
+        move |use_pid| {
+            let root = snapshot_dir(&spec_heavy, id)?;
+            load_heavy_owned(&spec_heavy, root, turbo, use_pid)
+        },
+    )
+}
+
+/// Load the heavy render bundle — the two DiTs + VAE (+ optional PiD overlay), everything but the text
+/// encoder. Quality mode loads both DiTs; turbo loads the single conditional DiT and installs the
+/// bundled TurboTime LoRA AFTER the Q4/Q8 quantize (fork-faithful: the residual is added over the
+/// possibly-quantized base). The PiD student is loaded only when `use_pid` (F-177) — Resident passes
+/// `true` (loaded once, reused), Sequential passes `req.use_pid` so a non-PiD generate skips it.
+fn load_heavy_owned(
+    spec: &LoadSpec,
+    root: &Path,
+    turbo: bool,
+    use_pid: bool,
+) -> Result<Ideogram4HeavyOwned> {
+    let mut heavy = if turbo {
+        Ideogram4Heavy::load_turbo(root)?
+    } else {
+        Ideogram4Heavy::load(root)?
+    };
+    if let Some(q) = spec.quantize {
+        heavy.quantize(q.bits())?;
+    }
+    if turbo {
+        heavy.apply_adapters(&[AdapterSpec {
+            path: root.join(TURBO_LORA_FILE),
+            scale: TURBO_LORA_SCALE,
+            kind: AdapterKind::Lora,
+            pass_scales: None,
+            moe_expert: None,
+        }])?;
+    }
+    let pid = if use_pid { load_pid(spec)? } else { None };
+    Ok(Ideogram4HeavyOwned { heavy, pid })
+}
+
+/// Resolve the optional PiD decoder overlay (epic 7840, sc-7847) from `spec.pid`: load the shared
+/// `flux2` student + Gemma caption encoder once. Ideogram 4 is the FLUX.2 VAE latent space, so it
+/// reuses the same student as flux2/lens. `None` (the default) when the spec carries no PiD weights.
+fn load_pid(spec: &LoadSpec) -> Result<Option<PidEngine>> {
+    spec.pid
+        .as_ref()
+        .map(|p| PidEngine::from_spec(p, PID_BACKBONE))
+        .transpose()
 }
 
 mlx_gen::impl_generator!(Ideogram4 {
@@ -223,6 +305,10 @@ impl Ideogram4 {
     /// The rich-`Result` body behind [`Generator::generate`] — kept on the crate's own
     /// [`mlx_gen::Error`] so `?` lifts `mlx_rs` device exceptions transparently; the trait wrapper
     /// bridges the tail into [`gen_core::Error`] (epic 3720).
+    /// The staged residency lifecycle (tokenize + Qwen3-VL encode → **drop the TE** under `Sequential`
+    /// → load the two DiTs + VAE + optional PiD → edit-prep/denoise/decode → free the heavy bundle) is
+    /// driven by the shared [`Residency::run`] seam (sc-10840), which owns the eval/drop/clear
+    /// discipline, the stage-boundary cancel checks, and the error-safe cache flush.
     fn generate_impl(
         &self,
         req: &GenerationRequest,
@@ -231,8 +317,8 @@ impl Ideogram4 {
         validate_request(&self.descriptor.capabilities, req)?;
 
         // Turbo defaults to the few-step count; quality mode to the 48-step preset. `guidance` is
-        // inert in turbo (the pipeline runs CFG-free when the unconditional DiT is absent).
-        let default_steps = if self.pipeline.is_turbo() {
+        // inert in turbo (the heavy bundle runs CFG-free when the unconditional DiT is absent).
+        let default_steps = if self.turbo {
             DEFAULT_TURBO_STEPS
         } else {
             DEFAULT_STEPS
@@ -240,81 +326,86 @@ impl Ideogram4 {
         let steps = req.steps.unwrap_or(default_steps) as usize;
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let base_seed = req.seed.unwrap_or_else(default_seed);
+        // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`); the VAE encode
+        // happens in the heavy render closure (the VAE is a heavy-phase component). `None` → T2I.
+        let edit = resolve_edit(req)?;
 
-        // Edit (img2img / inpaint): resolve a source `Reference` (+ optional `Mask`) and VAE-encode
-        // the source once (seed-independent). `None` → the text-to-image path (byte-identical).
-        let edit_init = match resolve_edit(req)? {
-            Some((source, mask, strength)) => Some(
-                self.pipeline
-                    .prepare_edit(source, mask, strength, req.height, req.width)?,
-            ),
-            None => None,
-        };
+        self.residency.run(
+            &req.cancel,
+            req.use_pid,
+            on_progress,
+            // ── Phase A: tokenize + Qwen3-VL encode → prompt embeds. Seed-independent; under
+            // `Sequential` the shared seam materializes the embeds + DROPS the TE before the DiT/VAE
+            // load — bounding peak to `max(TE, DiTs+VAE)`. The JSON caption is identical across the
+            // count loop, so encoding once is byte-identical to the pre-seam per-image re-encode.
+            |text: &Ideogram4Text| {
+                let ids = text.tokenize(&req.prompt)?;
+                text.encode(&ids)
+            },
+            // Materialize the Qwen3-VL embeds while the encoder is still alive (Sequential only).
+            |te_out: &Array| {
+                mlx_rs::transforms::eval([te_out])?;
+                Ok(())
+            },
+            // ── Phase B: edit prep (VAE) + PiD plan + the count loop of denoise/decode over the two
+            // DiTs + VAE (+ optional PiD). Identical body for both residencies.
+            |heavy_owned: &Ideogram4HeavyOwned, te_out, on_progress: &mut dyn FnMut(Progress)| {
+                let heavy = &heavy_owned.heavy;
 
-        // Tokenize once — the JSON caption is identical across the count loop; only the seed varies.
-        let ids = self.pipeline.tokenize(&req.prompt)?;
+                // VAE-encode the img2img/inpaint source once (seed-independent). `None` → T2I.
+                let edit_init = match edit {
+                    Some((source, mask, strength)) => {
+                        Some(heavy.prepare_edit(source, mask, strength, req.height, req.width)?)
+                    }
+                    None => None,
+                };
 
-        // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder serves
-        // the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't loaded with
-        // `LoadSpec::pid`; `None` (the default) → the byte-exact native VAE path. Applies to both T2I and
-        // edit. When `pid_capture_sigma` asks for an early exit, mint the decoder at the achieved degrade
-        // σ and stop the denoise at `run_from` so PiD receives the partially-denoised latent. NOTE:
-        // Ideogram's `LogitNormalSchedule` is *inverted* (larger `eval` = cleaner), so `fromldm_capture`
-        // converts the executed σ trajectory into the standard descending flow-match frame PiD expects
-        // (`σ = 1 − eval`; `vp_frame=false`) before resolving the plan — the packed-128ch BN decode seam
-        // (sc-7847) is unchanged. `None`/no-benefit → clean σ=0, full range, byte-identical.
-        let (capture_sigma, run_from) = self
-            .pipeline
-            .fromldm_capture(
-                req.height,
-                req.width,
-                steps,
-                edit_init.as_ref().map(|e| e.strength),
-                req.use_pid.then_some(req.pid_capture_sigma).flatten(),
-            )
-            .map_or((0.0, 0), |(sigma, from)| (sigma, from));
-        let pid_decoder = resolve_pid_decoder_at_sigma(
-            self.pid.as_ref(),
-            req,
-            base_seed,
-            self.descriptor.id,
-            capture_sigma,
-        )?;
-        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+                // PiD decode overlay (epic 7840, sc-7847) + `from_ldm` early-stop (sc-8048): one decoder
+                // serves the whole count loop (same prompt). Errors if `req.use_pid` but the model wasn't
+                // loaded with `LoadSpec::pid`; `None` → the byte-exact native VAE path. Ideogram's
+                // `LogitNormalSchedule` is *inverted* (larger `eval` = cleaner), so `fromldm_capture`
+                // converts the executed σ trajectory into the standard descending flow-match frame PiD
+                // expects (`σ = 1 − eval`; `vp_frame=false`) before resolving the plan. `None`/no-benefit
+                // → clean σ=0, full range, byte-identical.
+                let (capture_sigma, run_from) = heavy
+                    .fromldm_capture(
+                        req.height,
+                        req.width,
+                        steps,
+                        edit_init.as_ref().map(|e| e.strength),
+                        req.use_pid.then_some(req.pid_capture_sigma).flatten(),
+                    )
+                    .map_or((0.0, 0), |(sigma, from)| (sigma, from));
+                let pid_decoder = resolve_pid_decoder_at_sigma(
+                    heavy_owned.pid.as_ref(),
+                    req,
+                    base_seed,
+                    self.descriptor.id,
+                    capture_sigma,
+                )?;
+                let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for n in 0..req.count {
-            let seed = base_seed.wrapping_add(n as u64);
-            let arr = match &edit_init {
-                Some(edit) => self.pipeline.generate_edit_with_progress_from(
-                    &ids,
-                    req.height,
-                    req.width,
-                    steps,
-                    guidance,
-                    seed,
-                    edit,
-                    run_from,
-                    pid_ref,
-                    &req.cancel,
-                    on_progress,
-                )?,
-                None => self.pipeline.generate_with_progress_from(
-                    &ids,
-                    req.height,
-                    req.width,
-                    steps,
-                    guidance,
-                    seed,
-                    run_from,
-                    pid_ref,
-                    &req.cancel,
-                    on_progress,
-                )?,
-            };
-            images.push(array_to_image(&arr)?);
-        }
-        Ok(GenerationOutput::Images(images))
+                let mut images = Vec::with_capacity(req.count as usize);
+                for n in 0..req.count {
+                    let seed = base_seed.wrapping_add(n as u64);
+                    let arr = heavy.run_denoise_from_embeds(
+                        &te_out,
+                        req.height,
+                        req.width,
+                        steps,
+                        guidance,
+                        seed,
+                        edit_init.as_ref(),
+                        run_from,
+                        pid_ref,
+                        &req.cancel,
+                        on_progress,
+                    )?;
+                    images.push(array_to_image(&arr)?);
+                }
+                Ok(GenerationOutput::Images(images))
+            },
+        )
     }
 }
 
@@ -804,5 +895,60 @@ mod tests {
             !e.contains("no generator registered"),
             "turbo id not resolved: {e}"
         );
+    }
+
+    // ── Sequential residency (epic 10834, sc-10840): weight-free proof the dispatch HONORS
+    // `offload_policy`. `build_residency` points at a non-existent snapshot dir; the discriminator is
+    // deferral:
+    //   * `Sequential` captures the two per-phase loaders, touches NO weights → `Ok` + `is_sequential`.
+    //   * `Resident` eager-loads the Qwen3-VL TE from the missing dir → `Err`.
+    // A dispatch that ignored `offload_policy` (always `Resident`) would eager-load under a `Sequential`
+    // request and fail the first assertion. The real-weights A/B is `#[ignore]`d; this runs by default.
+    fn missing_snapshot_spec(policy: mlx_gen::OffloadPolicy) -> LoadSpec {
+        LoadSpec::new(WeightsSource::Dir(
+            "/nonexistent/ideogram-residency-test-snapshot".into(),
+        ))
+        .with_offload_policy(policy)
+    }
+
+    #[test]
+    fn build_residency_sequential_defers_all_component_loads() {
+        // Both ids share the one dispatch — assert on the quality (non-turbo) id.
+        let res = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Sequential),
+            false,
+        )
+        .expect("Sequential must defer loads and not touch the (missing) snapshot dir");
+        assert!(
+            res.is_sequential(),
+            "Sequential policy must build a Sequential (deferred) residency"
+        );
+    }
+
+    #[test]
+    fn build_residency_resident_eager_loads_and_fails_on_missing_snapshot() {
+        let err = build_residency(
+            &missing_snapshot_spec(mlx_gen::OffloadPolicy::Resident),
+            false,
+        )
+        .err()
+        .expect("Resident must eager-load and fail on a missing snapshot dir");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("single .safetensors file"),
+            "expected an eager-load failure, not the up-front single-file guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn descriptors_advertise_sequential_offload() {
+        // Both ids honor the shared Residency seam (the descriptor bit consumers read).
+        for d in [descriptor(), descriptor_turbo()] {
+            assert!(
+                d.capabilities.supports_sequential_offload,
+                "{} must advertise supports_sequential_offload",
+                d.id
+            );
+        }
     }
 }

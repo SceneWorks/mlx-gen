@@ -191,75 +191,55 @@ fn rgb_to_luma(rgb: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-pub struct Ideogram4Pipeline {
+/// The **text-encode phase** of an Ideogram 4 pipeline (sc-10840): the Qwen3-VL text encoder + the
+/// tokenizer. The encoder is the phase-A component dropped first under
+/// [`OffloadPolicy::Sequential`](mlx_gen::OffloadPolicy): tokenize → encode → **drop the TE** →
+/// denoise/decode over the two DiTs + VAE, bounding peak unified memory to `max(TE, DiTs+VAE)`.
+pub struct Ideogram4Text {
+    te: Ideogram4TextEncoder,
+    tok: TextTokenizer,
+}
+
+/// The **heavy render phase** of an Ideogram 4 pipeline (sc-10840): the conditional DiT, the optional
+/// unconditional DiT (asymmetric-CFG negative branch; `None` in turbo), the VAE, and the DiT config.
+/// Held after the text encoder is dropped under `Sequential`; both residencies run the identical
+/// [`run_denoise_from_embeds`](Ideogram4Heavy::run_denoise_from_embeds) body, so a `Sequential` job is
+/// byte-identical to `Resident`. The PiD overlay is NOT here — it is owned separately by the registry's
+/// heavy bundle (mirroring lens), since the struct API threads it as a per-call parameter.
+pub struct Ideogram4Heavy {
     cond: Ideogram4Transformer,
     /// The unconditional DiT (asymmetric-CFG negative branch). `None` in the **turbo** mode
     /// ([`load_turbo`](Self::load_turbo)) — the CFG-free single-DiT path runs the conditional DiT
     /// alone, halving resident memory.
     uncond: Option<Ideogram4Transformer>,
-    te: Ideogram4TextEncoder,
     vae: Flux2Vae,
-    tok: TextTokenizer,
     dit: Ideogram4DitConfig,
 }
 
-impl Ideogram4Pipeline {
-    /// Load all components (2 DiTs + Qwen3-VL text encoder + VAE + tokenizer) from a converted
-    /// snapshot dir — the quality (asymmetric-CFG) mode.
+/// A loaded Ideogram 4 pipeline: the [`Ideogram4Text`] + [`Ideogram4Heavy`] phases (sc-10840 split)
+/// held together. This is the direct struct API used by the crate's `#[ignore]`d real-weight tests;
+/// the registry generator ([`crate::model`]) holds the two phases separately so it can drop the text
+/// encoder mid-job for `Sequential` residency.
+pub struct Ideogram4Pipeline {
+    text: Ideogram4Text,
+    heavy: Ideogram4Heavy,
+}
+
+impl Ideogram4Text {
+    /// Load the Qwen3-VL text encoder + tokenizer (`text_encoder/` + `tokenizer/`) — the phase-A
+    /// component dropped first under `Sequential`.
     pub fn load(root: &Path) -> Result<Self> {
         Ok(Self {
-            cond: load_transformer(root)?,
-            uncond: Some(load_unconditional_transformer(root)?),
             te: load_text_encoder(root)?,
-            vae: load_vae(root)?,
             tok: load_tokenizer(root)?,
-            dit: Ideogram4DitConfig::v4(),
         })
     }
 
-    /// Load the **turbo** pipeline (issue #488): the conditional DiT + Qwen3-VL TE + VAE + tokenizer,
-    /// **without** the unconditional DiT. The caller applies the TurboTime LoRA via
-    /// [`apply_adapters`](Self::apply_adapters) and runs the CFG-free [`generate`](Self::generate)
-    /// path (single forward per step, guidance off). Skips loading the ~half-of-weights uncond DiT.
-    pub fn load_turbo(root: &Path) -> Result<Self> {
-        Ok(Self {
-            cond: load_transformer(root)?,
-            uncond: None,
-            te: load_text_encoder(root)?,
-            vae: load_vae(root)?,
-            tok: load_tokenizer(root)?,
-            dit: Ideogram4DitConfig::v4(),
-        })
-    }
-
-    /// `true` when this pipeline runs the CFG-free single-DiT turbo path (no unconditional DiT).
-    pub fn is_turbo(&self) -> bool {
-        self.uncond.is_none()
-    }
-
-    /// Install adapters (the TurboTime LoRA, or a user Ideogram LoRA) onto the **conditional** DiT
-    /// via the shared strict loader — errors on any unmatched target. Apply **after**
-    /// [`quantize`](Self::quantize) (the residual is computed and added on top of the possibly
-    /// quantized base, fork-faithfully). No-op for an empty spec list.
-    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
-        if !specs.is_empty() {
-            apply_ideogram_adapters(&mut self.cond, specs)?;
-        }
-        Ok(())
-    }
-
-    /// Quantize the whole model in place (group-wise affine Q4/Q8) after the dense load — the
-    /// conditional DiT, the unconditional DiT (quality mode only), the Qwen3-VL text encoder, and the
-    /// VAE — matching the flux2 family's `spec.quantize` semantics. Norms / tiny embeddings stay
-    /// dense (each module's `quantize` decides). Done once at load; runtime is unchanged.
+    /// Quantize the Qwen3-VL text encoder (group-wise affine Q4/Q8) after the dense load. Factored so
+    /// the `Resident` and `Sequential` paths build a byte-identical encoder (quantization is
+    /// deterministic).
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.cond.quantize(bits)?;
-        if let Some(uncond) = &mut self.uncond {
-            uncond.quantize(bits)?;
-        }
-        self.te.quantize(bits)?;
-        self.vae.quantize(bits)?;
-        Ok(())
+        self.te.quantize(bits)
     }
 
     /// Tokenize a prompt to `input_ids` exactly as the reference `_tokenize`: wrap it in the
@@ -276,6 +256,72 @@ impl Ideogram4Pipeline {
             )));
         }
         Ok(ids)
+    }
+
+    /// Encode the (single, unpadded) prompt tokens to the Qwen3-VL prompt embeds `[1, num_text,
+    /// llm_dim]` — the phase-A conditioning materialized before the TE is dropped under `Sequential`.
+    /// Seed-independent (a forward pass, no RNG), so hoisting it out of the count loop is
+    /// byte-identical to the pre-sc-10840 per-image re-encode.
+    pub fn encode(&self, input_ids: &[i32]) -> Result<Array> {
+        let num_text = input_ids.len() as i32;
+        let ids = Array::from_slice(input_ids, &[1, num_text]);
+        let attn = Array::from_slice(&vec![1i32; num_text as usize], &[1, num_text]);
+        self.te.prompt_embeds(&ids, &attn) // [1, num_text, llm_dim]
+    }
+}
+
+impl Ideogram4Heavy {
+    /// Load the heavy render phase (2 DiTs + VAE) from a converted snapshot dir — the quality
+    /// (asymmetric-CFG) mode.
+    pub fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            cond: load_transformer(root)?,
+            uncond: Some(load_unconditional_transformer(root)?),
+            vae: load_vae(root)?,
+            dit: Ideogram4DitConfig::v4(),
+        })
+    }
+
+    /// Load the **turbo** heavy phase (issue #488): the conditional DiT + VAE, **without** the
+    /// unconditional DiT. The caller applies the TurboTime LoRA via
+    /// [`apply_adapters`](Self::apply_adapters) and runs the CFG-free path (single forward per step,
+    /// guidance off). Skips loading the ~half-of-weights uncond DiT.
+    pub fn load_turbo(root: &Path) -> Result<Self> {
+        Ok(Self {
+            cond: load_transformer(root)?,
+            uncond: None,
+            vae: load_vae(root)?,
+            dit: Ideogram4DitConfig::v4(),
+        })
+    }
+
+    /// `true` when this bundle runs the CFG-free single-DiT turbo path (no unconditional DiT).
+    pub fn is_turbo(&self) -> bool {
+        self.uncond.is_none()
+    }
+
+    /// Install adapters (the TurboTime LoRA, or a user Ideogram LoRA) onto the **conditional** DiT
+    /// via the shared strict loader — errors on any unmatched target. Apply **after**
+    /// [`quantize`](Self::quantize) (the residual is computed and added on top of the possibly
+    /// quantized base, fork-faithfully). No-op for an empty spec list.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        if !specs.is_empty() {
+            apply_ideogram_adapters(&mut self.cond, specs)?;
+        }
+        Ok(())
+    }
+
+    /// Quantize the heavy render components in place (group-wise affine Q4/Q8) after the dense load —
+    /// the conditional DiT, the unconditional DiT (quality mode only), and the VAE — matching the
+    /// flux2 family's `spec.quantize` semantics. Norms / tiny embeddings stay dense (each module's
+    /// `quantize` decides). The text encoder quantizes in the phase-A [`Ideogram4Text::quantize`].
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.cond.quantize(bits)?;
+        if let Some(uncond) = &mut self.uncond {
+            uncond.quantize(bits)?;
+        }
+        self.vae.quantize(bits)?;
+        Ok(())
     }
 
     /// VAE-encode a source image into the BN-normalized packed latent `[1, num_img, 128]` the
@@ -318,167 +364,6 @@ impl Ideogram4Pipeline {
             None => None,
         };
         Ok(EditInit { z0, mask, strength })
-    }
-
-    /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
-    /// `uint8` array. No progress/cancellation — see
-    /// [`generate_with_progress`](Self::generate_with_progress).
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate(
-        &self,
-        input_ids: &[i32],
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-    ) -> Result<Array> {
-        self.generate_with_progress(
-            input_ids,
-            height,
-            width,
-            num_steps,
-            guidance,
-            seed,
-            None, // native VAE decode (no PiD overlay)
-            &CancelFlag::new(),
-            &mut |_| {},
-        )
-    }
-
-    /// [`generate`](Self::generate) with cooperative cancellation + step/decode progress — the path
-    /// the [`Generator`](mlx_gen::Generator) registry adapter uses. `cancel` is checked at each step
-    /// boundary (returns `Err(Error::Canceled)` on trip); `on_progress` receives a
-    /// [`Progress::Step`] per denoise step and [`Progress::Decoding`] before the VAE decode. The
-    /// per-step `eval` makes the cancel check able to interrupt mid-render (MLX is lazy). Pure
-    /// text-to-image (no edit conditioning) — byte-identical to the original render path.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_with_progress(
-        &self,
-        input_ids: &[i32],
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-        pid: Option<&dyn LatentDecoder>,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Array> {
-        self.run_denoise(
-            input_ids,
-            height,
-            width,
-            num_steps,
-            guidance,
-            seed,
-            None,
-            0, // full denoise range (no PiD early-stop)
-            pid,
-            cancel,
-            on_progress,
-        )
-    }
-
-    /// PiD `from_ldm` early-stop (sc-8048) T2I entry: as [`generate_with_progress`](Self::generate_with_progress)
-    /// but stops the denoise at `run_from` so PiD receives the partially-denoised latent at the capture
-    /// σ (resolve `run_from` via [`fromldm_capture`](Self::fromldm_capture)). `run_from == 0` is the full
-    /// schedule (byte-identical).
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_with_progress_from(
-        &self,
-        input_ids: &[i32],
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-        run_from: usize,
-        pid: Option<&dyn LatentDecoder>,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Array> {
-        self.run_denoise(
-            input_ids,
-            height,
-            width,
-            num_steps,
-            guidance,
-            seed,
-            None,
-            run_from,
-            pid,
-            cancel,
-            on_progress,
-        )
-    }
-
-    /// [`generate_with_progress`](Self::generate_with_progress) for an **edit** (img2img / mask
-    /// inpaint, sc-6303/6330): the denoise starts from the [`EditInit`]'s noised source latent at a
-    /// strength-derived step and (if a mask is present) pins the keep region per step. Same
-    /// asymmetric-CFG / turbo denoise loop as the text-to-image path — only the initial latent,
-    /// start step, and optional per-step mask blend differ.
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_edit_with_progress(
-        &self,
-        input_ids: &[i32],
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-        edit: &EditInit,
-        pid: Option<&dyn LatentDecoder>,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Array> {
-        self.run_denoise(
-            input_ids,
-            height,
-            width,
-            num_steps,
-            guidance,
-            seed,
-            Some(edit),
-            0, // full denoise range (no PiD early-stop)
-            pid,
-            cancel,
-            on_progress,
-        )
-    }
-
-    /// PiD `from_ldm` early-stop (sc-8048) edit entry: as
-    /// [`generate_edit_with_progress`](Self::generate_edit_with_progress) but stops the denoise at
-    /// `run_from` (resolve via [`fromldm_capture`](Self::fromldm_capture) with the edit strength).
-    /// `run_from == 0` is the full schedule (byte-identical).
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_edit_with_progress_from(
-        &self,
-        input_ids: &[i32],
-        height: u32,
-        width: u32,
-        num_steps: usize,
-        guidance: f32,
-        seed: u64,
-        edit: &EditInit,
-        run_from: usize,
-        pid: Option<&dyn LatentDecoder>,
-        cancel: &CancelFlag,
-        on_progress: &mut dyn FnMut(Progress),
-    ) -> Result<Array> {
-        self.run_denoise(
-            input_ids,
-            height,
-            width,
-            num_steps,
-            guidance,
-            seed,
-            Some(edit),
-            run_from,
-            pid,
-            cancel,
-            on_progress,
-        )
     }
 
     /// PiD `from_ldm` early-stop (sc-8048) capture plan for one Ideogram generation.
@@ -527,16 +412,18 @@ impl Ideogram4Pipeline {
         Some((plan.sigma, run_from))
     }
 
-    /// The shared flow-matching denoise behind [`generate_with_progress`] (edit `None`) and
-    /// [`generate_edit_with_progress`] (edit `Some`). With `edit == None` the body is byte-identical
-    /// to the original text-to-image render (pure-noise init, full step range, no mask blend).
-    /// `run_from` is the PiD `from_ldm` early-stop loop lower bound (sc-8048): `0` runs the full range
-    /// (byte-identical); a larger value stops the denoise early, leaving the latent at the capture σ
-    /// (see [`fromldm_capture`](Self::fromldm_capture)).
+    /// The shared flow-matching denoise from PRE-ENCODED Qwen3-VL prompt embeds (sc-10840): the body
+    /// behind the T2I (`edit == None`) and edit (`edit == Some`) paths. `te_out` is the phase-A
+    /// [`Ideogram4Text::encode`] output `[1, num_text, llm_dim]` (hoisted out of this loop under
+    /// `Sequential` so the encoder is dropped before the DiTs load). With `edit == None` the body is
+    /// byte-identical to the original text-to-image render (pure-noise init, full step range, no mask
+    /// blend). `run_from` is the PiD `from_ldm` early-stop loop lower bound (sc-8048): `0` runs the
+    /// full range (byte-identical); a larger value stops the denoise early, leaving the latent at the
+    /// capture σ (see [`fromldm_capture`](Self::fromldm_capture)).
     #[allow(clippy::too_many_arguments)]
-    fn run_denoise(
+    pub fn run_denoise_from_embeds(
         &self,
-        input_ids: &[i32],
+        te_out: &Array,
         height: u32,
         width: u32,
         num_steps: usize,
@@ -561,16 +448,14 @@ impl Ideogram4Pipeline {
         let grid_h = (height / patch) as i32;
         let grid_w = (width / patch) as i32;
         let num_img = grid_h * grid_w;
-        let num_text = input_ids.len() as i32;
+        // `num_text` is the phase-A embed length (single unpadded prompt → positions 0..num_text).
+        let num_text = te_out.shape()[1];
         let seq = num_text + num_img;
         let llm_dim = self.dit.llm_features_dim;
         let ch = self.dit.in_channels;
 
-        // ── Text encode (single prompt, no padding → positions 0..num_text) ──
-        let ids = Array::from_slice(input_ids, &[1, num_text]);
-        let attn = Array::from_slice(&vec![1i32; num_text as usize], &[1, num_text]);
-        let te_out = self.te.prompt_embeds(&ids, &attn)?; // [1, num_text, llm_dim]
-        let llm_features = concatenate_axis(&[&te_out, &zeros(&[1, num_img, llm_dim])?], 1)?; // [1, seq, llm_dim]
+        // ── Text conditioning: the pre-encoded Qwen3-VL embeds padded with image-token zeros ──
+        let llm_features = concatenate_axis(&[te_out, &zeros(&[1, num_img, llm_dim])?], 1)?; // [1, seq, llm_dim]
 
         // ── Packed positions / segments / role indicators (host-built) ──
         let pack = Packing::build(num_text, grid_h, grid_w);
@@ -748,6 +633,244 @@ impl Ideogram4Pipeline {
         )?;
         let u8img = mlx_rs::ops::round(&scaled, None)?.as_dtype(Dtype::Uint8)?;
         Ok(u8img.reshape(&[h, w, 3])?)
+    }
+}
+
+// The composing struct API (sc-10840): `Ideogram4Pipeline` holds the two phases and delegates every
+// public method — tokenize/encode to [`Ideogram4Text`], everything DiT/VAE to [`Ideogram4Heavy`], and
+// the `generate*` fronts to `text.encode` → `heavy.run_denoise_from_embeds`. The registry generator
+// ([`crate::model`]) holds the two phases in a `Residency` instead, dropping the text encoder between
+// them under `Sequential`. Both routes share the phase types, so their output is byte-identical.
+impl Ideogram4Pipeline {
+    /// Load all components (2 DiTs + Qwen3-VL text encoder + VAE + tokenizer) from a converted
+    /// snapshot dir — the quality (asymmetric-CFG) mode.
+    pub fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            text: Ideogram4Text::load(root)?,
+            heavy: Ideogram4Heavy::load(root)?,
+        })
+    }
+
+    /// Load the **turbo** pipeline (issue #488): the conditional DiT + Qwen3-VL TE + VAE + tokenizer,
+    /// **without** the unconditional DiT. The caller applies the TurboTime LoRA via
+    /// [`apply_adapters`](Self::apply_adapters) and runs the CFG-free [`generate`](Self::generate)
+    /// path. Skips loading the ~half-of-weights uncond DiT.
+    pub fn load_turbo(root: &Path) -> Result<Self> {
+        Ok(Self {
+            text: Ideogram4Text::load(root)?,
+            heavy: Ideogram4Heavy::load_turbo(root)?,
+        })
+    }
+
+    /// `true` when this pipeline runs the CFG-free single-DiT turbo path (no unconditional DiT).
+    pub fn is_turbo(&self) -> bool {
+        self.heavy.is_turbo()
+    }
+
+    /// Install adapters (the TurboTime LoRA, or a user Ideogram LoRA) onto the conditional DiT.
+    /// Apply **after** [`quantize`](Self::quantize). No-op for an empty spec list.
+    pub fn apply_adapters(&mut self, specs: &[AdapterSpec]) -> Result<()> {
+        self.heavy.apply_adapters(specs)
+    }
+
+    /// Quantize the whole model in place (Q4/Q8) after the dense load — the two DiTs + VAE (heavy)
+    /// and the Qwen3-VL text encoder (phase A). Each component's quantize is independent and
+    /// deterministic, so this matches the pre-split whole-model quantize.
+    pub fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.heavy.quantize(bits)?;
+        self.text.quantize(bits)?;
+        Ok(())
+    }
+
+    /// Tokenize a prompt to `input_ids` (the Qwen3-VL chat template). Delegates to [`Ideogram4Text`].
+    pub fn tokenize(&self, prompt: &str) -> Result<Vec<i32>> {
+        self.text.tokenize(prompt)
+    }
+
+    /// VAE-encode a source image into the BN-normalized packed latent. Delegates to [`Ideogram4Heavy`].
+    pub fn encode_init_latents(&self, image: &Image, height: u32, width: u32) -> Result<Array> {
+        self.heavy.encode_init_latents(image, height, width)
+    }
+
+    /// Prepare the per-request [`EditInit`] (img2img / inpaint). Delegates to [`Ideogram4Heavy`].
+    pub fn prepare_edit(
+        &self,
+        source: &Image,
+        mask: Option<&Image>,
+        strength: f32,
+        height: u32,
+        width: u32,
+    ) -> Result<EditInit> {
+        self.heavy
+            .prepare_edit(source, mask, strength, height, width)
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) capture plan. Delegates to [`Ideogram4Heavy`].
+    pub fn fromldm_capture(
+        &self,
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        strength: Option<f32>,
+        capture_sigma: Option<f32>,
+    ) -> Option<(f32, usize)> {
+        self.heavy
+            .fromldm_capture(height, width, num_steps, strength, capture_sigma)
+    }
+
+    /// Generate one image. `input_ids`: the chat-templated prompt tokens. Returns an RGB `[H, W, 3]`
+    /// `uint8` array. No progress/cancellation — see
+    /// [`generate_with_progress`](Self::generate_with_progress).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+    ) -> Result<Array> {
+        self.generate_with_progress(
+            input_ids,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            None, // native VAE decode (no PiD overlay)
+            &CancelFlag::new(),
+            &mut |_| {},
+        )
+    }
+
+    /// [`generate`](Self::generate) with cooperative cancellation + step/decode progress. Encodes the
+    /// Qwen3-VL embeds once ([`Ideogram4Text::encode`]) then denoises/decodes over the heavy bundle
+    /// ([`Ideogram4Heavy::run_denoise_from_embeds`]). Pure text-to-image (no edit conditioning).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let te_out = self.text.encode(input_ids)?;
+        self.heavy.run_denoise_from_embeds(
+            &te_out,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            None,
+            0, // full denoise range (no PiD early-stop)
+            pid,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) T2I entry: as
+    /// [`generate_with_progress`](Self::generate_with_progress) but stops the denoise at `run_from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_with_progress_from(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        run_from: usize,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let te_out = self.text.encode(input_ids)?;
+        self.heavy.run_denoise_from_embeds(
+            &te_out,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            None,
+            run_from,
+            pid,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// [`generate_with_progress`](Self::generate_with_progress) for an **edit** (img2img / mask
+    /// inpaint, sc-6303/6330).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        edit: &EditInit,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let te_out = self.text.encode(input_ids)?;
+        self.heavy.run_denoise_from_embeds(
+            &te_out,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            Some(edit),
+            0, // full denoise range (no PiD early-stop)
+            pid,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// PiD `from_ldm` early-stop (sc-8048) edit entry: as
+    /// [`generate_edit_with_progress`](Self::generate_edit_with_progress) but stops at `run_from`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_edit_with_progress_from(
+        &self,
+        input_ids: &[i32],
+        height: u32,
+        width: u32,
+        num_steps: usize,
+        guidance: f32,
+        seed: u64,
+        edit: &EditInit,
+        run_from: usize,
+        pid: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Array> {
+        let te_out = self.text.encode(input_ids)?;
+        self.heavy.run_denoise_from_embeds(
+            &te_out,
+            height,
+            width,
+            num_steps,
+            guidance,
+            seed,
+            Some(edit),
+            run_from,
+            pid,
+            cancel,
+            on_progress,
+        )
     }
 }
 
