@@ -116,8 +116,10 @@ impl FluxVariant {
                 mac_only: true,
                 supports_kv_cache: false,
                 requires_sigma_shift: self.requires_sigma_shift(),
-                // Not wired onto the shared `Residency` seam (F-176); Sequential is a no-op fallback.
-                supports_sequential_offload: false,
+                // Wired onto the shared `Residency` seam (sc-10840); honors Sequential offload —
+                // drops the T5-XXL + CLIP-L text encoders after the prompt encode so peak unified
+                // memory is bounded to `max(T5+CLIP, DiT+VAE)` instead of their sum.
+                supports_sequential_offload: true,
             },
         }
     }
