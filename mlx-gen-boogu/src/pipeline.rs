@@ -8,6 +8,24 @@
 //! trailing `1.0` is appended; each Euler step is `x += (t_next − t)·v` (t ascending 0→1, latent
 //! initialized as pure noise). True-CFG: `pred = cond + (scale − 1)·(cond − uncond)` with the uncond
 //! pass run on the empty (drop) instruction. Per-sample `B=1` (the DiT runs once per condition).
+//!
+//! ## Component residency (epic 10834, sc-10840)
+//!
+//! The assembled model splits into two component bundles so a `Sequential`-offload generate can drop
+//! the ~17.5 GB Qwen3-VL `mllm/` encoder before the ~20.6 GB DiT loads:
+//!
+//! * [`BooguEncoders`] — the phase-A **mllm** (Qwen3-VL condition encoder + its lazily-loaded vision
+//!   tower). Turns a prompt/instruction (+ optional reference images) into DiT conditioning; dropped
+//!   first under `Sequential`.
+//! * [`BooguHeavy`] — the phase-B **render** bundle (mixed-stream DiT + FLUX.1 16-ch VAE). Loaded after
+//!   the mllm is dropped; also VAE-encodes reference/init images (edit / img2img) and decodes the final
+//!   latent — so the reference *latents* are produced in the render phase (like qwen-image's
+//!   `encode_init_latents`, F-118), and only the mllm-derived conditioning has to persist across the
+//!   drop.
+//!
+//! [`BooguPipeline`] holds both bundles resident and is the byte-exact warm path the real-weight tests
+//! drive directly; the [`crate::model`] generator wires the two bundles onto the shared
+//! [`mlx_gen::Residency`] seam.
 
 use mlx_rs::ops::{add, multiply, subtract};
 use mlx_rs::transforms::eval;
@@ -147,54 +165,327 @@ impl Default for EditOptions {
     }
 }
 
-/// The assembled Boogu Base pipeline: tokenizer + Qwen3-VL condition encoder + DiT + FLUX.1 VAE.
-///
-/// The Qwen3-VL **vision tower** (image-conditioned editing) is loaded lazily on the first
-/// [`Self::generate_edit`] call and cached, so the text-to-image paths keep their original footprint.
-pub struct BooguPipeline {
-    tok: BooguTokenizer,
+/// The phase-A **mllm** encoder bundle (epic 10834, sc-10840) — the Qwen3-VL condition encoder (`mllm/`
+/// text tower, ~17.5 GB bf16) plus its lazily-loaded (f32) vision tower for image-conditioned editing.
+/// Everything the mllm needs to turn a prompt/instruction (+ optional reference images) into DiT
+/// conditioning lives here; nothing it produces references the DiT/VAE, so the whole bundle can be
+/// dropped before the render bundle loads (`Sequential` offload).
+pub(crate) struct BooguEncoders {
     te: BooguTextEncoder,
-    dit: BooguTransformer,
-    vae: Vae,
     /// Snapshot root — kept so the vision tower can be lazily loaded from `mllm/` on first edit.
     root: PathBuf,
     /// Lazily-loaded (f32) Qwen3-VL vision tower; `None` until the first image-conditioned edit.
     vision: RefCell<Option<VisionTower>>,
 }
 
-impl BooguPipeline {
-    /// Load the text-to-image components from a standard Boogu snapshot (`mllm/`, `transformer/`,
-    /// `vae/`). The vision tower (edit-only) loads lazily on the first [`Self::generate_edit`].
-    pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
+/// The phase-B **render** bundle: the mixed-stream DiT (~20.6 GB bf16) + the FLUX.1 16-ch VAE. Loaded
+/// AFTER the mllm is dropped under `Sequential`, bounding peak unified memory to `max(mllm, DiT+VAE)`
+/// instead of their sum. The VAE both encodes reference/init images (edit / img2img — [`Self::
+/// encode_ref_latents`] / [`Self::encode_init_clean`]) and decodes the final latent, so it lives with
+/// the DiT (never the mllm): the reference latents are produced in the render phase, and only the
+/// mllm-derived conditioning has to persist across the drop.
+pub(crate) struct BooguHeavy {
+    dit: BooguTransformer,
+    vae: Vae,
+}
+
+/// The materialized mllm conditioning for the true-CFG Base and instruction-Edit paths: the positive
+/// instruction hidden states + mask, and (when CFG is active) the empty/drop-instruction uncond twin.
+/// Produced in phase A; under `Sequential` [`Self::materialize`] `eval`s it before the mllm is dropped
+/// so no un-evaluated output keeps the ~17.5 GB encoder referenced through MLX's lazy graph.
+pub(crate) struct BooguBaseCond {
+    cond: Array,
+    cond_mask: Array,
+    uncond: Option<(Array, Array)>,
+}
+
+impl BooguBaseCond {
+    /// Force-evaluate the conditioning tensors (cond + mask + optional uncond twin) while the encoder
+    /// is still alive — MLX is lazy, so an un-evaluated output would keep the encoder referenced and
+    /// the `Sequential` drop would free nothing. No-op-equivalent under `Resident` (never called).
+    pub(crate) fn materialize(&self) -> Result<()> {
+        let mut arrays = vec![&self.cond, &self.cond_mask];
+        if let Some((hidden, mask)) = &self.uncond {
+            arrays.push(hidden);
+            arrays.push(mask);
+        }
+        eval(arrays)?;
+        Ok(())
+    }
+}
+
+impl BooguEncoders {
+    /// Load the Qwen3-VL condition encoder from a snapshot's `mllm/`. The vision tower (edit-only)
+    /// loads lazily on the first image-conditioned edit, so the text-to-image paths keep their footprint.
+    pub(crate) fn load(root: &Path) -> Result<Self> {
         Ok(Self {
-            tok: BooguTokenizer::from_snapshot(root)?,
             te: load_text_encoder(root)?,
-            dit: load_transformer(root)?,
-            vae: load_vae(root)?,
             root: root.to_path_buf(),
             vision: RefCell::new(None),
         })
     }
 
-    /// Generate one RGB image from a text prompt. Convenience wrapper over
-    /// [`Self::generate_with_progress`] with no cancellation and a no-op progress sink.
-    pub fn generate(&self, prompt: &str, opts: &GenerateOptions) -> Result<Image> {
-        let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
-        self.generate_with_progress(prompt, opts, &sigmas, None, &CancelFlag::new(), &mut |_| {})
+    /// Quantize the Qwen3-VL text tower (Q4/Q8) in place — the mllm half of the E8 quant scope. The
+    /// lazily-loaded f32 vision tower stays dense (E7b-1 parity finding). No-op on an already-packed base.
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.te.quantize(bits)
     }
 
-    /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
-    /// each denoise step. A pre/mid-flight cancellation returns [`Error::Canceled`]; the per-step
-    /// `eval` bounds the lazy MLX graph and lets the cancel check interrupt mid-render.
-    ///
-    /// The `RES_MIN`/`RES_MAX` (256–2048) resolution range and the multiple-of-`RES_MULTIPLE`
-    /// constraint are a **Generator-layer guarantee** — enforced by `model::validate_request` (via
-    /// the shared `Capabilities` min/max-size + the explicit multiple check) before this pipeline
-    /// runs. This entry trusts the already-validated [`GenerateOptions`] dims (sc-6983).
-    pub fn generate_with_progress(
+    /// Base / img2img true-CFG conditioning: the positive instruction, plus (when `guidance > 1`) the
+    /// empty/drop CFG-negative instruction. Byte-identical to the pre-split inline encode.
+    pub(crate) fn encode_base(
         &self,
+        tok: &BooguTokenizer,
         prompt: &str,
+        guidance: f32,
+    ) -> Result<BooguBaseCond> {
+        let (cond_ids, cond_mask) = tok.encode_t2i(prompt)?;
+        let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
+        let uncond = if guidance > 1.0 {
+            let (u_ids, u_mask) = tok.encode_negative()?;
+            Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
+        } else {
+            None
+        };
+        Ok(BooguBaseCond {
+            cond,
+            cond_mask,
+            uncond,
+        })
+    }
+
+    /// Turbo (CFG-free DMD student) conditioning: the positive instruction only (no unconditional
+    /// branch — the guided velocity is distilled into the weights).
+    pub(crate) fn encode_turbo(
+        &self,
+        tok: &BooguTokenizer,
+        prompt: &str,
+    ) -> Result<(Array, Array)> {
+        let (ids, mask) = tok.encode_t2i(prompt)?;
+        let cond = self.te.last_hidden(&ids, &mask)?;
+        Ok((cond, mask))
+    }
+
+    /// Instruction-Edit conditioning (true-CFG). Faithful edit (`condition_on_image`) runs the
+    /// references through the Qwen3-VL vision tower so the MLLM sees them (image-conditioned instruction
+    /// features); otherwise the instruction is encoded text-only. The CFG-negative is the empty/drop
+    /// instruction, optionally image-conditioned (`use_input_images_4_neg_instruct`).
+    pub(crate) fn encode_edit(
+        &self,
+        tok: &BooguTokenizer,
+        references: &[Image],
+        instruction: &str,
+        opts: &EditOptions,
+    ) -> Result<BooguBaseCond> {
+        let (cond, cond_mask) = if opts.condition_on_image {
+            self.encode_image_instruction(tok, references, instruction)?
+        } else {
+            let (ids, mask) = tok.encode_edit(instruction)?;
+            (self.te.last_hidden(&ids, &mask)?, mask)
+        };
+        let uncond = if opts.text_guidance_scale > 1.0 {
+            if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
+                Some(self.encode_image_instruction(tok, references, "")?)
+            } else {
+                let (u_ids, u_mask) = tok.encode_negative()?;
+                Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
+            }
+        } else {
+            None
+        };
+        Ok(BooguBaseCond {
+            cond,
+            cond_mask,
+            uncond,
+        })
+    }
+
+    /// Image-conditioned instruction features for the edit path: preprocess each reference, run the
+    /// (lazily-loaded, f32) Qwen3-VL vision tower over each, build the chat template with one image
+    /// block per reference, and run the multi-image-conditioned MLLM forward. Returns
+    /// `(features [1, L, 4096], mask [1, L])` — the same `(hidden, mask)` shape the DiT
+    /// `forward_edit_multi` consumes, but with each `<|image_pad|>` run carrying its reference's merged
+    /// embeds + deepstack injections. A single reference is the `references.len() == 1` case.
+    fn encode_image_instruction(
+        &self,
+        tok: &BooguTokenizer,
+        references: &[Image],
+        instruction: &str,
+    ) -> Result<(Array, Array)> {
+        self.ensure_vision()?;
+        let vision = self.vision.borrow();
+        let tower = vision
+            .as_ref()
+            .expect("vision tower loaded by ensure_vision");
+
+        // Each reference → Qwen3-VL preprocessing (its own smart-resize / grid) → vision tower; collect
+        // per-image embeds / deepstack / grid + the merged-token count that drives the chat template.
+        let mut image_embeds: Vec<Array> = Vec::with_capacity(references.len());
+        let mut deepstacks: Vec<Vec<Array>> = Vec::with_capacity(references.len());
+        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(references.len());
+        let mut counts: Vec<usize> = Vec::with_capacity(references.len());
+        for r in references {
+            let rgb = image::RgbImage::from_raw(r.width, r.height, r.pixels.clone()).ok_or_else(
+                || Error::Msg("boogu edit: reference pixels != width·height·3".into()),
+            )?;
+            let (pixel_values, grid) = preprocess_image(&rgb)?;
+            let (embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
+            counts.push(embeds.shape()[0] as usize);
+            image_embeds.push(embeds);
+            deepstacks.push(deepstack);
+            grids.push(grid);
+        }
+
+        // Chat template with one `<|image_pad|>` block per reference, then the multi-image-conditioned
+        // MLLM forward (per-image vision splice + 3-D MRoPE advancing per image + deepstack injection).
+        let (ids, mask) = tok.encode_edit_with_images(instruction, &counts)?;
+        let feats = self.te.last_hidden_with_image_multi(
+            &ids,
+            &mask,
+            &image_embeds,
+            &deepstacks,
+            &grids,
+            IMAGE_TOKEN_ID,
+        )?;
+        Ok((feats, mask))
+    }
+
+    /// Ensure the Qwen3-VL vision tower is loaded (lazy, cached). Loaded from the snapshot's `mllm/`
+    /// (f32 — see [`load_vision_tower`]) only on the first image-conditioned edit, so the T2I paths
+    /// never pay for it.
+    fn ensure_vision(&self) -> Result<()> {
+        let needs_load = self.vision.borrow().is_none();
+        if needs_load {
+            let tower = load_vision_tower(&self.root)?;
+            *self.vision.borrow_mut() = Some(tower);
+        }
+        Ok(())
+    }
+}
+
+impl BooguHeavy {
+    /// Load the DiT + FLUX.1 VAE from a standard Boogu snapshot (`transformer/`, `vae/`).
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        Ok(Self {
+            dit: load_transformer(root)?,
+            vae: load_vae(root)?,
+        })
+    }
+
+    /// Quantize the DiT (~20.6 GB bf16) to Q4/Q8 in place — the render half of the E8 quant scope. The
+    /// FLUX.1 VAE (decode-precision-sensitive) stays dense. No-op on an already-packed base.
+    pub(crate) fn quantize(&mut self, bits: i32) -> Result<()> {
+        self.dit.quantize(bits)
+    }
+
+    /// VAE-encode a single init/reference image into a clean latent `[1, 16, H/8, W/8]` at the output
+    /// resolution (img2img latent-init). `preprocess_init_image` LANCZOS-resizes to W×H and normalizes
+    /// to `[-1,1]` NCHW. Seed-independent — the caller hoists it once across the `count` loop.
+    pub(crate) fn encode_init_clean(&self, init: &Image, width: u32, height: u32) -> Result<Array> {
+        self.vae
+            .encode(&preprocess_init_image(init, width, height)?)
+    }
+
+    /// VAE-encode each edit reference into its own clean latent `[1, 16, rH/8, rW/8]` (packed into the
+    /// DiT image sequence by `forward_edit_multi`). Validates the `1..` count + per-reference
+    /// multiple-of-16 dims. Seed-independent — hoisted once across the `count` loop.
+    pub(crate) fn encode_ref_latents(&self, references: &[Image]) -> Result<Vec<Array>> {
+        if references.is_empty() {
+            return Err(Error::Msg(
+                "boogu edit: at least one reference image is required".into(),
+            ));
+        }
+        references
+            .iter()
+            .map(|r| {
+                validate_multiple_of_16(r.width, r.height, "boogu")?;
+                self.vae.encode(&image_to_pixels(r)?)
+            })
+            .collect()
+    }
+
+    /// True-CFG flow velocity for the Base / img2img paths: `pred = cond + (scale − 1)·(cond − uncond)`
+    /// (or `cond` alone when CFG is off), negated into `run_flow_sampler`'s noise-fraction FLOW
+    /// convention and cast to f32. Shared by [`Self::render_base_t2i`] and [`Self::render_base_img2img`].
+    fn base_velocity(
+        &self,
+        x: &Array,
+        timestep: f32,
+        c: &BooguBaseCond,
+        scale: f32,
+    ) -> Result<Array> {
+        let t = Array::from_slice(&[timestep], &[1]);
+        let cond_v = self.dit.forward(x, &t, &c.cond, &c.cond_mask)?;
+        let pred = match &c.uncond {
+            Some((u_hidden, u_mask)) => {
+                let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
+                add(
+                    &cond_v,
+                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                )?
+            }
+            None => cond_v,
+        };
+        Ok(multiply(
+            &pred.as_dtype(Dtype::Float32)?,
+            Array::from_f32(-1.0),
+        )?)
+    }
+
+    /// True-CFG flow velocity for the Edit path — identical to [`Self::base_velocity`] but with the
+    /// reference latents threaded through the DiT's `forward_edit_multi` (`[ref₀; …; ref_{N-1}; noise]`).
+    fn edit_velocity(
+        &self,
+        x: &Array,
+        ref_latents: &[Array],
+        timestep: f32,
+        c: &BooguBaseCond,
+        scale: f32,
+    ) -> Result<Array> {
+        let t = Array::from_slice(&[timestep], &[1]);
+        let cond_v = self
+            .dit
+            .forward_edit_multi(x, ref_latents, &t, &c.cond, &c.cond_mask)?;
+        let pred = match &c.uncond {
+            Some((u_hidden, u_mask)) => {
+                let uncond_v = self
+                    .dit
+                    .forward_edit_multi(x, ref_latents, &t, u_hidden, u_mask)?;
+                add(
+                    &cond_v,
+                    &multiply(&subtract(&cond_v, &uncond_v)?, Array::from_f32(scale - 1.0))?,
+                )?
+            }
+            None => cond_v,
+        };
+        Ok(multiply(
+            &pred.as_dtype(Dtype::Float32)?,
+            Array::from_f32(-1.0),
+        )?)
+    }
+
+    /// CFG-free flow velocity for the Turbo DMD student: one DiT forward, negated into the FLOW
+    /// convention and cast to f32.
+    fn turbo_velocity(
+        &self,
+        x: &Array,
+        timestep: f32,
+        cond: &Array,
+        mask: &Array,
+    ) -> Result<Array> {
+        let t = Array::from_slice(&[timestep], &[1]);
+        let v = self.dit.forward(x, &t, cond, mask)?;
+        Ok(multiply(
+            &v.as_dtype(Dtype::Float32)?,
+            Array::from_f32(-1.0),
+        )?)
+    }
+
+    /// Render one Base (true-CFG) image from pure noise. `sigmas` is the (possibly `from_ldm`-truncated)
+    /// schedule; `c` is the phase-A conditioning; the per-image seed lives on `opts.seed`.
+    pub(crate) fn render_base_t2i(
+        &self,
+        c: &BooguBaseCond,
         opts: &GenerateOptions,
         sigmas: &[f32],
         decoder: Option<&dyn LatentDecoder>,
@@ -202,30 +493,7 @@ impl BooguPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
-
-        // Condition encoding: positive instruction + CFG-negative (empty/drop) instruction.
-        let (cond_ids, cond_mask) = self.tok.encode_t2i(prompt)?;
-        let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
-        let do_cfg = opts.text_guidance_scale > 1.0;
-        let uncond = if do_cfg {
-            let (u_ids, u_mask) = self.tok.encode_negative()?;
-            Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
-        } else {
-            None
-        };
-
-        // Initial latent noise [1, 16, H/8, W/8] (f32; the DiT casts to its compute dtype).
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
-
-        // Route the flow-match denoise through the unified curated-sampler framework (epic 7114): the
-        // native static-shift (`mu = 1.15`, v1 logistic) schedule is the byte-exact default and the
-        // curated sampler/scheduler menus become selectable. Boogu feeds the shifted clean-fraction
-        // timestep `t = 1 − σ` to the DiT (OneMinusSigma) and its DiT predicts the velocity in
-        // clean-fraction time (`dz/dt`), so `predict` negates it into `run_flow_sampler`'s noise-fraction
-        // FLOW convention (`dz/dσ = −dz/dt`) and casts to f32 (the native step's dtype). Cancellation,
-        // the per-step `eval`, and progress all live in `run_flow_sampler`. The `sigmas` schedule is
-        // built + resolved by the model layer ([`base_flow_schedule`]) so the PiD `from_ldm` early-stop
-        // (sc-8048) can hand a *truncated* slice here; the full schedule is byte-identical to before.
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
@@ -235,51 +503,21 @@ impl BooguPipeline {
             opts.seed,
             cancel,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let cond_v = self.dit.forward(x, &t, &cond, &cond_mask)?;
-                let pred = match &uncond {
-                    Some((u_hidden, u_mask)) => {
-                        let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
-                        // pred = cond + (scale − 1)·(cond − uncond)
-                        add(
-                            &cond_v,
-                            &multiply(
-                                &subtract(&cond_v, &uncond_v)?,
-                                Array::from_f32(scale - 1.0),
-                            )?,
-                        )?
-                    }
-                    None => cond_v,
-                };
-                Ok(multiply(
-                    &pred.as_dtype(Dtype::Float32)?,
-                    Array::from_f32(-1.0),
-                )?)
-            },
+            |x, timestep| self.base_velocity(x, timestep, c, scale),
         )?;
-
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder)
     }
 
-    /// **img2img latent-init on the Base (true-CFG) path** (epic 8588 A4.3, sc-10191). Seed the
-    /// flow-match denoise from a VAE-encoded `init` reference instead of pure noise: resize the
-    /// reference to the output W×H, encode it into the same normalized `[1, 16, H/8, W/8]` latent space
-    /// as [`init_noise`] (Boogu's FLUX.1 16-ch VAE, no temporal axis to squeeze — unlike Krea's
-    /// Qwen-Image VAE), blend `(1 − σ_k)·clean + σ_k·noise` at the start sigma `σ_k = sigmas[start_step]`,
-    /// and run the same true-CFG Euler over the tail `sigmas[start_step..]`. Higher strength → later
-    /// `start_step` → fewer denoise steps → the output stays closer to the reference.
-    ///
-    /// `sigmas` is the model layer's schedule already truncated for the PiD `from_ldm` early-stop
-    /// (`[..keep]`), so the effective denoise window is `sigmas[start_step..]` (`keep > start_step`,
-    /// mirroring Z-Image). The CFG velocity is byte-identical to [`Self::generate_with_progress`]; only
-    /// the initial latent (noise-blend vs pure noise) and the schedule slice differ.
+    /// Render one Base (true-CFG) **img2img** image: seed the denoise from the (pre-encoded) `clean`
+    /// reference latent blended with noise at `σ_k = sigmas[start_step]` and run the true-CFG Euler over
+    /// the tail `sigmas[start..]`. `clean` is hoisted by the caller (seed-independent). Byte-identical to
+    /// the pre-split path — only the VAE-encode of the reference moved out to [`Self::encode_init_clean`].
     #[allow(clippy::too_many_arguments)]
-    pub fn generate_base_img2img_with_progress(
+    pub(crate) fn render_base_img2img(
         &self,
-        prompt: &str,
-        init: &Image,
+        c: &BooguBaseCond,
+        clean: &Array,
         start_step: usize,
         opts: &GenerateOptions,
         sigmas: &[f32],
@@ -288,30 +526,10 @@ impl BooguPipeline {
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
-
-        let (cond_ids, cond_mask) = self.tok.encode_t2i(prompt)?;
-        let cond = self.te.last_hidden(&cond_ids, &cond_mask)?;
-        let do_cfg = opts.text_guidance_scale > 1.0;
-        let uncond = if do_cfg {
-            let (u_ids, u_mask) = self.tok.encode_negative()?;
-            Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
-        } else {
-            None
-        };
-
-        // Reference → clean latent [1, 16, H/8, W/8] at the output resolution. `preprocess_init_image`
-        // LANCZOS-resizes to W×H and normalizes to `[-1,1]` NCHW (the VAE encoder's expected input),
-        // matching the edit path's `image_to_pixels` normalization but with the img2img resize.
-        let clean = self
-            .vae
-            .encode(&preprocess_init_image(init, opts.width, opts.height)?)?;
         let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
-        // Seed at σ_k and denoise the tail. `start` is clamped so a strength that lands at the schedule
-        // end still leaves one step (the model layer only routes here when `start_step > 0`).
         let start = start_step.min(sigmas.len().saturating_sub(1));
-        let lat = add_noise_by_interpolation(&clean, &noise, sigmas[start])?;
+        let lat = add_noise_by_interpolation(clean, &noise, sigmas[start])?;
         let denoise_sigmas = &sigmas[start..];
-
         let scale = opts.text_guidance_scale;
         let lat = run_flow_sampler(
             opts.sampler.as_deref(),
@@ -321,50 +539,18 @@ impl BooguPipeline {
             opts.seed,
             cancel,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let cond_v = self.dit.forward(x, &t, &cond, &cond_mask)?;
-                let pred = match &uncond {
-                    Some((u_hidden, u_mask)) => {
-                        let uncond_v = self.dit.forward(x, &t, u_hidden, u_mask)?;
-                        // pred = cond + (scale − 1)·(cond − uncond)
-                        add(
-                            &cond_v,
-                            &multiply(
-                                &subtract(&cond_v, &uncond_v)?,
-                                Array::from_f32(scale - 1.0),
-                            )?,
-                        )?
-                    }
-                    None => cond_v,
-                };
-                Ok(multiply(
-                    &pred.as_dtype(Dtype::Float32)?,
-                    Array::from_f32(-1.0),
-                )?)
-            },
+            |x, timestep| self.base_velocity(x, timestep, c, scale),
         )?;
-
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder)
     }
 
-    /// Generate one RGB image via the **Turbo** DMD student few-step sampler (Boogu-Image-0.1-Turbo).
-    ///
-    /// Pure T2I, **no CFG** (the distilled student needs `text_guidance_scale == 1`). The sigma grid
-    /// is `linspace(conditioning_sigma, 1.0, steps+1)[:-1]` (ascending; `sigma` is the clean-fraction,
-    /// so the latent starts as noise). Each step: predict → `x += (1 − sigma)·v`, then (except the
-    /// last) renoise to the next level `x = (1 − sigma_next)·noise + sigma_next·x` with fresh noise.
-    /// Same DiT/TE/VAE as Base — only the sampler differs — so load this from a Turbo snapshot.
-    pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
-        self.generate_turbo_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
-    }
-
-    /// [`Self::generate_turbo`] with [`Progress`] streaming and per-step cooperative cancellation
-    /// ([`Error::Canceled`]).
-    pub fn generate_turbo_with_progress(
+    /// Render one Turbo (DMD few-step, CFG-free) image from pure noise. A selected sampler/scheduler
+    /// routes through the curated unified framework over the DMD σ grid; unset is the native DMD loop.
+    pub(crate) fn render_turbo_t2i(
         &self,
-        prompt: &str,
+        cond: &Array,
+        mask: &Array,
         opts: &TurboOptions,
         decoder: Option<&dyn LatentDecoder>,
         cancel: &CancelFlag,
@@ -372,25 +558,12 @@ impl BooguPipeline {
     ) -> Result<Image> {
         validate_multiple_of_16(opts.width, opts.height, "boogu")?;
 
-        let (ids, mask) = self.tok.encode_t2i(prompt)?;
-        let cond = self.te.last_hidden(&ids, &mask)?;
-
-        // Curated sampler axis (epic 7114 sc-7297): a selected sampler/scheduler routes the few-step
-        // denoise through the unified framework over the DMD σ grid. The DMD x0 estimate is identical
-        // to the native loop (`x0 = x + (1−c)·v`, the OneMinusSigma flow denoise with the velocity
-        // negated); only the renoise convention differs (the curated solver re-noises, the native loop
-        // flow-blends). Unset (the default) is the native DMD student loop, byte-exact below.
         if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
-            // F-093 / sc-11122: a scheduler-only request (sampler unset) must NOT fall through to
-            // `run_flow_sampler`'s `None → Euler` mapping — the deterministic solver `descriptor_turbo`
-            // deliberately excludes as out-of-regime for the DMD student (sc-7491). Default the sampler to
-            // `lcm`, the surveyed closest match (the curated few-step default), so the curated branch never
-            // resolves to Euler on Turbo.
+            // F-093 / sc-11122: a scheduler-only request defaults the sampler to `lcm` so the curated
+            // branch never resolves to the excluded Euler on the DMD student.
             let sampler = turbo_curated_sampler(opts.sampler.as_deref());
             let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
             let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
-            // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
-            // scheduler re-shape over the same σ span.
             let sigmas = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
             let lat = run_flow_sampler(
                 Some(sampler),
@@ -400,14 +573,7 @@ impl BooguPipeline {
                 opts.seed,
                 cancel,
                 on_progress,
-                |x, timestep| {
-                    let t = Array::from_slice(&[timestep], &[1]);
-                    let v = self.dit.forward(x, &t, &cond, &mask)?;
-                    Ok(multiply(
-                        &v.as_dtype(Dtype::Float32)?,
-                        Array::from_f32(-1.0),
-                    )?)
-                },
+                |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
             )?;
             on_progress(Progress::Decoding);
             return self.decode_latents(&lat, decoder);
@@ -416,8 +582,8 @@ impl BooguPipeline {
         let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
         let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
         let lat = self.denoise_turbo_native(
-            &cond,
-            &mask,
+            cond,
+            mask,
             lat,
             &sigmas,
             0,
@@ -427,18 +593,106 @@ impl BooguPipeline {
             cancel,
             on_progress,
         )?;
-
         on_progress(Progress::Decoding);
         self.decode_latents(&lat, decoder)
     }
 
-    /// The native DMD student few-step loop, shared by the Turbo t2i and img2img default paths so the
-    /// two never diverge (F-093 / sc-11122: the img2img path used to fall through to the excluded
-    /// deterministic Euler solver). Runs `sigmas[start..]` (clean-fraction ascending): each step
-    /// predicts the clean estimate `x += (1 − σ)·v` (f32), then — except on the final entry — renoises
-    /// to the next level `x = (1 − σ_next)·noise + σ_next·x` with fresh per-step noise. `lat` is the
-    /// already-seeded start latent (pure noise for t2i, the noise-blended reference for img2img);
-    /// progress streams over the `sigmas.len() − start` steps and cancellation is honored per step.
+    /// Render one Turbo **img2img** image: seed the few-step DMD denoise from the (pre-encoded) `clean`
+    /// reference latent noise-blended at the start σ. Curated + native branches mirror the t2i path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_turbo_img2img(
+        &self,
+        cond: &Array,
+        mask: &Array,
+        clean: &Array,
+        start_step: usize,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+
+        let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
+
+        if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
+            let sampler = turbo_curated_sampler(opts.sampler.as_deref());
+            let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
+            let full = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
+            let start = start_step.min(full.len().saturating_sub(1));
+            let lat = add_noise_by_interpolation(clean, &noise, full[start])?;
+            let sigmas = &full[start..];
+            let lat = run_flow_sampler(
+                Some(sampler),
+                TimestepConvention::OneMinusSigma,
+                sigmas,
+                lat,
+                opts.seed,
+                cancel,
+                on_progress,
+                |x, timestep| self.turbo_velocity(x, timestep, cond, mask),
+            )?;
+            on_progress(Progress::Decoding);
+            return self.decode_latents(&lat, decoder);
+        }
+
+        // Native DMD student loop seeded from the noise-blended reference (see the pre-split note: the
+        // native clean-fraction `c_k` → noise-fraction `1 − c_k` matches the curated blend byte-for-byte).
+        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
+        let start = start_step.min(sigmas.len().saturating_sub(1));
+        let lat = add_noise_by_interpolation(clean, &noise, 1.0 - sigmas[start])?;
+        let lat = self.denoise_turbo_native(
+            cond,
+            mask,
+            lat,
+            &sigmas,
+            start,
+            opts.height,
+            opts.width,
+            opts.seed,
+            cancel,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
+    /// Render one Edit (true-CFG) image: flow-match denoise from pure noise with the (pre-encoded)
+    /// reference latents packed into the DiT image sequence. `c` is the phase-A (optionally
+    /// image-conditioned) instruction conditioning; `ref_latents` is hoisted by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_edit(
+        &self,
+        c: &BooguBaseCond,
+        ref_latents: &[Array],
+        opts: &EditOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
+        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
+        let scale = opts.text_guidance_scale;
+        let lat = run_flow_sampler(
+            opts.sampler.as_deref(),
+            TimestepConvention::OneMinusSigma,
+            sigmas,
+            lat,
+            opts.seed,
+            cancel,
+            on_progress,
+            |x, timestep| self.edit_velocity(x, ref_latents, timestep, c, scale),
+        )?;
+        on_progress(Progress::Decoding);
+        self.decode_latents(&lat, decoder)
+    }
+
+    /// The native DMD student few-step loop, shared by the Turbo t2i and img2img paths so the two never
+    /// diverge (F-093 / sc-11122). Runs `sigmas[start..]` (clean-fraction ascending): each step predicts
+    /// the clean estimate `x += (1 − σ)·v` (f32), then — except on the final entry — renoises to the next
+    /// level `x = (1 − σ_next)·noise + σ_next·x` with fresh per-step noise. `lat` is the already-seeded
+    /// start latent; progress streams over the `sigmas.len() − start` steps, cancellation per step.
     #[allow(clippy::too_many_arguments)]
     fn denoise_turbo_native(
         &self,
@@ -487,15 +741,126 @@ impl BooguPipeline {
         Ok(lat)
     }
 
+    /// VAE-decode (or PiD-decode) a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
+    /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed; PiD
+    /// consumes that same normalized latent and additionally 4× super-resolves. `decoder` is `Some` only
+    /// when the request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else native VAE.
+    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
+        let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
+        let decoded = decoder.decode(lat)?.as_dtype(Dtype::Float32)?; // VAE [1,3,1,H,W]; PiD [1,3,4H,4W]
+        decoded_to_image(&decoded)
+    }
+}
+
+/// The assembled Boogu pipeline holding both component bundles resident: tokenizer + [`BooguEncoders`]
+/// (Qwen3-VL condition encoder + lazy vision tower) + [`BooguHeavy`] (DiT + FLUX.1 VAE). This is the
+/// byte-exact warm path the real-weight tests drive directly; the [`crate::model`] generator stages the
+/// same two bundles onto the shared [`mlx_gen::Residency`] seam for `Sequential` offload.
+pub struct BooguPipeline {
+    tok: BooguTokenizer,
+    enc: BooguEncoders,
+    heavy: BooguHeavy,
+}
+
+impl BooguPipeline {
+    /// Load the text-to-image components from a standard Boogu snapshot (`mllm/`, `transformer/`,
+    /// `vae/`). The vision tower (edit-only) loads lazily on the first edit.
+    pub fn from_snapshot(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        Ok(Self {
+            tok: BooguTokenizer::from_snapshot(root)?,
+            enc: BooguEncoders::load(root)?,
+            heavy: BooguHeavy::load(root)?,
+        })
+    }
+
+    /// Generate one RGB image from a text prompt. Convenience wrapper over
+    /// [`Self::generate_with_progress`] with no cancellation and a no-op progress sink.
+    pub fn generate(&self, prompt: &str, opts: &GenerateOptions) -> Result<Image> {
+        let sigmas = base_flow_schedule(opts.steps, opts.scheduler.as_deref());
+        self.generate_with_progress(prompt, opts, &sigmas, None, &CancelFlag::new(), &mut |_| {})
+    }
+
+    /// Generate one RGB image from a text prompt, streaming [`Progress`] and honoring `cancel` at
+    /// each denoise step. A pre/mid-flight cancellation returns [`Error::Canceled`]; the per-step
+    /// `eval` bounds the lazy MLX graph and lets the cancel check interrupt mid-render.
+    ///
+    /// The `RES_MIN`/`RES_MAX` (256–2048) resolution range and the multiple-of-`RES_MULTIPLE`
+    /// constraint are a **Generator-layer guarantee** — enforced by `model::validate_request` before
+    /// this pipeline runs. This entry trusts the already-validated [`GenerateOptions`] dims (sc-6983).
+    pub fn generate_with_progress(
+        &self,
+        prompt: &str,
+        opts: &GenerateOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let cond = self
+            .enc
+            .encode_base(&self.tok, prompt, opts.text_guidance_scale)?;
+        self.heavy
+            .render_base_t2i(&cond, opts, sigmas, decoder, cancel, on_progress)
+    }
+
+    /// **img2img latent-init on the Base (true-CFG) path** (epic 8588 A4.3, sc-10191). Seed the
+    /// flow-match denoise from a VAE-encoded `init` reference instead of pure noise. See
+    /// [`BooguHeavy::render_base_img2img`] for the noise-blend detail; `sigmas` is the model layer's
+    /// schedule already truncated for the PiD `from_ldm` early-stop (`[..keep]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_base_img2img_with_progress(
+        &self,
+        prompt: &str,
+        init: &Image,
+        start_step: usize,
+        opts: &GenerateOptions,
+        sigmas: &[f32],
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let cond = self
+            .enc
+            .encode_base(&self.tok, prompt, opts.text_guidance_scale)?;
+        let clean = self
+            .heavy
+            .encode_init_clean(init, opts.width, opts.height)?;
+        self.heavy.render_base_img2img(
+            &cond,
+            &clean,
+            start_step,
+            opts,
+            sigmas,
+            decoder,
+            cancel,
+            on_progress,
+        )
+    }
+
+    /// Generate one RGB image via the **Turbo** DMD student few-step sampler (Boogu-Image-0.1-Turbo).
+    /// Pure T2I, **no CFG**. Convenience wrapper over [`Self::generate_turbo_with_progress`].
+    pub fn generate_turbo(&self, prompt: &str, opts: &TurboOptions) -> Result<Image> {
+        self.generate_turbo_with_progress(prompt, opts, None, &CancelFlag::new(), &mut |_| {})
+    }
+
+    /// [`Self::generate_turbo`] with [`Progress`] streaming and per-step cooperative cancellation
+    /// ([`Error::Canceled`]).
+    pub fn generate_turbo_with_progress(
+        &self,
+        prompt: &str,
+        opts: &TurboOptions,
+        decoder: Option<&dyn LatentDecoder>,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let (cond, mask) = self.enc.encode_turbo(&self.tok, prompt)?;
+        self.heavy
+            .render_turbo_t2i(&cond, &mask, opts, decoder, cancel, on_progress)
+    }
+
     /// **img2img latent-init on the Turbo (DMD few-step, CFG-free) path** (epic 8588 A4.3, sc-10191).
-    /// The distilled analog of [`Self::generate_base_img2img_with_progress`]: VAE-encode the `init`
-    /// reference into the output-resolution latent, then seed the few-step denoise from the
-    /// noise-blended reference instead of pure noise. Routes through the curated [`run_flow_sampler`]
-    /// over the Turbo DMD grid's **noise-fraction** view ([`turbo_native_sigmas`], descending to the
-    /// trailing `0`), so the img2img noise-blend convention (`(1 − σ)·clean + σ·noise`) is consistent
-    /// with the Base path; `start_step` slices the tail. CFG-free (one DiT forward per step, the
-    /// velocity negated into the FLOW convention). The PiD `from_ldm` early-stop is not applicable to
-    /// Turbo (it rejects `pid_capture_sigma`); a `decoder`, if any, is the σ=0 PiD super-resolver.
+    /// The distilled analog of [`Self::generate_base_img2img_with_progress`].
     #[allow(clippy::too_many_arguments)]
     pub fn generate_turbo_img2img_with_progress(
         &self,
@@ -507,94 +872,24 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
-
-        let (ids, mask) = self.tok.encode_t2i(prompt)?;
-        let cond = self.te.last_hidden(&ids, &mask)?;
-
-        // Reference → clean latent [1, 16, H/8, W/8] at the output resolution (same VAE space as
-        // `init_noise`).
+        let (cond, mask) = self.enc.encode_turbo(&self.tok, prompt)?;
         let clean = self
-            .vae
-            .encode(&preprocess_init_image(init, opts.width, opts.height)?)?;
-        let noise = init_noise(opts.height, opts.width, opts.seed, 0)?;
-
-        // Curated sampler axis (epic 7114 sc-7491), mirroring the Turbo t2i split: a selected
-        // sampler/scheduler routes the img2img few-step denoise through the unified framework over the
-        // DMD σ grid's noise-fraction view. **Unset (the default) is the native DMD student loop** — NOT
-        // a fall-through to `run_flow_sampler`, whose `None → Euler` mapping is the deterministic solver
-        // `descriptor_turbo` deliberately excludes as out-of-regime for this DMD student (sc-7491). This
-        // is the F-093 / sc-11122 fix: the default img2img request now renders on the same native DMD
-        // solver as t2i instead of the excluded Euler.
-        if turbo_uses_curated(opts.sampler.as_deref(), opts.scheduler.as_deref()) {
-            // F-093 / sc-11122: mirror the t2i split — a scheduler-only request (sampler unset) defaults
-            // to `lcm` (the surveyed curated few-step default) so the curated branch never falls through
-            // to `run_flow_sampler`'s excluded `None → Euler` deterministic solver on Turbo.
-            let sampler = turbo_curated_sampler(opts.sampler.as_deref());
-            // The Turbo grid is linear in clean-fraction (no logistic shift), so the curated scheduler
-            // re-shape uses `mu = 0` over the same σ span as the native DMD loop.
-            let native = turbo_native_sigmas(opts.conditioning_sigma, opts.steps);
-            let full = resolve_flow_schedule(opts.scheduler.as_deref(), 0.0, opts.steps, &native);
-            let start = start_step.min(full.len().saturating_sub(1));
-            let lat = add_noise_by_interpolation(&clean, &noise, full[start])?;
-            let sigmas = &full[start..];
-            let lat = run_flow_sampler(
-                Some(sampler),
-                TimestepConvention::OneMinusSigma,
-                sigmas,
-                lat,
-                opts.seed,
-                cancel,
-                on_progress,
-                |x, timestep| {
-                    let t = Array::from_slice(&[timestep], &[1]);
-                    let v = self.dit.forward(x, &t, &cond, &mask)?;
-                    Ok(multiply(
-                        &v.as_dtype(Dtype::Float32)?,
-                        Array::from_f32(-1.0),
-                    )?)
-                },
-            )?;
-            on_progress(Progress::Decoding);
-            return self.decode_latents(&lat, decoder);
-        }
-
-        // Native DMD student loop seeded from the noise-blended reference. `sigmas` is clean-fraction
-        // ascending ([`dmd_sigmas`]); at start clean-fraction `c_k` the noise-fraction is `1 − c_k`, so
-        // the blend `(1 − c_k)·noise + c_k·clean` matches the curated path's `add_noise_by_interpolation`
-        // seed byte-for-byte (`turbo_native_sigmas[k] = 1 − c_k`). `start` is clamped to leave ≥1 step.
-        let sigmas = dmd_sigmas(opts.conditioning_sigma, opts.steps);
-        let start = start_step.min(sigmas.len().saturating_sub(1));
-        let lat = add_noise_by_interpolation(&clean, &noise, 1.0 - sigmas[start])?;
-        let lat = self.denoise_turbo_native(
+            .heavy
+            .encode_init_clean(init, opts.width, opts.height)?;
+        self.heavy.render_turbo_img2img(
             &cond,
             &mask,
-            lat,
-            &sigmas,
-            start,
-            opts.height,
-            opts.width,
-            opts.seed,
+            &clean,
+            start_step,
+            opts,
+            decoder,
             cancel,
             on_progress,
-        )?;
-
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
+        )
     }
 
-    /// Generate one RGB image via the **Edit** path: the single-reference convenience over
-    /// [`Self::generate_edit_multi`] (byte-identical to it with one reference). VAE-encode a reference
-    /// image into a clean reference latent, then flow-match denoise (true-CFG) with that reference
-    /// packed into the DiT's image sequence (`forward_edit_multi`). The reference shapes the output
-    /// spatially; the instruction drives the edit. Same static-v1 scheduler / true-CFG as
-    /// [`Self::generate`].
-    ///
-    /// Faithful Boogu edit (the default, `opts.condition_on_image`) feeds the reference image through
-    /// the Qwen3-VL **vision tower** so the MLLM "sees" it — the instruction features are
-    /// image-conditioned (semantic path) **and** the DiT gets the spatial reference latent. With
-    /// `condition_on_image = false` the instruction is encoded text-only (the E7 fallback); the DiT
-    /// spatial reference path is identical either way.
+    /// Generate one RGB image via the **Edit** path (single-reference convenience over
+    /// [`Self::generate_edit_multi`]).
     pub fn generate_edit(
         &self,
         reference: &Image,
@@ -605,7 +900,7 @@ impl BooguPipeline {
     }
 
     /// Multi-reference Edit (`N ∈ [1, 5]`): VAE-encode each reference and pack them all into the DiT
-    /// image sequence. `N = 1` is [`Self::generate_edit`]. See [`Self::generate_edit_multi_with_progress`].
+    /// image sequence. `N = 1` is [`Self::generate_edit`].
     pub fn generate_edit_multi(
         &self,
         references: &[Image],
@@ -626,10 +921,9 @@ impl BooguPipeline {
 
     /// Multi-reference Edit with [`Progress`] + cancellation. VAE-encodes each of the `N ∈ [1, 5]`
     /// references into its own clean latent, optionally runs each through the Qwen3-VL vision tower
-    /// (faithful semantic path), and flow-match denoises (true-CFG) with all references packed into
-    /// the DiT image sequence (`forward_edit_multi`, `[ref₀; …; ref_{N-1}; noise]`). The reference
-    /// latents are shared by both CFG passes; only the instruction differs. `N = 1` matches
-    /// [`Self::generate_edit_with_progress`].
+    /// (faithful semantic path), and flow-match denoises (true-CFG) with all references packed into the
+    /// DiT image sequence. `N = 1` matches [`Self::generate_edit`]. The `sigmas` schedule is the model
+    /// layer's, already truncated for the PiD `from_ldm` early-stop.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_edit_multi_with_progress(
         &self,
@@ -641,171 +935,27 @@ impl BooguPipeline {
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
-        if references.is_empty() {
-            return Err(Error::Msg(
-                "boogu edit: at least one reference image is required".into(),
-            ));
-        }
-        validate_multiple_of_16(opts.width, opts.height, "boogu")?;
-        for r in references {
-            validate_multiple_of_16(r.width, r.height, "boogu")?;
-        }
-
-        // Each reference → clean VAE latent [1, 16, rH/8, rW/8].
-        let ref_latents: Vec<Array> = references
-            .iter()
-            .map(|r| self.vae.encode(&image_to_pixels(r)?))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Condition encoding: edit instruction + CFG-negative (empty/drop) instruction. Both DiT
-        // passes carry the same reference latents — only the instruction differs (TI2I text guidance).
-        let (cond, cond_mask) = if opts.condition_on_image {
-            self.encode_image_instruction(references, instruction)?
-        } else {
-            let (ids, mask) = self.tok.encode_edit(instruction)?;
-            (self.te.last_hidden(&ids, &mask)?, mask)
-        };
-        let do_cfg = opts.text_guidance_scale > 1.0;
-        let uncond = if do_cfg {
-            // Reference `use_input_images_4_neg_instruct`: condition the negative on the images too
-            // (empty instruction); otherwise the text-only empty/drop instruction.
-            if opts.condition_on_image && opts.use_input_images_4_neg_instruct {
-                Some(self.encode_image_instruction(references, "")?)
-            } else {
-                let (u_ids, u_mask) = self.tok.encode_negative()?;
-                Some((self.te.last_hidden(&u_ids, &u_mask)?, u_mask))
-            }
-        } else {
-            None
-        };
-
-        let lat = init_noise(opts.height, opts.width, opts.seed, 0)?;
-
-        // Same unified-framework routing as the Base path (epic 7114), with the spatial reference latent
-        // threaded through `forward_edit_multi`. Native static-shift schedule is the byte-exact default;
-        // velocity is negated into the noise-fraction FLOW convention. The output resolution starts from
-        // pure noise (the reference shapes the DiT sequence, not the init latent), so there is no
-        // start-step slicing. The `sigmas` schedule is built + resolved by the model layer
-        // ([`base_flow_schedule`], shared with the Base path) so the PiD `from_ldm` early-stop (sc-8048)
-        // can hand a *truncated* slice here; the full schedule is byte-identical to before.
-        let scale = opts.text_guidance_scale;
-        let lat = run_flow_sampler(
-            opts.sampler.as_deref(),
-            TimestepConvention::OneMinusSigma,
+        let cond = self
+            .enc
+            .encode_edit(&self.tok, references, instruction, opts)?;
+        let ref_latents = self.heavy.encode_ref_latents(references)?;
+        self.heavy.render_edit(
+            &cond,
+            &ref_latents,
+            opts,
             sigmas,
-            lat,
-            opts.seed,
+            decoder,
             cancel,
             on_progress,
-            |x, timestep| {
-                let t = Array::from_slice(&[timestep], &[1]);
-                let cond_v = self
-                    .dit
-                    .forward_edit_multi(x, &ref_latents, &t, &cond, &cond_mask)?;
-                let pred = match &uncond {
-                    Some((u_hidden, u_mask)) => {
-                        let uncond_v =
-                            self.dit
-                                .forward_edit_multi(x, &ref_latents, &t, u_hidden, u_mask)?;
-                        add(
-                            &cond_v,
-                            &multiply(
-                                &subtract(&cond_v, &uncond_v)?,
-                                Array::from_f32(scale - 1.0),
-                            )?,
-                        )?
-                    }
-                    None => cond_v,
-                };
-                Ok(multiply(
-                    &pred.as_dtype(Dtype::Float32)?,
-                    Array::from_f32(-1.0),
-                )?)
-            },
-        )?;
-
-        on_progress(Progress::Decoding);
-        self.decode_latents(&lat, decoder)
-    }
-
-    /// Image-conditioned instruction features for the edit path: preprocess each reference, run the
-    /// (lazily-loaded, f32) Qwen3-VL vision tower over each, build the chat template with one image
-    /// block per reference, and run the multi-image-conditioned MLLM forward. Returns
-    /// `(features [1, L, 4096], mask [1, L])` — the same `(hidden, mask)` shape the DiT
-    /// `forward_edit_multi` consumes, but with each `<|image_pad|>` run carrying its reference's merged
-    /// embeds + deepstack injections. A single reference is the `references.len() == 1` case.
-    fn encode_image_instruction(
-        &self,
-        references: &[Image],
-        instruction: &str,
-    ) -> Result<(Array, Array)> {
-        self.ensure_vision()?;
-        let vision = self.vision.borrow();
-        let tower = vision
-            .as_ref()
-            .expect("vision tower loaded by ensure_vision");
-
-        // Each reference → Qwen3-VL preprocessing (its own smart-resize / grid) → vision tower; collect
-        // per-image embeds / deepstack / grid + the merged-token count that drives the chat template.
-        let mut image_embeds: Vec<Array> = Vec::with_capacity(references.len());
-        let mut deepstacks: Vec<Vec<Array>> = Vec::with_capacity(references.len());
-        let mut grids: Vec<[i32; 3]> = Vec::with_capacity(references.len());
-        let mut counts: Vec<usize> = Vec::with_capacity(references.len());
-        for r in references {
-            let rgb = image::RgbImage::from_raw(r.width, r.height, r.pixels.clone()).ok_or_else(
-                || Error::Msg("boogu edit: reference pixels != width·height·3".into()),
-            )?;
-            let (pixel_values, grid) = preprocess_image(&rgb)?;
-            let (embeds, deepstack) = tower.forward(&pixel_values, &[grid])?;
-            counts.push(embeds.shape()[0] as usize);
-            image_embeds.push(embeds);
-            deepstacks.push(deepstack);
-            grids.push(grid);
-        }
-
-        // Chat template with one `<|image_pad|>` block per reference, then the multi-image-conditioned
-        // MLLM forward (per-image vision splice + 3-D MRoPE advancing per image + deepstack injection).
-        let (ids, mask) = self.tok.encode_edit_with_images(instruction, &counts)?;
-        let feats = self.te.last_hidden_with_image_multi(
-            &ids,
-            &mask,
-            &image_embeds,
-            &deepstacks,
-            &grids,
-            IMAGE_TOKEN_ID,
-        )?;
-        Ok((feats, mask))
-    }
-
-    /// Ensure the Qwen3-VL vision tower is loaded (lazy, cached). Loaded from the snapshot's `mllm/`
-    /// (f32 — see [`load_vision_tower`]) only on the first image-conditioned edit, so the T2I paths
-    /// never pay for it.
-    fn ensure_vision(&self) -> Result<()> {
-        let needs_load = self.vision.borrow().is_none();
-        if needs_load {
-            let tower = load_vision_tower(&self.root)?;
-            *self.vision.borrow_mut() = Some(tower);
-        }
-        Ok(())
-    }
-
-    /// VAE-decode (or PiD-decode) a final latent `[1, 16, H/8, W/8]` → RGB8 image. z-image `Vae::decode`
-    /// de-normalizes (`z/scaling + shift`) internally, so the raw post-denoise latent is passed; PiD
-    /// consumes that same normalized latent and additionally 4× super-resolves. `decoder` is `Some` only
-    /// when the request set `use_pid` and a PiD overlay was loaded (epic 7840, sc-7846); else native VAE.
-    fn decode_latents(&self, lat: &Array, decoder: Option<&dyn LatentDecoder>) -> Result<Image> {
-        let decoder: &dyn LatentDecoder = decoder.unwrap_or(&self.vae);
-        let decoded = decoder.decode(lat)?.as_dtype(Dtype::Float32)?; // VAE [1,3,1,H,W]; PiD [1,3,4H,4W]
-        decoded_to_image(&decoded)
+        )
     }
 
     /// Quantize the two large weight stacks — the DiT (~20.6 GB bf16) and the Qwen3-VL TE (~17.5 GB
     /// bf16) — to Q4/Q8 in place (E8 / memory). The FLUX.1 VAE (0.34 GB, decode-precision-sensitive)
-    /// and the lazily-loaded f32 vision tower (E7b-1 parity finding) stay dense. The same group-wise
-    /// affine packing the on-disk converter ([`crate::convert::quantize_transformer`]) writes.
+    /// and the lazily-loaded f32 vision tower (E7b-1 parity finding) stay dense.
     pub fn quantize(&mut self, bits: i32) -> Result<()> {
-        self.dit.quantize(bits)?;
-        self.te.quantize(bits)?;
+        self.heavy.quantize(bits)?;
+        self.enc.quantize(bits)?;
         Ok(())
     }
 }
